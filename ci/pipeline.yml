@@ -46,7 +46,7 @@ jobs:
 resources:
 - #@ repo_resource(webhook=True)
 - #@ pipeline_tasks_resource()
-- #@ edge_image_resource(publicRepo=False)
+- #@ edge_image_resource()
 - #@ nodejs_deps_resource(pckgMgr="pnpm")
 - #@ deps_version_resource()
 - #@ bundled_deps_resource()
@@ -54,7 +54,7 @@ resources:
 
 - #@ version_resource()
 - #@ charts_repo_resource()
-- #@ versioned_image_resource(publicRepo=False)
+- #@ versioned_image_resource()
 
 - #@ gh_release_resource()
 - #@ charts_repo_bot_branch()
