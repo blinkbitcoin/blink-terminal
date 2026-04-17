@@ -200,6 +200,7 @@ on_failure: #@ slack_failure_notification()
 #@ params["SSH_PRIVATE_KEY"] = "((staging-ssh.ssh_private_key))"
 #@ params["SSH_PUB_KEY"] = "((staging-ssh.ssh_public_key))"
 #@ params["CMD"] = cmd
+#@ params["PARAMS_KEYS"] = " ".join(additional_params.keys())
 name: #@ name
 serial: true
 plan:
