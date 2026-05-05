@@ -150,10 +150,8 @@ FROM boltcards;
 -- ============================================
 
 -- For now, we add a comment explaining the migration strategy
-COMMENT ON COLUMN boltcards.card_id_hash IS 
-'Privacy-preserving ID derived from IssuerKey and UID. ' ||
-'Derived as: PRF(IssuerKey, 0x2d003f7b || UID). ' ||
-'Cards without this value will be lazily migrated on access.';
+COMMENT ON COLUMN boltcards.card_id_hash IS
+'Privacy-preserving ID derived from IssuerKey and UID. Derived as: PRF(IssuerKey, 0x2d003f7b || UID). Cards without this value will be lazily migrated on access.';
 
 -- ============================================
 -- SCHEMA VERSION UPDATE
