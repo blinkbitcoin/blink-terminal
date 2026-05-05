@@ -5,9 +5,76 @@
 -- Date: 2026-01-09
 -- ============================================
 
--- Alter velocity column to allow larger values
-ALTER TABLE community_metrics 
+-- Drop dependent views, alter column, recreate views
+-- community_leaderboard selects cm.velocity directly; community_heatmap does
+-- SELECT * from community_metrics so PG tracks a dep on every column. Both block ALTER TYPE.
+DROP VIEW IF EXISTS community_leaderboard;
+DROP VIEW IF EXISTS community_heatmap;
+
+ALTER TABLE community_metrics
 ALTER COLUMN velocity TYPE DECIMAL(20, 4);
+
+CREATE OR REPLACE VIEW community_leaderboard AS
+SELECT
+    c.id,
+    c.name,
+    c.slug,
+    c.country_code,
+    c.city,
+    c.member_count,
+    c.data_sharing_member_count,
+    cm.transaction_count,
+    cm.transaction_volume_sats,
+    cm.velocity,
+    cm.tx_count_growth_percent,
+    cm.internal_tx_count,
+    CASE
+        WHEN cm.transaction_count > 0
+        THEN (cm.internal_tx_count::DECIMAL / cm.transaction_count * 100)
+        ELSE 0
+    END as closed_loop_percent,
+    cm.period_start,
+    cm.period_end
+FROM communities c
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM community_metrics
+    WHERE community_id = c.id
+      AND period_type = 'monthly'
+    ORDER BY period_start DESC
+    LIMIT 1
+) cm ON true
+WHERE c.status = 'active'
+ORDER BY cm.transaction_volume_sats DESC NULLS LAST;
+
+CREATE OR REPLACE VIEW community_heatmap AS
+SELECT
+    c.id,
+    c.name,
+    c.latitude,
+    c.longitude,
+    c.country_code,
+    c.city,
+    c.member_count,
+    COALESCE(cm.transaction_volume_sats, 0) as volume_sats,
+    COALESCE(cm.tx_count_growth_percent, 0) as growth_percent,
+    LEAST(100, (
+        (COALESCE(c.member_count, 0) * 2) +
+        (COALESCE(cm.transaction_count, 0) / 10) +
+        (GREATEST(0, COALESCE(cm.tx_count_growth_percent, 0)))
+    )) as intensity_score
+FROM communities c
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM community_metrics
+    WHERE community_id = c.id
+      AND period_type = 'monthly'
+    ORDER BY period_start DESC
+    LIMIT 1
+) cm ON true
+WHERE c.status = 'active'
+  AND c.latitude IS NOT NULL
+  AND c.longitude IS NOT NULL;
 
 -- Update the compute_community_metrics function with better overflow handling
 CREATE OR REPLACE FUNCTION compute_community_metrics(
