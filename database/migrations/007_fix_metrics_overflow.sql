@@ -5,9 +5,45 @@
 -- Date: 2026-01-09
 -- ============================================
 
--- Alter velocity column to allow larger values
-ALTER TABLE community_metrics 
+-- Drop dependent view, alter column, recreate view
+-- (community_leaderboard from migration 002 selects cm.velocity, which blocks ALTER TYPE)
+DROP VIEW IF EXISTS community_leaderboard;
+
+ALTER TABLE community_metrics
 ALTER COLUMN velocity TYPE DECIMAL(20, 4);
+
+CREATE OR REPLACE VIEW community_leaderboard AS
+SELECT
+    c.id,
+    c.name,
+    c.slug,
+    c.country_code,
+    c.city,
+    c.member_count,
+    c.data_sharing_member_count,
+    cm.transaction_count,
+    cm.transaction_volume_sats,
+    cm.velocity,
+    cm.tx_count_growth_percent,
+    cm.internal_tx_count,
+    CASE
+        WHEN cm.transaction_count > 0
+        THEN (cm.internal_tx_count::DECIMAL / cm.transaction_count * 100)
+        ELSE 0
+    END as closed_loop_percent,
+    cm.period_start,
+    cm.period_end
+FROM communities c
+LEFT JOIN LATERAL (
+    SELECT *
+    FROM community_metrics
+    WHERE community_id = c.id
+      AND period_type = 'monthly'
+    ORDER BY period_start DESC
+    LIMIT 1
+) cm ON true
+WHERE c.status = 'active'
+ORDER BY cm.transaction_volume_sats DESC NULLS LAST;
 
 -- Update the compute_community_metrics function with better overflow handling
 CREATE OR REPLACE FUNCTION compute_community_metrics(
