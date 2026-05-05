@@ -81,6 +81,20 @@ ON CONFLICT (npub) DO UPDATE SET
     reason = EXCLUDED.reason,
     updated_at = NOW();
 
+-- Super Admin (also leads Test Community below)
+INSERT INTO community_leader_whitelist (npub, display_name, added_by, reason, status)
+VALUES (
+    'npub1flac02t5hw6jljk8x7mec22uq37ert8d3y3mpwzcma726g5pz4lsmfzlk6',
+    'Super Admin',
+    'npub1flac02t5hw6jljk8x7mec22uq37ert8d3y3mpwzcma726g5pz4lsmfzlk6',
+    'Self-whitelisted super admin - leads Test Community',
+    'active'
+)
+ON CONFLICT (npub) DO UPDATE SET
+    display_name = EXCLUDED.display_name,
+    reason = EXCLUDED.reason,
+    updated_at = NOW();
+
 -- ============================================
 -- SEED PIONEER COMMUNITIES
 -- ============================================
