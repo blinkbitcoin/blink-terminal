@@ -7,7 +7,7 @@
 
 import { useState } from "react"
 
-import { getApiUrl } from "../../lib/config/api"
+import { getApiUrl, isStaging } from "../../lib/config/api"
 import { useCombinedAuth } from "../../lib/hooks/useCombinedAuth"
 import { useNostrAuth } from "../../lib/hooks/useNostrAuth"
 import { useProfile } from "../../lib/hooks/useProfile"
@@ -244,7 +244,7 @@ export default function BlinkAccountSetup({
               onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
                 setApiKey(e.target.value)
               }
-              placeholder="blink_..."
+              placeholder={isStaging() ? "galoy_staging_..." : "blink_..."}
               required
               autoComplete="new-password"
               data-1p-ignore="true"

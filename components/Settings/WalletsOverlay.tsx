@@ -1,4 +1,4 @@
-import { getApiUrl, getLnAddressDomain } from "../../lib/config/api"
+import { getApiUrl, getLnAddressDomain, isStaging } from "../../lib/config/api"
 import type {
   AccountType,
   EditingWalletLabel,
@@ -553,7 +553,7 @@ export default function WalletsOverlay({
                       onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
                         setNewAccountApiKey(e.target.value)
                       }
-                      placeholder="blink_..."
+                      placeholder={isStaging() ? "galoy_staging_..." : "blink_..."}
                       required
                       autoFocus
                       autoComplete="off"

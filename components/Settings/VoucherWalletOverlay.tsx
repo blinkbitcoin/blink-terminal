@@ -1,4 +1,4 @@
-import { getApiUrl } from "../../lib/config/api"
+import { getApiUrl, isStaging } from "../../lib/config/api"
 import type { EditingWalletLabel } from "../../lib/hooks/useAccountManagement"
 import type { VoucherWallet } from "../../lib/hooks/useVoucherWalletState"
 import { formatNumber, NumberFormatPreference } from "../../lib/number-format"
@@ -549,7 +549,7 @@ export default function VoucherWalletOverlay({
                         setVoucherWalletError(null)
                         setVoucherWalletScopes(null)
                       }}
-                      placeholder="blink_..."
+                      placeholder={isStaging() ? "galoy_staging_..." : "blink_..."}
                       required
                       autoComplete="off"
                       data-1p-ignore="true"
