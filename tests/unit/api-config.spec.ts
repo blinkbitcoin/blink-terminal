@@ -191,4 +191,34 @@ describe("API Configuration", () => {
       expect(info).toHaveProperty("isProduction", false)
     })
   })
+
+  describe("isHostnameStaging()", () => {
+    // jsdom's window.location is non-configurable, so the hostname-detection
+    // logic is extracted into isHostnameStaging() for direct unit testing.
+
+    it("should return true for terminal.staging.blinkbtc.com", async () => {
+      const { isHostnameStaging } = await import("../../lib/config/api")
+      expect(isHostnameStaging("terminal.staging.blinkbtc.com")).toBe(true)
+    })
+
+    it("should return true for staging.terminal.blink.sv", async () => {
+      const { isHostnameStaging } = await import("../../lib/config/api")
+      expect(isHostnameStaging("staging.terminal.blink.sv")).toBe(true)
+    })
+
+    it("should return false for terminal.blinkbtc.com", async () => {
+      const { isHostnameStaging } = await import("../../lib/config/api")
+      expect(isHostnameStaging("terminal.blinkbtc.com")).toBe(false)
+    })
+
+    it("should return false for localhost", async () => {
+      const { isHostnameStaging } = await import("../../lib/config/api")
+      expect(isHostnameStaging("localhost")).toBe(false)
+    })
+
+    it("should return false for terminal.blink.sv", async () => {
+      const { isHostnameStaging } = await import("../../lib/config/api")
+      expect(isHostnameStaging("terminal.blink.sv")).toBe(false)
+    })
+  })
 })

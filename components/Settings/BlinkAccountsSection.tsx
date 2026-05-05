@@ -5,7 +5,7 @@
 
 import { useState } from "react"
 
-import { getApiUrl } from "../../lib/config/api"
+import { getApiUrl, isStaging } from "../../lib/config/api"
 import { useCombinedAuth } from "../../lib/hooks/useCombinedAuth"
 import type { LocalBlinkAccount } from "../../lib/hooks/useProfile"
 import { useTheme } from "../../lib/hooks/useTheme"
@@ -676,7 +676,7 @@ export default function BlinkAccountsSection() {
                 onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
                   setApiKey(e.target.value)
                 }
-                placeholder="blink_..."
+                placeholder={isStaging() ? "galoy_staging_..." : "blink_..."}
                 required
                 autoComplete="off"
                 data-1p-ignore="true"

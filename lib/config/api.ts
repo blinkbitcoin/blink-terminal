@@ -5,7 +5,10 @@
  *
  * Usage:
  * - Import { getApiUrl } and use instead of hardcoded URLs
- * - Use debug panel (tap logo 5 times on signin) to switch environments
+ * - Staging is auto-detected from window.location.hostname (any host
+ *   containing "staging" maps to the staging environment)
+ * - On non-staging hosts, the debug panel (tap logo 5 times on signin)
+ *   can override via localStorage
  * - Staging uses signet (not real sats)
  *
  * Staging Documentation: https://dev.blink.sv/self-host/deployment/staging-environment
@@ -70,6 +73,16 @@ const STORAGE_KEY: string = "blink_environment"
 // =============================================================================
 
 /**
+ * Returns true when the given hostname indicates a staging deployment.
+ * Exported so that unit tests can exercise the detection logic directly
+ * without needing to mutate the non-configurable jsdom window.location.
+ * @param hostname - window.location.hostname value
+ */
+export function isHostnameStaging(hostname: string): boolean {
+  return hostname.includes("staging")
+}
+
+/**
  * Get the current environment name
  * @returns Current environment
  */
@@ -79,7 +92,15 @@ export function getEnvironment(): EnvironmentName {
     return (process.env.BLINK_ENVIRONMENT as EnvironmentName) || "production"
   }
 
-  // Client-side: check localStorage
+  // Client-side: hostname auto-detect takes priority so that staging
+  // deployments (e.g. terminal.staging.blinkbtc.com) are never
+  // silently pointed at the production API due to a missing or stale
+  // localStorage value.
+  if (isHostnameStaging(window.location.hostname)) {
+    return "staging"
+  }
+
+  // localStorage override (debug panel) for non-staging hosts only
   const stored: string | null = localStorage.getItem(STORAGE_KEY)
   if (stored && ENVIRONMENTS[stored as EnvironmentName]) {
     return stored as EnvironmentName
@@ -274,6 +295,7 @@ if (typeof window !== "undefined") {
 }
 
 export default {
+  isHostnameStaging,
   getEnvironment,
   setEnvironment,
   getEnvironmentConfig,

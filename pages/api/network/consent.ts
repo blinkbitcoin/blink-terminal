@@ -146,11 +146,15 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       })
     }
 
-    // Validate API key format (Blink keys start with 'blink_')
-    if (!apiKey.startsWith("blink_")) {
+    // Validate API key format. Production keys start with "blink_";
+    // staging/signet keys start with "galoy_staging_". The downstream
+    // API call still verifies the key is valid for the given environment.
+    const isValidKeyPrefix =
+      apiKey.startsWith("blink_") || apiKey.startsWith("galoy_staging_")
+    if (!isValidKeyPrefix) {
       return res.status(400).json({
         success: false,
-        error: 'Invalid API key format. Blink API keys start with "blink_"',
+        error: 'Invalid API key format. Expected "blink_..." or "galoy_staging_..."',
       })
     }
 
