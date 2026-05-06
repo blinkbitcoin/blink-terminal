@@ -127,18 +127,16 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
         })
       }
 
-      // Get BlinkPOS credentials from environment (staging or production)
-      const isStaging = environment === "staging"
-      const blinkposApiKey = isStaging
-        ? process.env.BLINKPOS_STAGING_API_KEY
-        : process.env.BLINKPOS_API_KEY
-      const blinkposBtcWalletId = isStaging
-        ? process.env.BLINKPOS_STAGING_BTC_WALLET_ID
-        : process.env.BLINKPOS_BTC_WALLET_ID
+      // Get BlinkPOS credentials from environment.
+      // A single pair of env vars is used across staging and production; each
+      // deployment is responsible for setting these to the credentials that
+      // match its target Blink instance. The `environment` value still selects
+      // the Blink GraphQL URL via `getApiUrlForEnvironment`.
+      const blinkposApiKey = process.env.BLINKPOS_API_KEY
+      const blinkposBtcWalletId = process.env.BLINKPOS_BTC_WALLET_ID
 
       console.log("🔐 BlinkPOS credentials check:", {
         environment,
-        isStaging,
         hasApiKey: !!blinkposApiKey,
         apiKeyLength: blinkposApiKey ? blinkposApiKey.length : 0,
         hasWalletId: !!blinkposBtcWalletId,

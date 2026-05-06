@@ -525,15 +525,12 @@ async function forwardToLnAddress(
   forwardingData: ForwardingData,
   hybridStore: HybridStore,
 ) {
-  // Get the environment-specific API URL and credentials from stored forwarding data
+  // Get the environment-specific API URL from stored forwarding data.
+  // BlinkPOS credentials are set per-deployment; `environment` only
+  // selects which Blink GraphQL URL we talk to.
   const environment = forwardingData.environment || "production"
-  const isStaging = environment === "staging"
-  const blinkposApiKey = isStaging
-    ? process.env.BLINKPOS_STAGING_API_KEY
-    : process.env.BLINKPOS_API_KEY
-  const blinkposBtcWalletId = isStaging
-    ? process.env.BLINKPOS_STAGING_BTC_WALLET_ID
-    : process.env.BLINKPOS_BTC_WALLET_ID
+  const blinkposApiKey = process.env.BLINKPOS_API_KEY
+  const blinkposBtcWalletId = process.env.BLINKPOS_BTC_WALLET_ID
   const apiUrl = getApiUrlForEnvironment(environment)
 
   const blinkposAPI = new BlinkAPI(blinkposApiKey!, apiUrl)
@@ -672,15 +669,12 @@ async function forwardToNpubCash(
   forwardingData: ForwardingData,
   hybridStore: HybridStore,
 ) {
-  // Get the environment-specific API URL and credentials from stored forwarding data
+  // Get the environment-specific API URL from stored forwarding data.
+  // BlinkPOS credentials are set per-deployment; `environment` only
+  // selects which Blink GraphQL URL we talk to.
   const environment = forwardingData.environment || "production"
-  const isStaging = environment === "staging"
-  const blinkposApiKey = isStaging
-    ? process.env.BLINKPOS_STAGING_API_KEY
-    : process.env.BLINKPOS_API_KEY
-  const blinkposBtcWalletId = isStaging
-    ? process.env.BLINKPOS_STAGING_BTC_WALLET_ID
-    : process.env.BLINKPOS_BTC_WALLET_ID
+  const blinkposApiKey = process.env.BLINKPOS_API_KEY
+  const blinkposBtcWalletId = process.env.BLINKPOS_BTC_WALLET_ID
   const apiUrl = getApiUrlForEnvironment(environment)
 
   const blinkposAPI = new BlinkAPI(blinkposApiKey!, apiUrl)
@@ -766,15 +760,12 @@ async function forwardToNWCWallet(
   forwardingData: ForwardingData,
   hybridStore: HybridStore,
 ) {
-  // Get the environment-specific API URL and credentials from stored forwarding data
+  // Get the environment-specific API URL from stored forwarding data.
+  // BlinkPOS credentials are set per-deployment; `environment` only
+  // selects which Blink GraphQL URL we talk to.
   const environment = forwardingData.environment || "production"
-  const isStaging = environment === "staging"
-  const blinkposApiKey = isStaging
-    ? process.env.BLINKPOS_STAGING_API_KEY
-    : process.env.BLINKPOS_API_KEY
-  const blinkposBtcWalletId = isStaging
-    ? process.env.BLINKPOS_STAGING_BTC_WALLET_ID
-    : process.env.BLINKPOS_BTC_WALLET_ID
+  const blinkposApiKey = process.env.BLINKPOS_API_KEY
+  const blinkposBtcWalletId = process.env.BLINKPOS_BTC_WALLET_ID
   const apiUrl = getApiUrlForEnvironment(environment)
 
   const blinkposAPI = new BlinkAPI(blinkposApiKey!, apiUrl)
@@ -888,15 +879,12 @@ async function forwardToUserWallet(
   forwardingData: ForwardingData,
   hybridStore: HybridStore,
 ) {
-  // Get the environment-specific API URL and credentials from stored forwarding data
+  // Get the environment-specific API URL from stored forwarding data.
+  // BlinkPOS credentials are set per-deployment; `environment` only
+  // selects which Blink GraphQL URL we talk to.
   const environment = forwardingData.environment || "production"
-  const isStaging = environment === "staging"
-  const blinkposApiKey = isStaging
-    ? process.env.BLINKPOS_STAGING_API_KEY
-    : process.env.BLINKPOS_API_KEY
-  const blinkposBtcWalletId = isStaging
-    ? process.env.BLINKPOS_STAGING_BTC_WALLET_ID
-    : process.env.BLINKPOS_BTC_WALLET_ID
+  const blinkposApiKey = process.env.BLINKPOS_API_KEY
+  const blinkposBtcWalletId = process.env.BLINKPOS_BTC_WALLET_ID
   const apiUrl = getApiUrlForEnvironment(environment)
 
   const blinkposAPI = new BlinkAPI(blinkposApiKey!, apiUrl)
