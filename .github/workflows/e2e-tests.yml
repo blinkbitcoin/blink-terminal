@@ -31,7 +31,7 @@ env:
   # Force staging environment for all E2E tests
   BLINK_ENVIRONMENT: staging
   # Node version to use
-  NODE_VERSION: '20'
+  NODE_VERSION: '22'
 
 jobs:
   e2e-tests:
