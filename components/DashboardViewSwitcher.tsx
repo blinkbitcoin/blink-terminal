@@ -125,7 +125,7 @@ interface DashboardViewSwitcherProps {
   isSearchLoading: boolean
   txSearchQuery: string
   txSearchInput: string
-  txSearchInputRef: React.RefObject<HTMLInputElement>
+  txSearchInputRef: React.RefObject<HTMLInputElement | null>
   loadingMore: boolean
   hasMoreTransactions: boolean
   expandedMonths: Set<string>

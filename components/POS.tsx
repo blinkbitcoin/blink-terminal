@@ -755,7 +755,7 @@ const POS = forwardRef<POSRef, POSProps>(
       value: number | string,
       currency: string,
       className: string = "",
-    ): JSX.Element => {
+    ): React.JSX.Element => {
       const formatted = formatDisplayAmount(value, currency)
       const parts = parseAmountParts(formatted, currency, bitcoinFormat)
 

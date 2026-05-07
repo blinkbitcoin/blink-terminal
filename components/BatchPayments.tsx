@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from "react"
+import { useState, useCallback, useRef, useEffect, type JSX } from "react"
 
 import { generateTemplate } from "../lib/batch-payments"
 import { getApiUrl } from "../lib/config/api"
