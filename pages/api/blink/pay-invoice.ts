@@ -109,14 +109,10 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       `✅ SECURITY: Claimed payment ${paymentHash?.substring(0, 16)}... for NWC forwarding`,
     )
 
-    // Get BlinkPOS credentials from environment based on staging/production
-    const isStaging = environment === "staging"
-    const blinkposApiKey = isStaging
-      ? process.env.BLINKPOS_STAGING_API_KEY
-      : process.env.BLINKPOS_API_KEY
-    const blinkposBtcWalletId = isStaging
-      ? process.env.BLINKPOS_STAGING_BTC_WALLET_ID
-      : process.env.BLINKPOS_BTC_WALLET_ID
+    // BlinkPOS credentials are set per-deployment; the `environment` value
+    // only selects which Blink GraphQL URL we talk to.
+    const blinkposApiKey = process.env.BLINKPOS_API_KEY
+    const blinkposBtcWalletId = process.env.BLINKPOS_BTC_WALLET_ID
     const apiUrl = getApiUrlForEnvironment(environment)
 
     if (!blinkposApiKey || !blinkposBtcWalletId) {

@@ -183,18 +183,14 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       timestamp: new Date().toISOString(),
     })
 
-    // Get BlinkPOS credentials from environment based on staging/production
-    // Get environment from tip data (stored when invoice was created) or from request body
+    // Resolve environment from tip data (stored when invoice was created)
+    // or from the request body. BlinkPOS credentials are set per-deployment;
+    // `environment` only selects which Blink GraphQL URL we talk to.
     const environment = (tipData.environment ||
       reqEnvironment ||
       "production") as EnvironmentName
-    const isStaging = environment === "staging"
-    const blinkposApiKey = isStaging
-      ? process.env.BLINKPOS_STAGING_API_KEY
-      : process.env.BLINKPOS_API_KEY
-    const blinkposBtcWalletId = isStaging
-      ? process.env.BLINKPOS_STAGING_BTC_WALLET_ID
-      : process.env.BLINKPOS_BTC_WALLET_ID
+    const blinkposApiKey = process.env.BLINKPOS_API_KEY
+    const blinkposBtcWalletId = process.env.BLINKPOS_BTC_WALLET_ID
     const apiUrl = getApiUrlForEnvironment(environment)
 
     if (!blinkposApiKey || !blinkposBtcWalletId) {

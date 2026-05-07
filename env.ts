@@ -25,8 +25,6 @@ export const env = createEnv({
     BLINK_ENVIRONMENT: z.enum(["production", "staging"]).default("production"),
     BLINKPOS_API_KEY: z.string().min(1).optional(),
     BLINKPOS_BTC_WALLET_ID: z.string().min(1).optional(),
-    BLINKPOS_STAGING_API_KEY: z.string().min(1).optional(),
-    BLINKPOS_STAGING_BTC_WALLET_ID: z.string().min(1).optional(),
     BLINK_WEBHOOK_SECRET: z.string().min(1).optional(),
     BLINK_STAGING_WEBHOOK_SECRET: z.string().min(1).optional(),
 
@@ -78,8 +76,6 @@ export const env = createEnv({
     BLINK_ENVIRONMENT: process.env.BLINK_ENVIRONMENT,
     BLINKPOS_API_KEY: process.env.BLINKPOS_API_KEY,
     BLINKPOS_BTC_WALLET_ID: process.env.BLINKPOS_BTC_WALLET_ID,
-    BLINKPOS_STAGING_API_KEY: process.env.BLINKPOS_STAGING_API_KEY,
-    BLINKPOS_STAGING_BTC_WALLET_ID: process.env.BLINKPOS_STAGING_BTC_WALLET_ID,
     BLINK_WEBHOOK_SECRET: process.env.BLINK_WEBHOOK_SECRET,
     BLINK_STAGING_WEBHOOK_SECRET: process.env.BLINK_STAGING_WEBHOOK_SECRET,
 
