@@ -4,6 +4,7 @@ import {
   useRef,
   createContext,
   useContext,
+  type JSX,
   type ReactNode,
 } from "react"
 

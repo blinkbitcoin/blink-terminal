@@ -122,7 +122,9 @@ const NostrAuthContext = createContext<NostrAuthContextValue | null>(null)
 /**
  * NostrAuthProvider - Provides Nostr authentication context
  */
-export function NostrAuthProvider({ children }: NostrAuthProviderProps): JSX.Element {
+export function NostrAuthProvider({
+  children,
+}: NostrAuthProviderProps): React.JSX.Element {
   // Generate unique ID to track provider instances
   const providerInstanceId = useRef<string>(Math.random().toString(36).substring(7))
 

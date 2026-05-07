@@ -1,7 +1,7 @@
 import fs from "fs"
 import path from "path"
 
-import ReactPDF, { renderToBuffer } from "@react-pdf/renderer"
+import { renderToBuffer } from "@react-pdf/renderer"
 import type { NextApiRequest, NextApiResponse } from "next"
 import React from "react"
 
@@ -127,7 +127,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
     // Render to buffer
     const pdfBuffer = await renderToBuffer(
-      documentElement as React.ReactElement<ReactPDF.DocumentProps>,
+      documentElement as Parameters<typeof renderToBuffer>[0],
     )
 
     // Convert to base64

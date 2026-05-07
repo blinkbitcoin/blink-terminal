@@ -46,7 +46,7 @@ interface TransactionsViewProps {
   isSearchLoading: boolean
   txSearchQuery: string
   txSearchInput: string
-  txSearchInputRef: RefObject<HTMLInputElement>
+  txSearchInputRef: RefObject<HTMLInputElement | null>
   // Pagination
   loadingMore: boolean
   hasMoreTransactions: boolean
