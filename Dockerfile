@@ -1,6 +1,7 @@
 # Production Dockerfile for BlinkPOS
 FROM node:20-alpine AS base
-RUN corepack enable && corepack prepare pnpm@latest --activate
+ARG PNPM_VERSION=10.15.1
+RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
 
 # Install dependencies only when needed
 FROM base AS deps
@@ -77,4 +78,3 @@ RUN apk add --no-cache wget
 USER nextjs
 
 CMD ["node", "server.js"]
-
