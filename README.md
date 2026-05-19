@@ -93,6 +93,15 @@ Frontend (Next.js) → Direct Blink WebSocket → Instant Payment Detection
 - **PostgreSQL**: Permanent storage for transaction history, vouchers, and analytics
 - **Automatic Migration**: Data flows from Redis to PostgreSQL after completion
 
+### Redis Key Conventions
+
+All Redis keys are prefixed with `blink-terminal:` to prevent collisions when sharing a Redis instance with other services:
+
+| Key Pattern | Purpose | TTL |
+|---|---|---|
+| `blink-terminal:rate:{provider}:{CURRENCY}` | Exchange rate cache | 45s |
+| `blink-terminal:payment:{paymentHash}` | Active payment data (hot cache) | 15-30min |
+
 ## Quick Start
 
 ### Prerequisites

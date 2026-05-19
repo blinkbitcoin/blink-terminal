@@ -288,10 +288,11 @@ class HybridStore {
   }
 
   /**
-   * Generate Redis key for payment hash
+   * Generate Redis key for payment hash.
+   * All Redis keys use the "blink-terminal:" prefix to avoid collisions in shared Redis instances.
    */
   getRedisKey(paymentHash: string): string {
-    return `blinkpos:payment:${paymentHash}`
+    return `blink-terminal:payment:${paymentHash}`
   }
 
   /**

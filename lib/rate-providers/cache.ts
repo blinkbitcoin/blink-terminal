@@ -9,7 +9,8 @@ import { createClient, RedisClientType } from "redis"
 
 // Cache configuration
 const RATE_CACHE_TTL: number = 45 // seconds (between 30-60 recommended by Citrusrate)
-const CACHE_KEY_PREFIX: string = "rate:"
+// All Redis keys use the "blink-terminal:" prefix to avoid collisions in shared Redis instances.
+const CACHE_KEY_PREFIX: string = "blink-terminal:rate:"
 
 // Redis client singleton
 let redisClient: RedisClientType | null = null
