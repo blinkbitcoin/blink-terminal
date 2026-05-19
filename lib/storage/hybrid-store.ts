@@ -291,7 +291,7 @@ class HybridStore {
    * Generate Redis key for payment hash
    */
   getRedisKey(paymentHash: string): string {
-    return `blinkpos:payment:${paymentHash}`
+    return `blink-terminal:payment:${paymentHash}`
   }
 
   /**
