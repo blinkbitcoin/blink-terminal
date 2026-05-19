@@ -714,6 +714,29 @@ ssh ${PROD_USER}@${PROD_SERVER} bash <<EOF
         echo "✅ Migration 018 already applied (skipping)"
     fi
     
+    # Refresh schema version
+    SCHEMA_VERSION=\$(get_schema_version)
+    
+    # Apply migration 019 (payment splits, events, active payments view)
+    if [ "\${SCHEMA_VERSION}" -lt 19 ]; then
+        echo "🔄 Applying migration 019 (payment splits and events tables)..."
+        
+        if ! docker-compose -f docker-compose.prod.yml exec -T postgres psql -U blinkpos -d blinkpos < database/migrations/019_payment_splits.sql 2>&1 | tee ${BACKUP_DIR}/migration-019.log | grep -v "^$" | tail -20; then
+            echo ""
+            echo "❌ MIGRATION 019 FAILED!"
+            echo "📋 Check logs: ${BACKUP_DIR}/migration-019.log"
+            echo ""
+            echo "🔙 Rolling back deployment..."
+            docker-compose -f docker-compose.prod.yml down
+            echo "❌ Deployment stopped due to migration failure"
+            exit 1
+        fi
+        
+        echo "✅ Migration 019 applied successfully"
+    else
+        echo "✅ Migration 019 already applied (skipping)"
+    fi
+    
     # Display final schema version
     FINAL_VERSION=\$(get_schema_version)
     echo ""
