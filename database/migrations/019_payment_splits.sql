@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS payment_splits (
     memo                TEXT,
 
     -- Lifecycle status: pending -> processing -> completed | failed | expired
-    status              VARCHAR(20)     NOT NULL DEFAULT 'pending',
+    status              VARCHAR(20)     NOT NULL DEFAULT 'pending'
+        CONSTRAINT valid_payment_status CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'expired')),
 
     -- Flexible JSONB for forwarding config, NWC URIs, environment, etc.
     metadata            JSONB,
@@ -101,7 +102,8 @@ CREATE TABLE IF NOT EXISTS payment_events (
     event_type      VARCHAR(50)     NOT NULL,
 
     -- Outcome: success, failure
-    event_status    VARCHAR(20)     NOT NULL,
+    event_status    VARCHAR(20)     NOT NULL
+        CONSTRAINT valid_event_status CHECK (event_status IN ('success', 'failure')),
 
     -- Optional structured data
     metadata        JSONB,
