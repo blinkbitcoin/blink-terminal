@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS payment_splits (
     id                  BIGSERIAL       PRIMARY KEY,
 
     -- Unique Lightning invoice identifier (64-char hex hash)
-    payment_hash        VARCHAR(64)     NOT NULL UNIQUE,
+    payment_hash        VARCHAR(64)     NOT NULL,
 
     -- User identification (SHA-256 hash of the API key, never the key itself)
     user_api_key_hash   VARCHAR(64)     NOT NULL,
@@ -149,8 +149,19 @@ SELECT
     processed_at
 FROM payment_splits
 WHERE status IN ('pending', 'processing')
-  AND expires_at >= NOW()
-ORDER BY created_at DESC;
+  AND expires_at >= NOW();
+
+-- ============================================
+-- SCHEMA VERSION UPDATE
+-- ============================================
+
+INSERT INTO system_metrics (metric_name, metric_value, metric_unit, tags)
+VALUES (
+    'schema_version',
+    19,
+    'version',
+    '{"description": "Payment splits, events, and active payments view", "date": "2026-05-19"}'
+);
 
 -- ============================================
 -- COMPLETION
