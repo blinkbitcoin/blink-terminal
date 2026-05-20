@@ -158,12 +158,20 @@ WHERE status IN ('pending', 'processing')
 -- ============================================
 
 INSERT INTO system_metrics (metric_name, metric_value, metric_unit, tags)
-VALUES (
-    'schema_version',
-    19,
-    'version',
-    '{"description": "Payment splits, events, and active payments view", "date": "2026-05-19"}'
+SELECT 'schema_version', 19, 'version',
+       '{"description": "Payment splits, events, and active payments view", "date": "2026-05-19"}'::jsonb
+WHERE NOT EXISTS (
+    SELECT 1 FROM system_metrics
+    WHERE metric_name = 'schema_version' AND metric_value = 19
 );
+
+-- ============================================
+-- ROLLBACK (if needed):
+-- DROP VIEW IF EXISTS active_payments;
+-- DROP TABLE IF EXISTS payment_events;
+-- DROP TABLE IF EXISTS payment_splits;
+-- DELETE FROM system_metrics WHERE metric_name = 'schema_version' AND metric_value = 19;
+-- ============================================
 
 -- ============================================
 -- COMPLETION
