@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS payment_splits (
     user_api_key_hash   VARCHAR(64)     NOT NULL,
 
     -- Blink wallet ID that received the payment (or "NWC_ONLY_USER" placeholder)
-    user_wallet_id      VARCHAR(100)    NOT NULL,
+    -- VARCHAR(128) matches vouchers.wallet_id, boltcards.wallet_id, etc.
+    user_wallet_id      VARCHAR(128)    NOT NULL,
 
     -- Amounts in satoshis
     total_amount        BIGINT          NOT NULL,
@@ -35,7 +36,8 @@ CREATE TABLE IF NOT EXISTS payment_splits (
     tip_percent         DECIMAL(5,2)    NOT NULL DEFAULT 0,
 
     -- Tip forwarding destination (legacy single-recipient field)
-    tip_recipient       VARCHAR(100),
+    -- VARCHAR(255) matches counterparty_username, blink_username conventions
+    tip_recipient       VARCHAR(255),
 
     -- Display formatting
     display_currency    VARCHAR(10)     NOT NULL DEFAULT 'BTC',

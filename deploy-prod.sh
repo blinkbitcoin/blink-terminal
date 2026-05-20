@@ -721,7 +721,10 @@ ssh ${PROD_USER}@${PROD_SERVER} bash <<EOF
     if [ "\${SCHEMA_VERSION}" -lt 19 ]; then
         echo "🔄 Applying migration 019 (payment splits and events tables)..."
         
+        # Enable pipefail so the psql exit code is not masked by tee/grep/tail
+        set -o pipefail
         if ! docker-compose -f docker-compose.prod.yml exec -T postgres psql -U blinkpos -d blinkpos < database/migrations/019_payment_splits.sql 2>&1 | tee ${BACKUP_DIR}/migration-019.log | grep -v "^$" | tail -20; then
+            set +o pipefail
             echo ""
             echo "❌ MIGRATION 019 FAILED!"
             echo "📋 Check logs: ${BACKUP_DIR}/migration-019.log"
@@ -731,6 +734,7 @@ ssh ${PROD_USER}@${PROD_SERVER} bash <<EOF
             echo "❌ Deployment stopped due to migration failure"
             exit 1
         fi
+        set +o pipefail
         
         echo "✅ Migration 019 applied successfully"
     else
