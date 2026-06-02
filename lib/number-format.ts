@@ -16,6 +16,7 @@ export type NumberFormatPreference =
   | "space-comma"
 export type BitcoinFormatPreference = "sats" | "bip177" | "sat"
 export type NumpadLayoutPreference = "calculator" | "telephone"
+export type AmountDisplayPreference = "fiat-primary" | "sats-primary"
 
 export interface FormatPreview {
   integer: string
@@ -107,6 +108,31 @@ export const NUMPAD_LAYOUT_DESCRIPTIONS: Record<NumpadLayoutPreference, string> 
 
 // Default numpad layout
 export const DEFAULT_NUMPAD_LAYOUT: NumpadLayoutPreference = "calculator"
+
+// =============================================================================
+// Amount Display Configuration
+// =============================================================================
+
+// Amount display options (which value is primary when both fiat + sats are shown)
+export const AMOUNT_DISPLAY_OPTIONS: AmountDisplayPreference[] = [
+  "fiat-primary",
+  "sats-primary",
+]
+
+// Amount display labels for UI display
+export const AMOUNT_DISPLAY_LABELS: Record<AmountDisplayPreference, string> = {
+  "fiat-primary": "Local currency first",
+  "sats-primary": "Bitcoin first",
+}
+
+// Amount display descriptions for UI
+export const AMOUNT_DISPLAY_DESCRIPTIONS: Record<AmountDisplayPreference, string> = {
+  "fiat-primary": "Show the local currency amount as primary, sats in parentheses",
+  "sats-primary": "Show the Bitcoin amount as primary, local currency in parentheses",
+}
+
+// Default amount display preference
+export const DEFAULT_AMOUNT_DISPLAY: AmountDisplayPreference = "fiat-primary"
 
 /**
  * Format a Bitcoin/sats amount according to the specified format

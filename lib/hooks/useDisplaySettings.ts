@@ -17,9 +17,11 @@ import { useState, useCallback, useEffect } from "react"
 
 import {
   FORMAT_LOCALES,
+  DEFAULT_AMOUNT_DISPLAY,
   type NumberFormatPreference,
   type BitcoinFormatPreference,
   type NumpadLayoutPreference,
+  type AmountDisplayPreference,
 } from "../number-format"
 
 // ============================================================================
@@ -37,6 +39,9 @@ export type BitcoinFormat = BitcoinFormatPreference
 
 /** Numpad layout — re-exported from number-format.ts canonical types */
 export type NumpadLayout = NumpadLayoutPreference
+
+/** Amount display — re-exported from number-format.ts canonical types */
+export type AmountDisplay = AmountDisplayPreference
 
 /** Return type for the useDisplaySettings hook */
 export interface UseDisplaySettingsReturn {
@@ -56,6 +61,10 @@ export interface UseDisplaySettingsReturn {
   // Numpad layout state
   numpadLayout: NumpadLayout
   setNumpadLayout: (layout: NumpadLayout) => void
+
+  // Amount display state (fiat-primary vs sats-primary)
+  amountDisplay: AmountDisplay
+  setAmountDisplay: (preference: AmountDisplay) => void
 
   // Currency filter state (for currency selector search)
   currencyFilter: string
@@ -78,6 +87,7 @@ const STORAGE_KEYS = {
   NUMBER_FORMAT: "blinkpos-number-format",
   BITCOIN_FORMAT: "blinkpos-bitcoin-format",
   NUMPAD_LAYOUT: "blinkpos-numpad-layout",
+  AMOUNT_DISPLAY: "blinkpos-amount-display",
 } as const
 
 const DEFAULT_NUMBER_FORMAT: NumberFormat = "auto"
@@ -171,6 +181,10 @@ export function useDisplaySettings(): UseDisplaySettingsReturn {
     getFromStorage(STORAGE_KEYS.NUMPAD_LAYOUT, DEFAULT_NUMPAD_LAYOUT),
   )
 
+  const [amountDisplay, setAmountDisplayState] = useState<AmountDisplay>(() =>
+    getFromStorage(STORAGE_KEYS.AMOUNT_DISPLAY, DEFAULT_AMOUNT_DISPLAY),
+  )
+
   const [currencyFilter, setCurrencyFilterState] = useState<string>("")
   const [currencyFilterDebounced, setCurrencyFilterDebouncedState] = useState<string>("")
 
@@ -211,6 +225,15 @@ export function useDisplaySettings(): UseDisplaySettingsReturn {
   const setNumpadLayout = useCallback((layout: NumpadLayout) => {
     setNumpadLayoutState(layout)
     setToStorage(STORAGE_KEYS.NUMPAD_LAYOUT, layout)
+  }, [])
+
+  // ---------------------------------------------------------------------------
+  // Callbacks - Amount Display
+  // ---------------------------------------------------------------------------
+
+  const setAmountDisplay = useCallback((preference: AmountDisplay) => {
+    setAmountDisplayState(preference)
+    setToStorage(STORAGE_KEYS.AMOUNT_DISPLAY, preference)
   }, [])
 
   // ---------------------------------------------------------------------------
@@ -321,6 +344,10 @@ export function useDisplaySettings(): UseDisplaySettingsReturn {
     // Numpad layout
     numpadLayout,
     setNumpadLayout,
+
+    // Amount display
+    amountDisplay,
+    setAmountDisplay,
 
     // Currency filter
     currencyFilter,

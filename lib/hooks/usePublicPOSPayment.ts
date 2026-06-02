@@ -8,25 +8,32 @@ import {
 
 import { getApiUrl } from "../config/api"
 
+import type { PaymentData } from "./useBlinkWebSocket"
+
 // ─── Types ────────────────────────────────────────────────────────
 
 export interface CurrentInvoice {
   paymentRequest?: string
+  paymentHash?: string
   satAmount?: number
   amount?: number
   memo?: string
+  displayAmount?: number
+  displayCurrency?: string
+  tipAmount?: number
+  tipCurrency?: string
+  tipPercent?: number
 }
 
-export interface PaymentData {
-  amount: number
-  currency: string
-  memo?: string
-}
+// Re-export the shared PaymentData type for consumers of this hook
+export type { PaymentData }
 
 export interface UsePublicPOSPaymentParams {
   showingInvoice: boolean
   soundEnabled: boolean
   posPaymentReceivedRef: React.RefObject<(() => void) | null>
+  /** Merchant username to show on the success screen / receipt */
+  merchant?: string
 }
 
 export interface UsePublicPOSPaymentReturn {
@@ -54,6 +61,7 @@ export function usePublicPOSPayment({
   showingInvoice,
   soundEnabled,
   posPaymentReceivedRef,
+  merchant,
 }: UsePublicPOSPaymentParams): UsePublicPOSPaymentReturn {
   const [currentInvoice, setCurrentInvoice] = useState<CurrentInvoice | null>(null)
   const [paymentSuccess, setPaymentSuccess] = useState<boolean>(false)
@@ -97,11 +105,22 @@ export function usePublicPOSPayment({
         if (status === "PAID") {
           console.log("✅ Public invoice payment received!")
 
-          // Set payment data for animation
+          // Set payment data for animation with the richer invoice context so
+          // the success screen + receipt can show fiat, payment hash, tip, etc.
           setPaymentData({
             amount: currentInvoice.satAmount || currentInvoice.amount || 0,
             currency: "BTC", // Always show sats
             memo: currentInvoice.memo,
+            satAmount: currentInvoice.satAmount || currentInvoice.amount || 0,
+            displayAmount: currentInvoice.displayAmount,
+            displayCurrency: currentInvoice.displayCurrency,
+            paymentHash: currentInvoice.paymentHash,
+            paymentRequest: currentInvoice.paymentRequest,
+            timestamp: Date.now(),
+            merchant,
+            tipAmount: currentInvoice.tipAmount,
+            tipCurrency: currentInvoice.tipCurrency,
+            tipPercent: currentInvoice.tipPercent,
           })
           setPaymentSuccess(true)
 

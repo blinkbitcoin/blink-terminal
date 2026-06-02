@@ -12,8 +12,10 @@ import {
   formatNumber,
   formatBitcoinAmount,
   DEFAULT_BITCOIN_FORMAT,
+  DEFAULT_AMOUNT_DISPLAY,
   NumberFormatPreference,
   BitcoinFormatPreference,
+  AmountDisplayPreference,
 } from "./number-format"
 
 // =============================================================================
@@ -292,6 +294,66 @@ export const formatDisplayAmount = (
   }
 
   return formatCurrencyAmount(value, currency, numberFormat, bitcoinFormat)
+}
+
+/**
+ * Format a combined amount string showing both the fiat value and the sats value,
+ * with the order determined by the amount-display preference.
+ *
+ * - fiat-primary: "$50.00 (5,000 sats)"
+ * - sats-primary: "5,000 sats ($50.00)"
+ *
+ * When no fiat value is available (e.g. a Bitcoin-denominated payment), only the
+ * sats value is returned. When the sats value is missing, only the fiat is returned.
+ *
+ * @param sats - Amount in satoshis (may be undefined for fiat-only contexts)
+ * @param displayAmount - Fiat amount (may be undefined for sats-only contexts)
+ * @param displayCurrency - Fiat currency id (e.g. "USD", "KES"); BTC currencies are treated as no-fiat
+ * @param amountDisplay - Which value is primary
+ * @param numberFormat - Number format preference
+ * @param bitcoinFormat - Bitcoin format preference
+ * @param currencyList - Currency metadata list (optional; enables symbol-aware fiat formatting)
+ * @returns Combined display string
+ */
+export const formatCombinedAmount = (
+  sats: number | undefined,
+  displayAmount: number | string | undefined,
+  displayCurrency: string | undefined,
+  amountDisplay: AmountDisplayPreference = DEFAULT_AMOUNT_DISPLAY,
+  numberFormat: NumberFormatPreference = "auto",
+  bitcoinFormat: BitcoinFormatPreference = DEFAULT_BITCOIN_FORMAT,
+  currencyList: CurrencyMetadata[] = [],
+): string => {
+  const hasSats = typeof sats === "number" && !Number.isNaN(sats)
+  const hasFiat =
+    displayAmount !== undefined &&
+    displayAmount !== null &&
+    displayAmount !== "" &&
+    !!displayCurrency &&
+    !isBitcoinCurrency(displayCurrency)
+
+  const satsStr = hasSats
+    ? formatBitcoinAmount(sats as number, bitcoinFormat, numberFormat)
+    : ""
+  const fiatStr = hasFiat
+    ? formatDisplayAmount(
+        displayAmount as number | string,
+        displayCurrency as string,
+        currencyList,
+        numberFormat,
+        bitcoinFormat,
+      )
+    : ""
+
+  // Only one side available
+  if (!hasFiat) return satsStr
+  if (!hasSats) return fiatStr
+
+  // Both available - order by preference
+  if (amountDisplay === "sats-primary") {
+    return `${satsStr} (${fiatStr})`
+  }
+  return `${fiatStr} (${satsStr})`
 }
 
 /**

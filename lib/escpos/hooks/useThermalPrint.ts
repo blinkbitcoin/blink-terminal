@@ -71,6 +71,10 @@ interface UseThermalPrintReturn {
     voucher: Record<string, unknown>,
     printOptions?: Record<string, unknown>,
   ) => Promise<PrintHookResult>
+  printReceipt: (
+    receipt: Record<string, unknown>,
+    printOptions?: Record<string, unknown>,
+  ) => Promise<PrintHookResult>
   printStandard: (
     voucher: Record<string, unknown>,
     opts?: Record<string, unknown>,
@@ -282,6 +286,52 @@ export function useThermalPrint(
   )
 
   /**
+   * Print a payment receipt.
+   *
+   * Uses the currently active adapter (which tracks the selected method via
+   * selectMethod). Receipts route through PrintService.printReceipt → the
+   * CompanionAdapter `app=payment` deep link on mobile, or raw ESC/POS on
+   * local-print-server / WebSerial on desktop.
+   *
+   * @param receipt - Pre-formatted receipt data (amount string already combined)
+   * @param printOptions - Print options
+   */
+  const printReceipt = useCallback(
+    async (
+      receipt: Record<string, unknown>,
+      printOptions: Record<string, unknown> = {},
+    ): Promise<PrintHookResult> => {
+      if (!printServiceRef.current) {
+        return { success: false, error: "Print service not initialized" }
+      }
+
+      setIsPrinting(true)
+      setError(null)
+      setPrintStatus(PrintStatus.PENDING)
+
+      try {
+        const result = await printServiceRef.current.printReceipt(
+          receipt as never,
+          printOptions,
+        )
+        setLastResult(result)
+        if (!result.success) {
+          setError(result.error || null)
+        }
+        return result
+      } catch (err: unknown) {
+        const errorMsg: string = (err as Error).message || "Print failed"
+        setError(errorMsg)
+        setLastResult({ success: false, error: errorMsg })
+        return { success: false, error: errorMsg }
+      } finally {
+        setIsPrinting(false)
+      }
+    },
+    [],
+  )
+
+  /**
    * Change print method
    */
   const selectMethod = useCallback(async (methodType: string): Promise<void> => {
@@ -354,6 +404,7 @@ export function useThermalPrint(
 
     // Methods
     print,
+    printReceipt,
     printStandard,
     printMinimal,
     printReissue,

@@ -3,13 +3,37 @@ import { useEffect, useRef, useState } from "react"
 import { getWsUrl } from "../config/api"
 
 /**
- * Payment data structure from WebSocket transaction events
+ * Payment data structure from WebSocket transaction events.
+ *
+ * `amount`/`currency` are the settlement values (sats / "BTC") shown on the
+ * success animation. The optional fields below carry the richer context
+ * available at payment-success time (from the client-held invoice + auth
+ * context) so the success screen and printed receipt can show a formatted
+ * fiat amount, merchant, payment hash, tip breakdown, etc.
  */
 export interface PaymentData {
   amount: number
   currency: string
   memo?: string
   isForwarded?: boolean
+
+  // Sats total (mirrors `amount` when currency is BTC; kept explicit for receipts)
+  satAmount?: number
+
+  // Fiat display values
+  displayAmount?: number
+  displayCurrency?: string
+
+  // Identifiers / metadata for the receipt
+  paymentHash?: string
+  paymentRequest?: string
+  timestamp?: number
+  merchant?: string
+
+  // Tip breakdown (structured, not just embedded in memo)
+  tipAmount?: number
+  tipCurrency?: string
+  tipPercent?: number
 }
 
 /**
@@ -160,6 +184,15 @@ export function useBlinkWebSocket(
               amount: transaction.settlementAmount,
               currency: transaction.settlementCurrency,
               memo: transaction.memo,
+              satAmount:
+                transaction.settlementCurrency === "BTC"
+                  ? transaction.settlementAmount
+                  : undefined,
+              paymentHash: transaction.initiationVia?.paymentHash,
+              timestamp: transaction.createdAt
+                ? Number(transaction.createdAt) * 1000
+                : Date.now(),
+              merchant: username || undefined,
             }
 
             setLastPayment(paymentData)

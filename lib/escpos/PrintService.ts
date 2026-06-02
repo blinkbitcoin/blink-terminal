@@ -26,6 +26,7 @@
 
 import BaseAdapter from "./adapters/BaseAdapter"
 import ConnectionManager, { getConnectionManager } from "./ConnectionManager"
+import ReceiptBuilder, { type ReceiptData } from "./ReceiptBuilder"
 import VoucherReceipt, { type VoucherData as VoucherReceiptData } from "./VoucherReceipt"
 
 /**
@@ -239,6 +240,109 @@ class PrintService {
       this._emit("jobFailed", { jobId, error: errorMsg })
       return { success: false, jobId, error: errorMsg }
     }
+  }
+
+  /**
+   * Print a payment receipt (received-payment slip).
+   *
+   * Parallel to printVoucher() but builds via ReceiptBuilder and routes the
+   * receipt context to the adapter so the companion app can build an
+   * `app=payment` deep link (which works on Nyx/Bitcoinize printers).
+   *
+   * @param receipt - Pre-formatted receipt data (amount string already combined)
+   * @param options - Print options (merged with defaults)
+   */
+  async printReceipt(
+    receipt: ReceiptData,
+    options: PrintOptions = {},
+  ): Promise<PrintResult> {
+    const opts: PrintOptions = { ...this.options, ...options }
+    const jobId: string = this._createJobId()
+
+    this._emit("jobStarted", { jobId, receipt })
+
+    try {
+      // Build ESC/POS receipt (async to support logo loading)
+      this._emit("jobStatus", { jobId, status: PrintStatus.PREPARING })
+      const escposData: Uint8Array = await this._buildPaymentReceipt(receipt, opts)
+
+      // Get adapter and print
+      this._emit("jobStatus", { jobId, status: PrintStatus.SENDING })
+      const adapter: BaseAdapter = await this.connectionManager.getActiveAdapter()
+
+      let success = false
+      let lastError: Error | null = null
+      let attempts = 0
+      const maxAttempts: number = opts.retryOnFail ? (opts.maxRetries || 0) + 1 : 1
+
+      while (!success && attempts < maxAttempts) {
+        attempts++
+        try {
+          success = await (
+            adapter as BaseAdapter & {
+              print: (
+                data: Uint8Array,
+                opts?: Record<string, unknown>,
+              ) => Promise<boolean>
+            }
+          ).print(escposData, {
+            receipt,
+            paperWidth: opts.paperWidth,
+          })
+        } catch (err: unknown) {
+          lastError = err as Error
+          if (attempts < maxAttempts) {
+            await this._sleep(1000)
+          }
+        }
+      }
+
+      if (success) {
+        this._emit("jobStatus", { jobId, status: PrintStatus.COMPLETED })
+        this._emit("jobCompleted", { jobId, adapter: adapter.type })
+        return { success: true, jobId, adapter: adapter.type }
+      } else {
+        const error: string = lastError?.message || "Print failed"
+        this._emit("jobStatus", { jobId, status: PrintStatus.FAILED, error })
+        this._emit("jobFailed", { jobId, error })
+        return { success: false, jobId, error }
+      }
+    } catch (err: unknown) {
+      const errorMsg: string = (err as Error).message || "Unknown error"
+      this._emit("jobStatus", { jobId, status: PrintStatus.FAILED, error: errorMsg })
+      this._emit("jobFailed", { jobId, error: errorMsg })
+      return { success: false, jobId, error: errorMsg }
+    }
+  }
+
+  /**
+   * Build ESC/POS bytes for a payment receipt.
+   * @private
+   */
+  async _buildPaymentReceipt(
+    receipt: ReceiptData,
+    options: PrintOptions,
+  ): Promise<Uint8Array> {
+    const builder = new ReceiptBuilder({
+      paperWidth: options.paperWidth,
+      autoCut: options.autoCut,
+      feedLinesAfter: options.feedLinesAfter,
+      showLogo: options.showLogo !== false,
+    })
+    if (options.showLogo !== false) {
+      await builder.preloadLogo()
+    }
+    return builder.build(receipt).getBytes()
+  }
+
+  /**
+   * Get ESC/POS data for a payment receipt without printing (preview/debug).
+   */
+  async getReceiptBytes(
+    receipt: ReceiptData,
+    options: PrintOptions = {},
+  ): Promise<Uint8Array> {
+    return this._buildPaymentReceipt(receipt, { ...this.options, ...options })
   }
 
   /**

@@ -131,6 +131,11 @@ interface InvoiceData {
   displayAmount?: number
   displayCurrency?: string
   satAmount?: number
+  // Structured tip info (kept alongside the memo text so the success screen
+  // and printed receipt can show a tip breakdown)
+  tipAmount?: number
+  tipCurrency?: string
+  tipPercent?: number
   [key: string]: string | number | boolean | undefined
 }
 
@@ -643,6 +648,16 @@ const POS = forwardRef<POSRef, POSProps>(
                   currency: "BTC",
                   memo: invoice.memo || `BlinkPOS: ${paymentAmount} sats`,
                   isForwarded: true,
+                  satAmount: invoice.satAmount || invoice.satoshis || paymentAmount,
+                  displayAmount: invoice.displayAmount,
+                  displayCurrency: invoice.displayCurrency,
+                  paymentHash: invoice.paymentHash,
+                  paymentRequest: invoice.paymentRequest,
+                  timestamp: Date.now(),
+                  merchant: publicUsername || _user?.username || undefined,
+                  tipAmount: invoice.tipAmount,
+                  tipCurrency: invoice.tipCurrency,
+                  tipPercent: invoice.tipPercent,
                 })
               }
 
@@ -682,8 +697,11 @@ const POS = forwardRef<POSRef, POSProps>(
       invoice?.satoshis,
       invoice?.amount,
       invoice?.memo,
+      invoice,
       onPaymentReceived,
       triggerPaymentAnimation,
+      publicUsername,
+      _user,
     ])
 
     // Notify parent when invoice or tip dialog state changes
@@ -1316,6 +1334,9 @@ const POS = forwardRef<POSRef, POSProps>(
               displayCurrency: displayCurrency,
               satAmount: finalTotalInSats,
               memo: memo,
+              tipAmount: effectiveTipPercent > 0 ? tipAmount : 0,
+              tipCurrency: displayCurrency,
+              tipPercent: effectiveTipPercent,
             }
             setInvoice(enhancedInvoice)
             // Notify parent of invoice creation with full invoice data
@@ -1422,6 +1443,9 @@ const POS = forwardRef<POSRef, POSProps>(
               displayCurrency: displayCurrency,
               satAmount: finalTotalInSats,
               memo: memo,
+              tipAmount: effectiveTipPercent > 0 ? tipAmount : 0,
+              tipCurrency: displayCurrency,
+              tipPercent: effectiveTipPercent,
             }
             setInvoice(enhancedInvoice)
             // Notify parent of invoice creation for NFC scanning and payment hash tracking

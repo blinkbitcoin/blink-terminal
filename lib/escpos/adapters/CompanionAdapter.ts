@@ -58,8 +58,18 @@ interface VoucherLike {
   amount?: number
 }
 
+interface ReceiptLike {
+  /** Pre-formatted amount line, e.g. "5,000 sats ($50.00)" */
+  amount?: string
+  merchant?: string
+  memo?: string
+  paymentHash?: string
+  timestamp?: number
+}
+
 interface PrintOptions {
   voucher?: VoucherLike
+  receipt?: ReceiptLike
   paperWidth?: number
   qrMode?: string
   timeout?: number
@@ -266,6 +276,13 @@ class CompanionAdapter extends BaseAdapter {
     const scheme = this.options.scheme
     const params = new URLSearchParams()
 
+    // Payment receipts use the V1 `app=payment` format. This is required because
+    // the companion app's V2 raw-ESC/POS path is a no-op on Nyx/Bitcoinize
+    // printers; the V1 path renders on both Nyx and generic Bluetooth printers.
+    if (options.receipt) {
+      return this._buildPaymentDeepLinkUrl(options.receipt)
+    }
+
     // Check if we should use legacy format (compatible with current companion app)
     // The current companion app expects app=voucher with individual parameters
     if (this.options.useLegacyFormat && options.voucher) {
@@ -399,6 +416,59 @@ class CompanionAdapter extends BaseAdapter {
 
     const url = `${scheme}://print?${params.toString()}`
     console.log("🖨️ Using legacy companion app format:", url)
+
+    return url
+  }
+
+  /**
+   * Build a payment-receipt deep link (V1 `app=payment` format).
+   *
+   * The companion app renders this on both Nyx/Bitcoinize and generic
+   * Bluetooth printers. Params map to MainActivity.parseV1PrintJob():
+   * username, amount, paymentHash, date, time, memo.
+   *
+   * @private
+   */
+  private _buildPaymentDeepLinkUrl(receipt: ReceiptLike): string {
+    const scheme = this.options.scheme
+    const params = new URLSearchParams()
+
+    // Default app type is payment; set explicitly for clarity.
+    params.set("app", "payment")
+
+    if (receipt.merchant) {
+      params.set("username", receipt.merchant)
+    }
+
+    // Pre-formatted combined amount string (e.g. "5,000 sats ($50.00)")
+    if (receipt.amount) {
+      params.set("amount", receipt.amount)
+    }
+
+    if (receipt.paymentHash) {
+      params.set("paymentHash", receipt.paymentHash)
+    }
+
+    if (receipt.memo) {
+      params.set("memo", receipt.memo)
+    }
+
+    // Split timestamp into date + time for the V1 template
+    const date = new Date(receipt.timestamp || Date.now())
+    const y = date.getFullYear()
+    const m = String(date.getMonth() + 1).padStart(2, "0")
+    const d = String(date.getDate()).padStart(2, "0")
+    params.set("date", `${y}-${m}-${d}`)
+
+    let hours = date.getHours()
+    const minutes = String(date.getMinutes()).padStart(2, "0")
+    const ampm = hours >= 12 ? "pm" : "am"
+    hours = hours % 12
+    if (hours === 0) hours = 12
+    params.set("time", `${hours}:${minutes} ${ampm}`)
+
+    const url = `${scheme}://print?${params.toString()}`
+    console.log("🖨️ Using payment receipt companion format:", url)
 
     return url
   }
