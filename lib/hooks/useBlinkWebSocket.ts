@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react"
 
 import { getWsUrl } from "../config/api"
+import { parseTxTimestamp } from "../time-utils"
 
 /**
  * Payment data structure from WebSocket transaction events.
@@ -189,9 +190,13 @@ export function useBlinkWebSocket(
                   ? transaction.settlementAmount
                   : undefined,
               paymentHash: transaction.initiationVia?.paymentHash,
-              timestamp: transaction.createdAt
-                ? Number(transaction.createdAt) * 1000
-                : Date.now(),
+              // createdAt may be Unix seconds (number) or an ISO string; parse
+              // robustly and fall back to now if absent/unparseable.
+              timestamp: (() => {
+                if (!transaction.createdAt) return Date.now()
+                const ts = parseTxTimestamp(transaction.createdAt)
+                return Number.isNaN(ts) ? Date.now() : ts
+              })(),
               merchant: username || undefined,
             }
 

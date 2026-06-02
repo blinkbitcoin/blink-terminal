@@ -139,10 +139,23 @@ class ReceiptBuilder {
 
   /**
    * Build the payment receipt.
+   *
+   * Note: paper width is fixed at construction (it determines the underlying
+   * ESCPOSBuilder character width). Any `paperWidth` passed in `options` here is
+   * ignored so the layout math (label widths, hash wrapping) can never diverge
+   * from the actual printer width. Other options (autoCut, feedLinesAfter, etc.)
+   * may still be overridden per build.
+   *
    * @returns this (for chaining)
    */
   build(data: ReceiptData, options: ReceiptOptions = {}): ReceiptBuilder {
-    const opts: RequiredReceiptOptions = { ...this.options, ...options }
+    // Merge non-width options, but force paperWidth to the constructor value so
+    // it stays in sync with the underlying ESCPOSBuilder (single source of truth).
+    const opts: RequiredReceiptOptions = {
+      ...this.options,
+      ...options,
+      paperWidth: this.options.paperWidth,
+    }
     const b = this.builder
     const compact = opts.compactMode || opts.paperWidth === 58
     const labelWidth = compact ? 9 : 11
@@ -220,12 +233,15 @@ class ReceiptBuilder {
   }
 
   /**
-   * Print the payment hash wrapped to the paper width, centered.
+   * Print the payment hash wrapped to the printer's line width, centered.
+   *
+   * Wraps based on the underlying ESCPOSBuilder's actual `charsPerLine` so the
+   * wrapping always matches the real paper width (single source of truth).
    * @private
    */
   _printWrappedHash(hash: string): void {
     const b = this.builder
-    const width = this.options.paperWidth === 58 ? 30 : 32
+    const width = b.charsPerLine
     for (let i = 0; i < hash.length; i += width) {
       b.line(hash.slice(i, i + width))
     }

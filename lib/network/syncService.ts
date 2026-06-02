@@ -8,6 +8,7 @@
 
 import AuthManager from "../auth"
 import BlinkAPI from "../blink-api"
+import { parseTxTimestamp } from "../time-utils"
 
 import * as db from "./db"
 
@@ -196,17 +197,6 @@ function decryptApiKey(encryptedKey: string): string {
     throw new Error("Failed to decrypt API key")
   }
   return decrypted
-}
-
-/**
- * Parse transaction date to timestamp (milliseconds)
- */
-function parseTxTimestamp(createdAt: string | number): number {
-  if (typeof createdAt === "number") {
-    // Unix timestamp in seconds
-    return createdAt * 1000
-  }
-  return new Date(createdAt).getTime()
 }
 
 /**
