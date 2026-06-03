@@ -181,17 +181,27 @@ export function useBlinkWebSocket(
           if (transaction && transaction.direction === "RECEIVE") {
             console.log("🎉 DIRECT PAYMENT DETECTED!", transaction)
 
+            // Blink settlementAmount is in MINOR units of the wallet currency:
+            // satoshis for BTC, cents for USD (settlementCurrency is "BTC" | "USD").
+            // Normalize so downstream never treats cents as sats: BTC -> satAmount,
+            // USD -> fiat displayAmount in dollars (cents / 100).
+            const isBtcSettlement = transaction.settlementCurrency === "BTC"
+            const isUsdSettlement = transaction.settlementCurrency === "USD"
+
             const paymentData: PaymentData = {
               amount: transaction.settlementAmount,
               currency: transaction.settlementCurrency,
               memo: transaction.memo,
-              satAmount:
-                transaction.settlementCurrency === "BTC"
-                  ? transaction.settlementAmount
-                  : undefined,
+              satAmount: isBtcSettlement ? transaction.settlementAmount : undefined,
+              // USD settlement: settlementAmount is cents -> dollars for display.
+              displayAmount: isUsdSettlement
+                ? transaction.settlementAmount / 100
+                : undefined,
+              displayCurrency: isUsdSettlement ? "USD" : undefined,
               paymentHash: transaction.initiationVia?.paymentHash,
-              // createdAt may be Unix seconds (number) or an ISO string; parse
-              // robustly and fall back to now if absent/unparsable.
+              // Blink's Timestamp scalar serializes createdAt as Unix seconds
+              // (number). parseTxTimestamp also tolerates ISO strings defensively;
+              // fall back to now if absent/unparsable.
               timestamp: (() => {
                 if (!transaction.createdAt) return Date.now()
                 const ts = parseTxTimestamp(transaction.createdAt)

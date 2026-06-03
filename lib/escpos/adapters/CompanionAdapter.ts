@@ -454,7 +454,7 @@ class CompanionAdapter extends BaseAdapter {
     }
 
     // Split timestamp into date + time for the V1 template
-    const date = new Date(receipt.timestamp || Date.now())
+    const date = new Date(receipt.timestamp ?? Date.now())
     const y = date.getFullYear()
     const m = String(date.getMonth() + 1).padStart(2, "0")
     const d = String(date.getDate()).padStart(2, "0")

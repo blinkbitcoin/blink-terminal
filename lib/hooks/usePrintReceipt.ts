@@ -69,7 +69,13 @@ export function usePrintReceipt({
 
   const printReceipt = useCallback(
     async (payment: PaymentData): Promise<void> => {
-      const sats = payment.satAmount ?? payment.amount
+      // `payment.amount` is the settlement amount in MINOR units of `currency`
+      // (sats for BTC, cents for USD). Only treat it as sats when the payment is
+      // actually Bitcoin so we never print a fiat amount labelled as sats.
+      const isBtc =
+        payment.satAmount !== undefined ||
+        (!!payment.currency && isBitcoinCurrency(payment.currency))
+      const sats = isBtc ? (payment.satAmount ?? payment.amount) : undefined
 
       // Combined, preference-ordered amount string (e.g. "5,000 sats ($50.00)").
       const amount = formatCombinedAmount(

@@ -5,8 +5,10 @@
 /**
  * Parse a transaction timestamp into milliseconds since epoch.
  *
- * Blink's `createdAt` can arrive either as a Unix timestamp in seconds
- * (number) or as an ISO-8601 string (e.g. "2024-01-15T10:30:00Z").
+ * Blink's GraphQL `Timestamp` scalar serializes `createdAt` as Unix seconds
+ * (an integer number) — confirmed in the blink monorepo's Timestamp scalar
+ * (`Math.floor(date.getTime() / 1000)`). This helper additionally tolerates an
+ * ISO-8601 string defensively in case a caller passes a non-API value.
  *
  * - number  -> treated as Unix seconds, multiplied by 1000
  * - string  -> parsed via Date.parse

@@ -180,7 +180,7 @@ class ReceiptBuilder {
     b.doubleLine()
     b.align("left")
 
-    const date = new Date(data.timestamp || Date.now())
+    const date = new Date(data.timestamp ?? Date.now())
     b.labelValue("Date:", formatDate(date), { labelWidth })
     b.labelValue("Time:", formatTime(date), { labelWidth })
 

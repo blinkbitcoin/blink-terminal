@@ -266,9 +266,18 @@ class PrintService {
       this._emit("jobStatus", { jobId, status: PrintStatus.PREPARING })
       const escposData: Uint8Array = await this._buildPaymentReceipt(receipt, opts)
 
-      // Get adapter and print
+      // Get adapter and print. Receipts must never use the PDF adapter (it is
+      // voucher-only and ignores raw ESC/POS), so explicitly pick a non-PDF
+      // adapter rather than the cached/preferred active adapter.
       this._emit("jobStatus", { jobId, status: PrintStatus.SENDING })
-      const adapter: BaseAdapter = await this.connectionManager.getActiveAdapter()
+      const adapter: BaseAdapter | null =
+        await this.connectionManager.getBestNonPdfAdapter()
+      if (!adapter) {
+        const error = "No thermal print method available for receipts"
+        this._emit("jobStatus", { jobId, status: PrintStatus.FAILED, error })
+        this._emit("jobFailed", { jobId, error })
+        return { success: false, jobId, error }
+      }
 
       let success = false
       let lastError: Error | null = null

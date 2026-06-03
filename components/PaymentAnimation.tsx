@@ -116,7 +116,13 @@ export default function PaymentAnimation({
   // Derive the formatted amounts
   // ---------------------------------------------------------------------------
 
-  const sats = payment?.satAmount ?? payment?.amount
+  // Only treat the payment as sats-denominated when it's actually Bitcoin.
+  // `payment.amount` is the settlement amount in MINOR units of `currency`
+  // (sats for BTC, cents for USD), so it must NOT be rendered as sats for fiat.
+  const isBtc =
+    payment?.satAmount !== undefined ||
+    (!!payment?.currency && isBitcoinCurrency(payment.currency))
+  const sats = isBtc ? (payment?.satAmount ?? payment?.amount) : undefined
   const hasFiat =
     payment?.displayAmount !== undefined &&
     !!payment?.displayCurrency &&
@@ -143,15 +149,25 @@ export default function PaymentAnimation({
         )
       : ""
 
-    if (!hasFiat) {
-      // Bitcoin-only payment: sats is primary, no secondary.
-      primaryAmount = satsStr || `${payment.amount}`
-    } else if (amountDisplay === "sats-primary") {
-      primaryAmount = satsStr
-      secondaryAmount = fiatStr
-    } else {
+    if (hasFiat && satsStr) {
+      // Both fiat and sats available - order by preference.
+      if (amountDisplay === "sats-primary") {
+        primaryAmount = satsStr
+        secondaryAmount = fiatStr
+      } else {
+        primaryAmount = fiatStr
+        secondaryAmount = satsStr
+      }
+    } else if (hasFiat) {
+      // Fiat-only (e.g. USD settlement): show the formatted fiat amount.
       primaryAmount = fiatStr
-      secondaryAmount = satsStr
+    } else if (satsStr) {
+      // Bitcoin-only payment.
+      primaryAmount = satsStr
+    } else {
+      // Last-resort fallback: label the raw amount with its currency code
+      // rather than implying sats.
+      primaryAmount = `${payment.amount}${payment.currency ? ` ${payment.currency}` : ""}`
     }
   }
 
