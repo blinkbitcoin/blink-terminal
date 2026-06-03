@@ -27,6 +27,7 @@ import {
   type BitcoinFormatPreference,
   type NumberFormatPreference,
 } from "../number-format"
+import { selectFooter, type OrangePillMode } from "../orangepill"
 
 import type { PaymentData } from "./useBlinkWebSocket"
 
@@ -37,6 +38,10 @@ interface UsePrintReceiptParams {
   currencies?: CurrencyMetadata[]
   /** Paper width in mm (58 or 80). Defaults to the connection/service default. */
   paperWidth?: number
+  /** Orange-pill footer mode. Defaults to "off" (no footer). */
+  orangePillMode?: OrangePillMode
+  /** Static-QR URL when orangePillMode is "static". */
+  staticQRUrl?: string
 }
 
 interface UsePrintReceiptReturn {
@@ -53,6 +58,8 @@ export function usePrintReceipt({
   bitcoinFormat = "sats",
   currencies = [],
   paperWidth,
+  orangePillMode = "off",
+  staticQRUrl,
 }: UsePrintReceiptParams = {}): UsePrintReceiptReturn {
   const {
     printReceipt: thermalPrintReceipt,
@@ -109,6 +116,18 @@ export function usePrintReceipt({
         tipLine = `incl. ${tipValue} tip${pct}`
       }
 
+      // Orange-pill footer: date-matched fact/QR, quote, shuffle, or static QR.
+      // Seeded by payment hash so re-prints of the same receipt are identical —
+      // except "shuffle", which is intentionally random on every print so each
+      // customer gets a different education bit.
+      const footerContent =
+        orangePillMode === "off"
+          ? null
+          : selectFooter(orangePillMode, new Date(payment.timestamp ?? Date.now()), {
+              seed: orangePillMode === "shuffle" ? undefined : payment.paymentHash,
+              staticUrl: staticQRUrl,
+            })
+
       const receipt: ReceiptData = {
         amount,
         merchant: payment.merchant,
@@ -116,6 +135,7 @@ export function usePrintReceipt({
         paymentHash: payment.paymentHash,
         timestamp: payment.timestamp,
         tipLine,
+        footer: footerContent ?? undefined,
       }
 
       const opts: Record<string, unknown> = {}
@@ -135,6 +155,8 @@ export function usePrintReceipt({
       bitcoinFormat,
       currencies,
       paperWidth,
+      orangePillMode,
+      staticQRUrl,
       thermalPrintReceipt,
     ],
   )

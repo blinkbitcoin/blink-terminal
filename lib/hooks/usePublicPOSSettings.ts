@@ -8,6 +8,7 @@ import {
   type NumpadLayoutPreference,
   type AmountDisplayPreference,
 } from "../number-format"
+import type { OrangePillMode } from "../orangepill"
 
 interface UsePublicPOSSettingsReturn {
   displayCurrency: string
@@ -24,6 +25,10 @@ interface UsePublicPOSSettingsReturn {
   setSoundEnabled: Dispatch<SetStateAction<boolean>>
   soundTheme: SoundThemeName
   setSoundTheme: Dispatch<SetStateAction<SoundThemeName>>
+  orangePillMode: OrangePillMode
+  setOrangePillMode: Dispatch<SetStateAction<OrangePillMode>>
+  orangePillStaticUrl: string
+  setOrangePillStaticUrl: Dispatch<SetStateAction<string>>
 }
 
 /**
@@ -94,6 +99,20 @@ export function usePublicPOSSettings(): UsePublicPOSSettingsReturn {
     return "success"
   })
 
+  const [orangePillMode, setOrangePillMode] = useState<OrangePillMode>(() => {
+    if (typeof window !== "undefined") {
+      return (localStorage.getItem("publicpos-orangePillMode") as OrangePillMode) || "off"
+    }
+    return "off"
+  })
+
+  const [orangePillStaticUrl, setOrangePillStaticUrl] = useState<string>(() => {
+    if (typeof window !== "undefined") {
+      return localStorage.getItem("publicpos-orangePillStaticUrl") || ""
+    }
+    return ""
+  })
+
   // Persist all settings to localStorage
   useEffect(() => {
     if (typeof window !== "undefined") {
@@ -131,6 +150,18 @@ export function usePublicPOSSettings(): UsePublicPOSSettingsReturn {
     }
   }, [amountDisplay])
 
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      localStorage.setItem("publicpos-orangePillMode", orangePillMode)
+    }
+  }, [orangePillMode])
+
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      localStorage.setItem("publicpos-orangePillStaticUrl", orangePillStaticUrl)
+    }
+  }, [orangePillStaticUrl])
+
   return {
     displayCurrency,
     setDisplayCurrency,
@@ -146,5 +177,9 @@ export function usePublicPOSSettings(): UsePublicPOSSettingsReturn {
     setSoundEnabled,
     soundTheme,
     setSoundTheme,
+    orangePillMode,
+    setOrangePillMode,
+    orangePillStaticUrl,
+    setOrangePillStaticUrl,
   }
 }

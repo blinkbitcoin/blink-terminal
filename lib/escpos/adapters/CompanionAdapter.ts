@@ -58,6 +58,22 @@ interface VoucherLike {
   amount?: number
 }
 
+/**
+ * Orange-pill footer carried through the V1 `app=payment` deep link.
+ * All fields optional; lengths are capped before serialization to keep the
+ * deep-link URI small (Android Intent/URI size limits).
+ */
+interface ReceiptFooterLike {
+  /** Heading, e.g. "On this day, 2009:". */
+  heading?: string
+  /** Body text (already joined to a single string). */
+  text?: string
+  /** Caption under the QR, e.g. "Read: Bitcoin is Time - Gigi". */
+  caption?: string
+  /** QR payload (URL). */
+  qr?: string
+}
+
 interface ReceiptLike {
   /** Pre-formatted amount line, e.g. "5,000 sats ($50.00)" */
   amount?: string
@@ -65,6 +81,23 @@ interface ReceiptLike {
   memo?: string
   paymentHash?: string
   timestamp?: number
+  /** Optional orange-pill education footer. */
+  footer?: ReceiptFooterLike
+}
+
+/**
+ * Max characters for the footer body in the deep link. Kept conservative so
+ * the total `app=payment` URI stays well within Android's practical limits.
+ */
+const FOOTER_TEXT_MAX = 160
+const FOOTER_HEADING_MAX = 48
+const FOOTER_CAPTION_MAX = 80
+
+/** Truncate to `max` chars, appending an ellipsis when cut. */
+function capText(s: string, max: number): string {
+  const t = s.trim()
+  if (t.length <= max) return t
+  return t.slice(0, Math.max(0, max - 1)).trimEnd() + "…"
 }
 
 interface PrintOptions {
@@ -466,6 +499,24 @@ class CompanionAdapter extends BaseAdapter {
     hours = hours % 12
     if (hours === 0) hours = 12
     params.set("time", `${hours}:${minutes} ${ampm}`)
+
+    // Optional orange-pill footer (Bitcoin education). New companion versions
+    // render these; older versions ignore the unknown params (graceful).
+    const footer = receipt.footer
+    if (footer) {
+      if (footer.heading) {
+        params.set("footerHeading", capText(footer.heading, FOOTER_HEADING_MAX))
+      }
+      if (footer.text) {
+        params.set("footerText", capText(footer.text, FOOTER_TEXT_MAX))
+      }
+      if (footer.caption) {
+        params.set("footerCaption", capText(footer.caption, FOOTER_CAPTION_MAX))
+      }
+      if (footer.qr) {
+        params.set("footerQr", footer.qr)
+      }
+    }
 
     const url = `${scheme}://print?${params.toString()}`
     console.log("🖨️ Using payment receipt companion format:", url)

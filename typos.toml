@@ -1,5 +1,7 @@
 [files]
-extend-exclude = ["CHANGELOG.md"]
+# Bundled Bitcoin-quote/calendar dataset (lib/orangepill/data) contains many
+# proper nouns, foreign words, and verbatim quotes; exclude from spell check.
+extend-exclude = ["CHANGELOG.md", "lib/orangepill/data/"]
 
 [default.extend-words]
 # MENA = Middle East & North Africa region
