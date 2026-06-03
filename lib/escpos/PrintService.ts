@@ -335,6 +335,7 @@ class PrintService {
     const builder = new ReceiptBuilder({
       paperWidth: options.paperWidth,
       autoCut: options.autoCut,
+      partialCut: options.partialCut,
       feedLinesAfter: options.feedLinesAfter,
       showLogo: options.showLogo !== false,
     })

@@ -288,10 +288,13 @@ export function useThermalPrint(
   /**
    * Print a payment receipt.
    *
-   * Uses the currently active adapter (which tracks the selected method via
-   * selectMethod). Receipts route through PrintService.printReceipt → the
-   * CompanionAdapter `app=payment` deep link on mobile, or raw ESC/POS on
-   * local-print-server / WebSerial on desktop.
+   * Receipts route through PrintService.printReceipt, which selects the best
+   * available NON-PDF adapter (the PDF adapter is voucher-only and ignores raw
+   * ESC/POS). This means receipt printing does not necessarily follow the
+   * persisted selectMethod preference when that preference is PDF; otherwise it
+   * honors the preferred adapter. In practice that's the CompanionAdapter
+   * `app=payment` deep link on mobile, or raw ESC/POS via local-print-server /
+   * WebSerial on desktop.
    *
    * @param receipt - Pre-formatted receipt data (amount string already combined)
    * @param printOptions - Print options
