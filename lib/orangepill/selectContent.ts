@@ -81,6 +81,22 @@ function quoteFooter(seed?: string): FooterContent | null {
   }
 }
 
+/**
+ * Max length for a footer body line. Matches the companion deep-link cap so a
+ * body chosen here never gets truncated downstream. Quotes are filtered to this
+ * length at generation; long history events are handled in onDateFooter.
+ */
+const MAX_BODY_LEN = 420
+
+/** Truncate text to MAX_BODY_LEN on a word boundary, with an ASCII ellipsis. */
+function truncateBody(text: string): string {
+  if (text.length <= MAX_BODY_LEN) return text
+  const slice = text.slice(0, MAX_BODY_LEN - 3)
+  const lastSpace = slice.lastIndexOf(" ")
+  const body = lastSpace > MAX_BODY_LEN * 0.6 ? slice.slice(0, lastSpace) : slice
+  return body.trimEnd() + "..."
+}
+
 /** Build a caption for a curated link (e.g. "Read: Title - Author"). */
 function linkCaption(link: CalendarLink): string {
   const parts = [link.title]
@@ -105,7 +121,9 @@ function linkFooter(link: CalendarLink, events: string[] = []): FooterContent {
 
   if (link.year != null) {
     const match = events.map(splitEvent).find((e) => e.year === String(link.year))
-    if (match) body = match.text
+    // Use the matching event as the body only when it fits; otherwise keep the
+    // (short) link title so the body never gets truncated mid-sentence.
+    if (match && match.text.length <= MAX_BODY_LEN) body = match.text
   }
 
   return {
@@ -129,14 +147,14 @@ function onDateFooter(date: Date, seed?: string): FooterContent | null {
     return linkFooter(link, day.events)
   }
 
-  // 2. Fall back to a history event (no QR).
+  // 2. Fall back to a history event (no QR). Clean-truncate long events.
   if (day && day.events.length > 0) {
     const ev = day.events[pickIndex(day.events.length, seed)]
     const { year, text } = splitEvent(ev)
     return {
       kind: "event",
       heading: year ? `On this day, ${year}:` : "On this day:",
-      lines: [text],
+      lines: [truncateBody(text)],
     }
   }
 

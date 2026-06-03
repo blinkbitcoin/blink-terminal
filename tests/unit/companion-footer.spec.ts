@@ -57,9 +57,9 @@ describe("CompanionAdapter payment deep link footer", () => {
     expect(p.has("footerQr")).toBe(false)
   })
 
-  it("caps an over-long footer text", () => {
+  it("caps an over-long footer text on a word boundary with ASCII ellipsis", () => {
     const adapter = new CompanionAdapter()
-    const long = "word ".repeat(100) // 500 chars
+    const long = "word ".repeat(120) // 600 chars
     const url = adapter.getDeepLinkUrl(emptyEscpos, {
       receipt: {
         amount: "5,000 sats",
@@ -69,7 +69,25 @@ describe("CompanionAdapter payment deep link footer", () => {
 
     const p = parse(url)
     const text = p.get("footerText") || ""
-    expect(text.length).toBeLessThanOrEqual(160)
-    expect(text.endsWith("…")).toBe(true)
+    expect(text.length).toBeLessThanOrEqual(420)
+    expect(text.endsWith("...")).toBe(true)
+    // ASCII only — no `…` glyph that would mojibake on a CP437 printer.
+    expect(text).not.toMatch(/[^\x20-\x7e]/)
+  })
+
+  it("transliterates non-ASCII footer text to printer-safe ASCII", () => {
+    const adapter = new CompanionAdapter()
+    const url = adapter.getDeepLinkUrl(emptyEscpos, {
+      receipt: {
+        amount: "5,000 sats",
+        footer: {
+          text: "Mere inflation \u2014 that is\u2026",
+          caption: "- Maréchal",
+        },
+      },
+    })
+    const p = parse(url)
+    expect(p.get("footerText")).toBe("Mere inflation - that is...")
+    expect(p.get("footerCaption")).toBe("- Marechal")
   })
 })

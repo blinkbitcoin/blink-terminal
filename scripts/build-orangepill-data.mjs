@@ -60,6 +60,71 @@ function normalize(s) {
 }
 
 /**
+ * Max length for a quote/body to remain in rotation. Mirrors MAX_BODY_LEN in
+ * lib/orangepill/selectContent.ts and FOOTER_TEXT_MAX in CompanionAdapter, so
+ * no committed quote can be truncated downstream.
+ */
+const MAX_QUOTE_LEN = 420
+
+/** Explicit transliteration overrides (mirrors lib/escpos/asciiize.ts). */
+const ASCII_OVERRIDES = {
+  "\u2018": "'",
+  "\u2019": "'",
+  "\u201A": "'",
+  "\u201B": "'",
+  "\u2032": "'",
+  "\u00B4": "'",
+  "\u201C": '"',
+  "\u201D": '"',
+  "\u201E": '"',
+  "\u201F": '"',
+  "\u2033": '"',
+  "\u00AB": '"',
+  "\u00BB": '"',
+  "\u2010": "-",
+  "\u2011": "-",
+  "\u2012": "-",
+  "\u2013": "-",
+  "\u2014": "-",
+  "\u2015": "-",
+  "\u2212": "-",
+  "\u2026": "...",
+  "\u00A0": " ",
+  "\u2009": " ",
+  "\u202F": " ",
+  "\uFB01": "fi",
+  "\uFB02": "fl",
+  "\u0153": "oe",
+  "\u0152": "OE",
+  "\u00E6": "ae",
+  "\u00C6": "AE",
+  "\u00DF": "ss",
+  "\u0142": "l",
+  "\u0141": "L",
+  "\u00F8": "o",
+  "\u00D8": "O",
+  "\u0111": "d",
+  "\u0110": "D",
+  "\u2022": "*",
+  "\u20AC": "EUR",
+  "\u00A3": "GBP",
+  "\u00A5": "JPY",
+}
+
+/**
+ * Transliterate text to printer-safe 7-bit ASCII (mirrors lib/escpos/asciiize).
+ * Receipts print on CP437 thermal printers, so bake ASCII into the dataset.
+ */
+function asciiize(input) {
+  if (!input) return input
+  let out = ""
+  for (const ch of input) out += ASCII_OVERRIDES[ch] ?? ch
+  out = out.normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
+  // eslint-disable-next-line no-control-regex
+  return out.replace(/[^\x09\x0a\x20-\x7e]/g, "")
+}
+
+/**
  * Parse a quotes file into { text, author }[].
  * Lines look like:  "<quote text>"\t- <Author>  or  "<quote>" - <Author>
  * or (unwrapped)    <quote text>\t<Author>
@@ -99,9 +164,15 @@ function parseQuotes(raw) {
     // (U+2015), and whitespace/tabs.
     author = author.replace(/^[-–—―\s]+/, "").trim()
     text = normalize(text).replace(/^["“]|["”]$/g, "")
+    // Transliterate to printer-safe ASCII (CP437 thermal printers).
+    text = asciiize(text)
+    author = asciiize(author)
     // Drop empty or implausibly short fragments (source data has stray junk like
     // a lone "su"). Shortest legitimate quote is ~17 chars, so 10 is safe.
     if (text.length < 10) continue
+    // Filter quotes too long to fit on a receipt without truncation, so every
+    // quote in rotation prints in full (<= MAX_QUOTE_LEN).
+    if (text.length > MAX_QUOTE_LEN) continue
     out.push({ text, author })
   }
   return out
@@ -134,7 +205,8 @@ function parseLink(rest) {
     title = body.trim()
   }
 
-  return { year, author, title, url }
+  // Transliterate display fields to printer-safe ASCII (URL kept verbatim).
+  return { year, author: asciiize(author), title: asciiize(title), url }
 }
 
 /** Detect a "M/D" day marker at the start of a line; returns {key, restText} or null. */
@@ -169,13 +241,15 @@ function parseMonthFile(raw, calendar) {
     if (marker) {
       currentKey = marker.key
       if (!calendar[currentKey]) calendar[currentKey] = { events: [], links: [] }
-      if (marker.restText) calendar[currentKey].events.push(normalize(marker.restText))
+      if (marker.restText) {
+        calendar[currentKey].events.push(asciiize(normalize(marker.restText)))
+      }
       continue
     }
 
     // Indented continuation event line (starts with a year).
     if (currentKey && /^\d{4}\b/.test(trimmed)) {
-      calendar[currentKey].events.push(normalize(trimmed))
+      calendar[currentKey].events.push(asciiize(normalize(trimmed)))
     }
   }
 }
