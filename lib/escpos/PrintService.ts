@@ -30,6 +30,35 @@ import ReceiptBuilder, { type ReceiptData } from "./ReceiptBuilder"
 import VoucherReceipt, { type VoucherData as VoucherReceiptData } from "./VoucherReceipt"
 
 /**
+ * Map a ReceiptData to the flat receipt context passed to adapters.
+ *
+ * The companion adapter uses this to build the V1 `app=payment` deep link.
+ * In particular, the structured `footer.lines[]` is joined into a single
+ * `footer.text` string (the deep-link transport is flat).
+ */
+function toAdapterReceipt(receipt: ReceiptData): Record<string, unknown> {
+  const base: Record<string, unknown> = {
+    amount: receipt.amount,
+    merchant: receipt.merchant,
+    memo: receipt.memo,
+    paymentHash: receipt.paymentHash,
+    timestamp: receipt.timestamp,
+  }
+
+  if (receipt.footer) {
+    const text = receipt.footer.lines.filter((l) => l && l.trim()).join(" ")
+    base.footer = {
+      heading: receipt.footer.heading,
+      text: text || undefined,
+      caption: receipt.footer.caption,
+      qr: receipt.footer.qr,
+    }
+  }
+
+  return base
+}
+
+/**
  * Print job status
  */
 export const PrintStatus = {
@@ -295,7 +324,7 @@ class PrintService {
               ) => Promise<boolean>
             }
           ).print(escposData, {
-            receipt,
+            receipt: toAdapterReceipt(receipt),
             paperWidth: opts.paperWidth,
           })
         } catch (err: unknown) {

@@ -152,6 +152,10 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
     setSoundEnabled,
     soundTheme,
     setSoundTheme,
+    orangePillMode,
+    setOrangePillMode,
+    orangePillStaticUrl,
+    setOrangePillStaticUrl,
   } = usePublicPOSSettings()
 
   // View navigation state
@@ -188,6 +192,8 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
     numberFormat,
     bitcoinFormat,
     currencies,
+    orangePillMode,
+    staticQRUrl: orangePillStaticUrl,
   })
 
   // Exchange rate for sats equivalent display
@@ -392,6 +398,10 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
           setNumpadLayout={setNumpadLayout}
           amountDisplay={amountDisplay}
           setAmountDisplay={setAmountDisplay}
+          orangePillMode={orangePillMode}
+          setOrangePillMode={setOrangePillMode}
+          orangePillStaticUrl={orangePillStaticUrl}
+          setOrangePillStaticUrl={setOrangePillStaticUrl}
           getSubmenuBgClasses={getSubmenuBgClasses}
           getSubmenuHeaderClasses={getSubmenuHeaderClasses}
         />

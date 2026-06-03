@@ -18,6 +18,12 @@ import {
   type NumpadLayoutPreference,
   type AmountDisplayPreference,
 } from "../../lib/number-format"
+import {
+  ORANGE_PILL_OPTIONS,
+  ORANGE_PILL_LABELS,
+  ORANGE_PILL_DESCRIPTIONS,
+  type OrangePillMode,
+} from "../../lib/orangepill"
 
 /**
  * PublicPOSRegionalOverlay - Regional settings overlay for PublicPOSDashboard
@@ -36,6 +42,10 @@ interface PublicPOSRegionalOverlayProps {
   setNumpadLayout: (layout: NumpadLayoutPreference) => void
   amountDisplay: AmountDisplayPreference
   setAmountDisplay: (preference: AmountDisplayPreference) => void
+  orangePillMode: OrangePillMode
+  setOrangePillMode: (mode: OrangePillMode) => void
+  orangePillStaticUrl: string
+  setOrangePillStaticUrl: (url: string) => void
   getSubmenuBgClasses: () => string
   getSubmenuHeaderClasses: () => string
 }
@@ -51,6 +61,10 @@ export default function PublicPOSRegionalOverlay({
   setNumpadLayout,
   amountDisplay,
   setAmountDisplay,
+  orangePillMode,
+  setOrangePillMode,
+  orangePillStaticUrl,
+  setOrangePillStaticUrl,
   getSubmenuBgClasses,
   getSubmenuHeaderClasses,
 }: PublicPOSRegionalOverlayProps) {
@@ -378,6 +392,85 @@ export default function PublicPOSRegionalOverlay({
                 </div>
               </div>
             </div>
+          </div>
+
+          {/* Receipt Education (Orange-pill) Section */}
+          <div>
+            <h3
+              className={`text-sm font-medium mb-3 ${darkMode ? "text-gray-400" : "text-gray-600"}`}
+            >
+              Bitcoin Education on Receipts
+            </h3>
+            <div className="space-y-2">
+              {ORANGE_PILL_OPTIONS.map((mode) => (
+                <button
+                  key={mode}
+                  onClick={() => setOrangePillMode(mode)}
+                  className={`w-full p-3 rounded-lg text-left transition-all ${
+                    orangePillMode === mode
+                      ? "bg-blink-accent/20 border-2 border-blink-accent"
+                      : darkMode
+                        ? "bg-gray-900 hover:bg-gray-800 border-2 border-transparent"
+                        : "bg-gray-50 hover:bg-gray-100 border-2 border-transparent"
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <span
+                        className={`text-sm font-medium ${darkMode ? "text-white" : "text-gray-900"}`}
+                      >
+                        {ORANGE_PILL_LABELS[mode]}
+                      </span>
+                      <p
+                        className={`text-xs mt-0.5 ${darkMode ? "text-gray-400" : "text-gray-500"}`}
+                      >
+                        {ORANGE_PILL_DESCRIPTIONS[mode]}
+                      </p>
+                    </div>
+                    {orangePillMode === mode && (
+                      <svg
+                        className="w-5 h-5 text-blink-accent flex-shrink-0 ml-2"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth="2"
+                          d="M5 13l4 4L19 7"
+                        />
+                      </svg>
+                    )}
+                  </div>
+                </button>
+              ))}
+            </div>
+
+            {orangePillMode === "static" && (
+              <div className="mt-3">
+                <label
+                  className={`text-xs font-medium mb-1 block ${darkMode ? "text-gray-400" : "text-gray-600"}`}
+                >
+                  QR destination URL
+                </label>
+                <input
+                  type="url"
+                  inputMode="url"
+                  value={orangePillStaticUrl}
+                  onChange={(e) => setOrangePillStaticUrl(e.target.value)}
+                  placeholder="https://www.blink.sv/en/blog/articles"
+                  className={`w-full p-3 text-sm rounded-lg border-2 border-transparent ${
+                    darkMode ? "bg-gray-900 text-white" : "bg-gray-50 text-gray-900"
+                  }`}
+                />
+                <p
+                  className={`text-xs mt-1 ${darkMode ? "text-gray-400" : "text-gray-500"}`}
+                >
+                  Leave blank to use the Blink blog.
+                </p>
+              </div>
+            )}
           </div>
 
           {/* Language Section (Placeholder) */}

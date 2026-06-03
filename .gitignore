@@ -77,7 +77,11 @@ NIP46_PORTAL_INTEGRATION.md
 MERCHANT_VERIFICATION_BTCMAP.md
 CSV_EXPORT_FIELDS.md
 PROJECT_STATUS_UPDATE_DEC_2025.md
+AGENTS.md
 .voucher-store.json
+
+# opencode local config
+opencode.json
 
 # CI build artifacts
 ci/build/

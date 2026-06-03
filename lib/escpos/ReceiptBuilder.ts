@@ -40,6 +40,25 @@ export interface ReceiptData {
   timestamp?: number
   /** Optional pre-formatted tip line, e.g. "incl. $0.15 tip (15%)" */
   tipLine?: string
+  /**
+   * Optional "orange-pill" footer: a small piece of Bitcoin education printed
+   * before the "Thank You!" line. Built by lib/orangepill (selectFooter).
+   */
+  footer?: ReceiptFooter
+}
+
+/**
+ * Orange-pill footer payload. `lines` are wrapped to paper width at print time.
+ */
+export interface ReceiptFooter {
+  /** Heading above the body, e.g. "On this day, 2009:". */
+  heading?: string
+  /** Body text rows (quote text, event text, etc.). */
+  lines: string[]
+  /** QR code payload (URL). */
+  qr?: string
+  /** Caption under the QR, e.g. "Read: Bitcoin is Time - Gigi". */
+  caption?: string
 }
 
 export interface ReceiptOptions {
@@ -210,6 +229,11 @@ class ReceiptBuilder {
       b.emptyLines(1)
     }
 
+    // ===== ORANGE-PILL FOOTER =====
+    if (data.footer) {
+      this._printFooter(data.footer)
+    }
+
     // ===== THANK YOU =====
     b.align("center")
     b.bold(true)
@@ -245,6 +269,84 @@ class ReceiptBuilder {
     for (let i = 0; i < hash.length; i += width) {
       b.line(hash.slice(i, i + width))
     }
+  }
+
+  /**
+   * Word-wrap `text` to the printer's line width and print each row.
+   * Words longer than the line are hard-split. Empty input prints nothing.
+   * @private
+   */
+  _printWrapped(text: string): void {
+    const b = this.builder
+    const width = b.charsPerLine
+    const words = text.split(/\s+/).filter(Boolean)
+    let current = ""
+
+    const flush = () => {
+      if (current) {
+        b.line(current)
+        current = ""
+      }
+    }
+
+    for (const word of words) {
+      if (word.length > width) {
+        // Hard-split a single over-long word.
+        flush()
+        for (let i = 0; i < word.length; i += width) {
+          b.line(word.slice(i, i + width))
+        }
+        continue
+      }
+      if (!current) {
+        current = word
+      } else if (current.length + 1 + word.length <= width) {
+        current += " " + word
+      } else {
+        flush()
+        current = word
+      }
+    }
+    flush()
+  }
+
+  /**
+   * Print the orange-pill footer: optional heading, wrapped body lines, an
+   * optional QR code, and an optional caption. Centered.
+   * @private
+   */
+  _printFooter(footer: ReceiptFooter): void {
+    const b = this.builder
+    const hasBody =
+      (footer.heading && footer.heading.trim()) ||
+      footer.lines.some((l) => l.trim()) ||
+      footer.qr ||
+      (footer.caption && footer.caption.trim())
+    if (!hasBody) return
+
+    b.doubleLine()
+    b.align("center")
+
+    if (footer.heading && footer.heading.trim()) {
+      b.bold(true)
+      this._printWrapped(footer.heading.trim())
+      b.bold(false)
+    }
+
+    for (const line of footer.lines) {
+      if (line.trim()) this._printWrapped(line.trim())
+    }
+
+    if (footer.qr) {
+      b.emptyLines(1)
+      b.qrCodeAuto(footer.qr)
+    }
+
+    if (footer.caption && footer.caption.trim()) {
+      this._printWrapped(footer.caption.trim())
+    }
+
+    b.emptyLines(1)
   }
 
   /**

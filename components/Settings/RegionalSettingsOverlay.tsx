@@ -22,16 +22,26 @@ import {
   NumpadLayoutPreference,
   AmountDisplayPreference,
 } from "../../lib/number-format"
+import {
+  ORANGE_PILL_OPTIONS,
+  ORANGE_PILL_LABELS,
+  ORANGE_PILL_DESCRIPTIONS,
+  type OrangePillMode,
+} from "../../lib/orangepill"
 
 interface RegionalSettingsOverlayProps {
   numberFormat: NumberFormatPreference
   bitcoinFormat: BitcoinFormatPreference
   numpadLayout: NumpadLayoutPreference
   amountDisplay: AmountDisplayPreference
+  orangePillMode: OrangePillMode
+  orangePillStaticUrl: string
   setNumberFormat: (format: NumberFormatPreference) => void
   setBitcoinFormat: (format: BitcoinFormatPreference) => void
   setNumpadLayout: (layout: NumpadLayoutPreference) => void
   setAmountDisplay: (preference: AmountDisplayPreference) => void
+  setOrangePillMode: (mode: OrangePillMode) => void
+  setOrangePillStaticUrl: (url: string) => void
   setShowRegionalSettings: (show: boolean) => void
   getSubmenuBgClasses: () => string
   getSubmenuHeaderClasses: () => string
@@ -49,10 +59,14 @@ export default function RegionalSettingsOverlay({
   bitcoinFormat,
   numpadLayout,
   amountDisplay,
+  orangePillMode,
+  orangePillStaticUrl,
   setNumberFormat,
   setBitcoinFormat,
   setNumpadLayout,
   setAmountDisplay,
+  setOrangePillMode,
+  setOrangePillStaticUrl,
   setShowRegionalSettings,
   getSubmenuBgClasses,
   getSubmenuHeaderClasses,
@@ -350,6 +364,74 @@ export default function RegionalSettingsOverlay({
                 </div>
               </div>
             </div>
+          </div>
+
+          {/* Receipt Education (Orange-pill) Section */}
+          <div>
+            <h3 className={`text-sm font-medium mb-3 ${getSectionLabelClasses()}`}>
+              Bitcoin Education on Receipts
+            </h3>
+            <div className="space-y-2">
+              {ORANGE_PILL_OPTIONS.map((mode) => (
+                <button
+                  key={mode}
+                  onClick={() => setOrangePillMode(mode)}
+                  className={`w-full p-3 text-left transition-all ${
+                    orangePillMode === mode
+                      ? getSubmenuOptionActiveClasses()
+                      : getSubmenuOptionClasses()
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <span className={`text-sm font-medium ${getPrimaryTextClasses()}`}>
+                        {ORANGE_PILL_LABELS[mode]}
+                      </span>
+                      <p className={`text-xs mt-0.5 ${getSecondaryTextClasses()}`}>
+                        {ORANGE_PILL_DESCRIPTIONS[mode]}
+                      </p>
+                    </div>
+                    {orangePillMode === mode && (
+                      <svg
+                        className={`w-5 h-5 ${getCheckmarkClasses()} flex-shrink-0 ml-2`}
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth="2"
+                          d="M5 13l4 4L19 7"
+                        />
+                      </svg>
+                    )}
+                  </div>
+                </button>
+              ))}
+            </div>
+
+            {/* Static URL input (only relevant in static mode) */}
+            {orangePillMode === "static" && (
+              <div className="mt-3">
+                <label
+                  className={`text-xs font-medium mb-1 block ${getSectionLabelClasses()}`}
+                >
+                  QR destination URL
+                </label>
+                <input
+                  type="url"
+                  inputMode="url"
+                  value={orangePillStaticUrl}
+                  onChange={(e) => setOrangePillStaticUrl(e.target.value)}
+                  placeholder="https://www.blink.sv/en/blog/articles"
+                  className={`w-full p-3 text-sm rounded ${getSubmenuOptionClasses()} ${getPrimaryTextClasses()}`}
+                />
+                <p className={`text-xs mt-1 ${getSecondaryTextClasses()}`}>
+                  Leave blank to use the Blink blog.
+                </p>
+              </div>
+            )}
           </div>
 
           {/* Language Section (Placeholder) */}

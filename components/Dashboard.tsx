@@ -177,6 +177,10 @@ export default function Dashboard() {
     setNumpadLayout,
     amountDisplay,
     setAmountDisplay,
+    orangePillMode,
+    setOrangePillMode,
+    orangePillStaticUrl,
+    setOrangePillStaticUrl,
     currencyFilter,
     setCurrencyFilter,
     currencyFilterDebounced,
@@ -741,6 +745,8 @@ export default function Dashboard() {
     numberFormat,
     bitcoinFormat,
     currencies,
+    orangePillMode,
+    staticQRUrl: orangePillStaticUrl,
   })
 
   // Navigation handlers (touch swipe + keyboard) - extracted to useNavigationHandlers hook
@@ -1091,10 +1097,14 @@ export default function Dashboard() {
           bitcoinFormat={bitcoinFormat}
           numpadLayout={numpadLayout}
           amountDisplay={amountDisplay}
+          orangePillMode={orangePillMode}
+          orangePillStaticUrl={orangePillStaticUrl}
           setNumberFormat={setNumberFormat}
           setBitcoinFormat={setBitcoinFormat}
           setNumpadLayout={setNumpadLayout}
           setAmountDisplay={setAmountDisplay}
+          setOrangePillMode={setOrangePillMode}
+          setOrangePillStaticUrl={setOrangePillStaticUrl}
           setShowRegionalSettings={setShowRegionalSettings}
           getSubmenuBgClasses={getSubmenuBgClasses}
           getSubmenuHeaderClasses={getSubmenuHeaderClasses}

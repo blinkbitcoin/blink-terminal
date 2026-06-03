@@ -23,6 +23,7 @@ import {
   type NumpadLayoutPreference,
   type AmountDisplayPreference,
 } from "../number-format"
+import type { OrangePillMode } from "../orangepill"
 
 // ============================================================================
 // Types
@@ -66,6 +67,12 @@ export interface UseDisplaySettingsReturn {
   amountDisplay: AmountDisplay
   setAmountDisplay: (preference: AmountDisplay) => void
 
+  // Orange-pill receipt footer state
+  orangePillMode: OrangePillMode
+  setOrangePillMode: (mode: OrangePillMode) => void
+  orangePillStaticUrl: string
+  setOrangePillStaticUrl: (url: string) => void
+
   // Currency filter state (for currency selector search)
   currencyFilter: string
   setCurrencyFilter: (filter: string) => void
@@ -88,6 +95,8 @@ const STORAGE_KEYS = {
   BITCOIN_FORMAT: "blinkpos-bitcoin-format",
   NUMPAD_LAYOUT: "blinkpos-numpad-layout",
   AMOUNT_DISPLAY: "blinkpos-amount-display",
+  ORANGE_PILL_MODE: "blinkpos-orangepill-mode",
+  ORANGE_PILL_STATIC_URL: "blinkpos-orangepill-static-url",
 } as const
 
 const DEFAULT_NUMBER_FORMAT: NumberFormat = "auto"
@@ -185,6 +194,14 @@ export function useDisplaySettings(): UseDisplaySettingsReturn {
     getFromStorage(STORAGE_KEYS.AMOUNT_DISPLAY, DEFAULT_AMOUNT_DISPLAY),
   )
 
+  const [orangePillMode, setOrangePillModeState] = useState<OrangePillMode>(() =>
+    getFromStorage<OrangePillMode>(STORAGE_KEYS.ORANGE_PILL_MODE, "off"),
+  )
+
+  const [orangePillStaticUrl, setOrangePillStaticUrlState] = useState<string>(() =>
+    getFromStorage(STORAGE_KEYS.ORANGE_PILL_STATIC_URL, ""),
+  )
+
   const [currencyFilter, setCurrencyFilterState] = useState<string>("")
   const [currencyFilterDebounced, setCurrencyFilterDebouncedState] = useState<string>("")
 
@@ -234,6 +251,20 @@ export function useDisplaySettings(): UseDisplaySettingsReturn {
   const setAmountDisplay = useCallback((preference: AmountDisplay) => {
     setAmountDisplayState(preference)
     setToStorage(STORAGE_KEYS.AMOUNT_DISPLAY, preference)
+  }, [])
+
+  // ---------------------------------------------------------------------------
+  // Callbacks - Orange-pill footer
+  // ---------------------------------------------------------------------------
+
+  const setOrangePillMode = useCallback((mode: OrangePillMode) => {
+    setOrangePillModeState(mode)
+    setToStorage(STORAGE_KEYS.ORANGE_PILL_MODE, mode)
+  }, [])
+
+  const setOrangePillStaticUrl = useCallback((url: string) => {
+    setOrangePillStaticUrlState(url)
+    setToStorage(STORAGE_KEYS.ORANGE_PILL_STATIC_URL, url)
   }, [])
 
   // ---------------------------------------------------------------------------
@@ -348,6 +379,12 @@ export function useDisplaySettings(): UseDisplaySettingsReturn {
     // Amount display
     amountDisplay,
     setAmountDisplay,
+
+    // Orange-pill footer
+    orangePillMode,
+    setOrangePillMode,
+    orangePillStaticUrl,
+    setOrangePillStaticUrl,
 
     // Currency filter
     currencyFilter,
