@@ -12,3 +12,6 @@ chaching = "chaching"
 JOD = "JOD"
 # .ist = TLD for Istanbul/Turkey
 ist = "ist"
+# "Feburary" is an upstream filename in the bitcoinCalendar repo (orangepill
+# data source), preserved verbatim in scripts/build-orangepill-data.mjs.
+Feburary = "Feburary"
