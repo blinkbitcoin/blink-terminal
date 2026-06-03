@@ -438,9 +438,7 @@ class ConnectionManager {
     // Prefer the user's chosen adapter if it's available and not PDF.
     const preferredType = this._preferences.preferredAdapter
     if (preferredType && preferredType !== "pdf") {
-      const preferred = adapters.find(
-        (a) => a.type === preferredType && a.available,
-      )
+      const preferred = adapters.find((a) => a.type === preferredType && a.available)
       if (preferred) return preferred.adapter
     }
 
