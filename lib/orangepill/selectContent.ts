@@ -212,13 +212,20 @@ export function selectFooter(
     case "shuffle":
       return shuffleFooter(seed)
 
-    case "static":
+    case "static": {
+      const url = staticUrl || DEFAULT_STATIC_URL
       return {
         kind: "static",
         lines: ["Learn more about Bitcoin"],
-        qr: staticUrl || DEFAULT_STATIC_URL,
-        caption: "Scan to read the Blink blog",
+        qr: url,
+        // Use the blog-specific caption only for the default URL; a custom URL
+        // gets a generic caption so the receipt isn't misleading.
+        caption:
+          url === DEFAULT_STATIC_URL
+            ? "Scan to read the Blink blog"
+            : "Scan to learn more about Bitcoin",
       }
+    }
 
     case "ondate":
       return onDateFooter(date, seed)

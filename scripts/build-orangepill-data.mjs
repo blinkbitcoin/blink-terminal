@@ -33,12 +33,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(__dirname, "..")
 const OUT_DIR = path.join(REPO_ROOT, "lib", "orangepill", "data")
 
-const DEFAULT_SOURCE = path.join(
-  os.homedir(),
-  "Documents",
-  "BLINK",
-  "bitcoinCalendar",
-)
+const DEFAULT_SOURCE = path.join(os.homedir(), "Documents", "BLINK", "bitcoinCalendar")
 const SOURCE = process.argv[2] || DEFAULT_SOURCE
 
 // Month file names in the repo (note the original typos are preserved).
@@ -66,9 +61,13 @@ function normalize(s) {
 
 /**
  * Parse a quotes file into { text, author }[].
- * Lines look like:  "<quote text>"\t- <Author>  or  "<quote>"\t<Author>
- * The split point is the last quote char or the last tab; author may have a
- * leading "- ".
+ * Lines look like:  "<quote text>"\t- <Author>  or  "<quote>" - <Author>
+ * or (unwrapped)    <quote text>\t<Author>
+ *
+ * Quote-wrapped lines are matched GREEDILY to the LAST quote char so that
+ * quotes containing inner quote marks (e.g. `"The state "plans" ..."`) keep
+ * their full text — the author always follows the final closing quote and
+ * never itself contains a quote char. Unwrapped lines fall back to a tab split.
  */
 function parseQuotes(raw) {
   const out = []
@@ -79,8 +78,9 @@ function parseQuotes(raw) {
     let text = ""
     let author = ""
 
-    // Preferred: quote wrapped in straight or curly quotes.
-    const m = line.match(/^["“](.+?)["”]\s*(.*)$/s)
+    // Preferred: quote wrapped in straight or curly quotes. Greedy (.+) so the
+    // closing quote is the LAST one on the line, not the first inner quote.
+    const m = line.match(/^["“](.+)["”]\s*(.*)$/s)
     if (m) {
       text = m[1]
       author = m[2]
@@ -235,10 +235,7 @@ function main() {
   )
 
   const dayCount = Object.keys(sortedCalendar).length
-  const linkCount = Object.values(sortedCalendar).reduce(
-    (n, d) => n + d.links.length,
-    0,
-  )
+  const linkCount = Object.values(sortedCalendar).reduce((n, d) => n + d.links.length, 0)
   const eventCount = Object.values(sortedCalendar).reduce(
     (n, d) => n + d.events.length,
     0,

@@ -20,6 +20,24 @@ describe("orangepill datasets", () => {
     }
   })
 
+  it("parses quotes with inner quote marks without splitting text/author", () => {
+    // Regression: quotes containing inner `"` were previously split mid-sentence
+    // (text truncated, remainder dumped into author). Author must never contain
+    // a quote char, and known inner-quote quotes must be intact.
+    for (const q of quotesData) {
+      expect(q.author).not.toMatch(/["“”]/)
+    }
+    const hayek = quotesData.find((q) => q.text.includes("more the state"))
+    expect(hayek).toBeDefined()
+    expect(hayek!.text).toMatch(/"plans" the more difficult/)
+    expect(hayek!.author).toBe("Friedrich August von Hayek")
+
+    const aa = quotesData.find((q) => q.text.startsWith("We don't want to"))
+    expect(aa).toBeDefined()
+    expect(aa!.text).toMatch(/"bank" the "unbanked"/)
+    expect(aa!.author).toBe("Andreas Antonopoulos")
+  })
+
   it("ships a calendar keyed by MM-DD with events/links", () => {
     const keys = Object.keys(CALENDAR)
     expect(keys.length).toBeGreaterThan(300)
@@ -76,6 +94,17 @@ describe("selectFooter", () => {
     const url = "https://example.com/learn"
     const f = selectFooter("static", new Date(), { staticUrl: url })
     expect(f!.qr).toBe(url)
+  })
+
+  it("static mode caption is generic for a custom URL, blog-specific for default", () => {
+    const custom = selectFooter("static", new Date(), {
+      staticUrl: "https://example.com/learn",
+    })
+    expect(custom!.caption).toBe("Scan to learn more about Bitcoin")
+    expect(custom!.caption).not.toMatch(/blog/i)
+
+    const def = selectFooter("static")
+    expect(def!.caption).toMatch(/blog/i)
   })
 
   it("ondate returns a coherent event/link + QR for a curated day", () => {
