@@ -11,7 +11,7 @@
  * - number  -> treated as Unix seconds, multiplied by 1000
  * - string  -> parsed via Date.parse
  *
- * Returns `NaN` only if the input is an unparseable string; callers that
+ * Returns `NaN` only if the input is an unparsable string; callers that
  * need a guaranteed value should fall back to `Date.now()`.
  *
  * @param createdAt - Unix seconds (number) or ISO date string

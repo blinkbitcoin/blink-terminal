@@ -191,7 +191,7 @@ export function useBlinkWebSocket(
                   : undefined,
               paymentHash: transaction.initiationVia?.paymentHash,
               // createdAt may be Unix seconds (number) or an ISO string; parse
-              // robustly and fall back to now if absent/unparseable.
+              // robustly and fall back to now if absent/unparsable.
               timestamp: (() => {
                 if (!transaction.createdAt) return Date.now()
                 const ts = parseTxTimestamp(transaction.createdAt)
