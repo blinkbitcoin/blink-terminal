@@ -25,7 +25,12 @@ describe("orangepill datasets", () => {
     // (text truncated, remainder dumped into author). Author must never contain
     // a quote char, and known inner-quote quotes must be intact.
     for (const q of quotesData) {
+      // No quote chars, stray dashes/bars, or tabs leaked into the author.
       expect(q.author).not.toMatch(/["“”]/)
+      expect(q.author).not.toMatch(/^[-–—―\s]/)
+      expect(q.author).not.toMatch(/[\t\u2015]/)
+      // No junk-short quote fragments (e.g. a lone "su").
+      expect(q.text.trim().length).toBeGreaterThanOrEqual(10)
     }
     const hayek = quotesData.find((q) => q.text.includes("more the state"))
     expect(hayek).toBeDefined()

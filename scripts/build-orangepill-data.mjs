@@ -95,9 +95,13 @@ function parseQuotes(raw) {
       }
     }
 
-    author = author.replace(/^[-–—\s]+/, "").trim()
+    // Strip leading separator punctuation: hyphen, en/em dash, horizontal bar
+    // (U+2015), and whitespace/tabs.
+    author = author.replace(/^[-–—―\s]+/, "").trim()
     text = normalize(text).replace(/^["“]|["”]$/g, "")
-    if (!text) continue
+    // Drop empty or implausibly short fragments (source data has stray junk like
+    // a lone "su"). Shortest legitimate quote is ~17 chars, so 10 is safe.
+    if (text.length < 10) continue
     out.push({ text, author })
   }
   return out
