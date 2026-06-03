@@ -43,6 +43,26 @@ describe("orangepill datasets", () => {
     expect(aa!.author).toBe("Andreas Antonopoulos")
   })
 
+  it("contains only printer-safe ASCII and no over-long quotes", () => {
+    // All footer content must be 7-bit ASCII (CP437 printers) and quotes in
+    // rotation must fit within the receipt cap (so they never truncate).
+    // eslint-disable-next-line no-control-regex
+    const NON_ASCII = /[^\x09\x0a\x20-\x7e]/
+    for (const q of quotesData) {
+      expect(q.text).not.toMatch(NON_ASCII)
+      expect(q.author).not.toMatch(NON_ASCII)
+      expect(q.text.length).toBeLessThanOrEqual(420)
+    }
+    for (const key of Object.keys(CALENDAR)) {
+      const day = CALENDAR[key]
+      for (const e of day.events) expect(e).not.toMatch(NON_ASCII)
+      for (const l of day.links) {
+        expect(l.title).not.toMatch(NON_ASCII)
+        expect(l.author).not.toMatch(NON_ASCII)
+      }
+    }
+  })
+
   it("ships a calendar keyed by MM-DD with events/links", () => {
     const keys = Object.keys(CALENDAR)
     expect(keys.length).toBeGreaterThan(300)
@@ -184,5 +204,31 @@ describe("selectFooter", () => {
     }
     const f = selectFooter("ondate", missing, { seed: "y" })
     expect(f!.kind).toBe("quote")
+  })
+
+  it("never emits a footer body longer than 420 chars", () => {
+    // Across all modes/dates, the body line must fit the receipt cap so it is
+    // never truncated downstream. (ondate uses link title or a clean truncate
+    // for long events; quotes are pre-filtered.)
+    for (const mode of ["quote", "shuffle"] as const) {
+      for (let i = 0; i < 40; i++) {
+        const f = selectFooter(mode, new Date(), { seed: `s${i}` })
+        for (const line of f!.lines) expect(line.length).toBeLessThanOrEqual(420)
+      }
+    }
+    // ondate across every calendar day.
+    for (const key of Object.keys(CALENDAR)) {
+      const [mm, dd] = key.split("-").map(Number)
+      const f = selectFooter("ondate", new Date(2026, mm - 1, dd), { seed: "z" })
+      for (const line of f!.lines) expect(line.length).toBeLessThanOrEqual(420)
+    }
+  })
+
+  it("ondate uses the link title (not a giant event) when the event is long", () => {
+    // 10-31 (Bitcoin Whitepaper Day) has a ~15k-char event and a curated link.
+    const f = selectFooter("ondate", new Date(2026, 9, 31), { seed: "k" })
+    expect(f!.kind).toBe("event")
+    expect(f!.qr).toMatch(/^https?:\/\//)
+    expect(f!.lines[0].length).toBeLessThanOrEqual(420)
   })
 })

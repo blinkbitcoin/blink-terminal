@@ -129,7 +129,7 @@
   },
   "01-07": {
     "events": [
-      "2016 - Bitcoin Core releases statement: Bitcoin is a “peer-to-peer version of electronic cash that allows online payments to be sent directly from one party to another without going through a financial institution”. Our vision for Bitcoin is to expand the flexibility of the system to work efficiently at extremely high scale, while at the same time maintaining security and the core properties of decentralization that make Bitcoin unique."
+      "2016 - Bitcoin Core releases statement: Bitcoin is a \"peer-to-peer version of electronic cash that allows online payments to be sent directly from one party to another without going through a financial institution\". Our vision for Bitcoin is to expand the flexibility of the system to work efficiently at extremely high scale, while at the same time maintaining security and the core properties of decentralization that make Bitcoin unique."
     ],
     "links": [
       {
@@ -149,7 +149,7 @@
     "links": [
       {
         "year": 2020,
-        "author": "Pascal Hügli",
+        "author": "Pascal Hugli",
         "title": "Bitcoin and the Primacy of the Digital World",
         "url": "https://bitcoinwords.github.io/cy20m1#bitcoin-and-the-primacy-of-the-digital-world"
       },
@@ -523,7 +523,7 @@
       {
         "year": 2019,
         "author": "",
-        "title": "Stephan Livera and Guido Hülsmann on Austrian Monetary Economics & Bitcoin",
+        "title": "Stephan Livera and Guido Hulsmann on Austrian Monetary Economics & Bitcoin",
         "url": "https://stephanlivera.com/episode/51/"
       },
       {
@@ -604,7 +604,7 @@
       },
       {
         "year": 2020,
-        "author": "Elisabeth Préfontaine",
+        "author": "Elisabeth Prefontaine",
         "title": "Why Bitcoin is Not a Security",
         "url": "https://bitcoinwords.github.io/cy20m2#why-bitcoin-is-not-a-security"
       }
@@ -810,7 +810,7 @@
       },
       {
         "year": 2019,
-        "author": "Tuur Demeester, Tamás Blummer and Michiel Lescrauwaet",
+        "author": "Tuur Demeester, Tamas Blummer and Michiel Lescrauwaet",
         "title": "A Primer on Bitcoin Investor Sentiment and Changes in Saving Behaviour",
         "url": "https://bitcoinwords.github.io/cy19m2#a-primer-on-bitcoin-investor-sentiment-and-changes-in-saving-behavior"
       },
@@ -868,7 +868,7 @@
   },
   "02-23": {
     "events": [
-      "2016 - Release of Bitcoin Core v0.12.0: Outlook: \"The release of Version 0.12 will be a major move forward for the Bitcoin Core client. However, there is still much more to do and we’re always looking for more contributors. For more details see our contributing page https://bitcoincore.org/en/contribute/ \""
+      "2016 - Release of Bitcoin Core v0.12.0: Outlook: \"The release of Version 0.12 will be a major move forward for the Bitcoin Core client. However, there is still much more to do and we're always looking for more contributors. For more details see our contributing page https://bitcoincore.org/en/contribute/ \""
     ],
     "links": []
   },
@@ -1017,7 +1017,7 @@
   },
   "03-06": {
     "events": [
-      "2011 - Jed McCaleb sells MtGox to Japan’s Tibanne Company. A new high of nearly 900Ghash/sec total Bitcoin network computation speed is reached, dropping to 500Ghash/sec soon after. It is speculated that the reduction is the result of a supercomputer or bot-net joining the network."
+      "2011 - Jed McCaleb sells MtGox to Japan's Tibanne Company. A new high of nearly 900Ghash/sec total Bitcoin network computation speed is reached, dropping to 500Ghash/sec soon after. It is speculated that the reduction is the result of a supercomputer or bot-net joining the network."
     ],
     "links": [
       {
@@ -1036,7 +1036,7 @@
   },
   "03-07": {
     "events": [
-      "2011 - As per https://bitcointalk.org/index.php?topic=149958.0 First release of the Schildbach Bitcoin Wallet for Android, the very first mobile wallet. Its ongoing development was motivated simply because Andreas (also known for popular Android apps like Öffi) found it too cumbersome to use his laptop to pay for burgers and beer in room77. This was the first time it was possible to pay with a phone at all, so it sparked a first wave of Bitcoin technology hipness.",
+      "2011 - As per https://bitcointalk.org/index.php?topic=149958.0 First release of the Schildbach Bitcoin Wallet for Android, the very first mobile wallet. Its ongoing development was motivated simply because Andreas (also known for popular Android apps like Offi) found it too cumbersome to use his laptop to pay for burgers and beer in room77. This was the first time it was possible to pay with a phone at all, so it sparked a first wave of Bitcoin technology hipness.",
       "2012 - First transaction including a P2SH-compatible address.",
       "2014 - \"I am not Dorian Nakamoto.\"",
       "2019 - Coinbase acquired intelligence firm Neutrino for US$13.5 million. The company was founded by three former employees of Hacking Team, a controversial Italian surveillance vendor that was caught several times selling spyware to governments with dubious human rights records, such as Ethiopia, Saudi Arabia, and Sudan.\""
@@ -1101,7 +1101,7 @@
       {
         "year": 2017,
         "author": "Jameson Lopp",
-        "title": "Nobody Understands Bitcoin (And That’s OK)",
+        "title": "Nobody Understands Bitcoin (And That's OK)",
         "url": "https://archive.is/hCMlb"
       },
       {
@@ -1166,7 +1166,7 @@
       {
         "year": 2018,
         "author": "Beautyon",
-        "title": "Why America Can’t Regulate Bitcoin",
+        "title": "Why America Can't Regulate Bitcoin",
         "url": "https://archive.is/yAOwZ"
       },
       {
@@ -1208,8 +1208,8 @@
   },
   "03-17": {
     "events": [
-      "2013 - Pensacola homeless shelter, Sean’s Outpost, ran by Jason King, begins accepting Bitcoin donations.",
-      "2013 - The audio show, Let’s Talk Bitcoin! is launched by Adam B. Levine with its first episode, and was later co-hosted by Andreas M. Antonopoulos and Stephanie Murphy. \""
+      "2013 - Pensacola homeless shelter, Sean's Outpost, ran by Jason King, begins accepting Bitcoin donations.",
+      "2013 - The audio show, Let's Talk Bitcoin! is launched by Adam B. Levine with its first episode, and was later co-hosted by Andreas M. Antonopoulos and Stephanie Murphy. \""
     ],
     "links": []
   },
@@ -1228,7 +1228,7 @@
       {
         "year": 2020,
         "author": "Giacomo Zucco",
-        "title": "A Match Made in the Whitepaper – A Treatise on Bitcoin & Privacy, Part 1",
+        "title": "A Match Made in the Whitepaper - A Treatise on Bitcoin & Privacy, Part 1",
         "url": "https://bitcoinaudible.com/?p=3895"
       }
     ]
@@ -1279,7 +1279,7 @@
       {
         "year": 2020,
         "author": "Giacomo Zucco",
-        "title": "Dont be Misled by Red Herrings – Treatise on Bitcoin & Privacy Part 2",
+        "title": "Dont be Misled by Red Herrings - Treatise on Bitcoin & Privacy Part 2",
         "url": "https://bitcoinaudible.com/?p=3903"
       },
       {
@@ -1331,7 +1331,7 @@
       {
         "year": 2021,
         "author": "Jonathan Bier",
-        "title": "The Blocksize War – Chapter 1 – First Strike",
+        "title": "The Blocksize War - Chapter 1 - First Strike",
         "url": "https://archive.is/y9c56"
       }
     ]
@@ -1445,7 +1445,7 @@
       {
         "year": 2021,
         "author": "Jonathan Bier",
-        "title": "The Blocksize War – Chapter 2 – March To War",
+        "title": "The Blocksize War - Chapter 2 - March To War",
         "url": "https://archive.is/tNqe0"
       }
     ]
@@ -1559,7 +1559,7 @@
   "04-05": {
     "events": [
       "1933 - Executive Order 6102 - \"forbidding the hoarding of gold coin, gold bullion, and gold certificates within the continental United States.\"",
-      "2011 - BitMarket.eu opens and becomes the first market for the exchange of Bitcoins and the Polish złoty, the Euro, and several other currencies."
+      "2011 - BitMarket.eu opens and becomes the first market for the exchange of Bitcoins and the Polish zloty, the Euro, and several other currencies."
     ],
     "links": [
       {
@@ -1571,7 +1571,7 @@
       {
         "year": 2021,
         "author": "Jonathan Bier",
-        "title": "The Blocksize War – Chapter 3 – Scaling I – Montreal",
+        "title": "The Blocksize War - Chapter 3 - Scaling I - Montreal",
         "url": "https://archive.is/buunB"
       }
     ]
@@ -1642,12 +1642,12 @@
   },
   "04-10": {
     "events": [
-      "2013 - Bitcoin Bubbles: Bitcoin hits an all-time high of US$266, up from only $13 the year before. - The Bitcoin price falls from $266 to $76 and returns to $160 within six hours the payment processor when „BitInstant” and the largest exchange platform MtGox experience strong delays of up to a half an hour on sales orders due to high demand overburdening their capacity."
+      "2013 - Bitcoin Bubbles: Bitcoin hits an all-time high of US$266, up from only $13 the year before. - The Bitcoin price falls from $266 to $76 and returns to $160 within six hours the payment processor when \"BitInstant\" and the largest exchange platform MtGox experience strong delays of up to a half an hour on sales orders due to high demand overburdening their capacity."
     ],
     "links": [
       {
         "year": 2018,
-        "author": "Murad Mahmudov and Adam Taché",
+        "author": "Murad Mahmudov and Adam Tache",
         "title": "The Many Faces of Bitcoin",
         "url": "https://archive.is/HNGpc"
       }
@@ -1686,7 +1686,7 @@
       {
         "year": 2021,
         "author": "Jonathan Bier",
-        "title": "The Blocksize War – Chapter 4 – Scaling II – Hong Kong",
+        "title": "The Blocksize War - Chapter 4 - Scaling II - Hong Kong",
         "url": "https://archive.is/FsH6s"
       }
     ]
@@ -1736,7 +1736,7 @@
   },
   "04-15": {
     "events": [
-      "2016 - Bitcoin Core release 0.12.1: This maintenance update includes the first soft fork deployment utilising “version bits” as part of the capacity increases roadmap."
+      "2016 - Bitcoin Core release 0.12.1: This maintenance update includes the first soft fork deployment utilising \"version bits\" as part of the capacity increases roadmap."
     ],
     "links": [
       {
@@ -1795,7 +1795,7 @@
       },
       {
         "year": 2019,
-        "author": "Tamás Blummer",
+        "author": "Tamas Blummer",
         "title": "How soft forks might work of fail",
         "url": "https://bitcoinwords.github.io/cy19m4#how-soft-forks-might-work-or-fail"
       },
@@ -1834,7 +1834,7 @@
       {
         "year": 2021,
         "author": "Jonathan Bier",
-        "title": "The Blocksize War – Chapter 5 – SegWit",
+        "title": "The Blocksize War - Chapter 5 - SegWit",
         "url": "https://archive.is/NFwon"
       }
     ]
@@ -1842,7 +1842,7 @@
   "04-20": {
     "events": [
       "2012 - Bitcoinica.com gets licensed as a MSB.",
-      "2013 - Bitcoin Crashes: Bitcoin Central is hacked, with hackers making away with “a few hundred” Bitcoins that the site’s owners agreed to fully cover."
+      "2013 - Bitcoin Crashes: Bitcoin Central is hacked, with hackers making away with \"a few hundred\" Bitcoins that the site's owners agreed to fully cover."
     ],
     "links": []
   },
@@ -1944,7 +1944,7 @@
   },
   "04-25": {
     "events": [
-      "2012 - First Music album sold for bitcoins exclusively – Before being sold on iTunes"
+      "2012 - First Music album sold for bitcoins exclusively - Before being sold on iTunes"
     ],
     "links": [
       {
@@ -1981,7 +1981,7 @@
       {
         "year": 2021,
         "author": "Jonathan Bier",
-        "title": "The Blocksize War – Chapter 6 – Lightning Network",
+        "title": "The Blocksize War - Chapter 6 - Lightning Network",
         "url": "https://archive.is/MbEvH"
       }
     ]
@@ -2094,7 +2094,7 @@
       {
         "year": 2021,
         "author": "Jonathan Bier",
-        "title": "The Blocksize War – Chapter 7 – Bitcoin Classic",
+        "title": "The Blocksize War - Chapter 7 - Bitcoin Classic",
         "url": "https://archive.is/D0BGS"
       }
     ]
@@ -2156,12 +2156,12 @@
       {
         "year": 2019,
         "author": "Conner Brown",
-        "title": "Bitcoin Has No Intrinsic Value — and That’s Great",
+        "title": "Bitcoin Has No Intrinsic Value - and That's Great",
         "url": "https://archive.is/ORygI"
       },
       {
         "year": 2019,
-        "author": "Tamás Blummer",
+        "author": "Tamas Blummer",
         "title": "How to bribe miners to re-org?",
         "url": "https://bitcoinwords.github.io/cy19m5#how-to-bribe-miners-to-re-org"
       },
@@ -2200,7 +2200,7 @@
       {
         "year": 2021,
         "author": "Jonathan Bier",
-        "title": "The Blocksize War – Chapter 8 – Hong Kong Roundtable",
+        "title": "The Blocksize War - Chapter 8 - Hong Kong Roundtable",
         "url": "https://archive.is/IMHSm"
       }
     ]
@@ -2278,7 +2278,7 @@
       },
       {
         "year": 2019,
-        "author": "Deniz Özgür",
+        "author": "Deniz Ozgur",
         "title": "Cryptocurrencies & Their Effects on Monetary Policy",
         "url": "https://bitcoinwords.github.io/cy19m5#cryptocurrencies--their-effects-on-monetary-policy"
       },
@@ -2336,7 +2336,7 @@
       {
         "year": 2021,
         "author": "Jonathan Bier",
-        "title": "The Blocksize War – Chapter 9 – Faketoshi",
+        "title": "The Blocksize War - Chapter 9 - Faketoshi",
         "url": "https://archive.is/c1Cc3"
       }
     ]
@@ -2351,7 +2351,7 @@
     "links": [
       {
         "year": 2019,
-        "author": "Merwande Draï",
+        "author": "Merwande Drai",
         "title": "Bitcoin is the worst enemy of communism and dictatorship",
         "url": "https://bitcoinwords.github.io/cy19m5#bitcoin-is-the-worst-enemy-of-communism-and-dictatorship"
       }
@@ -2365,7 +2365,7 @@
       {
         "year": null,
         "author": "2020   Nic Carter",
-        "title": "The Last Word on Bitcoin’s Energy Consumption",
+        "title": "The Last Word on Bitcoin's Energy Consumption",
         "url": "https://archive.is/VquJD"
       }
     ]
@@ -2451,7 +2451,7 @@
       {
         "year": 2021,
         "author": "Jonathan Bier",
-        "title": "The Blocksize War – Chapter 10 – The DAO",
+        "title": "The Blocksize War - Chapter 10 - The DAO",
         "url": "https://archive.is/fAbyW"
       }
     ]
@@ -2549,7 +2549,7 @@
     "links": [
       {
         "year": 2018,
-        "author": "Murad Mahmudov and Adam Taché",
+        "author": "Murad Mahmudov and Adam Tache",
         "title": "Bitcoin: Past and Future",
         "url": "https://archive.is/jEdSw"
       }
@@ -2561,7 +2561,7 @@
       {
         "year": 2021,
         "author": "Jonathan Bier",
-        "title": "The Blocksize War – Chapter 11 – Scaling III – Milan",
+        "title": "The Blocksize War - Chapter 11 - Scaling III - Milan",
         "url": "https://archive.is/nMZQR"
       }
     ]
@@ -2658,7 +2658,7 @@
       {
         "year": 2018,
         "author": "Aaron van Wirdum",
-        "title": "The Future of Bitcoin – What Lightning Could Look Like",
+        "title": "The Future of Bitcoin - What Lightning Could Look Like",
         "url": "https://bitcoinaudible.com/?p=551"
       }
     ]
@@ -2671,7 +2671,7 @@
       {
         "year": 2021,
         "author": "Jonathan Bier",
-        "title": "The Blocksize War – Chapter 12 – Bitcoin Unlimited",
+        "title": "The Blocksize War - Chapter 12 - Bitcoin Unlimited",
         "url": "https://archive.is/Wm4ut"
       }
     ]
@@ -2806,13 +2806,13 @@
       {
         "year": 2018,
         "author": "Aaron van Wirdum",
-        "title": "If Bitcoin Had a First Draft, Wei Dai’s B-Money Was It",
+        "title": "If Bitcoin Had a First Draft, Wei Dai's B-Money Was It",
         "url": "https://bitcoinaudible.com/?p=76"
       },
       {
         "year": 2021,
         "author": "Jonathan Bier",
-        "title": "The Blocksize War – Chapter 13 – Exchanges",
+        "title": "The Blocksize War - Chapter 13 - Exchanges",
         "url": "https://archive.is/NhQsA"
       }
     ]
@@ -2933,7 +2933,7 @@
       {
         "year": 2021,
         "author": "Jonathan Bier",
-        "title": "The Blocksize War – Chapter 14 – ASICBoost",
+        "title": "The Blocksize War - Chapter 14 - ASICBoost",
         "url": "https://archive.is/YCDMA"
       }
     ]
@@ -3023,7 +3023,7 @@
       {
         "year": 2021,
         "author": "Jonathan Bier",
-        "title": "The Blocksize War – Chapter 15 – Dragons’ Den",
+        "title": "The Blocksize War - Chapter 15 - Dragons' Den",
         "url": "https://archive.is/IxvKc"
       }
     ]
@@ -3098,7 +3098,7 @@
       {
         "year": 2021,
         "author": "Jonathan Bier",
-        "title": "The Blocksize War – Chapter 16 – Litecoin -",
+        "title": "The Blocksize War - Chapter 16 - Litecoin -",
         "url": "https://archive.is/PoRTa"
       }
     ]
@@ -3216,7 +3216,7 @@
       {
         "year": 2021,
         "author": "Jonathan Bier",
-        "title": "The Blocksize War – Chapter 17 – User-Activated Softfork",
+        "title": "The Blocksize War - Chapter 17 - User-Activated Softfork",
         "url": "https://archive.is/Zog77"
       }
     ]
@@ -3350,7 +3350,7 @@
       {
         "year": 2021,
         "author": "Jonathan Bier",
-        "title": "The Blocksize War – Chapter 18 – New York Agreement",
+        "title": "The Blocksize War - Chapter 18 - New York Agreement",
         "url": "https://archive.is/aAfcm"
       }
     ]
@@ -3406,7 +3406,7 @@
       {
         "year": 2019,
         "author": "Nic Carter",
-        "title": "It’s the settlement assurances, stupid",
+        "title": "It's the settlement assurances, stupid",
         "url": "https://archive.is/5pRXy"
       },
       {
@@ -3449,7 +3449,7 @@
       {
         "year": 2021,
         "author": "Jonathan Bier",
-        "title": "The Blocksize War – Chapter 19 – Bitcoin Cash",
+        "title": "The Blocksize War - Chapter 19 - Bitcoin Cash",
         "url": "https://archive.is/TXHrI"
       }
     ]
@@ -3476,7 +3476,7 @@
   "07-26": {
     "events": [
       "2011 - Room77 becomes the first brick-and-mortar business (bar) to accept Bitcoin as a means of payment.",
-      "2011 - Poland-based Bitomat, the world’s third largest Bitcoin exchange, loses access to its wallet.dat file and the 17,000 Bitcoins they are holding for clients.\""
+      "2011 - Poland-based Bitomat, the world's third largest Bitcoin exchange, loses access to its wallet.dat file and the 17,000 Bitcoins they are holding for clients.\""
     ],
     "links": [
       {
@@ -3569,7 +3569,7 @@
       {
         "year": 2021,
         "author": "Jonathan Bier",
-        "title": "The Blocksize War – Chapter 20 – SegWit2x",
+        "title": "The Blocksize War - Chapter 20 - SegWit2x",
         "url": "https://archive.is/EquBQ"
       }
     ]
@@ -3599,7 +3599,7 @@
       {
         "year": 2019,
         "author": "Parker Lewis",
-        "title": "Bitcoin Can’t Be Copied",
+        "title": "Bitcoin Can't Be Copied",
         "url": "https://archive.is/pSqtA"
       },
       {
@@ -3707,7 +3707,7 @@
       {
         "year": 2021,
         "author": "Jonathan Bier",
-        "title": "The Blocksize War – Chapter 21 – Victory",
+        "title": "The Blocksize War - Chapter 21 - Victory",
         "url": "https://archive.is/VQ0Jh"
       }
     ]
@@ -3993,13 +3993,13 @@
   },
   "08-28": {
     "events": [
-      "2014 - Hal’s Day RIP Hal Finney."
+      "2014 - Hal's Day RIP Hal Finney."
     ],
     "links": [
       {
         "year": 2020,
         "author": "Aaron van Wirdum",
-        "title": "Hal’s Quest for Digital Cash",
+        "title": "Hal's Quest for Digital Cash",
         "url": "https://bitcoinaudible.com/?p=4732"
       }
     ]
@@ -4194,7 +4194,7 @@
       },
       {
         "year": 2019,
-        "author": "Tamás Blummer",
+        "author": "Tamas Blummer",
         "title": "Floor on Bitcoin's risk less interest rate",
         "url": "https://bitcoinwords.github.io/cy19m9#floor-on-bitcoins-risk-less-interest-rate"
       },
@@ -4267,7 +4267,7 @@
       },
       {
         "year": 2020,
-        "author": "Gael Sánchez Smith",
+        "author": "Gael Sanchez Smith",
         "title": "Bitcoin is the Most Sustainable Money The World Has Ever Seen",
         "url": "https://bitcoinwords.github.io/cy20m11#bitcoin-is-the-most-sustainable-money-the-world-has-ever-seen"
       }
@@ -4281,7 +4281,7 @@
       {
         "year": 2019,
         "author": "Giacomo Zucco",
-        "title": "Discovering Bitcoin – From Cavemen to Lightning, Intro & Part 1",
+        "title": "Discovering Bitcoin - From Cavemen to Lightning, Intro & Part 1",
         "url": "https://bitcoinaudible.com/?p=4587"
       },
       {
@@ -4304,7 +4304,7 @@
       {
         "year": 2019,
         "author": "Giacomo Zucco",
-        "title": "Discovering Bitcoin Part 2 – About People",
+        "title": "Discovering Bitcoin Part 2 - About People",
         "url": "https://bitcoinaudible.com/?p=4591"
       }
     ]
@@ -4350,7 +4350,7 @@
       {
         "year": 2019,
         "author": "Giacomo Zucco",
-        "title": "Discovering Bitcoin Part 4 – A Wrong Turn & A New Plan",
+        "title": "Discovering Bitcoin Part 4 - A Wrong Turn & A New Plan",
         "url": "https://bitcoinaudible.com/?p=4623"
       }
     ]
@@ -4361,7 +4361,7 @@
       {
         "year": 2019,
         "author": "Giacomo Zucco",
-        "title": "Discovering Bitcoin Part 5 – Digital Scarcity",
+        "title": "Discovering Bitcoin Part 5 - Digital Scarcity",
         "url": "https://bitcoinaudible.com/?p=4636"
       },
       {
@@ -4378,7 +4378,7 @@
       {
         "year": 2019,
         "author": "Giacomo Zucco",
-        "title": "Discovering Bitcoin Part 6 – Digital Contracts",
+        "title": "Discovering Bitcoin Part 6 - Digital Contracts",
         "url": "https://bitcoinaudible.com/?p=4656"
       }
     ]
@@ -4395,7 +4395,7 @@
       {
         "year": 2019,
         "author": "Giacomo Zucco",
-        "title": "Discovering Bitcoin Part 7 – Missing Pieces",
+        "title": "Discovering Bitcoin Part 7 - Missing Pieces",
         "url": "https://bitcoinaudible.com/?p=4684"
       }
     ]
@@ -4571,7 +4571,7 @@
       {
         "year": 2018,
         "author": "Dan Held",
-        "title": "Bitcoin’s Distribution was Fair",
+        "title": "Bitcoin's Distribution was Fair",
         "url": "https://archive.is/LWUwJ"
       }
     ]
@@ -4699,7 +4699,7 @@
   },
   "10-14": {
     "events": [
-      "2014 - «The Darknet - From Memes to Onionland. An Exploration» by !Mediengruppe Bitnik opens in Kunstalle St. Gallen / Switzerland exhibiting The Random Darknet Shopper, an automated online shopping bot which is provided with a budget of $100 in Bitcoins per week. Once a week the bot goes shopping in the deep web where it randomly chooses and purchases one item and has it mailed directly to the exhibition space. Once the items arrive they are unpacked and displayed, each new object adding to a landscape of traded goods from the Darknet."
+      "2014 - \"The Darknet - From Memes to Onionland. An Exploration\" by !Mediengruppe Bitnik opens in Kunstalle St. Gallen / Switzerland exhibiting The Random Darknet Shopper, an automated online shopping bot which is provided with a budget of $100 in Bitcoins per week. Once a week the bot goes shopping in the deep web where it randomly chooses and purchases one item and has it mailed directly to the exhibition space. Once the items arrive they are unpacked and displayed, each new object adding to a landscape of traded goods from the Darknet."
     ],
     "links": []
   },
@@ -4753,7 +4753,7 @@
       {
         "year": 2018,
         "author": "Pierre Rochard",
-        "title": "Bitcoin’s Buyers of Last Resort",
+        "title": "Bitcoin's Buyers of Last Resort",
         "url": "https://archive.is/PbOIb"
       },
       {
@@ -4930,7 +4930,7 @@
       {
         "year": 2018,
         "author": "Nic Carter",
-        "title": "Bitcoin’s Existential Crisis",
+        "title": "Bitcoin's Existential Crisis",
         "url": "https://archive.is/Lvl6T"
       },
       {
@@ -5003,7 +5003,7 @@
   },
   "11-06": {
     "events": [
-      "1976 - New Directions in Cryptography released by Withfield Diffie and Martin Hellman known as Diffie–Hellman key exchange.",
+      "1976 - New Directions in Cryptography released by Withfield Diffie and Martin Hellman known as Diffie-Hellman key exchange.",
       "2009 - \"You will not find a solution to political problems in cryptography.\"\" \"\"Yes, but we can win a major battle in the arms race and gain a new territory of freedom for several years.\"\"",
       "2010 - Calculated by multiplying the number of Bitcoins in circulation by the last trade on MtGox, the Bitcoin economy exceeds US$1 million. The price on MtGox reached US$0.50/BTC.\""
     ],
@@ -5360,7 +5360,7 @@
       {
         "year": 2017,
         "author": "Dhruv Bansal",
-        "title": "Why It’s Hard to “Get” Bitcoin",
+        "title": "Why It's Hard to \"Get\" Bitcoin",
         "url": "https://archive.is/j9jey"
       },
       {
@@ -5394,7 +5394,7 @@
       {
         "year": 2018,
         "author": "Su Zhu & Hasu",
-        "title": "Skeptic's Guide to Bitcoin: Unpacking Bitcoin’s Social Contract",
+        "title": "Skeptic's Guide to Bitcoin: Unpacking Bitcoin's Social Contract",
         "url": "https://archive.is/lTPMQ"
       },
       {
@@ -5519,7 +5519,7 @@
   },
   "12-12": {
     "events": [
-      "2011 - Jed McCaleb sells MtGox to Japan’s Tibanne Company.",
+      "2011 - Jed McCaleb sells MtGox to Japan's Tibanne Company.",
       "2011 - A new high of nearly 900Ghash/sec total Bitcoin network computation speed is reached, dropping to 500Ghash/sec soon after. It is speculated that the reduction is the result of a supercomputer or bot-net joining the network."
     ],
     "links": []
@@ -5588,7 +5588,7 @@
   },
   "12-17": {
     "events": [
-      "2017 – Bitcoin Valued at US$20,000"
+      "2017 - Bitcoin Valued at US$20,000"
     ],
     "links": []
   },

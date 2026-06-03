@@ -9,6 +9,7 @@
  */
 
 export { selectFooter, dateKey } from "./selectContent"
+export { asciiizeReceiptText } from "../escpos/asciiize"
 export {
   DEFAULT_STATIC_URL,
   ORANGE_PILL_OPTIONS,

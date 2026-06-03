@@ -12,6 +12,8 @@
  * images, barcodes, QR codes, and paper handling.
  */
 
+import { asciiizeReceiptText } from "./asciiize"
+
 type Alignment = "left" | "center" | "right"
 type FontType = "A" | "B" | "C"
 type ErrorCorrectionLevel = "L" | "M" | "Q" | "H"
@@ -93,6 +95,10 @@ class ESCPOSBuilder {
    */
   initialize(): ESCPOSBuilder {
     this.buffer.push(0x1b, 0x40) // ESC @
+    // Select CP437 code page (ESC t 0) for deterministic single-byte output.
+    // Text is transliterated to ASCII before printing, so only the ASCII range
+    // is ever used, but pinning the table avoids printer-default surprises.
+    this.buffer.push(0x1b, 0x74, 0x00) // ESC t n (n=0 -> CP437)
     return this
   }
 
@@ -207,8 +213,12 @@ class ESCPOSBuilder {
    * @returns {ESCPOSBuilder}
    */
   text(text: string): ESCPOSBuilder {
+    // Transliterate to printer-safe ASCII first: the printer reads CP437, so
+    // raw UTF-8 multi-byte chars (smart quotes, em dashes, accents) would print
+    // as mojibake. asciiizeReceiptText maps them to ASCII equivalents.
+    const safe = asciiizeReceiptText(text)
     const encoder = new TextEncoder()
-    const bytes = encoder.encode(text)
+    const bytes = encoder.encode(safe)
     this.buffer.push(...bytes)
     return this
   }

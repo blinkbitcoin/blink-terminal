@@ -18,6 +18,8 @@
  * - Native apps can use optimized Bluetooth libraries
  */
 
+import { asciiizeReceiptText } from "../asciiize"
+
 import { BaseAdapter, AdapterStatus, AdapterCapabilities } from "./BaseAdapter"
 
 /**
@@ -86,18 +88,29 @@ interface ReceiptLike {
 }
 
 /**
- * Max characters for the footer body in the deep link. Kept conservative so
- * the total `app=payment` URI stays well within Android's practical limits.
+ * Max characters for footer fields in the deep link. The total `app=payment`
+ * URI stays well within Android's practical limits (a few KB) at these sizes.
+ * Quotes in rotation are filtered to <= 420 chars upstream, so footerText is
+ * essentially never truncated; the cap is a safety net for long history events.
  */
-const FOOTER_TEXT_MAX = 160
+const FOOTER_TEXT_MAX = 420
 const FOOTER_HEADING_MAX = 48
-const FOOTER_CAPTION_MAX = 80
+const FOOTER_CAPTION_MAX = 120
 
-/** Truncate to `max` chars, appending an ellipsis when cut. */
+/**
+ * Truncate to `max` chars on a word boundary, appending an ASCII "..." when
+ * cut. ASCII (not the `…` glyph) so it never mojibakes on a CP437 printer.
+ */
 function capText(s: string, max: number): string {
-  const t = s.trim()
+  // Transliterate first so the deep link carries printer-safe ASCII (the
+  // companion app renders these params natively) and the length cap counts
+  // ASCII chars, not multi-byte code units.
+  const t = asciiizeReceiptText(s).trim()
   if (t.length <= max) return t
-  return t.slice(0, Math.max(0, max - 1)).trimEnd() + "…"
+  const slice = t.slice(0, Math.max(0, max - 3))
+  const lastSpace = slice.lastIndexOf(" ")
+  const body = lastSpace > max * 0.6 ? slice.slice(0, lastSpace) : slice
+  return body.trimEnd() + "..."
 }
 
 interface PrintOptions {
