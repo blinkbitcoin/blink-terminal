@@ -12,7 +12,13 @@ export interface PaymentPollingInvoice {
   paymentRequest?: string
   satoshis?: number
   amount?: number
+  satAmount?: number
   memo?: string
+  displayAmount?: number
+  displayCurrency?: string
+  tipAmount?: number
+  tipCurrency?: string
+  tipPercent?: number
 }
 
 /** @deprecated Use PaymentData from useBlinkWebSocket instead */
@@ -25,6 +31,8 @@ export interface UsePaymentPollingParams {
   fetchData: () => void
   soundEnabled: boolean
   soundTheme: SoundTheme | string
+  /** Merchant username to show on the success screen / receipt */
+  merchant?: string
 }
 
 export interface UsePaymentPollingReturn {
@@ -61,6 +69,7 @@ export function usePaymentPolling({
   fetchData,
   soundEnabled,
   soundTheme,
+  merchant,
 }: UsePaymentPollingParams): UsePaymentPollingReturn {
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null)
   const pollingStartTimeRef = useRef<number | null>(null)
@@ -107,12 +116,27 @@ export function usePaymentPolling({
               pollingIntervalRef.current = null
             }
 
-            // Trigger payment animation
+            // Trigger payment animation with the richer invoice context so the
+            // success screen + receipt can show fiat, payment hash, tip, etc.
             triggerPaymentAnimation({
               amount: currentInvoice.satoshis || currentInvoice.amount || 0,
               currency: "BTC",
               memo: currentInvoice.memo || `Payment received`,
               isForwarded: true,
+              satAmount:
+                currentInvoice.satAmount ||
+                currentInvoice.satoshis ||
+                currentInvoice.amount ||
+                0,
+              displayAmount: currentInvoice.displayAmount,
+              displayCurrency: currentInvoice.displayCurrency,
+              paymentHash: currentInvoice.paymentHash,
+              paymentRequest: currentInvoice.paymentRequest,
+              timestamp: Date.now(),
+              merchant,
+              tipAmount: currentInvoice.tipAmount,
+              tipCurrency: currentInvoice.tipCurrency,
+              tipPercent: currentInvoice.tipPercent,
             })
 
             // Clear POS invoice

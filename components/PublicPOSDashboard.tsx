@@ -1,6 +1,7 @@
 import { useRef } from "react"
 
 import { useCurrencies } from "../lib/hooks/useCurrencies"
+import { usePrintReceipt } from "../lib/hooks/usePrintReceipt"
 import { usePublicPOSExchangeRate } from "../lib/hooks/usePublicPOSExchangeRate"
 import { usePublicPOSMenuState } from "../lib/hooks/usePublicPOSMenuState"
 import {
@@ -145,6 +146,8 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
     setBitcoinFormat,
     numpadLayout,
     setNumpadLayout,
+    amountDisplay,
+    setAmountDisplay,
     soundEnabled,
     setSoundEnabled,
     soundTheme,
@@ -172,7 +175,20 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
     paymentData,
     handleInvoiceChange,
     handlePaymentAnimationHide,
-  } = usePublicPOSPayment({ showingInvoice, soundEnabled, posPaymentReceivedRef })
+  } = usePublicPOSPayment({
+    showingInvoice,
+    soundEnabled,
+    posPaymentReceivedRef,
+    merchant: username,
+  })
+
+  // Receipt printing for the payment-success screen (manual, button-triggered)
+  const { printReceipt, printAvailable } = usePrintReceipt({
+    amountDisplay,
+    numberFormat,
+    bitcoinFormat,
+    currencies,
+  })
 
   // Exchange rate for sats equivalent display
   const { exchangeRate, loadingRate: _loadingRate } = usePublicPOSExchangeRate({
@@ -374,6 +390,8 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
           setBitcoinFormat={setBitcoinFormat}
           numpadLayout={numpadLayout}
           setNumpadLayout={setNumpadLayout}
+          amountDisplay={amountDisplay}
+          setAmountDisplay={setAmountDisplay}
           getSubmenuBgClasses={getSubmenuBgClasses}
           getSubmenuHeaderClasses={getSubmenuHeaderClasses}
         />
@@ -461,6 +479,12 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
           onHide={handlePaymentAnimationHide}
           soundEnabled={soundEnabled}
           soundTheme={soundTheme}
+          amountDisplay={amountDisplay}
+          numberFormat={numberFormat}
+          bitcoinFormat={bitcoinFormat}
+          currencies={currencies}
+          onPrintReceipt={printReceipt}
+          printAvailable={printAvailable}
         />
 
         {/* Conditional Content Based on Current View */}

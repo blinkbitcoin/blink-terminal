@@ -13,6 +13,7 @@ import { useInvoiceState } from "../lib/hooks/useInvoiceState"
 import { useNavigationHandlers } from "../lib/hooks/useNavigationHandlers"
 import { usePaycodeState } from "../lib/hooks/usePaycodeState"
 import { usePaymentPolling } from "../lib/hooks/usePaymentPolling"
+import { usePrintReceipt } from "../lib/hooks/usePrintReceipt"
 import { usePWAInstall, type BeforeInstallPromptEvent } from "../lib/hooks/usePWAInstall"
 import { useServerSync, getVoucherWalletKey } from "../lib/hooks/useServerSync"
 import { useSoundSettings } from "../lib/hooks/useSoundSettings"
@@ -174,6 +175,8 @@ export default function Dashboard() {
     setBitcoinFormat,
     numpadLayout,
     setNumpadLayout,
+    amountDisplay,
+    setAmountDisplay,
     currencyFilter,
     setCurrencyFilter,
     currencyFilterDebounced,
@@ -729,6 +732,15 @@ export default function Dashboard() {
     fetchData,
     soundEnabled,
     soundTheme,
+    merchant: user?.username ?? undefined,
+  })
+
+  // Receipt printing for the payment-success screen (manual, button-triggered)
+  const { printReceipt, printAvailable } = usePrintReceipt({
+    amountDisplay,
+    numberFormat,
+    bitcoinFormat,
+    currencies,
   })
 
   // Navigation handlers (touch swipe + keyboard) - extracted to useNavigationHandlers hook
@@ -787,6 +799,12 @@ export default function Dashboard() {
         onHide={hideAnimation}
         soundEnabled={soundEnabled}
         soundTheme={soundTheme}
+        amountDisplay={amountDisplay}
+        numberFormat={numberFormat}
+        bitcoinFormat={bitcoinFormat}
+        currencies={currencies}
+        onPrintReceipt={printReceipt}
+        printAvailable={printAvailable}
       />
 
       {/* Mobile Header - Hidden when showing invoice or voucher QR */}
@@ -1072,9 +1090,11 @@ export default function Dashboard() {
           numberFormat={numberFormat}
           bitcoinFormat={bitcoinFormat}
           numpadLayout={numpadLayout}
+          amountDisplay={amountDisplay}
           setNumberFormat={setNumberFormat}
           setBitcoinFormat={setBitcoinFormat}
           setNumpadLayout={setNumpadLayout}
+          setAmountDisplay={setAmountDisplay}
           setShowRegionalSettings={setShowRegionalSettings}
           getSubmenuBgClasses={getSubmenuBgClasses}
           getSubmenuHeaderClasses={getSubmenuHeaderClasses}

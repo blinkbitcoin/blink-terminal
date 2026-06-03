@@ -10,9 +10,13 @@ import {
   NUMPAD_LAYOUT_OPTIONS,
   NUMPAD_LAYOUT_LABELS,
   NUMPAD_LAYOUT_DESCRIPTIONS,
+  AMOUNT_DISPLAY_OPTIONS,
+  AMOUNT_DISPLAY_LABELS,
+  AMOUNT_DISPLAY_DESCRIPTIONS,
   type NumberFormatPreference,
   type BitcoinFormatPreference,
   type NumpadLayoutPreference,
+  type AmountDisplayPreference,
 } from "../../lib/number-format"
 
 /**
@@ -30,6 +34,8 @@ interface PublicPOSRegionalOverlayProps {
   setBitcoinFormat: (format: BitcoinFormatPreference) => void
   numpadLayout: NumpadLayoutPreference
   setNumpadLayout: (layout: NumpadLayoutPreference) => void
+  amountDisplay: AmountDisplayPreference
+  setAmountDisplay: (preference: AmountDisplayPreference) => void
   getSubmenuBgClasses: () => string
   getSubmenuHeaderClasses: () => string
 }
@@ -43,6 +49,8 @@ export default function PublicPOSRegionalOverlay({
   setBitcoinFormat,
   numpadLayout,
   setNumpadLayout,
+  amountDisplay,
+  setAmountDisplay,
   getSubmenuBgClasses,
   getSubmenuHeaderClasses,
 }: PublicPOSRegionalOverlayProps) {
@@ -193,6 +201,69 @@ export default function PublicPOSRegionalOverlay({
                       </p>
                     </div>
                     {bitcoinFormat === format && (
+                      <svg
+                        className="w-5 h-5 text-blink-accent flex-shrink-0 ml-2"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth="2"
+                          d="M5 13l4 4L19 7"
+                        />
+                      </svg>
+                    )}
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Amount Display Section */}
+          <div>
+            <h3
+              className={`text-sm font-medium mb-3 ${darkMode ? "text-gray-400" : "text-gray-600"}`}
+            >
+              Amount Display
+            </h3>
+            <div className="space-y-2">
+              {AMOUNT_DISPLAY_OPTIONS.map((preference) => (
+                <button
+                  key={preference}
+                  onClick={() => setAmountDisplay(preference)}
+                  className={`w-full p-3 rounded-lg text-left transition-all ${
+                    amountDisplay === preference
+                      ? "bg-blink-accent/20 border-2 border-blink-accent"
+                      : darkMode
+                        ? "bg-gray-900 hover:bg-gray-800 border-2 border-transparent"
+                        : "bg-gray-50 hover:bg-gray-100 border-2 border-transparent"
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <div className="flex items-center gap-3">
+                        <span
+                          className={`text-sm font-medium ${darkMode ? "text-white" : "text-gray-900"}`}
+                        >
+                          {AMOUNT_DISPLAY_LABELS[preference]}
+                        </span>
+                        <span
+                          className={`text-sm font-mono ${darkMode ? "text-gray-400" : "text-gray-500"}`}
+                        >
+                          {preference === "sats-primary"
+                            ? `${getBitcoinFormatPreview(bitcoinFormat, numberFormat)} ($1.00)`
+                            : `$1.00 (${getBitcoinFormatPreview(bitcoinFormat, numberFormat)})`}
+                        </span>
+                      </div>
+                      <p
+                        className={`text-xs mt-0.5 ${darkMode ? "text-gray-400" : "text-gray-500"}`}
+                      >
+                        {AMOUNT_DISPLAY_DESCRIPTIONS[preference]}
+                      </p>
+                    </div>
+                    {amountDisplay === preference && (
                       <svg
                         className="w-5 h-5 text-blink-accent flex-shrink-0 ml-2"
                         fill="none"

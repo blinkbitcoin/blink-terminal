@@ -14,18 +14,24 @@ import {
   NUMPAD_LAYOUT_OPTIONS,
   NUMPAD_LAYOUT_LABELS,
   NUMPAD_LAYOUT_DESCRIPTIONS,
+  AMOUNT_DISPLAY_OPTIONS,
+  AMOUNT_DISPLAY_LABELS,
+  AMOUNT_DISPLAY_DESCRIPTIONS,
   NumberFormatPreference,
   BitcoinFormatPreference,
   NumpadLayoutPreference,
+  AmountDisplayPreference,
 } from "../../lib/number-format"
 
 interface RegionalSettingsOverlayProps {
   numberFormat: NumberFormatPreference
   bitcoinFormat: BitcoinFormatPreference
   numpadLayout: NumpadLayoutPreference
+  amountDisplay: AmountDisplayPreference
   setNumberFormat: (format: NumberFormatPreference) => void
   setBitcoinFormat: (format: BitcoinFormatPreference) => void
   setNumpadLayout: (layout: NumpadLayoutPreference) => void
+  setAmountDisplay: (preference: AmountDisplayPreference) => void
   setShowRegionalSettings: (show: boolean) => void
   getSubmenuBgClasses: () => string
   getSubmenuHeaderClasses: () => string
@@ -42,9 +48,11 @@ export default function RegionalSettingsOverlay({
   numberFormat,
   bitcoinFormat,
   numpadLayout,
+  amountDisplay,
   setNumberFormat,
   setBitcoinFormat,
   setNumpadLayout,
+  setAmountDisplay,
   setShowRegionalSettings,
   getSubmenuBgClasses,
   getSubmenuHeaderClasses,
@@ -183,6 +191,63 @@ export default function RegionalSettingsOverlay({
                       </p>
                     </div>
                     {bitcoinFormat === format && (
+                      <svg
+                        className={`w-5 h-5 ${getCheckmarkClasses()} flex-shrink-0 ml-2`}
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth="2"
+                          d="M5 13l4 4L19 7"
+                        />
+                      </svg>
+                    )}
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Amount Display Section */}
+          <div>
+            <h3 className={`text-sm font-medium mb-3 ${getSectionLabelClasses()}`}>
+              Amount Display
+            </h3>
+            <div className="space-y-2">
+              {AMOUNT_DISPLAY_OPTIONS.map((preference) => (
+                <button
+                  key={preference}
+                  onClick={() => setAmountDisplay(preference)}
+                  className={`w-full p-3 text-left transition-all ${
+                    amountDisplay === preference
+                      ? getSubmenuOptionActiveClasses()
+                      : getSubmenuOptionClasses()
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <div className="flex items-center gap-3">
+                        <span
+                          className={`text-sm font-medium ${getPrimaryTextClasses()}`}
+                        >
+                          {AMOUNT_DISPLAY_LABELS[preference]}
+                        </span>
+                        <span
+                          className={`text-sm font-mono ${getSecondaryTextClasses()}`}
+                        >
+                          {preference === "sats-primary"
+                            ? `${getBitcoinFormatPreview(bitcoinFormat, numberFormat)} ($1.00)`
+                            : `$1.00 (${getBitcoinFormatPreview(bitcoinFormat, numberFormat)})`}
+                        </span>
+                      </div>
+                      <p className={`text-xs mt-0.5 ${getSecondaryTextClasses()}`}>
+                        {AMOUNT_DISPLAY_DESCRIPTIONS[preference]}
+                      </p>
+                    </div>
+                    {amountDisplay === preference && (
                       <svg
                         className={`w-5 h-5 ${getCheckmarkClasses()} flex-shrink-0 ml-2`}
                         fill="none"

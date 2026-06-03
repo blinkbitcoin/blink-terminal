@@ -1,10 +1,12 @@
 import { useState, useEffect, type Dispatch, type SetStateAction } from "react"
 
 import type { SoundThemeName } from "../audio-utils"
-import type {
-  NumberFormatPreference,
-  BitcoinFormatPreference,
-  NumpadLayoutPreference,
+import {
+  DEFAULT_AMOUNT_DISPLAY,
+  type NumberFormatPreference,
+  type BitcoinFormatPreference,
+  type NumpadLayoutPreference,
+  type AmountDisplayPreference,
 } from "../number-format"
 
 interface UsePublicPOSSettingsReturn {
@@ -16,6 +18,8 @@ interface UsePublicPOSSettingsReturn {
   setBitcoinFormat: Dispatch<SetStateAction<BitcoinFormatPreference>>
   numpadLayout: NumpadLayoutPreference
   setNumpadLayout: Dispatch<SetStateAction<NumpadLayoutPreference>>
+  amountDisplay: AmountDisplayPreference
+  setAmountDisplay: Dispatch<SetStateAction<AmountDisplayPreference>>
   soundEnabled: boolean
   setSoundEnabled: Dispatch<SetStateAction<boolean>>
   soundTheme: SoundThemeName
@@ -62,6 +66,16 @@ export function usePublicPOSSettings(): UsePublicPOSSettingsReturn {
       )
     }
     return "calculator"
+  })
+
+  const [amountDisplay, setAmountDisplay] = useState<AmountDisplayPreference>(() => {
+    if (typeof window !== "undefined") {
+      return (
+        (localStorage.getItem("publicpos-amountDisplay") as AmountDisplayPreference) ||
+        DEFAULT_AMOUNT_DISPLAY
+      )
+    }
+    return DEFAULT_AMOUNT_DISPLAY
   })
 
   const [soundEnabled, setSoundEnabled] = useState(() => {
@@ -111,6 +125,12 @@ export function usePublicPOSSettings(): UsePublicPOSSettingsReturn {
     }
   }, [numpadLayout])
 
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      localStorage.setItem("publicpos-amountDisplay", amountDisplay)
+    }
+  }, [amountDisplay])
+
   return {
     displayCurrency,
     setDisplayCurrency,
@@ -120,6 +140,8 @@ export function usePublicPOSSettings(): UsePublicPOSSettingsReturn {
     setBitcoinFormat,
     numpadLayout,
     setNumpadLayout,
+    amountDisplay,
+    setAmountDisplay,
     soundEnabled,
     setSoundEnabled,
     soundTheme,

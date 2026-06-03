@@ -1,15 +1,40 @@
 import { useEffect, useRef, useState } from "react"
 
 import { getWsUrl } from "../config/api"
+import { parseTxTimestamp } from "../time-utils"
 
 /**
- * Payment data structure from WebSocket transaction events
+ * Payment data structure from WebSocket transaction events.
+ *
+ * `amount`/`currency` are the settlement values (sats / "BTC") shown on the
+ * success animation. The optional fields below carry the richer context
+ * available at payment-success time (from the client-held invoice + auth
+ * context) so the success screen and printed receipt can show a formatted
+ * fiat amount, merchant, payment hash, tip breakdown, etc.
  */
 export interface PaymentData {
   amount: number
   currency: string
   memo?: string
   isForwarded?: boolean
+
+  // Sats total (mirrors `amount` when currency is BTC; kept explicit for receipts)
+  satAmount?: number
+
+  // Fiat display values
+  displayAmount?: number
+  displayCurrency?: string
+
+  // Identifiers / metadata for the receipt
+  paymentHash?: string
+  paymentRequest?: string
+  timestamp?: number
+  merchant?: string
+
+  // Tip breakdown (structured, not just embedded in memo)
+  tipAmount?: number
+  tipCurrency?: string
+  tipPercent?: number
 }
 
 /**
@@ -156,10 +181,33 @@ export function useBlinkWebSocket(
           if (transaction && transaction.direction === "RECEIVE") {
             console.log("🎉 DIRECT PAYMENT DETECTED!", transaction)
 
+            // Blink settlementAmount is in MINOR units of the wallet currency:
+            // satoshis for BTC, cents for USD (settlementCurrency is "BTC" | "USD").
+            // Normalize so downstream never treats cents as sats: BTC -> satAmount,
+            // USD -> fiat displayAmount in dollars (cents / 100).
+            const isBtcSettlement = transaction.settlementCurrency === "BTC"
+            const isUsdSettlement = transaction.settlementCurrency === "USD"
+
             const paymentData: PaymentData = {
               amount: transaction.settlementAmount,
               currency: transaction.settlementCurrency,
               memo: transaction.memo,
+              satAmount: isBtcSettlement ? transaction.settlementAmount : undefined,
+              // USD settlement: settlementAmount is cents -> dollars for display.
+              displayAmount: isUsdSettlement
+                ? transaction.settlementAmount / 100
+                : undefined,
+              displayCurrency: isUsdSettlement ? "USD" : undefined,
+              paymentHash: transaction.initiationVia?.paymentHash,
+              // Blink's Timestamp scalar serializes createdAt as Unix seconds
+              // (number). parseTxTimestamp also tolerates ISO strings defensively;
+              // fall back to now if absent/unparsable.
+              timestamp: (() => {
+                if (!transaction.createdAt) return Date.now()
+                const ts = parseTxTimestamp(transaction.createdAt)
+                return Number.isNaN(ts) ? Date.now() : ts
+              })(),
+              merchant: username || undefined,
             }
 
             setLastPayment(paymentData)
