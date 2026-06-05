@@ -859,7 +859,6 @@ export default function Dashboard() {
           setShowPaycode={setShowPaycode}
           setShowBatchPayments={setShowBatchPayments}
           setShowBoltcards={setShowBoltcards}
-          setShowNetworkOverlay={setShowNetworkOverlay}
           handleInstallApp={handleInstallApp}
           handleLogout={handleLogout}
           getSubmenuBgClasses={getSubmenuBgClasses}

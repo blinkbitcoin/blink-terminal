@@ -48,7 +48,6 @@ interface SideMenuOverlayProps {
   setShowPaycode: (show: boolean) => void
   setShowBatchPayments: (show: boolean) => void
   setShowBoltcards: (show: boolean) => void
-  setShowNetworkOverlay: (show: boolean) => void
   handleInstallApp: () => void
   handleLogout: () => void
   getSubmenuBgClasses: () => string
@@ -86,7 +85,6 @@ export default function SideMenuOverlay({
   setShowPaycode,
   setShowBatchPayments,
   setShowBoltcards,
-  setShowNetworkOverlay,
   handleInstallApp,
   handleLogout,
   getSubmenuBgClasses,
@@ -450,9 +448,14 @@ export default function SideMenuOverlay({
                 className={`w-full rounded-lg p-4 ${getMenuTileClasses()} transition-colors`}
               >
                 <div className="flex items-center justify-between">
-                  <span className="text-sm font-medium text-gray-900 dark:text-white">
-                    Boltcards
-                  </span>
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-medium text-gray-900 dark:text-white">
+                      Boltcards
+                    </span>
+                    <span className="px-2 py-0.5 text-xs font-medium rounded bg-purple-500/20 text-purple-400">
+                      Beta
+                    </span>
+                  </div>
                   <div className="flex items-center text-sm text-gray-500 dark:text-gray-400">
                     <svg
                       className="w-4 h-4"
@@ -472,37 +475,6 @@ export default function SideMenuOverlay({
                 </div>
               </button>
             )}
-
-            {/* Circular Economy Network */}
-            <button
-              onClick={() => {
-                setShowNetworkOverlay(true)
-                setSideMenuOpen(false)
-              }}
-              className={`w-full rounded-lg p-4 ${getMenuTileClasses()} transition-colors`}
-            >
-              <div className="flex items-center justify-between">
-                <span className="text-sm font-medium text-gray-900 dark:text-white">
-                  Circular Economy Network
-                </span>
-                <div className="flex items-center text-sm text-gray-500 dark:text-gray-400">
-                  <svg
-                    className="w-4 h-4"
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth="2"
-                      d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"
-                    />
-                  </svg>
-                  <span className="ml-1">›</span>
-                </div>
-              </div>
-            </button>
 
             {/* Action Buttons */}
             <div className="space-y-3 pt-4">

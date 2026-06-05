@@ -37,6 +37,7 @@ import ProfileStorage, {
   type ProfileExportData,
 } from "../storage/ProfileStorage"
 
+import { mergeProfileData, pushLocalOnlyToServer } from "./profileMerge"
 import { useNostrAuth } from "./useNostrAuth"
 
 // ============= Server Response Types =============
@@ -637,6 +638,68 @@ export function ProfileProvider({ children }: ProfileProviderProps): React.JSX.E
   )
 
   /**
+   * Sync NWC connections to the server (immediate).
+   *
+   * NWC URIs are bearer secrets stored device-encrypted locally; the server
+   * stores them re-encrypted with the server key. We decrypt each URI with the
+   * device key, send plaintext, and the server re-encrypts on write. Connection
+   * `id`s are preserved so the records round-trip across devices.
+   */
+  const syncNWCConnectionsToServer = useCallback(
+    async (connections: StoredNWCConnection[]) => {
+      if (!publicKey) return
+
+      try {
+        const connectionsToSync = (
+          await Promise.all(
+            connections.map(async (conn: StoredNWCConnection) => {
+              let uri: string | null = null
+              try {
+                uri = await CryptoUtils.decryptWithDeviceKey(conn.uri)
+              } catch (err: unknown) {
+                console.warn(
+                  "[useProfile] Could not decrypt NWC URI for connection:",
+                  conn.id,
+                  err,
+                )
+              }
+              if (!uri) return null
+              return {
+                id: conn.id,
+                label: conn.label,
+                uri,
+                capabilities: conn.capabilities || [],
+                isActive: conn.isActive,
+                createdAt: conn.createdAt,
+              }
+            }),
+          )
+        ).filter((c): c is NonNullable<typeof c> => c !== null)
+
+        const response = await fetch("/api/user/sync", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            pubkey: publicKey,
+            field: "nwcConnections",
+            data: connectionsToSync,
+          }),
+        })
+
+        if (response.ok) {
+          console.log("[useProfile] ✓ NWC connections synced to server")
+          updateState({ serverSynced: true })
+        } else {
+          console.error("[useProfile] NWC sync failed:", response.status)
+        }
+      } catch (err: unknown) {
+        console.error("[useProfile] NWC sync error:", err)
+      }
+    },
+    [publicKey, updateState],
+  )
+
+  /**
    * Fetch all Blink data from server (API accounts + LN Address wallets)
    * NOTE: This requires hasServerSession to be true - caller must check
    */
@@ -644,19 +707,36 @@ export function ProfileProvider({ children }: ProfileProviderProps): React.JSX.E
     blinkApiAccounts: ServerBlinkApiAccount[]
     blinkLnAddressWallets: ServerLnAddressWallet[]
     npubCashWallets: ServerNpubCashWallet[]
+    nwcConnections: StoredNWCConnection[]
+    /**
+     * Whether this result reflects an authoritative read of the server.
+     * `false` means the fetch was skipped or failed (e.g. the session was not
+     * yet established), and the empty arrays do NOT mean "the server has no
+     * data". Callers MUST NOT treat a non-authoritative result as a signal to
+     * overwrite/delete server-side data — doing so clobbers wallets that other
+     * devices added (the cross-device divergence bug).
+     */
+    authoritative: boolean
   }> => {
-    if (!publicKey)
-      return { blinkApiAccounts: [], blinkLnAddressWallets: [], npubCashWallets: [] }
+    const empty = {
+      blinkApiAccounts: [],
+      blinkLnAddressWallets: [],
+      npubCashWallets: [],
+      nwcConnections: [],
+    }
+
+    if (!publicKey) return { ...empty, authoritative: false }
 
     // IMPORTANT: Don't fetch from server if session isn't established yet
-    // This prevents 401 errors during the auth race condition
+    // This prevents 401 errors during the auth race condition. The result is
+    // marked non-authoritative so the merge does not push local state up.
     if (!hasServerSession) {
       console.log(
         "[useProfile] Skipping server fetch - no session yet (hasServerSession:",
         hasServerSession,
         ")",
       )
-      return { blinkApiAccounts: [], blinkLnAddressWallets: [], npubCashWallets: [] }
+      return { ...empty, authoritative: false }
     }
 
     try {
@@ -665,7 +745,7 @@ export function ProfileProvider({ children }: ProfileProviderProps): React.JSX.E
 
       if (!response.ok) {
         console.error("[useProfile] Server fetch failed:", response.status)
-        return { blinkApiAccounts: [], blinkLnAddressWallets: [], npubCashWallets: [] }
+        return { ...empty, authoritative: false }
       }
 
       const data = await response.json()
@@ -673,16 +753,19 @@ export function ProfileProvider({ children }: ProfileProviderProps): React.JSX.E
         blinkApiAccounts: data.blinkApiAccounts?.length || 0,
         blinkLnAddressWallets: data.blinkLnAddressWallets?.length || 0,
         npubCashWallets: data.npubCashWallets?.length || 0,
+        nwcConnections: data.nwcConnections?.length || 0,
       })
 
       return {
         blinkApiAccounts: data.blinkApiAccounts || [],
         blinkLnAddressWallets: data.blinkLnAddressWallets || [],
         npubCashWallets: data.npubCashWallets || [],
+        nwcConnections: data.nwcConnections || [],
+        authoritative: true,
       }
     } catch (err: unknown) {
       console.error("[useProfile] Server fetch error:", err)
-      return { blinkApiAccounts: [], blinkLnAddressWallets: [], npubCashWallets: [] }
+      return { ...empty, authoritative: false }
     }
   }, [publicKey, hasServerSession])
 
@@ -722,241 +805,43 @@ export function ProfileProvider({ children }: ProfileProviderProps): React.JSX.E
 
     // Fetch all Blink data from server for cross-device sync
     const serverData = await fetchBlinkDataFromServer()
-    const serverApiAccounts: ServerBlinkApiAccount[] = serverData.blinkApiAccounts || []
-    const serverLnAddressWallets: ServerLnAddressWallet[] =
-      serverData.blinkLnAddressWallets || []
-    const serverNpubCashWallets: ServerNpubCashWallet[] = serverData.npubCashWallets || []
 
-    // Separate local accounts by type
-    const localApiKeyAccounts = localAccounts.filter(
-      (a: LocalBlinkAccount) =>
-        a.type !== "ln-address" && a.type !== "npub-cash" && a.apiKey,
-    )
-    const localLnAddressWallets = localAccounts.filter(
-      (a: LocalBlinkAccount) => a.type === "ln-address",
-    )
-    const localNpubCashWallets = localAccounts.filter(
-      (a: LocalBlinkAccount) => a.type === "npub-cash",
-    )
-
-    let mergedAccounts: LocalBlinkAccount[] = [...localAccounts]
-    let needsLocalUpdate = false
-    let needsServerSyncApi = false
-    let needsServerSyncLnAddr = false
-    let needsServerSyncNpubCash = false
-
-    // === Merge Blink API accounts ===
-    if (serverApiAccounts.length > 0) {
-      const mergedApiAccounts: LocalBlinkAccount[] = []
-
-      // Add all server API accounts, checking against local
-      for (const serverAccount of serverApiAccounts) {
-        const localAccount = localApiKeyAccounts.find(
-          (l: LocalBlinkAccount) =>
-            l.id === serverAccount.id || l.username === serverAccount.username,
-        )
-
-        if (localAccount) {
-          // Keep local version (has encrypted API key for this device)
-          mergedApiAccounts.push(localAccount)
-        } else if (serverAccount.apiKey) {
-          // New account from server - encrypt API key for local storage
-          console.log(
-            "[useProfile] Adding server API account to local:",
-            serverAccount.username,
-          )
-          try {
-            const encryptedApiKey = await CryptoUtils.encryptWithDeviceKey(
-              serverAccount.apiKey,
-            )
-            mergedApiAccounts.push({
-              id: serverAccount.id,
-              label: serverAccount.label,
-              username: serverAccount.username,
-              apiKey: encryptedApiKey,
-              defaultCurrency: serverAccount.defaultCurrency || "BTC",
-              isActive: localAccounts.length === 0 && mergedApiAccounts.length === 0, // First account is active
-              createdAt: new Date(serverAccount.createdAt).getTime(),
-              lastUsed: serverAccount.lastUsed
-                ? new Date(serverAccount.lastUsed).getTime()
-                : undefined,
-              source: "server",
-            })
-            needsLocalUpdate = true
-          } catch (err: unknown) {
-            console.error("[useProfile] Failed to encrypt server API key:", err)
-          }
-        }
-      }
-
-      // Add any local-only API accounts
-      for (const localAccount of localApiKeyAccounts) {
-        const existsOnServer = serverApiAccounts.find(
-          (s: ServerBlinkApiAccount) =>
-            s.id === localAccount.id || s.username === localAccount.username,
-        )
-        if (!existsOnServer) {
-          mergedApiAccounts.push(localAccount)
-          needsServerSyncApi = true
-        }
-      }
-
-      // Replace local API accounts with merged (preserve npub.cash wallets)
-      mergedAccounts = [
-        ...mergedApiAccounts,
-        ...localLnAddressWallets,
-        ...localNpubCashWallets,
-      ]
-    } else if (localApiKeyAccounts.length > 0) {
-      // No server API accounts but we have local - sync to server
+    // CROSS-DEVICE SYNC CORRECTNESS:
+    // If the read was NOT authoritative (session not yet established, or the
+    // request failed) the empty arrays do not mean "the server has no data".
+    // In that case we keep the local view as-is and DO NOT merge or push
+    // anything up — pushing a partial/empty local set would overwrite wallets
+    // that other devices added (the root cause of devices showing different
+    // wallet sets). We'll re-run once the session is ready.
+    if (!serverData.authoritative) {
       console.log(
-        "[useProfile] No server API accounts, syncing",
-        localApiKeyAccounts.length,
-        "local accounts to server",
+        "[useProfile] Non-authoritative server read - keeping local view, no sync-up",
       )
-      needsServerSyncApi = true
+      return
     }
 
-    // === Merge LN Address wallets ===
-    if (serverLnAddressWallets.length > 0) {
-      const currentApiAccounts = mergedAccounts.filter(
-        (a: LocalBlinkAccount) => a.type !== "ln-address" && a.type !== "npub-cash",
-      )
-      const currentNpubCashWallets = mergedAccounts.filter(
-        (a: LocalBlinkAccount) => a.type === "npub-cash",
-      )
-      const mergedLnAddressWallets: LocalBlinkAccount[] = []
-
-      // Add all server LN Address wallets, checking against local
-      for (const serverWallet of serverLnAddressWallets) {
-        const localWallet = localLnAddressWallets.find(
-          (l: LocalBlinkAccount) => l.id === serverWallet.id,
-        )
-
-        if (localWallet) {
-          mergedLnAddressWallets.push(localWallet)
-        } else {
-          // Add from server (new wallet from another device)
-          console.log(
-            "[useProfile] Adding server LN Address wallet to local:",
-            serverWallet.username,
-          )
-          mergedLnAddressWallets.push({
-            id: serverWallet.id,
-            type: "ln-address",
-            label: serverWallet.label,
-            username: serverWallet.username,
-            lightningAddress: serverWallet.lightningAddress,
-            walletId: serverWallet.walletId,
-            isActive: mergedAccounts.length === 0 && mergedLnAddressWallets.length === 0,
-            createdAt: new Date(serverWallet.createdAt).getTime(),
-            lastUsed: serverWallet.lastUsed
-              ? new Date(serverWallet.lastUsed).getTime()
-              : undefined,
-            source: "server",
-          })
-          needsLocalUpdate = true
-        }
-      }
-
-      // Add any local-only LN Address wallets
-      for (const localWallet of localLnAddressWallets) {
-        if (
-          !serverLnAddressWallets.find(
-            (s: ServerLnAddressWallet) => s.id === localWallet.id,
-          )
-        ) {
-          mergedLnAddressWallets.push(localWallet)
-          needsServerSyncLnAddr = true
-        }
-      }
-
-      mergedAccounts = [
-        ...currentApiAccounts,
-        ...mergedLnAddressWallets,
-        ...currentNpubCashWallets,
-      ]
-    } else if (localLnAddressWallets.length > 0) {
-      // No server LN Address wallets but we have local - sync to server
-      console.log(
-        "[useProfile] No server LN Address wallets, syncing",
-        localLnAddressWallets.length,
-        "local wallets to server",
-      )
-      needsServerSyncLnAddr = true
-    }
-
-    // === Merge npub.cash wallets ===
-    if (serverNpubCashWallets.length > 0) {
-      const currentApiAccounts = mergedAccounts.filter(
-        (a: LocalBlinkAccount) => a.type !== "ln-address" && a.type !== "npub-cash",
-      )
-      const currentLnAddressWallets = mergedAccounts.filter(
-        (a: LocalBlinkAccount) => a.type === "ln-address",
-      )
-      const mergedNpubCashWallets: LocalBlinkAccount[] = []
-
-      // Add all server npub.cash wallets, checking against local
-      for (const serverWallet of serverNpubCashWallets) {
-        const localWallet = localNpubCashWallets.find(
-          (l: LocalBlinkAccount) => l.id === serverWallet.id,
-        )
-
-        if (localWallet) {
-          mergedNpubCashWallets.push(localWallet)
-        } else {
-          // Add from server (new wallet from another device)
-          console.log(
-            "[useProfile] Adding server npub.cash wallet to local:",
-            serverWallet.address || serverWallet.lightningAddress,
-          )
-          mergedNpubCashWallets.push({
-            id: serverWallet.id,
-            type: "npub-cash",
-            label: serverWallet.label,
-            lightningAddress: serverWallet.lightningAddress || serverWallet.address,
-            localpart: serverWallet.localpart,
-            isNpub: serverWallet.isNpub,
-            pubkey: serverWallet.pubkey,
-            isActive: mergedAccounts.length === 0 && mergedNpubCashWallets.length === 0,
-            createdAt: serverWallet.createdAt
-              ? new Date(serverWallet.createdAt).getTime()
-              : Date.now(),
-            lastUsed: serverWallet.lastUsed
-              ? new Date(serverWallet.lastUsed).getTime()
-              : undefined,
-            source: "server",
-          })
-          needsLocalUpdate = true
-        }
-      }
-
-      // Add any local-only npub.cash wallets
-      for (const localWallet of localNpubCashWallets) {
-        if (
-          !serverNpubCashWallets.find(
-            (s: ServerNpubCashWallet) => s.id === localWallet.id,
-          )
-        ) {
-          mergedNpubCashWallets.push(localWallet)
-          needsServerSyncNpubCash = true
-        }
-      }
-
-      mergedAccounts = [
-        ...currentApiAccounts,
-        ...currentLnAddressWallets,
-        ...mergedNpubCashWallets,
-      ]
-    } else if (localNpubCashWallets.length > 0) {
-      // No server npub.cash wallets but we have local - sync to server
-      console.log(
-        "[useProfile] No server npub.cash wallets, syncing",
-        localNpubCashWallets.length,
-        "local wallets to server",
-      )
-      needsServerSyncNpubCash = true
-    }
+    // Server-authoritative merge of local + server data. Pure logic lives in
+    // lib/hooks/profileMerge.ts so it can be unit-tested in isolation; the hook
+    // owns all I/O (state, localStorage, server PATCHes).
+    const {
+      mergedAccounts,
+      mergedNwcConnections,
+      needsLocalUpdate,
+      needsServerSyncApi,
+      needsServerSyncLnAddr,
+      needsServerSyncNpubCash,
+      needsServerSyncNwc,
+    } = await mergeProfileData({
+      localAccounts,
+      localNwcConnections: authProfile.nwcConnections || [],
+      server: {
+        blinkApiAccounts: serverData.blinkApiAccounts || [],
+        blinkLnAddressWallets: serverData.blinkLnAddressWallets || [],
+        npubCashWallets: serverData.npubCashWallets || [],
+        nwcConnections: serverData.nwcConnections || [],
+      },
+      encryptWithDeviceKey: CryptoUtils.encryptWithDeviceKey.bind(CryptoUtils),
+    })
 
     // Update localStorage with merged data if needed
     if (needsLocalUpdate && authProfile.id) {
@@ -964,33 +849,50 @@ export function ProfileProvider({ children }: ProfileProviderProps): React.JSX.E
       const profile = ProfileStorage.getProfileById(authProfile.id)
       if (profile) {
         profile.blinkAccounts = mergedAccounts as StoredBlinkAccount[]
+        profile.nwcConnections = mergedNwcConnections
         ProfileStorage.updateProfile(profile)
       }
     }
 
     updateState({
       blinkAccounts: mergedAccounts,
+      nwcConnections: mergedNwcConnections,
       serverSynced: true,
     })
 
-    // Sync local-only accounts to server
-    if (needsServerSyncApi) {
-      syncBlinkApiAccountsToServer(mergedAccounts)
-    }
-    if (needsServerSyncLnAddr) {
-      syncLnAddressWalletsToServer(mergedAccounts)
-    }
-    if (needsServerSyncNpubCash) {
-      syncNpubCashWalletsToServer(mergedAccounts)
-    }
+    // Push any local-only items up to the server.
+    //
+    // IMPORTANT: use the IMMEDIATE (non-debounced) sync variants and run them
+    // sequentially via pushLocalOnlyToServer. The debounced helpers all share a
+    // single timer ref and each cancels the previous one, so firing several
+    // back-to-back would only persist the LAST category — leaving the rest
+    // unsynced and other devices unable to converge.
+    await pushLocalOnlyToServer(
+      {
+        mergedAccounts,
+        mergedNwcConnections,
+        needsLocalUpdate,
+        needsServerSyncApi,
+        needsServerSyncLnAddr,
+        needsServerSyncNpubCash,
+        needsServerSyncNwc,
+      },
+      {
+        pushApi: syncBlinkApiAccountsToServerImmediate,
+        pushLnAddr: syncLnAddressWalletsToServerImmediate,
+        pushNpubCash: syncNpubCashWalletsToServerImmediate,
+        pushNwc: syncNWCConnectionsToServer,
+      },
+    )
   }, [
     isAuthenticated,
     authProfile,
     updateState,
     fetchBlinkDataFromServer,
-    syncBlinkApiAccountsToServer,
-    syncLnAddressWalletsToServer,
-    syncNpubCashWalletsToServer,
+    syncBlinkApiAccountsToServerImmediate,
+    syncLnAddressWalletsToServerImmediate,
+    syncNpubCashWalletsToServerImmediate,
+    syncNWCConnectionsToServer,
   ])
 
   // Load profile data when auth changes
