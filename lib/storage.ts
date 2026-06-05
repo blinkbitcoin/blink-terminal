@@ -26,8 +26,20 @@ class StorageManager {
     }
   }
 
-  // Get user-specific storage path
+  // Get user-specific storage path.
+  //
+  // Uses the FULL SHA-256 hex (64 chars). Previously this was truncated to 16
+  // hex chars (64 bits), which has a non-negligible collision risk across many
+  // users — two distinct identities could map to the same file and read each
+  // other's API keys. The full digest removes that risk.
   getUserStoragePath(userId: string): string {
+    const hashedId: string = crypto.createHash("sha256").update(userId).digest("hex")
+    return path.join(this.storageDir, `user_${hashedId}.json`)
+  }
+
+  // Legacy (pre-collision-fix) path using a 16-hex truncated hash. Retained so
+  // existing records remain readable and can be migrated forward on next write.
+  getLegacyUserStoragePath(userId: string): string {
     const hashedId: string = crypto
       .createHash("sha256")
       .update(userId)
@@ -62,9 +74,21 @@ class StorageManager {
 
   // Load user data
   async loadUserData(userId: string): Promise<UserData | null> {
+    let fileContent: string | null = null
+
+    // Prefer the full-hash path; fall back to the legacy truncated-hash path so
+    // records written before the collision fix remain readable.
     try {
-      const filePath: string = this.getUserStoragePath(userId)
-      const fileContent: string = await fs.readFile(filePath, "utf8")
+      fileContent = await fs.readFile(this.getUserStoragePath(userId), "utf8")
+    } catch (_err: unknown) {
+      try {
+        fileContent = await fs.readFile(this.getLegacyUserStoragePath(userId), "utf8")
+      } catch (_legacyErr: unknown) {
+        return null
+      }
+    }
+
+    try {
       const data: UserData = JSON.parse(fileContent) as UserData
 
       // Decrypt API key
@@ -74,20 +98,25 @@ class StorageManager {
 
       return data
     } catch (_err: unknown) {
-      // File doesn't exist or other error
       return null
     }
   }
 
-  // Delete user data
+  // Delete user data (both the full-hash and legacy truncated-hash files).
   async deleteUserData(userId: string): Promise<boolean> {
-    try {
-      const filePath: string = this.getUserStoragePath(userId)
-      await fs.unlink(filePath)
-      return true
-    } catch (_err: unknown) {
-      return false
+    let deleted = false
+    for (const filePath of [
+      this.getUserStoragePath(userId),
+      this.getLegacyUserStoragePath(userId),
+    ]) {
+      try {
+        await fs.unlink(filePath)
+        deleted = true
+      } catch (_err: unknown) {
+        // ignore missing file
+      }
     }
+    return deleted
   }
 
   // List all users (for admin purposes)

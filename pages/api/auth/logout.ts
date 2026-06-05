@@ -1,5 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
+import { buildClearSessionCookie } from "../../../lib/auth/cookies"
 import { withRateLimit, RATE_LIMIT_AUTH } from "../../../lib/rate-limit"
 
 async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -7,10 +8,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     return res.status(405).json({ error: "Method not allowed" })
   }
 
-  // Clear authentication cookie
-  res.setHeader("Set-Cookie", [
-    "auth-token=; HttpOnly; Path=/; SameSite=Strict; Max-Age=0",
-  ])
+  // Clear authentication cookie (centralized attributes)
+  res.setHeader("Set-Cookie", buildClearSessionCookie())
 
   res.status(200).json({
     success: true,
