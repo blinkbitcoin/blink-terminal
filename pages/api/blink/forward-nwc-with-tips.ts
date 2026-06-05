@@ -250,7 +250,12 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     // If deferTips=true, return data without processing
     // This allows the caller to forward base amount FIRST, then send tips SECOND
     if (deferTips) {
-      // For payments WITH tips - return tip data for later processing
+      // For payments WITH tips - signal that tips are deferred.
+      // SECURITY: We intentionally do NOT return tip amounts or recipients to
+      // the client. /api/blink/send-nwc-tips reads the authoritative tip data
+      // from storage (keyed on paymentHash) so the client cannot influence what
+      // gets paid out from the BlinkPOS wallet. The record stays in `processing`
+      // until send-nwc-tips completes it.
       if (tipAmountNum > 0 && tipRecipients.length > 0) {
         console.log(
           "⏸️ Deferring tip sending (deferTips=true) - base amount will be forwarded first",
@@ -262,16 +267,6 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
           tipAmount: tipAmountNum,
           enhancedMemo,
           tipsDeferred: true,
-          tipData: {
-            paymentHash,
-            tipAmount: tipAmountNum,
-            tipRecipients: tipRecipients.map((r: ApiTipRecipient) => ({
-              username: r.username,
-              share: r.share,
-            })),
-            displayCurrency: tipData.displayCurrency || "BTC",
-            tipAmountDisplay: tipData.tipAmountDisplay,
-          },
         })
       } else {
         // For payments WITHOUT tips - just return base amount info

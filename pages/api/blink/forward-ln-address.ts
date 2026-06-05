@@ -17,8 +17,10 @@ import {
   isBitcoinCurrency,
 } from "../../../lib/currency-formatter-server"
 import { getInvoiceFromLightningAddress } from "../../../lib/lnurl"
+import { assertWithinMaxForward, verifyForwardInvoice } from "../../../lib/payout-guard"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
 import { getHybridStore, type HybridStore } from "../../../lib/storage/hybrid-store"
+import { paymentHashSchema } from "../../../lib/validation"
 
 interface ApiTipRecipient {
   username: string
@@ -57,140 +59,129 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   let claimSucceeded = false
 
   try {
-    const {
-      paymentHash: reqPaymentHash,
-      totalAmount,
-      memo,
-      recipientWalletId,
-      recipientUsername,
-    } = req.body as {
-      paymentHash: string
-      totalAmount: number
-      memo?: string
-      recipientWalletId: string
-      recipientUsername: string
-    }
+    const { memo } = req.body as { memo?: string }
 
-    paymentHash = reqPaymentHash
+    // SECURITY: paymentHash is mandatory. It binds this payout to a stored,
+    // customer-funded payment and is the key for the atomic duplicate-payout
+    // claim. The recipient and amount are read from storage — never the body.
+    const hashParse = paymentHashSchema.safeParse(req.body?.paymentHash)
+    if (!hashParse.success) {
+      return res.status(401).json({
+        error: "Unauthorized: a valid paymentHash is required",
+      })
+    }
+    paymentHash = hashParse.data
 
     console.log("📥 Forward to LN Address request:", {
-      paymentHash: paymentHash?.substring(0, 16) + "...",
-      totalAmount,
-      recipientUsername,
-      recipientWalletId: recipientWalletId?.substring(0, 16) + "...",
+      paymentHash: paymentHash.substring(0, 16) + "...",
     })
 
-    if (!recipientWalletId || !recipientUsername) {
-      return res.status(400).json({ error: "Missing recipient wallet information" })
-    }
-
-    if (!totalAmount) {
-      return res.status(400).json({ error: "Missing totalAmount" })
-    }
-
-    // Get BlinkPOS credentials based on environment from stored tip data
-    // For LN Address forwarding, we get environment from the stored tip data
-    let environment: EnvironmentName = "production"
-
-    // Check stored tip data for environment
     hybridStore = await getHybridStore()
     if (!hybridStore) {
       return res.status(500).json({ error: "Storage unavailable" })
     }
-    if (paymentHash) {
-      const tipData = await hybridStore.getTipData(paymentHash)
-      if (tipData?.environment) {
-        environment = tipData.environment as EnvironmentName
+
+    // CRITICAL: Use atomic claim to prevent duplicate payouts. This is now
+    // unconditional — a request without a claimable payment cannot proceed.
+    const claimResult = await hybridStore.claimPaymentForProcessing(paymentHash)
+
+    if (!claimResult.claimed) {
+      console.log(
+        `🔒 [LN Address] DUPLICATE PREVENTION: Payment ${paymentHash.substring(0, 16)}... ${claimResult.reason}`,
+      )
+
+      if (claimResult.reason === "already_completed") {
+        return res.status(200).json({
+          success: true,
+          message: "Payment already processed",
+          alreadyProcessed: true,
+          details: { paymentHash, status: "completed" },
+        })
+      } else if (claimResult.reason === "already_processing") {
+        return res.status(409).json({
+          error: "Payment is being processed by another request",
+          retryable: false,
+          details: { paymentHash, status: "processing" },
+        })
+      } else {
+        // not_found — unknown or already cleaned-up payment. Never pay out.
+        console.log(
+          "⚠️ [LN Address] No stored data found - refusing to forward (prevents duplicate / unauthorized payout)",
+        )
+        return res.status(200).json({
+          success: true,
+          message: "Payment data not found - likely already processed",
+          alreadyProcessed: true,
+          skipForwarding: true,
+          details: { paymentHash, status: "not_found" },
+        })
       }
     }
 
+    claimSucceeded = true
+    const tipData = claimResult.paymentData
+    if (!tipData) {
+      await hybridStore.releaseFailedClaim(paymentHash, "No payment data in claim")
+      claimSucceeded = false
+      return res.status(400).json({ error: "No payment data found in claim" })
+    }
+    console.log(
+      `✅ [LN Address] CLAIMED payment ${paymentHash.substring(0, 16)}... for processing`,
+    )
+
+    // SECURITY: recipient comes from the stored record (set at invoice creation),
+    // not from the request body.
+    const recipientUsername = tipData.blinkLnAddressUsername
+    if (!recipientUsername) {
+      await hybridStore.releaseFailedClaim(paymentHash, "Missing stored recipient")
+      claimSucceeded = false
+      return res.status(400).json({ error: "No stored recipient for this payment" })
+    }
+    const storedRecipientWalletId = tipData.blinkLnAddressWalletId || null
+
     // BlinkPOS credentials are set per-deployment; the `environment` value
     // only selects which Blink GraphQL URL we talk to.
+    const environment: EnvironmentName = (tipData.environment ||
+      "production") as EnvironmentName
     const blinkposApiKey = process.env.BLINKPOS_API_KEY
     const blinkposBtcWalletId = process.env.BLINKPOS_BTC_WALLET_ID
     const apiUrl = getApiUrlForEnvironment(environment)
 
     if (!blinkposApiKey || !blinkposBtcWalletId) {
+      await hybridStore.releaseFailedClaim(paymentHash, "Missing BlinkPOS config")
+      claimSucceeded = false
       return res.status(500).json({ error: "BlinkPOS configuration missing" })
     }
 
     const blinkposAPI = new BlinkAPI(blinkposApiKey, apiUrl)
 
-    // CRITICAL: Use atomic claim to prevent duplicate payouts
-    // This ensures only ONE request (client or webhook) can process this payment
-    if (paymentHash) {
-      const claimResult = await hybridStore.claimPaymentForProcessing(paymentHash)
+    // All money amounts come from the stored record.
+    const baseAmount = tipData.baseAmount || 0
+    const tipAmount = tipData.tipAmount || 0
+    const tipRecipients: ApiTipRecipient[] = tipData.tipRecipients || []
+    const displayCurrency = tipData.displayCurrency || "BTC"
+    const tipAmountDisplay = Number(tipData.tipAmountDisplay) || tipAmount
+    const storedMemo = tipData.memo || memo
 
-      if (!claimResult.claimed) {
-        // Payment already being processed or completed - return appropriate response
-        console.log(
-          `🔒 [LN Address] DUPLICATE PREVENTION: Payment ${paymentHash?.substring(0, 16)}... ${claimResult.reason}`,
-        )
+    console.log("📄 Tip data found:", {
+      baseAmount,
+      tipAmount,
+      tipRecipients: tipRecipients.length,
+      displayCurrency,
+    })
 
-        if (claimResult.reason === "already_completed") {
-          // Already successfully processed - return success (idempotent)
-          return res.status(200).json({
-            success: true,
-            message: "Payment already processed",
-            alreadyProcessed: true,
-            details: { paymentHash, status: "completed" },
-          })
-        } else if (claimResult.reason === "already_processing") {
-          // Another request (likely webhook) is processing - return 409
-          return res.status(409).json({
-            error: "Payment is being processed by another request",
-            retryable: false,
-            details: { paymentHash, status: "processing" },
-          })
-        } else {
-          // Not found - payment was likely already processed and cleaned up
-          // CRITICAL FIX: Do NOT continue - this could cause duplicate payments
-          console.log(
-            "⚠️ [LN Address] No stored data found - likely already processed, skipping to prevent duplicate",
-          )
-          return res.status(200).json({
-            success: true,
-            message: "Payment data not found - likely already processed",
-            alreadyProcessed: true,
-            skipForwarding: true,
-            details: { paymentHash, status: "not_found" },
-          })
-        }
-      } else {
-        claimSucceeded = true
-        console.log(
-          `✅ [LN Address] CLAIMED payment ${paymentHash?.substring(0, 16)}... for processing`,
-        )
-      }
+    if (!baseAmount || baseAmount <= 0) {
+      await hybridStore.releaseFailedClaim(paymentHash, "Invalid stored base amount")
+      claimSucceeded = false
+      return res.status(400).json({ error: "Invalid stored base amount" })
     }
 
-    // Check for tip data if we have a payment hash
-    let baseAmount = totalAmount
-    let tipAmount = 0
-    let tipRecipients: ApiTipRecipient[] = []
-    let displayCurrency = "BTC"
-    let _baseAmountDisplay = totalAmount
-    let tipAmountDisplay = 0
-    let storedMemo = memo
-
-    if (paymentHash) {
-      const tipData = await hybridStore.getTipData(paymentHash)
-      if (tipData) {
-        baseAmount = tipData.baseAmount || totalAmount
-        tipAmount = tipData.tipAmount || 0
-        tipRecipients = tipData.tipRecipients || []
-        displayCurrency = tipData.displayCurrency || "BTC"
-        _baseAmountDisplay = Number(tipData.baseAmountDisplay) || baseAmount
-        tipAmountDisplay = Number(tipData.tipAmountDisplay) || tipAmount
-        storedMemo = tipData.memo || memo
-
-        console.log("📄 Tip data found:", {
-          baseAmount,
-          tipAmount,
-          tipRecipients: tipRecipients.length,
-          displayCurrency,
-        })
-      }
+    // Defense-in-depth ceiling.
+    const maxGuard = assertWithinMaxForward(baseAmount)
+    if (!maxGuard.ok) {
+      await hybridStore.releaseFailedClaim(paymentHash, maxGuard.error)
+      claimSucceeded = false
+      return res.status(400).json({ error: maxGuard.error })
     }
 
     // Format the forwarding memo with tip recipient information
@@ -266,19 +257,29 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
     const walletLookupData = await walletLookupResponse.json()
 
-    let btcWalletId = recipientWalletId // Fallback to stored wallet
+    // Fallback to the wallet stored at invoice-creation time (never a client value).
+    let btcWalletId = storedRecipientWalletId
 
     if (
       walletLookupData.data?.accountDefaultWallet?.id &&
       walletLookupData.data?.accountDefaultWallet?.walletCurrency === "BTC"
     ) {
       btcWalletId = walletLookupData.data.accountDefaultWallet.id
-      console.log("✅ Found BTC wallet:", btcWalletId.substring(0, 16) + "...")
+      console.log("✅ Found BTC wallet:", btcWalletId?.substring(0, 16) + "...")
     } else {
       console.log(
         "⚠️ Could not find BTC wallet, using stored wallet:",
-        recipientWalletId?.substring(0, 16) + "...",
+        storedRecipientWalletId?.substring(0, 16) + "...",
       )
+    }
+
+    if (!btcWalletId) {
+      await hybridStore.releaseFailedClaim(
+        paymentHash,
+        "Could not resolve recipient BTC wallet",
+      )
+      claimSucceeded = false
+      return res.status(400).json({ error: "Could not resolve recipient BTC wallet" })
     }
 
     // Step 2: Create invoice on behalf of recipient using public Blink API
@@ -340,6 +341,20 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       paymentHash: recipientInvoice.paymentHash?.substring(0, 16) + "...",
       satoshis: recipientInvoice.satoshis,
     })
+
+    // SECURITY: verify the invoice we are about to pay encodes exactly the stored
+    // base amount and is destined for a Blink node (Blink LN address is intraledger).
+    const invGuard = verifyForwardInvoice({
+      invoice: recipientInvoice.paymentRequest,
+      expectedSats: Math.round(baseAmount),
+      requireBlinkNode: true,
+    })
+    if (!invGuard.ok) {
+      console.error(`🔒 [LN Address] Invoice rejected: ${invGuard.error}`)
+      await hybridStore.releaseFailedClaim(paymentHash, invGuard.error)
+      claimSucceeded = false
+      return res.status(400).json({ error: invGuard.error })
+    }
 
     // Step 2: Pay the invoice from BlinkPOS (base amount FIRST)
     console.log("💸 Paying invoice from BlinkPOS...")

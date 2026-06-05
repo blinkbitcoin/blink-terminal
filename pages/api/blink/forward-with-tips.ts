@@ -7,9 +7,11 @@ import {
   isBitcoinCurrency,
 } from "../../../lib/currency-formatter-server"
 import { getInvoiceFromLightningAddress, isNpubCashAddress } from "../../../lib/lnurl"
+import { assertWithinMaxForward, verifyForwardInvoice } from "../../../lib/payout-guard"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
 import { getHybridStore, type HybridStore } from "../../../lib/storage/hybrid-store"
 import { getTracer, withSpan, getActiveTraceId } from "../../../lib/tracing"
+import { forwardWithTipsSchema, validateBody } from "../../../lib/validation"
 
 const tracer = getTracer("bbt-payment")
 
@@ -63,34 +65,21 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     let claimSucceeded = false
 
     try {
-      const {
-        paymentHash: reqPaymentHash,
-        totalAmount,
-        memo = "",
-      } = req.body as {
-        paymentHash: string
-        totalAmount: number
-        memo?: string
-      }
+      const parsed = validateBody(req, res, forwardWithTipsSchema)
+      if (!parsed) return // 400 already sent
+      const { paymentHash: reqPaymentHash, memo = "" } = parsed
       paymentHash = reqPaymentHash
 
       rootSpan.setAttribute("payment.hash", paymentHash || "")
-      rootSpan.setAttribute("payment.total_amount_sats", totalAmount || 0)
 
-      // CRITICAL: Log all tip forwarding attempts for security audit
+      // CRITICAL: Log all tip forwarding attempts for security audit.
+      // NOTE: body `totalAmount` is intentionally NOT used for any payout math;
+      // all amounts are read from the claimed stored record below.
       console.log("🎯 TIP FORWARDING REQUEST:", {
         paymentHash: paymentHash?.substring(0, 16) + "...",
-        totalAmount,
         timestamp: new Date().toISOString(),
         memo: memo?.substring(0, 50) + "...",
       })
-
-      // Validate required fields
-      if (!paymentHash || !totalAmount) {
-        return res.status(400).json({
-          error: "Missing required fields: paymentHash, totalAmount",
-        })
-      }
 
       // CRITICAL FIX: Use atomic claim to prevent duplicate payouts
       // This ensures only ONE request can process this payment
@@ -202,7 +191,6 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
       console.log("🎯 Processing payment with tip splitting:", {
         paymentHash: paymentHash.substring(0, 8) + "...",
-        totalAmount,
         baseAmount: tipData.baseAmount,
         tipAmount: tipData.tipAmount,
         tipRecipientsCount: tipRecipients.length,
@@ -211,8 +199,21 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
         ),
       })
 
-      // Calculate the amount to forward to user (total - tip)
-      const userAmount = totalAmount - (tipData.tipAmount || 0)
+      // SECURITY: the amount forwarded to the merchant is the STORED base amount,
+      // never derived from a client-supplied total.
+      const userAmount = Number(tipData.baseAmount) || 0
+      if (userAmount <= 0) {
+        await hybridStore.releaseFailedClaim(paymentHash, "Invalid stored base amount")
+        claimSucceeded = false
+        return res.status(400).json({ error: "Invalid stored base amount" })
+      }
+
+      const maxGuard = assertWithinMaxForward(userAmount)
+      if (!maxGuard.ok) {
+        await hybridStore.releaseFailedClaim(paymentHash, maxGuard.error)
+        claimSucceeded = false
+        return res.status(400).json({ error: maxGuard.error })
+      }
 
       // Step 1: Forward base amount to user
       const userBlinkAPI = new BlinkAPI(tipData.userApiKey, apiUrl)
@@ -278,6 +279,21 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       }
 
       console.log("📄 User invoice created:", { paymentHash: userInvoice.paymentHash })
+
+      // SECURITY: verify the invoice we created encodes exactly the stored base
+      // amount and is destined for a Blink node (API-key wallets are Blink wallets;
+      // forwarding is intraledger / zero-fee).
+      const invGuard = verifyForwardInvoice({
+        invoice: userInvoice.paymentRequest,
+        expectedSats: Math.round(userAmount),
+        requireBlinkNode: true,
+      })
+      if (!invGuard.ok) {
+        console.error(`🔒 [forward-with-tips] Invoice rejected: ${invGuard.error}`)
+        await hybridStore.releaseFailedClaim(paymentHash, invGuard.error)
+        claimSucceeded = false
+        return res.status(400).json({ error: invGuard.error })
+      }
 
       // Step 2: Pay the user's invoice from BlinkPOS
       const blinkposAPI = new BlinkAPI(blinkposApiKey, apiUrl)
@@ -587,7 +603,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
         message: "Payment successfully processed with tip splitting",
         details: {
           paymentHash,
-          totalAmount,
+          totalAmount: Number(tipData.baseAmount) + Number(tipData.tipAmount || 0),
           forwardedAmount: userAmount,
           userWalletId: tipData.userWalletId,
           paymentStatus: paymentResult.status,

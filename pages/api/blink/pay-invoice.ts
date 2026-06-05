@@ -2,15 +2,22 @@ import type { NextApiRequest, NextApiResponse } from "next"
 
 import BlinkAPI from "../../../lib/blink-api"
 import { getApiUrlForEnvironment, type EnvironmentName } from "../../../lib/config/api"
+import { assertWithinMaxForward, verifyForwardInvoice } from "../../../lib/payout-guard"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
 import { getHybridStore, type HybridStore } from "../../../lib/storage/hybrid-store"
+import { paymentHashSchema } from "../../../lib/validation"
 
 /**
  * API endpoint to pay a lightning invoice from BlinkPOS account
- * Used for forwarding payments to NWC wallets
+ * Used for forwarding the base amount to NWC wallets.
  *
- * SECURITY: This endpoint requires a valid paymentHash that corresponds to
- * a pending payment in our database. This prevents unauthorized invoice payments.
+ * SECURITY: This endpoint only pays an invoice that:
+ *   1. Corresponds to a stored payment in the `processing` state (claimed by
+ *      /api/blink/forward-nwc-with-tips). This binds the payout to a real,
+ *      customer-funded payment and prevents arbitrary payouts.
+ *   2. Encodes the EXACT stored `baseAmount` (no amountless / inflated invoices).
+ *   3. Is destined for a Blink node (NWC forwarding is intraledger / zero-fee),
+ *      preventing routing-fee drain and off-network exfiltration.
  *
  * POST /api/blink/pay-invoice
  * Body: { paymentHash: string, invoice: string, memo?: string }
@@ -21,36 +28,32 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 
   let hybridStore: HybridStore | null = null
-  let claimSucceeded = false
   let paymentHash: string | null = null
 
   try {
+    // SECURITY: Require a well-formed paymentHash.
+    const hashParse = paymentHashSchema.safeParse(req.body?.paymentHash)
+    if (!hashParse.success) {
+      console.error("❌ SECURITY: Missing/invalid paymentHash - rejecting request")
+      return res.status(401).json({
+        error: "Unauthorized: a valid paymentHash is required",
+      })
+    }
+    paymentHash = hashParse.data
+
     // Support both 'invoice' and 'paymentRequest' field names for compatibility
     const {
-      paymentHash: reqPaymentHash,
       invoice: invoiceField,
       paymentRequest,
       memo = "",
-      environment = "production",
+      environment: reqEnvironment = "production",
     } = req.body as {
-      paymentHash: string
       invoice?: string
       paymentRequest?: string
       memo?: string
       environment?: EnvironmentName
     }
     const invoice = invoiceField || paymentRequest
-    paymentHash = reqPaymentHash
-
-    // SECURITY: Require paymentHash to prevent unauthorized payments
-    if (!paymentHash) {
-      console.error(
-        "❌ SECURITY: Missing paymentHash - rejecting unauthenticated request",
-      )
-      return res.status(401).json({
-        error: "Unauthorized: paymentHash is required to verify payment legitimacy",
-      })
-    }
 
     // Validate required fields
     if (!invoice) {
@@ -69,48 +72,68 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       })
     }
 
-    // SECURITY: Verify this is a legitimate payment by claiming it from the database
-    // This ensures only payments created through BlinkPOS can be forwarded
     const store: HybridStore = await getHybridStore()
     hybridStore = store
-    const claimResult = await store.claimPaymentForProcessing(paymentHash)
 
-    if (!claimResult.claimed) {
-      console.log(
-        `🔒 SECURITY: Payment claim failed for ${paymentHash?.substring(0, 16)}... - ${claimResult.reason}`,
+    // SECURITY: Load the authoritative payment record. It must exist and be
+    // mid-flow (`processing`) — claimed by the base-amount forward step. We do
+    // NOT re-claim here: the claim is owned by forward-nwc-with-tips and released
+    // by send-nwc-tips on completion.
+    const stored = await store.getTipData(paymentHash)
+    if (!stored) {
+      console.error(
+        `❌ SECURITY: Payment ${paymentHash.substring(0, 16)}... not found - rejecting`,
       )
-
-      if (claimResult.reason === "already_completed") {
-        // Payment already processed - return success (idempotent)
-        return res.status(200).json({
-          success: true,
-          message: "Payment already processed",
-          alreadyProcessed: true,
-        })
-      } else if (claimResult.reason === "already_processing") {
-        // Another request is processing this payment
-        return res.status(409).json({
-          error: "Payment is being processed by another request",
-          retryable: false,
-        })
-      } else {
-        // Payment not found - reject to prevent unauthorized payments
-        console.error(
-          `❌ SECURITY: Payment ${paymentHash?.substring(0, 16)}... not found - rejecting`,
-        )
-        return res.status(401).json({
-          error: "Unauthorized: Payment not found or already processed",
-        })
-      }
+      return res.status(401).json({
+        error: "Unauthorized: Payment not found",
+      })
     }
 
-    claimSucceeded = true
-    console.log(
-      `✅ SECURITY: Claimed payment ${paymentHash?.substring(0, 16)}... for NWC forwarding`,
-    )
+    if (stored.status === "completed") {
+      // Idempotent — already forwarded.
+      return res.status(200).json({
+        success: true,
+        message: "Payment already processed",
+        alreadyProcessed: true,
+      })
+    }
+
+    if (stored.status !== "processing") {
+      console.error(
+        `🔒 SECURITY: Payment ${paymentHash.substring(0, 16)}... in status '${stored.status}' - refusing to pay`,
+      )
+      return res.status(409).json({
+        error: "Payment is not ready for forwarding",
+        retryable: false,
+      })
+    }
+
+    // SECURITY: The invoice we are about to pay must encode EXACTLY the stored
+    // base amount and be destined for a Blink node (intraledger / zero-fee).
+    const baseAmount = Number(stored.baseAmount)
+    const maxGuard = assertWithinMaxForward(baseAmount)
+    if (!maxGuard.ok) {
+      console.error(`🔒 SECURITY: ${maxGuard.error}`)
+      return res.status(400).json({ error: maxGuard.error })
+    }
+
+    const invGuard = verifyForwardInvoice({
+      invoice,
+      expectedSats: baseAmount,
+      requireBlinkNode: true,
+    })
+    if (!invGuard.ok) {
+      console.error(
+        `🔒 SECURITY: Invoice rejected for ${paymentHash.substring(0, 16)}...: ${invGuard.error}`,
+      )
+      return res.status(400).json({ error: invGuard.error })
+    }
 
     // BlinkPOS credentials are set per-deployment; the `environment` value
-    // only selects which Blink GraphQL URL we talk to.
+    // only selects which Blink GraphQL URL we talk to. Prefer the stored value.
+    const environment = (stored.environment ||
+      reqEnvironment ||
+      "production") as EnvironmentName
     const blinkposApiKey = process.env.BLINKPOS_API_KEY
     const blinkposBtcWalletId = process.env.BLINKPOS_BTC_WALLET_ID
     const apiUrl = getApiUrlForEnvironment(environment)
@@ -123,14 +146,14 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     }
 
     console.log("⚡ Paying invoice from BlinkPOS:", {
-      paymentHash: paymentHash?.substring(0, 16) + "...",
+      paymentHash: paymentHash.substring(0, 16) + "...",
+      baseAmount,
       invoicePrefix: invoice.substring(0, 50) + "...",
       memo: memo || "NWC forwarding",
       timestamp: new Date().toISOString(),
     })
 
     // Pay the invoice from BlinkPOS account
-    // Pass memo for better transaction history visibility
     const blinkposAPI = new BlinkAPI(blinkposApiKey, apiUrl)
 
     const paymentResult = await blinkposAPI.payLnInvoice(
@@ -148,11 +171,12 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     // Log the successful forwarding
     await store.logEvent(paymentHash, "nwc_invoice_paid", "success", {
       memo,
+      baseAmount,
       invoicePrefix: invoice.substring(0, 30),
     })
 
-    // Note: We don't mark as completed here because tips may still need to be sent
-    // The /api/blink/send-nwc-tips endpoint or the caller will handle completion
+    // Note: We don't mark as completed here because tips may still need to be sent.
+    // The /api/blink/send-nwc-tips endpoint handles completion (and replay safety).
 
     res.status(200).json({
       success: true,
@@ -166,12 +190,12 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     const message = error instanceof Error ? error.message : "Unknown error"
     console.error("❌ Pay invoice error:", error)
 
-    // Release claim if we claimed but failed to complete
-    if (claimSucceeded && hybridStore && paymentHash) {
+    // Release the claim back to `pending` so a genuine retry can re-run the flow.
+    if (hybridStore && paymentHash) {
       try {
         await hybridStore.releaseFailedClaim(paymentHash, message)
         console.log(
-          `🔓 Released claim for failed payment ${paymentHash?.substring(0, 16)}...`,
+          `🔓 Released claim for failed payment ${paymentHash.substring(0, 16)}...`,
         )
       } catch (releaseError: unknown) {
         console.error("❌ Failed to release claim:", releaseError)

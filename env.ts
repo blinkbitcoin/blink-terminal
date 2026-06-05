@@ -25,6 +25,9 @@ export const env = createEnv({
     BLINK_ENVIRONMENT: z.enum(["production", "staging"]).default("production"),
     BLINKPOS_API_KEY: z.string().min(1).optional(),
     BLINKPOS_BTC_WALLET_ID: z.string().min(1).optional(),
+    // Optional absolute ceiling (sats) on a single forward/tip payout from the
+    // BlinkPOS intermediary wallet. Defense-in-depth; unset disables the check.
+    BLINKPOS_MAX_FORWARD_SATS: z.coerce.number().int().positive().optional(),
     BLINK_WEBHOOK_SECRET: z.string().min(1).optional(),
     BLINK_STAGING_WEBHOOK_SECRET: z.string().min(1).optional(),
 
@@ -76,6 +79,7 @@ export const env = createEnv({
     BLINK_ENVIRONMENT: process.env.BLINK_ENVIRONMENT,
     BLINKPOS_API_KEY: process.env.BLINKPOS_API_KEY,
     BLINKPOS_BTC_WALLET_ID: process.env.BLINKPOS_BTC_WALLET_ID,
+    BLINKPOS_MAX_FORWARD_SATS: process.env.BLINKPOS_MAX_FORWARD_SATS,
     BLINK_WEBHOOK_SECRET: process.env.BLINK_WEBHOOK_SECRET,
     BLINK_STAGING_WEBHOOK_SECRET: process.env.BLINK_STAGING_WEBHOOK_SECRET,
 

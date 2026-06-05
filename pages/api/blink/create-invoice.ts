@@ -2,10 +2,11 @@ import type { NextApiRequest, NextApiResponse } from "next"
 
 import AuthManager from "../../../lib/auth"
 import BlinkAPI from "../../../lib/blink-api"
-import { getApiUrlForEnvironment, type EnvironmentName } from "../../../lib/config/api"
+import { getApiUrlForEnvironment } from "../../../lib/config/api"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
 import { getHybridStore } from "../../../lib/storage/hybrid-store"
 import { getTracer, withSpan, getActiveTraceId } from "../../../lib/tracing"
+import { createInvoiceSchema, validateBody } from "../../../lib/validation"
 
 const tracer = getTracer("bbt-payment")
 
@@ -22,6 +23,10 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     }
 
     try {
+      // Validate + coerce the request body against the shared Zod schema.
+      const parsed = validateBody(req, res, createInvoiceSchema)
+      if (!parsed) return // 400 already sent
+
       const {
         amount,
         currency,
@@ -33,7 +38,6 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
         baseAmount,
         tipAmount,
         tipPercent,
-        tipRecipients = [],
         baseAmountDisplay,
         tipAmountDisplay,
         nwcActive,
@@ -47,29 +51,11 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
         npubCashLightningAddress,
         // Environment for staging/production switching
         environment = "production",
-      } = req.body as {
-        amount: string | number
-        currency: string
-        memo?: string
-        walletId?: string
-        apiKey?: string
-        userWalletId?: string
-        displayCurrency?: string
-        baseAmount?: number
-        tipAmount?: number
-        tipPercent?: number
-        tipRecipients?: Array<{ username: string; share?: number }>
-        baseAmountDisplay?: number
-        tipAmountDisplay?: number
-        nwcActive?: boolean
-        nwcConnectionUri?: string
-        blinkLnAddress?: boolean
-        blinkLnAddressWalletId?: string
-        blinkLnAddressUsername?: string
-        npubCashActive?: boolean
-        npubCashLightningAddress?: string
-        environment?: EnvironmentName
-      }
+      } = parsed
+      const tipRecipients = (parsed.tipRecipients || []) as Array<{
+        username: string
+        share?: number
+      }>
 
       // Get the API URL for the specified environment
       const apiUrl = getApiUrlForEnvironment(environment)
