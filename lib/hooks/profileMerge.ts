@@ -126,6 +126,26 @@ const isNpubCash = (a: MergeableAccount): boolean => a.type === "npub-cash"
 const wasFromServer = (a: MergeableAccount): boolean => a.source === "server"
 
 /**
+ * Result of reconciling a local item that also exists on the server during an
+ * authoritative merge. The item is kept (the local copy carries the
+ * device-encrypted secret) but stamped `source: "server"` so a later
+ * disappearance from the server is correctly read as a remote DELETE rather
+ * than a brand-new local addition that should be pushed back up.
+ *
+ * `changed` reports whether the marker was newly added, so the caller knows it
+ * must persist the updated local record.
+ */
+function markServerBacked<T extends MergeableAccount>(
+  local: T,
+): {
+  item: T
+  changed: boolean
+} {
+  if (local.source === "server") return { item: local, changed: false }
+  return { item: { ...local, source: "server" }, changed: true }
+}
+
+/**
  * Compute the server-authoritative merge of local + server profile data.
  *
  * The caller MUST only invoke this for an authoritative server read.
@@ -149,7 +169,12 @@ export async function mergeProfileData(input: MergeInput): Promise<MergeResult> 
       (l) => l.id === serverAccount.id || l.username === serverAccount.username,
     )
     if (localAccount) {
-      mergedApiAccounts.push(localAccount)
+      // Exists on both sides — keep the local copy (it holds the device
+      // encrypted API key) but mark it server-backed so a future delete on
+      // another device propagates instead of being re-synced from here.
+      const { item, changed } = markServerBacked(localAccount)
+      mergedApiAccounts.push(item)
+      if (changed) needsLocalUpdate = true
     } else if (serverAccount.apiKey) {
       try {
         const encryptedApiKey = await encryptWithDeviceKey(serverAccount.apiKey)
@@ -191,7 +216,9 @@ export async function mergeProfileData(input: MergeInput): Promise<MergeResult> 
   for (const serverWallet of server.blinkLnAddressWallets) {
     const localWallet = localLnAddressWallets.find((l) => l.id === serverWallet.id)
     if (localWallet) {
-      mergedLnAddressWallets.push(localWallet)
+      const { item, changed } = markServerBacked(localWallet)
+      mergedLnAddressWallets.push(item)
+      if (changed) needsLocalUpdate = true
     } else {
       mergedLnAddressWallets.push({
         id: serverWallet.id,
@@ -226,7 +253,9 @@ export async function mergeProfileData(input: MergeInput): Promise<MergeResult> 
   for (const serverWallet of server.npubCashWallets) {
     const localWallet = localNpubCashWallets.find((l) => l.id === serverWallet.id)
     if (localWallet) {
-      mergedNpubCashWallets.push(localWallet)
+      const { item, changed } = markServerBacked(localWallet)
+      mergedNpubCashWallets.push(item)
+      if (changed) needsLocalUpdate = true
     } else {
       mergedNpubCashWallets.push({
         id: serverWallet.id,
@@ -320,5 +349,42 @@ export async function mergeProfileData(input: MergeInput): Promise<MergeResult> 
     needsServerSyncLnAddr,
     needsServerSyncNpubCash,
     needsServerSyncNwc,
+  }
+}
+
+/** Per-field push callbacks used to persist local-only items to the server. */
+export interface SyncPushers {
+  pushApi: (accounts: MergeableAccount[]) => Promise<void>
+  pushLnAddr: (accounts: MergeableAccount[]) => Promise<void>
+  pushNpubCash: (accounts: MergeableAccount[]) => Promise<void>
+  pushNwc: (connections: StoredNWCConnection[]) => Promise<void>
+}
+
+/**
+ * Push every wallet category that the merge flagged as having local-only items,
+ * one after another.
+ *
+ * This MUST run the pushes sequentially (awaiting each) rather than firing
+ * debounced helpers back-to-back: the debounced sync helpers share a single
+ * timer and cancel one another, so a fire-and-forget approach would persist
+ * only the last category and leave the rest unsynced. Running each push to
+ * completion guarantees a mixed local-only profile (e.g. an API-key wallet AND
+ * an LN-address wallet) is fully written so other devices can converge.
+ */
+export async function pushLocalOnlyToServer(
+  plan: MergeResult,
+  pushers: SyncPushers,
+): Promise<void> {
+  if (plan.needsServerSyncApi) {
+    await pushers.pushApi(plan.mergedAccounts)
+  }
+  if (plan.needsServerSyncLnAddr) {
+    await pushers.pushLnAddr(plan.mergedAccounts)
+  }
+  if (plan.needsServerSyncNpubCash) {
+    await pushers.pushNpubCash(plan.mergedAccounts)
+  }
+  if (plan.needsServerSyncNwc) {
+    await pushers.pushNwc(plan.mergedNwcConnections)
   }
 }

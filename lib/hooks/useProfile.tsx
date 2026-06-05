@@ -37,7 +37,7 @@ import ProfileStorage, {
   type ProfileExportData,
 } from "../storage/ProfileStorage"
 
-import { mergeProfileData } from "./profileMerge"
+import { mergeProfileData, pushLocalOnlyToServer } from "./profileMerge"
 import { useNostrAuth } from "./useNostrAuth"
 
 // ============= Server Response Types =============
@@ -860,27 +860,38 @@ export function ProfileProvider({ children }: ProfileProviderProps): React.JSX.E
       serverSynced: true,
     })
 
-    // Sync local-only items to server
-    if (needsServerSyncApi) {
-      syncBlinkApiAccountsToServer(mergedAccounts)
-    }
-    if (needsServerSyncLnAddr) {
-      syncLnAddressWalletsToServer(mergedAccounts)
-    }
-    if (needsServerSyncNpubCash) {
-      syncNpubCashWalletsToServer(mergedAccounts)
-    }
-    if (needsServerSyncNwc) {
-      syncNWCConnectionsToServer(mergedNwcConnections)
-    }
+    // Push any local-only items up to the server.
+    //
+    // IMPORTANT: use the IMMEDIATE (non-debounced) sync variants and run them
+    // sequentially via pushLocalOnlyToServer. The debounced helpers all share a
+    // single timer ref and each cancels the previous one, so firing several
+    // back-to-back would only persist the LAST category — leaving the rest
+    // unsynced and other devices unable to converge.
+    await pushLocalOnlyToServer(
+      {
+        mergedAccounts,
+        mergedNwcConnections,
+        needsLocalUpdate,
+        needsServerSyncApi,
+        needsServerSyncLnAddr,
+        needsServerSyncNpubCash,
+        needsServerSyncNwc,
+      },
+      {
+        pushApi: syncBlinkApiAccountsToServerImmediate,
+        pushLnAddr: syncLnAddressWalletsToServerImmediate,
+        pushNpubCash: syncNpubCashWalletsToServerImmediate,
+        pushNwc: syncNWCConnectionsToServer,
+      },
+    )
   }, [
     isAuthenticated,
     authProfile,
     updateState,
     fetchBlinkDataFromServer,
-    syncBlinkApiAccountsToServer,
-    syncLnAddressWalletsToServer,
-    syncNpubCashWalletsToServer,
+    syncBlinkApiAccountsToServerImmediate,
+    syncLnAddressWalletsToServerImmediate,
+    syncNpubCashWalletsToServerImmediate,
     syncNWCConnectionsToServer,
   ])
 

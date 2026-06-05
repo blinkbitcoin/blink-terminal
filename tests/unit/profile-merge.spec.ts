@@ -17,8 +17,11 @@
 
 import {
   mergeProfileData,
+  pushLocalOnlyToServer,
   type MergeableAccount,
+  type MergeResult,
   type ServerData,
+  type SyncPushers,
 } from "../../lib/hooks/profileMerge"
 import type { EncryptedData } from "../../lib/storage/CryptoUtils"
 import type { StoredNWCConnection } from "../../lib/storage/ProfileStorage"
@@ -156,6 +159,96 @@ describe("mergeProfileData (server-authoritative)", () => {
     expect(result.needsServerSyncApi).toBe(false)
   })
 
+  it("marks an unmarked local item as server-backed when it exists on the server", async () => {
+    // The device CREATED this wallet (no source flag) and it has since synced,
+    // so the server now has it too. After an authoritative merge the local copy
+    // must be stamped source:"server" and the localStorage update flagged.
+    const local: MergeableAccount[] = [
+      {
+        id: "ln-mine",
+        type: "ln-address",
+        label: "Mine",
+        username: "mine",
+        lightningAddress: "mine@blink.sv",
+        isActive: true,
+        // no source: created locally, already synced
+      },
+    ]
+    const server = emptyServer()
+    server.blinkLnAddressWallets = [
+      {
+        id: "ln-mine",
+        label: "Mine",
+        username: "mine",
+        lightningAddress: "mine@blink.sv",
+        isActive: true,
+        createdAt: new Date().toISOString(),
+      },
+    ]
+
+    const result = await mergeProfileData({
+      localAccounts: local,
+      localNwcConnections: [],
+      server,
+      encryptWithDeviceKey: fakeEncrypt,
+    })
+
+    expect(result.mergedAccounts).toHaveLength(1)
+    expect(result.mergedAccounts[0].source).toBe("server")
+    expect(result.needsLocalUpdate).toBe(true)
+    expect(result.needsServerSyncLnAddr).toBe(false)
+  })
+
+  it("drops (not re-syncs) a locally-created item after it disappears from the server", async () => {
+    // Regression for the originating-device deletion bug: a wallet created on
+    // this device, synced (so it gets stamped server-backed on the first
+    // authoritative merge), is then deleted on another device. On the next
+    // merge the server no longer has it and it must be DROPPED, not re-pushed.
+
+    // Pass 1: unmarked local item present on the server -> stamped server-backed.
+    const pass1Local: MergeableAccount[] = [
+      {
+        id: "ln-mine",
+        type: "ln-address",
+        label: "Mine",
+        username: "mine",
+        lightningAddress: "mine@blink.sv",
+        isActive: true,
+      },
+    ]
+    const serverWithItem = emptyServer()
+    serverWithItem.blinkLnAddressWallets = [
+      {
+        id: "ln-mine",
+        label: "Mine",
+        username: "mine",
+        lightningAddress: "mine@blink.sv",
+        isActive: true,
+        createdAt: new Date().toISOString(),
+      },
+    ]
+
+    const pass1 = await mergeProfileData({
+      localAccounts: pass1Local,
+      localNwcConnections: [],
+      server: serverWithItem,
+      encryptWithDeviceKey: fakeEncrypt,
+    })
+    expect(pass1.mergedAccounts[0].source).toBe("server")
+
+    // Pass 2: feed pass-1 output back as local state; server has dropped it.
+    const pass2 = await mergeProfileData({
+      localAccounts: pass1.mergedAccounts,
+      localNwcConnections: [],
+      server: emptyServer(),
+      encryptWithDeviceKey: fakeEncrypt,
+    })
+
+    expect(pass2.mergedAccounts).toHaveLength(0)
+    expect(pass2.needsServerSyncLnAddr).toBe(false)
+    expect(pass2.needsLocalUpdate).toBe(true)
+  })
+
   it("adopts a server-only NWC connection and re-encrypts its URI", async () => {
     const server = emptyServer()
     server.nwcConnections = [
@@ -259,5 +352,95 @@ describe("mergeProfileData (server-authoritative)", () => {
     expect(result.needsServerSyncLnAddr).toBe(false)
     expect(result.needsServerSyncNpubCash).toBe(false)
     expect(result.needsServerSyncNwc).toBe(false)
+  })
+})
+
+describe("pushLocalOnlyToServer", () => {
+  const basePlan = (overrides: Partial<MergeResult>): MergeResult => ({
+    mergedAccounts: [],
+    mergedNwcConnections: [],
+    needsLocalUpdate: false,
+    needsServerSyncApi: false,
+    needsServerSyncLnAddr: false,
+    needsServerSyncNpubCash: false,
+    needsServerSyncNwc: false,
+    ...overrides,
+  })
+
+  const makePushers = (): { pushers: SyncPushers; calls: string[] } => {
+    const calls: string[] = []
+    const pushers: SyncPushers = {
+      pushApi: async () => {
+        calls.push("api")
+      },
+      pushLnAddr: async () => {
+        calls.push("lnAddr")
+      },
+      pushNpubCash: async () => {
+        calls.push("npubCash")
+      },
+      pushNwc: async () => {
+        calls.push("nwc")
+      },
+    }
+    return { pushers, calls }
+  }
+
+  it("writes ALL flagged categories (mixed local-only profile)", async () => {
+    // Regression: previously the debounced helpers shared one timer and
+    // cancelled each other, so only the last category was persisted.
+    const { pushers, calls } = makePushers()
+    const plan = basePlan({
+      needsServerSyncApi: true,
+      needsServerSyncLnAddr: true,
+    })
+
+    await pushLocalOnlyToServer(plan, pushers)
+
+    expect(calls).toEqual(["api", "lnAddr"])
+  })
+
+  it("writes every category when all four are flagged", async () => {
+    const { pushers, calls } = makePushers()
+    const plan = basePlan({
+      needsServerSyncApi: true,
+      needsServerSyncLnAddr: true,
+      needsServerSyncNpubCash: true,
+      needsServerSyncNwc: true,
+    })
+
+    await pushLocalOnlyToServer(plan, pushers)
+
+    expect(calls).toEqual(["api", "lnAddr", "npubCash", "nwc"])
+  })
+
+  it("pushes nothing when no category is flagged", async () => {
+    const { pushers, calls } = makePushers()
+    await pushLocalOnlyToServer(basePlan({}), pushers)
+    expect(calls).toEqual([])
+  })
+
+  it("awaits each push to completion before starting the next", async () => {
+    // Prove sequencing: a slow first push still completes before the second
+    // starts, so neither can be lost to a shared-timer cancellation.
+    const order: string[] = []
+    const pushers: SyncPushers = {
+      pushApi: async () => {
+        await new Promise((r) => setTimeout(r, 10))
+        order.push("api-done")
+      },
+      pushLnAddr: async () => {
+        order.push("lnAddr-start")
+      },
+      pushNpubCash: async () => {},
+      pushNwc: async () => {},
+    }
+
+    await pushLocalOnlyToServer(
+      basePlan({ needsServerSyncApi: true, needsServerSyncLnAddr: true }),
+      pushers,
+    )
+
+    expect(order).toEqual(["api-done", "lnAddr-start"])
   })
 })
