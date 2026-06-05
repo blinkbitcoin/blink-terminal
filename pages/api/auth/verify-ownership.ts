@@ -31,6 +31,7 @@ import type { NextApiRequest, NextApiResponse } from "next"
 
 import AuthManager from "../../../lib/auth"
 import { verifyChallenge } from "../../../lib/auth/challengeStore"
+import { buildSessionCookie } from "../../../lib/auth/cookies"
 import { withRateLimit, RATE_LIMIT_AUTH } from "../../../lib/rate-limit"
 
 interface CryptoModules {
@@ -149,41 +150,6 @@ function getTagValue(tags: string[][], tagName: string): string | null {
   return tag ? tag[1] : null
 }
 
-/**
- * Serialize a cookie value with options
- */
-function serializeCookie(
-  name: string,
-  value: string,
-  options: {
-    maxAge?: number
-    path?: string
-    httpOnly?: boolean
-    secure?: boolean
-    sameSite?: string
-  } = {},
-): string {
-  let cookie = `${encodeURIComponent(name)}=${encodeURIComponent(value)}`
-
-  if (options.maxAge) {
-    cookie += `; Max-Age=${options.maxAge}`
-  }
-  if (options.path) {
-    cookie += `; Path=${options.path}`
-  }
-  if (options.httpOnly) {
-    cookie += "; HttpOnly"
-  }
-  if (options.secure) {
-    cookie += "; Secure"
-  }
-  if (options.sameSite) {
-    cookie += `; SameSite=${options.sameSite}`
-  }
-
-  return cookie
-}
-
 interface SignedEvent {
   id: string
   pubkey: string
@@ -214,11 +180,14 @@ function validateSignedEvent(event: SignedEvent): { valid: boolean; error?: stri
     }
   }
 
-  // Validate kind (22242 for AUTH, or accept 27235 for NIP-98 compatibility)
-  if (event.kind !== 22242 && event.kind !== 27235) {
+  // Validate kind. This challenge flow is exclusively kind 22242 (NIP-42 AUTH).
+  // We deliberately do NOT accept 27235 here: NIP-98 (kind 27235) has its own
+  // endpoint (/api/auth/nostr-login) with a tighter 60-120s freshness window.
+  // Accepting it here would expose a second, more lenient verification path.
+  if (event.kind !== 22242) {
     return {
       valid: false,
-      error: `Invalid event kind: ${event.kind}, expected 22242 or 27235`,
+      error: `Invalid event kind: ${event.kind}, expected 22242`,
     }
   }
 
@@ -242,9 +211,12 @@ function validateSignedEvent(event: SignedEvent): { valid: boolean; error?: stri
     return { valid: false, error: "Tags must be an array" }
   }
 
-  // Validate timestamp (not too old, not in future)
+  // Validate timestamp (not too old, not in future).
+  // 5 minutes matches the challenge TTL while staying lenient enough for the
+  // external-signer (Amber) redirect round-trip. The challenge's own single-use
+  // + expiry is the primary replay defense; this is a secondary bound.
   const now = Math.floor(Date.now() / 1000)
-  const maxAge = 600 // 10 minutes (more lenient for external signers)
+  const maxAge = 300 // 5 minutes
 
   if (now - event.created_at > maxAge) {
     return {
@@ -343,8 +315,15 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       })
     }
 
-    // 5. Verify challenge was issued by us and hasn't been used/expired
-    const challengeResult = verifyChallenge(challenge)
+    // 5. Verify challenge was issued by us, hasn't been used/expired, and bind
+    //    it to the verified signer pubkey. Because the Schnorr signature was
+    //    already checked (step 3), `signedEvent.pubkey` is the cryptographically
+    //    proven signer. Binding here ensures a challenge can only ever mint a
+    //    session for the single pubkey that first presents it — a victim who is
+    //    phished into signing a challenge cannot have it replayed by an attacker
+    //    for a different identity, and vice versa.
+    const pubkey = signedEvent.pubkey.toLowerCase()
+    const challengeResult = await verifyChallenge(challenge, pubkey)
     if (!challengeResult.valid) {
       console.warn(
         "[verify-ownership] Challenge verification failed:",
@@ -357,21 +336,11 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     }
 
     // 6. All validations passed! Create session
-    const pubkey = signedEvent.pubkey.toLowerCase()
     const sessionUsername = `nostr:${pubkey}`
     const token = AuthManager.generateSession(sessionUsername)
 
-    // Set session cookie
-    res.setHeader(
-      "Set-Cookie",
-      serializeCookie("auth-token", token, {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === "production",
-        sameSite: "Lax",
-        maxAge: 60 * 60 * 24, // 24 hours
-        path: "/",
-      }),
-    )
+    // Set session cookie (centralized attributes)
+    res.setHeader("Set-Cookie", buildSessionCookie(token))
 
     console.log(
       "[verify-ownership] ✓ Session created for:",

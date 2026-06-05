@@ -17,6 +17,7 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
 import AuthManager from "../../../lib/auth"
+import { buildSessionCookie } from "../../../lib/auth/cookies"
 import Nip98Verifier from "../../../lib/nostr/Nip98Verifier"
 import { withRateLimit, RATE_LIMIT_AUTH } from "../../../lib/rate-limit"
 
@@ -30,45 +31,6 @@ function getRequestUrl(req: NextApiRequest): string {
   const host = req.headers["x-forwarded-host"] || req.headers.host
   const path = req.url
   return `${protocol}://${host}${path}`
-}
-
-/**
- * Serialize a cookie value with options
- * @param {string} name - Cookie name
- * @param {string} value - Cookie value
- * @param {Object} options - Cookie options
- * @returns {string}
- */
-function serializeCookie(
-  name: string,
-  value: string,
-  options: {
-    maxAge?: number
-    path?: string
-    httpOnly?: boolean
-    secure?: boolean
-    sameSite?: string
-  } = {},
-): string {
-  let cookie = `${encodeURIComponent(name)}=${encodeURIComponent(value)}`
-
-  if (options.maxAge) {
-    cookie += `; Max-Age=${options.maxAge}`
-  }
-  if (options.path) {
-    cookie += `; Path=${options.path}`
-  }
-  if (options.httpOnly) {
-    cookie += "; HttpOnly"
-  }
-  if (options.secure) {
-    cookie += "; Secure"
-  }
-  if (options.sameSite) {
-    cookie += `; SameSite=${options.sameSite}`
-  }
-
-  return cookie
 }
 
 async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -114,17 +76,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     const sessionUsername = `nostr:${pubkey}`
     const token = AuthManager.generateSession(sessionUsername)
 
-    // Set session cookie
-    res.setHeader(
-      "Set-Cookie",
-      serializeCookie("auth-token", token, {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === "production",
-        sameSite: "Lax",
-        maxAge: 60 * 60 * 24, // 24 hours
-        path: "/",
-      }),
-    )
+    // Set session cookie (centralized attributes)
+    res.setHeader("Set-Cookie", buildSessionCookie(token))
 
     // Return success with user info
     return res.status(200).json({

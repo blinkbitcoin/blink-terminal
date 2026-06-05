@@ -1,6 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
 import AuthManager from "../../../lib/auth"
+import { buildSessionCookie } from "../../../lib/auth/cookies"
 import BlinkAPI from "../../../lib/blink-api"
 import { withRateLimit, RATE_LIMIT_AUTH } from "../../../lib/rate-limit"
 import StorageManager from "../../../lib/storage"
@@ -64,10 +65,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       lastLogin: Date.now(),
     })
 
-    // Set secure cookie
-    res.setHeader("Set-Cookie", [
-      `auth-token=${sessionToken}; HttpOnly; Path=/; SameSite=Strict; Max-Age=${24 * 60 * 60}`, // 24 hours
-    ])
+    // Set secure session cookie (centralized attributes)
+    res.setHeader("Set-Cookie", buildSessionCookie(sessionToken))
 
     res.status(200).json({
       success: true,

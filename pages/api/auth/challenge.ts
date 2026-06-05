@@ -32,8 +32,11 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     // Generate a new challenge
     const challenge = generateChallenge()
 
-    // Store it for verification (5 minute expiry)
-    storeChallenge(challenge, 300)
+    // Store it for verification (5 minute expiry).
+    // The challenge is intentionally NOT bound to a pubkey at issue time: the
+    // external-signer flow fetches the challenge before the signer reveals the
+    // pubkey. Binding happens on first verify (see challengeStore + verify-ownership).
+    await storeChallenge(challenge, 300)
 
     // Get the app URL for the relay tag
     const protocol = req.headers["x-forwarded-proto"] || "http"
