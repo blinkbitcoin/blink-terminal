@@ -1,7 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
 import AuthManager from "../../../lib/auth"
-import { withRateLimit, RATE_LIMIT_AUTH } from "../../../lib/rate-limit"
+import { withRateLimit, RATE_LIMIT_READ } from "../../../lib/rate-limit"
 import StorageManager from "../../../lib/storage"
 
 async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -44,4 +44,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 }
 
-export default withRateLimit(handler, RATE_LIMIT_AUTH)
+// Session-status read polled by the client on mount/navigation — use the READ
+// tier (120/min), not AUTH (10/min). AUTH is for credential-submitting routes
+// (login, challenge, verify-ownership); throttling a benign poll there could
+// lock a legitimate user out of the app on a transient render churn.
+export default withRateLimit(handler, RATE_LIMIT_READ)
