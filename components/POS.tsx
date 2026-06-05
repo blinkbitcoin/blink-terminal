@@ -563,7 +563,7 @@ const POS = forwardRef<POSRef, POSProps>(
 
                       console.log("📄 NWC forwarding data:", {
                         baseAmount,
-                        hasTips: !!tipResult.tipData,
+                        hasTips: !!tipResult.tipsDeferred,
                       })
 
                       // Step 2: Create NWC invoice for base amount
@@ -603,15 +603,17 @@ const POS = forwardRef<POSRef, POSProps>(
                         if (payResponse.ok) {
                           console.log("✅ NWC base amount forwarded successfully!")
 
-                          // Step 4: Send tips if there are deferred tips
-                          if (tipResult.tipsDeferred && tipResult.tipData) {
+                          // Step 4: Send tips if there are deferred tips.
+                          // SECURITY: we no longer send tip amounts/recipients from
+                          // the client — the server reads them from the stored,
+                          // claimed payment record keyed on paymentHash.
+                          if (tipResult.tipsDeferred) {
                             console.log("💰 Sending deferred tips...")
                             await fetch("/api/blink/send-nwc-tips", {
                               method: "POST",
                               headers: { "Content-Type": "application/json" },
                               body: JSON.stringify({
                                 paymentHash: invoice.paymentHash,
-                                tipData: tipResult.tipData,
                                 environment: getEnvironment(),
                               }),
                             })

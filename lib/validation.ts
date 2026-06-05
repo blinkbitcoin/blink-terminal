@@ -67,12 +67,24 @@ export const createInvoiceSchema = z.object({
   tipAmountDisplay: optionalAmountSchema,
   nwcActive: z.boolean().optional(),
   nwcConnectionUri: z.string().optional(),
-  blinkLnAddress: z.string().optional(),
+  blinkLnAddress: z.boolean().optional(),
   blinkLnAddressWalletId: z.string().optional(),
   blinkLnAddressUsername: z.string().optional(),
   npubCashActive: z.boolean().optional(),
   npubCashLightningAddress: z.string().optional(),
   environment: environmentSchema,
+})
+
+/**
+ * POST /api/blink/forward-with-tips
+ * Only paymentHash is authoritative; totalAmount/memo are advisory. All money
+ * amounts and recipients are read server-side from the stored payment record.
+ */
+export const forwardWithTipsSchema = z.object({
+  paymentHash: paymentHashSchema,
+  totalAmount: z.coerce.number().int().positive().optional(),
+  memo: z.string().max(640).optional().default(""),
+  environment: environmentSchema.optional(),
 })
 
 /** POST /api/blink/pay-invoice */

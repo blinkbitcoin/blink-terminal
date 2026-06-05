@@ -22,8 +22,10 @@ import {
   getInvoiceFromLightningAddress,
   type LnurlFullInvoiceResponse,
 } from "../../../lib/lnurl"
+import { assertWithinMaxForward, verifyForwardInvoice } from "../../../lib/payout-guard"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
 import { getHybridStore, type HybridStore } from "../../../lib/storage/hybrid-store"
+import { paymentHashSchema } from "../../../lib/validation"
 
 interface ApiTipRecipient {
   username: string
@@ -62,141 +64,126 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   let claimSucceeded = false
 
   try {
-    const {
-      paymentHash: reqPaymentHash,
-      totalAmount,
-      memo,
-      recipientAddress, // Full npub.cash address (e.g., "npub1xxx@npub.cash")
-    } = req.body as {
-      paymentHash: string
-      totalAmount: number
-      memo?: string
-      recipientAddress: string
-    }
+    const { memo } = req.body as { memo?: string }
 
-    paymentHash = reqPaymentHash
+    // SECURITY: paymentHash is mandatory. Recipient and amount are read from
+    // storage — never the request body.
+    const hashParse = paymentHashSchema.safeParse(req.body?.paymentHash)
+    if (!hashParse.success) {
+      return res.status(401).json({
+        error: "Unauthorized: a valid paymentHash is required",
+      })
+    }
+    paymentHash = hashParse.data
 
     console.log("🥜 Forward to npub.cash request:", {
-      paymentHash: paymentHash?.substring(0, 16) + "...",
-      totalAmount,
-      recipientAddress,
+      paymentHash: paymentHash.substring(0, 16) + "...",
     })
 
-    if (!recipientAddress) {
-      return res.status(400).json({ error: "Missing recipient npub.cash address" })
-    }
-
-    if (!recipientAddress.endsWith("@npub.cash")) {
-      return res.status(400).json({ error: "Invalid npub.cash address format" })
-    }
-
-    if (!totalAmount) {
-      return res.status(400).json({ error: "Missing totalAmount" })
-    }
-
-    // Get BlinkPOS credentials based on environment from stored tip data
-    // For npub.cash forwarding, we get environment from the stored tip data
-    let environment: EnvironmentName = "production"
-
-    // Check stored tip data for environment
     hybridStore = await getHybridStore()
     if (!hybridStore) {
       return res.status(500).json({ error: "Storage unavailable" })
     }
-    if (paymentHash) {
-      const tipData = await hybridStore.getTipData(paymentHash)
-      if (tipData?.environment) {
-        environment = tipData.environment as EnvironmentName
+
+    // CRITICAL: Atomic claim to prevent duplicate payouts — now unconditional.
+    const claimResult = await hybridStore.claimPaymentForProcessing(paymentHash)
+
+    if (!claimResult.claimed) {
+      console.log(
+        `🔒 [npub.cash] DUPLICATE PREVENTION: Payment ${paymentHash.substring(0, 16)}... ${claimResult.reason}`,
+      )
+
+      if (claimResult.reason === "already_completed") {
+        return res.status(200).json({
+          success: true,
+          message: "Payment already processed",
+          alreadyProcessed: true,
+          details: { paymentHash, status: "completed" },
+        })
+      } else if (claimResult.reason === "already_processing") {
+        return res.status(409).json({
+          error: "Payment is being processed by another request",
+          retryable: false,
+          details: { paymentHash, status: "processing" },
+        })
+      } else {
+        console.log(
+          "⚠️ [npub.cash] No stored data found - refusing to forward (prevents duplicate / unauthorized payout)",
+        )
+        return res.status(200).json({
+          success: true,
+          message: "Payment data not found - likely already processed",
+          alreadyProcessed: true,
+          skipForwarding: true,
+          details: { paymentHash, status: "not_found" },
+        })
       }
+    }
+
+    claimSucceeded = true
+    const tipData = claimResult.paymentData
+    if (!tipData) {
+      await hybridStore.releaseFailedClaim(paymentHash, "No payment data in claim")
+      claimSucceeded = false
+      return res.status(400).json({ error: "No payment data found in claim" })
+    }
+    console.log(
+      `✅ [npub.cash] CLAIMED payment ${paymentHash.substring(0, 16)}... for processing`,
+    )
+
+    // SECURITY: recipient address comes from the stored record only.
+    const recipientAddress = tipData.npubCashLightningAddress
+    if (!recipientAddress || !recipientAddress.endsWith("@npub.cash")) {
+      await hybridStore.releaseFailedClaim(
+        paymentHash,
+        "Missing/invalid stored npub.cash address",
+      )
+      claimSucceeded = false
+      return res.status(400).json({ error: "No valid stored npub.cash recipient" })
     }
 
     // BlinkPOS credentials are set per-deployment; the `environment` value
     // only selects which Blink GraphQL URL we talk to.
+    const environment: EnvironmentName = (tipData.environment ||
+      "production") as EnvironmentName
     const blinkposApiKey = process.env.BLINKPOS_API_KEY
     const blinkposBtcWalletId = process.env.BLINKPOS_BTC_WALLET_ID
     const apiUrl = getApiUrlForEnvironment(environment)
 
     if (!blinkposApiKey || !blinkposBtcWalletId) {
+      await hybridStore.releaseFailedClaim(paymentHash, "Missing BlinkPOS config")
+      claimSucceeded = false
       return res.status(500).json({ error: "BlinkPOS configuration missing" })
     }
 
     const blinkposAPI = new BlinkAPI(blinkposApiKey, apiUrl)
 
-    // CRITICAL: Use atomic claim to prevent duplicate payouts
-    // This ensures only ONE request (client or webhook) can process this payment
-    if (paymentHash) {
-      const claimResult = await hybridStore.claimPaymentForProcessing(paymentHash)
+    // All money amounts come from the stored record.
+    const baseAmount = tipData.baseAmount || 0
+    const tipAmount = tipData.tipAmount || 0
+    const tipRecipients: ApiTipRecipient[] = tipData.tipRecipients || []
+    const displayCurrency = tipData.displayCurrency || "BTC"
+    const tipAmountDisplay = Number(tipData.tipAmountDisplay) || tipAmount
+    const storedMemo = tipData.memo || memo
 
-      if (!claimResult.claimed) {
-        // Payment already being processed or completed - return appropriate response
-        console.log(
-          `🔒 [npub.cash] DUPLICATE PREVENTION: Payment ${paymentHash?.substring(0, 16)}... ${claimResult.reason}`,
-        )
+    console.log("📄 Tip data found:", {
+      baseAmount,
+      tipAmount,
+      tipRecipients: tipRecipients.length,
+      displayCurrency,
+    })
 
-        if (claimResult.reason === "already_completed") {
-          // Already successfully processed - return success (idempotent)
-          return res.status(200).json({
-            success: true,
-            message: "Payment already processed",
-            alreadyProcessed: true,
-            details: { paymentHash, status: "completed" },
-          })
-        } else if (claimResult.reason === "already_processing") {
-          // Another request (likely webhook) is processing - return 409
-          return res.status(409).json({
-            error: "Payment is being processed by another request",
-            retryable: false,
-            details: { paymentHash, status: "processing" },
-          })
-        } else {
-          // Not found - payment was likely already processed and cleaned up
-          // CRITICAL FIX: Do NOT continue - this could cause duplicate payments
-          console.log(
-            "⚠️ [npub.cash] No stored data found - likely already processed, skipping to prevent duplicate",
-          )
-          return res.status(200).json({
-            success: true,
-            message: "Payment data not found - likely already processed",
-            alreadyProcessed: true,
-            skipForwarding: true,
-            details: { paymentHash, status: "not_found" },
-          })
-        }
-      } else {
-        claimSucceeded = true
-        console.log(
-          `✅ [npub.cash] CLAIMED payment ${paymentHash?.substring(0, 16)}... for processing`,
-        )
-      }
+    if (!baseAmount || baseAmount <= 0) {
+      await hybridStore.releaseFailedClaim(paymentHash, "Invalid stored base amount")
+      claimSucceeded = false
+      return res.status(400).json({ error: "Invalid stored base amount" })
     }
 
-    // Check for tip data if we have a payment hash
-    let baseAmount = totalAmount
-    let tipAmount = 0
-    let tipRecipients: ApiTipRecipient[] = []
-    let displayCurrency = "BTC"
-    let _baseAmountDisplay = totalAmount
-    let tipAmountDisplay = 0
-    let storedMemo = memo
-
-    if (paymentHash) {
-      const tipData = await hybridStore.getTipData(paymentHash)
-      if (tipData) {
-        baseAmount = tipData.baseAmount || totalAmount
-        tipAmount = tipData.tipAmount || 0
-        tipRecipients = tipData.tipRecipients || []
-        displayCurrency = tipData.displayCurrency || "BTC"
-        _baseAmountDisplay = Number(tipData.baseAmountDisplay) || baseAmount
-        tipAmountDisplay = Number(tipData.tipAmountDisplay) || tipAmount
-        storedMemo = tipData.memo || memo
-
-        console.log("📄 Tip data found:", {
-          baseAmount,
-          tipAmount,
-          tipRecipients: tipRecipients.length,
-          displayCurrency,
-        })
-      }
+    const maxGuard = assertWithinMaxForward(baseAmount)
+    if (!maxGuard.ok) {
+      await hybridStore.releaseFailedClaim(paymentHash, maxGuard.error)
+      claimSucceeded = false
+      return res.status(400).json({ error: maxGuard.error })
     }
 
     // Format the forwarding memo with tip recipient information
@@ -275,6 +262,20 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       minSats: invoiceData.metadata?.minSendable / 1000,
       maxSats: invoiceData.metadata?.maxSendable / 1000,
     })
+
+    // SECURITY: verify the LNURL-supplied invoice encodes exactly the stored base
+    // amount and is destined for a Blink node (npub.cash is intraledger / zero-fee).
+    const invGuard = verifyForwardInvoice({
+      invoice: invoiceData.paymentRequest,
+      expectedSats: Math.round(baseAmount),
+      requireBlinkNode: true,
+    })
+    if (!invGuard.ok) {
+      console.error(`🔒 [npub.cash] Invoice rejected: ${invGuard.error}`)
+      await hybridStore.releaseFailedClaim(paymentHash, invGuard.error)
+      claimSucceeded = false
+      return res.status(400).json({ error: invGuard.error })
+    }
 
     // Step 2: Pay the invoice from BlinkPOS (this will be intraledger since npub.cash uses Blink)
     console.log("💸 Paying npub.cash invoice from BlinkPOS (intraledger)...")
