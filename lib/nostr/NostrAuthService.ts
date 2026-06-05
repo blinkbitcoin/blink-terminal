@@ -1627,7 +1627,11 @@ class NostrAuthService {
    */
   static async fetchChallenge(): Promise<ChallengeResult> {
     try {
-      const response = await fetch("/api/auth/challenge")
+      // credentials: "include" so the HttpOnly challenge cookie (the redemption
+      // secret) is stored on this browser; it is required by verify-ownership.
+      const response = await fetch("/api/auth/challenge", {
+        credentials: "include",
+      })
       const data = (await response.json()) as Record<string, unknown>
 
       if (!response.ok) {

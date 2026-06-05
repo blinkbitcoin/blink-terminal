@@ -17,6 +17,7 @@
 
 import {
   generateChallenge,
+  generateChallengeSecret,
   storeChallenge,
   verifyChallenge,
 } from "../../lib/auth/challengeStore"
@@ -103,6 +104,58 @@ describe("challengeStore pubkey binding", () => {
     const b = generateChallenge()
     expect(a.startsWith("blinkpos:")).toBe(true)
     expect(b.startsWith("blinkpos:")).toBe(true)
+    expect(a).not.toBe(b)
+  })
+})
+
+describe("challengeStore secret (anti-bearer) binding", () => {
+  it("verifies when the presented secret matches the stored one", async () => {
+    const challenge = generateChallenge()
+    const secret = generateChallengeSecret()
+    await storeChallenge(challenge, 300, secret)
+
+    const result = await verifyChallenge(challenge, PUBKEY_A, secret)
+    expect(result.valid).toBe(true)
+  })
+
+  it("SECURITY: rejects when no secret is presented for a secret-bound challenge", async () => {
+    const challenge = generateChallenge()
+    const secret = generateChallengeSecret()
+    await storeChallenge(challenge, 300, secret)
+
+    const result = await verifyChallenge(challenge, PUBKEY_A /* no secret */)
+    expect(result.valid).toBe(false)
+    expect(result.error).toMatch(/secret/i)
+  })
+
+  it("SECURITY: rejects when the wrong secret is presented (phished from another browser)", async () => {
+    const challenge = generateChallenge()
+    const secret = generateChallengeSecret()
+    await storeChallenge(challenge, 300, secret)
+
+    // Attacker has a valid signed event but a different browser → different/no secret.
+    const attackerSecret = generateChallengeSecret()
+    const result = await verifyChallenge(challenge, PUBKEY_A, attackerSecret)
+    expect(result.valid).toBe(false)
+    expect(result.error).toMatch(/secret/i)
+  })
+
+  it("SECURITY: a failed secret check does NOT consume the challenge (legit browser can still redeem)", async () => {
+    const challenge = generateChallenge()
+    const secret = generateChallengeSecret()
+    await storeChallenge(challenge, 300, secret)
+
+    // Attacker attempt with wrong secret fails...
+    expect((await verifyChallenge(challenge, PUBKEY_A, "deadbeef")).valid).toBe(false)
+    // ...and the legitimate browser (correct secret) can still complete login.
+    expect((await verifyChallenge(challenge, PUBKEY_A, secret)).valid).toBe(true)
+  })
+
+  it("generateChallengeSecret returns unique 64-hex secrets", () => {
+    const a = generateChallengeSecret()
+    const b = generateChallengeSecret()
+    expect(a).toMatch(/^[0-9a-f]{64}$/)
+    expect(b).toMatch(/^[0-9a-f]{64}$/)
     expect(a).not.toBe(b)
   })
 })

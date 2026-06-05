@@ -31,7 +31,11 @@ import type { NextApiRequest, NextApiResponse } from "next"
 
 import AuthManager from "../../../lib/auth"
 import { verifyChallenge } from "../../../lib/auth/challengeStore"
-import { buildSessionCookie } from "../../../lib/auth/cookies"
+import {
+  CHALLENGE_COOKIE_NAME,
+  buildClearChallengeCookie,
+  buildSessionCookie,
+} from "../../../lib/auth/cookies"
 import { withRateLimit, RATE_LIMIT_AUTH } from "../../../lib/rate-limit"
 
 interface CryptoModules {
@@ -315,15 +319,20 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       })
     }
 
-    // 5. Verify challenge was issued by us, hasn't been used/expired, and bind
-    //    it to the verified signer pubkey. Because the Schnorr signature was
-    //    already checked (step 3), `signedEvent.pubkey` is the cryptographically
-    //    proven signer. Binding here ensures a challenge can only ever mint a
-    //    session for the single pubkey that first presents it — a victim who is
-    //    phished into signing a challenge cannot have it replayed by an attacker
-    //    for a different identity, and vice versa.
+    // 5. Verify the challenge: issued by us, not used/expired, bound to the
+    //    redemption secret from THIS browser's challenge cookie, and bound to the
+    //    verified signer pubkey on first use.
+    //
+    //    The secret cookie is the key anti-bearer control. The Schnorr signature
+    //    (step 3) only proves `signedEvent.pubkey` signed the challenge — it does
+    //    NOT prove the submitter requested it. Without the secret, a signed
+    //    challenge phished from a victim could be redeemed by an attacker from
+    //    their own browser to mint the victim's session. Requiring the secret
+    //    that was cookie-bound at issue time means only the browser that
+    //    requested the challenge can redeem it.
     const pubkey = signedEvent.pubkey.toLowerCase()
-    const challengeResult = await verifyChallenge(challenge, pubkey)
+    const presentedSecret = req.cookies[CHALLENGE_COOKIE_NAME]
+    const challengeResult = await verifyChallenge(challenge, pubkey, presentedSecret)
     if (!challengeResult.valid) {
       console.warn(
         "[verify-ownership] Challenge verification failed:",
@@ -335,12 +344,12 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       })
     }
 
-    // 6. All validations passed! Create session
+    // 6. All validations passed! Create session.
     const sessionUsername = `nostr:${pubkey}`
     const token = AuthManager.generateSession(sessionUsername)
 
-    // Set session cookie (centralized attributes)
-    res.setHeader("Set-Cookie", buildSessionCookie(token))
+    // Set session cookie and clear the now-consumed challenge cookie.
+    res.setHeader("Set-Cookie", [buildSessionCookie(token), buildClearChallengeCookie()])
 
     console.log(
       "[verify-ownership] ✓ Session created for:",

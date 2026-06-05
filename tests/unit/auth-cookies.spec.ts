@@ -11,8 +11,12 @@
 import {
   AUTH_COOKIE_NAME,
   AUTH_COOKIE_MAX_AGE_SECONDS,
+  CHALLENGE_COOKIE_NAME,
+  CHALLENGE_COOKIE_MAX_AGE_SECONDS,
   buildSessionCookie,
   buildClearSessionCookie,
+  buildChallengeCookie,
+  buildClearChallengeCookie,
 } from "../../lib/auth/cookies"
 
 const ORIGINAL_NODE_ENV = process.env.NODE_ENV
@@ -73,5 +77,46 @@ describe("buildClearSessionCookie", () => {
   it("adds Secure in production on clear too", () => {
     setNodeEnv("production")
     expect(buildClearSessionCookie()).toContain("Secure")
+  })
+})
+
+describe("buildChallengeCookie", () => {
+  it("carries the secret, HttpOnly, Path, SameSite=Lax and a 5-min Max-Age", () => {
+    setNodeEnv("test")
+    const cookie = buildChallengeCookie("sek123")
+    expect(cookie).toContain(`${CHALLENGE_COOKIE_NAME}=sek123`)
+    expect(cookie).toContain("HttpOnly")
+    expect(cookie).toContain("Path=/")
+    expect(cookie).toContain("SameSite=Lax")
+    expect(cookie).toContain(`Max-Age=${CHALLENGE_COOKIE_MAX_AGE_SECONDS}`)
+    expect(CHALLENGE_COOKIE_MAX_AGE_SECONDS).toBe(300)
+  })
+
+  it("URL-encodes the secret value", () => {
+    setNodeEnv("test")
+    expect(buildChallengeCookie("a/b")).toContain(`${CHALLENGE_COOKIE_NAME}=a%2Fb`)
+  })
+
+  it("omits Secure outside production, adds it in production", () => {
+    setNodeEnv("development")
+    expect(buildChallengeCookie("s")).not.toContain("Secure")
+    setNodeEnv("production")
+    expect(buildChallengeCookie("s")).toContain("Secure")
+  })
+
+  it("is HttpOnly so the redemption secret is not readable from JS", () => {
+    setNodeEnv("production")
+    expect(buildChallengeCookie("s")).toContain("HttpOnly")
+  })
+})
+
+describe("buildClearChallengeCookie", () => {
+  it("expires the challenge cookie with Max-Age=0 and matching attributes", () => {
+    setNodeEnv("test")
+    const cookie = buildClearChallengeCookie()
+    expect(cookie).toContain(`${CHALLENGE_COOKIE_NAME}=`)
+    expect(cookie).toContain("Max-Age=0")
+    expect(cookie).toContain("HttpOnly")
+    expect(cookie).toContain("SameSite=Lax")
   })
 })

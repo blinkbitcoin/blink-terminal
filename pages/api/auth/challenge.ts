@@ -19,7 +19,12 @@
 
 import type { NextApiRequest, NextApiResponse } from "next"
 
-import { generateChallenge, storeChallenge } from "../../../lib/auth/challengeStore"
+import {
+  generateChallenge,
+  generateChallengeSecret,
+  storeChallenge,
+} from "../../../lib/auth/challengeStore"
+import { buildChallengeCookie } from "../../../lib/auth/cookies"
 import { withRateLimit, RATE_LIMIT_AUTH } from "../../../lib/rate-limit"
 
 async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -29,14 +34,25 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 
   try {
-    // Generate a new challenge
-    const challenge = generateChallenge()
-
-    // Store it for verification (5 minute expiry).
+    // Generate a new challenge plus a high-entropy redemption secret. The secret
+    // is handed to THIS browser via an HttpOnly cookie; only its hash is stored.
+    // At verify time the browser must present the matching secret, so a signed
+    // challenge event is not a bearer artifact that any party can redeem — it can
+    // only be redeemed by the browser that requested the challenge. This closes
+    // the signer-phishing/session-minting vector.
+    //
     // The challenge is intentionally NOT bound to a pubkey at issue time: the
     // external-signer flow fetches the challenge before the signer reveals the
-    // pubkey. Binding happens on first verify (see challengeStore + verify-ownership).
-    await storeChallenge(challenge, 300)
+    // pubkey. Pubkey binding happens on first verify (see challengeStore +
+    // verify-ownership).
+    const challenge = generateChallenge()
+    const secret = generateChallengeSecret()
+
+    // Store it for verification (5 minute expiry), bound to the secret's hash.
+    await storeChallenge(challenge, 300, secret)
+
+    // Hand the secret to the requesting browser as an HttpOnly cookie.
+    res.setHeader("Set-Cookie", buildChallengeCookie(secret))
 
     // Get the app URL for the relay tag
     const protocol = req.headers["x-forwarded-proto"] || "http"

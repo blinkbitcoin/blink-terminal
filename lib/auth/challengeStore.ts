@@ -33,6 +33,15 @@ interface ChallengeData {
   used: boolean
   /** Pubkey this challenge has been bound to (set on first verify). */
   boundPubkey?: string
+  /**
+   * SHA-256 (hex) of the high-entropy secret that was handed to the requesting
+   * browser via an HttpOnly cookie at issue time. Redemption requires the
+   * caller to present the matching secret, so a signed challenge event is NOT a
+   * pure bearer artifact: it can only be redeemed by the browser that requested
+   * the challenge. We store only the hash so a leak of the store does not
+   * reveal the redemption secret.
+   */
+  boundSecretHash?: string
 }
 
 interface ChallengeVerifyResult {
@@ -123,6 +132,10 @@ function isValidPubkey(pubkey: string): boolean {
   return /^[0-9a-f]{64}$/i.test(pubkey)
 }
 
+function sha256Hex(input: string): string {
+  return crypto.createHash("sha256").update(input).digest("hex")
+}
+
 /**
  * Generate a cryptographically secure challenge.
  * Format: blinkpos:{timestamp}:{random_nonce}
@@ -134,18 +147,33 @@ function generateChallenge(): string {
 }
 
 /**
+ * Generate the high-entropy redemption secret handed to the requesting browser
+ * via an HttpOnly cookie. The caller stores `sha256(secret)` with the challenge
+ * (via storeChallenge) and must present the raw secret at verify time.
+ */
+function generateChallengeSecret(): string {
+  return crypto.randomBytes(32).toString("hex")
+}
+
+/**
  * Store a challenge for later verification.
  * @param challenge - The challenge string
  * @param ttlSeconds - Time to live in seconds (default: 300)
+ * @param secret - The raw redemption secret handed to the requesting browser.
+ *   Only its SHA-256 hash is persisted. When provided, verifyChallenge requires
+ *   the same secret to be presented (anti-bearer binding). Optional for
+ *   backward compatibility, but production callers always set it.
  */
 async function storeChallenge(
   challenge: string,
   ttlSeconds: number = DEFAULT_TTL_SECONDS,
+  secret?: string,
 ): Promise<void> {
   const data: ChallengeData = {
     createdAt: Date.now(),
     expiresAt: Date.now() + ttlSeconds * 1000,
     used: false,
+    boundSecretHash: secret ? sha256Hex(secret) : undefined,
   }
 
   const redis = await getRedisClient()
@@ -169,12 +197,16 @@ async function storeChallenge(
 }
 
 /**
- * Verify and consume a challenge, binding it to `pubkey`.
+ * Verify and consume a challenge, binding it to `pubkey` and the issuing
+ * browser's redemption secret.
  *
  * Enforces:
  *   1. Challenge exists and is not expired.
  *   2. Challenge has not already been used (single-use).
- *   3. Challenge is bound to `pubkey` on first verify; any later attempt with a
+ *   3. The presented secret matches the one issued to the requesting browser
+ *      (anti-bearer: a signed challenge can only be redeemed by the browser
+ *      that requested it). Rejected with the challenge left intact-but-burnable.
+ *   4. Challenge is bound to `pubkey` on first verify; any later attempt with a
  *      different pubkey is rejected.
  *
  * The pubkey MUST be the cryptographically verified signer pubkey from the
@@ -182,21 +214,29 @@ async function storeChallenge(
  *
  * @param challenge - The challenge to verify
  * @param pubkey - The verified signer pubkey (64-hex)
+ * @param presentedSecret - The raw redemption secret from the challenge cookie
  * @returns An object indicating validity, with an optional error message
  */
 async function verifyChallenge(
   challenge: string,
   pubkey: string,
+  presentedSecret?: string,
 ): Promise<ChallengeVerifyResult> {
   if (!pubkey || !isValidPubkey(pubkey)) {
     return { valid: false, error: "Invalid or missing pubkey for challenge binding" }
   }
   const normalizedPubkey = pubkey.toLowerCase()
+  const presentedSecretHash = presentedSecret ? sha256Hex(presentedSecret) : undefined
 
   const redis = await getRedisClient()
   if (redis && redisConnected) {
     try {
-      return await verifyChallengeRedis(redis, challenge, normalizedPubkey)
+      return await verifyChallengeRedis(
+        redis,
+        challenge,
+        normalizedPubkey,
+        presentedSecretHash,
+      )
     } catch (error: unknown) {
       console.warn(
         "Challenge store Redis verify failed; using in-memory:",
@@ -205,12 +245,24 @@ async function verifyChallenge(
     }
   }
 
-  return verifyChallengeInMemory(challenge, normalizedPubkey)
+  return verifyChallengeInMemory(challenge, normalizedPubkey, presentedSecretHash)
+}
+
+/**
+ * Constant-time-ish comparison of two hex hashes. Both are server-computed
+ * SHA-256 digests of equal length, so this is defense-in-depth rather than a
+ * strict requirement, but we use timingSafeEqual when lengths match.
+ */
+function secretHashMatches(expected?: string, presented?: string): boolean {
+  if (!expected) return true // challenge issued without a secret (legacy/none)
+  if (!presented || presented.length !== expected.length) return false
+  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(presented))
 }
 
 function verifyChallengeInMemory(
   challenge: string,
   pubkey: string,
+  presentedSecretHash?: string,
 ): ChallengeVerifyResult {
   const data: ChallengeData | undefined = challengeStore.get(challenge)
 
@@ -225,6 +277,10 @@ function verifyChallengeInMemory(
 
   if (data.used) {
     return { valid: false, error: "Challenge already used" }
+  }
+
+  if (!secretHashMatches(data.boundSecretHash, presentedSecretHash)) {
+    return { valid: false, error: "Challenge secret mismatch" }
   }
 
   if (data.boundPubkey && data.boundPubkey !== pubkey) {
@@ -249,6 +305,7 @@ async function verifyChallengeRedis(
   redis: RedisClientType,
   challenge: string,
   pubkey: string,
+  presentedSecretHash?: string,
 ): Promise<ChallengeVerifyResult> {
   const key = REDIS_KEY_PREFIX + challenge
 
@@ -278,6 +335,11 @@ async function verifyChallengeRedis(
     return { valid: false, error: "Challenge already used" }
   }
 
+  if (!secretHashMatches(data.boundSecretHash, presentedSecretHash)) {
+    await redis.unwatch()
+    return { valid: false, error: "Challenge secret mismatch" }
+  }
+
   if (data.boundPubkey && data.boundPubkey !== pubkey) {
     await redis.unwatch()
     return { valid: false, error: "Challenge bound to a different pubkey" }
@@ -299,5 +361,5 @@ async function verifyChallengeRedis(
   return { valid: true }
 }
 
-export { generateChallenge, storeChallenge, verifyChallenge }
+export { generateChallenge, generateChallengeSecret, storeChallenge, verifyChallenge }
 export type { ChallengeData, ChallengeVerifyResult }

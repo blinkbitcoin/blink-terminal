@@ -91,13 +91,15 @@ function buildSignedEvent(
   return { ...base, id, sig: overrides.sig ?? SIG }
 }
 
-function mockReqRes(body: unknown) {
-  const req = { method: "POST", body, headers: {}, cookies: {} } as NextApiRequest
-  const headers: Record<string, string> = {}
+const VALID_SECRET = "s".repeat(64)
+
+function mockReqRes(body: unknown, cookies: Record<string, string> = {}) {
+  const req = { method: "POST", body, headers: {}, cookies } as NextApiRequest
+  const headers: Record<string, string | string[]> = {}
   const res = {
     _status: 200,
     _json: null as any,
-    setHeader(k: string, v: string) {
+    setHeader(k: string, v: string | string[]) {
       headers[k.toLowerCase()] = v
     },
     getHeader(k: string) {
@@ -117,10 +119,18 @@ function mockReqRes(body: unknown) {
     res: res as unknown as NextApiResponse & {
       _status: number
       _json: any
-      getHeader: (k: string) => string | undefined
+      getHeader: (k: string) => string | string[] | undefined
     },
   }
 }
+
+/** Set-Cookie may be a string or array; flatten to a single string for assertions. */
+function cookieStr(v: string | number | string[] | undefined): string {
+  if (!v) return ""
+  return Array.isArray(v) ? v.join("\n") : String(v)
+}
+
+const WITH_SECRET = { "blinkpos-challenge": VALID_SECRET }
 
 beforeEach(() => {
   jest.clearAllMocks()
@@ -129,13 +139,33 @@ beforeEach(() => {
 })
 
 describe("verify-ownership security", () => {
-  it("passes the verified signer pubkey to verifyChallenge (binding)", async () => {
-    const { req, res } = mockReqRes({ signedEvent: buildSignedEvent() })
+  it("passes the signer pubkey AND the challenge-cookie secret to verifyChallenge", async () => {
+    const { req, res } = mockReqRes({ signedEvent: buildSignedEvent() }, WITH_SECRET)
     await handler(req, res)
     expect(res._status).toBe(200)
-    expect(mockVerifyChallenge).toHaveBeenCalledWith(CHALLENGE, PUBKEY)
+    expect(mockVerifyChallenge).toHaveBeenCalledWith(CHALLENGE, PUBKEY, VALID_SECRET)
     expect(mockGenerateSession).toHaveBeenCalledWith(`nostr:${PUBKEY}`)
-    expect(res.getHeader("Set-Cookie")).toContain("auth-token=")
+    const setCookie = cookieStr(res.getHeader("Set-Cookie"))
+    expect(setCookie).toContain("auth-token=")
+    // The consumed challenge cookie is cleared on success.
+    expect(setCookie).toContain("blinkpos-challenge=;")
+  })
+
+  it("SECURITY: passes undefined secret when no challenge cookie is present", async () => {
+    // The bot's exact scenario: a valid signed event submitted from a browser
+    // that never requested the challenge (no secret cookie). The handler still
+    // calls verifyChallenge, but with no secret — the store rejects it. Here we
+    // assert the secret is threaded through as undefined.
+    const { req, res } = mockReqRes({ signedEvent: buildSignedEvent() } /* no cookie */)
+    mockVerifyChallenge.mockResolvedValue({
+      valid: false,
+      error: "Challenge secret mismatch",
+    })
+    await handler(req, res)
+    expect(mockVerifyChallenge).toHaveBeenCalledWith(CHALLENGE, PUBKEY, undefined)
+    expect(res._status).toBe(401)
+    expect(mockGenerateSession).not.toHaveBeenCalled()
+    expect(cookieStr(res.getHeader("Set-Cookie"))).not.toContain("auth-token=")
   })
 
   it("SECURITY: 401 and no session when challenge binding fails", async () => {
