@@ -60,7 +60,7 @@
     "react-qr-code": "^2.0.18",
     "redis": "^4.7.0",
     "ws": "^8.18.3",
-    "zod": "^3.23.8"
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@playwright/test": "^1.58.1",
