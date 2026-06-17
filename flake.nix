@@ -14,9 +14,9 @@
     flake-utils.lib.eachDefaultSystem (system: let
       overlays = [
         (self: super: {
-          nodejs = super.nodejs_20;
+          nodejs = super.nodejs_22;
           pnpm = super.pnpm.override {
-            nodejs = super.nodejs_20;
+            nodejs = super.nodejs_22;
           };
         })
       ];

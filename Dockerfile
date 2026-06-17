@@ -1,5 +1,5 @@
 # Production Dockerfile for BlinkPOS
-FROM node:20-alpine AS base
+FROM node:22-alpine AS base
 ARG PNPM_VERSION=10.15.1
 RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
 
