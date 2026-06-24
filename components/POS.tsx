@@ -1397,54 +1397,54 @@ const POS = forwardRef<POSRef, POSProps>(
           // settlement detection. For a custodial account it responds 409, and we
           // fall back to the escrow create-invoice path below.
           if (hasBlinkLnAddressWallet && activeBlinkAccount?.username) {
-            try {
-              const scResponse = await fetch("/api/blink/public-invoice-lnaddress", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  username: activeBlinkAccount.username,
-                  amount: finalTotalInSats,
-                  memo: memo || `Payment to ${activeBlinkAccount.username}`,
-                  environment: getEnvironment(),
-                }),
-              })
+            const scResponse = await fetch("/api/blink/public-invoice-lnaddress", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                username: activeBlinkAccount.username,
+                amount: finalTotalInSats,
+                memo: memo || `Payment to ${activeBlinkAccount.username}`,
+                environment: getEnvironment(),
+              }),
+            })
 
-              if (scResponse.status !== 409) {
-                const scData = await scResponse.json()
-                if (!scResponse.ok) {
-                  throw new Error(scData.error || `Server error: ${scResponse.status}`)
-                }
-                if (scData.success && scData.invoice) {
-                  const enhancedInvoice: InvoiceData = {
-                    ...scData.invoice,
-                    displayAmount: totalWithTip,
-                    displayCurrency: displayCurrency,
-                    satAmount: finalTotalInSats,
-                    memo: memo,
-                    tipAmount: effectiveTipPercent > 0 ? tipAmount : 0,
-                    tipCurrency: displayCurrency,
-                    tipPercent: effectiveTipPercent,
-                  }
-                  setInvoice(enhancedInvoice)
-                  if (onInvoiceChange) {
-                    console.log(
-                      "📋 Self-custodial invoice created (direct, no escrow):",
-                      scData.invoice.paymentHash?.substring(0, 16) + "...",
-                    )
-                    onInvoiceChange(enhancedInvoice)
-                  }
-                  return
-                }
+            // ONLY a confirmed custodial 409 falls through to the escrow path.
+            // For any other outcome we must NOT mint a BlinkPOS escrow invoice:
+            // a known/possibly-Spark receiver has no custodial BTC wallet, so an
+            // escrow invoice could never be forwarded (forward-ln-address would
+            // fail with "Could not resolve recipient BTC wallet"), stranding the
+            // customer-paid funds in BlinkPOS. Surface the error instead — it
+            // propagates to the outer catch and is shown to the operator.
+            if (scResponse.status === 409) {
+              // Custodial account; fall through to the escrow create-invoice path.
+              console.log("↪️ LN-address account is custodial; using escrow path.")
+            } else {
+              const scData = await scResponse.json().catch(() => ({}))
+              if (!scResponse.ok) {
+                throw new Error(scData.error || `Server error: ${scResponse.status}`)
+              }
+              if (!scData.success || !scData.invoice) {
                 throw new Error("Invalid response from server")
               }
-              // 409 => custodial account; fall through to escrow path.
-              console.log("↪️ LN-address account is custodial; using escrow path.")
-            } catch (scErr: unknown) {
-              // Network/other error on the direct path: fall through to escrow.
-              console.warn(
-                "Self-custodial direct receive failed; falling back to escrow:",
-                scErr instanceof Error ? scErr.message : scErr,
-              )
+              const enhancedInvoice: InvoiceData = {
+                ...scData.invoice,
+                displayAmount: totalWithTip,
+                displayCurrency: displayCurrency,
+                satAmount: finalTotalInSats,
+                memo: memo,
+                tipAmount: effectiveTipPercent > 0 ? tipAmount : 0,
+                tipCurrency: displayCurrency,
+                tipPercent: effectiveTipPercent,
+              }
+              setInvoice(enhancedInvoice)
+              if (onInvoiceChange) {
+                console.log(
+                  "📋 Self-custodial invoice created (direct, no escrow):",
+                  scData.invoice.paymentHash?.substring(0, 16) + "...",
+                )
+                onInvoiceChange(enhancedInvoice)
+              }
+              return
             }
           }
 
