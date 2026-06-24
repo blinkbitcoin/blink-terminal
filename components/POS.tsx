@@ -1382,6 +1382,65 @@ const POS = forwardRef<POSRef, POSProps>(
           const tipInSats =
             effectiveTipPercent > 0 ? Math.max(0, finalTotalInSats - baseInSats) : 0
 
+          // SELF-CUSTODIAL (Spark) DIRECT RECEIVE:
+          // When the active receiving wallet is a Blink LN-address wallet, try the
+          // direct LN-address endpoint first. For a self-custodial (Spark) account
+          // it mints an invoice directly on the merchant's Lightning address (no
+          // BlinkPOS escrow, no forwarding) and returns a LUD-21 verify URL for
+          // settlement detection. For a custodial account it responds 409, and we
+          // fall back to the escrow create-invoice path below.
+          if (hasBlinkLnAddressWallet && activeBlinkAccount?.username) {
+            try {
+              const scResponse = await fetch("/api/blink/public-invoice-lnaddress", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  username: activeBlinkAccount.username,
+                  amount: finalTotalInSats,
+                  memo: memo || `Payment to ${activeBlinkAccount.username}`,
+                  environment: getEnvironment(),
+                }),
+              })
+
+              if (scResponse.status !== 409) {
+                const scData = await scResponse.json()
+                if (!scResponse.ok) {
+                  throw new Error(scData.error || `Server error: ${scResponse.status}`)
+                }
+                if (scData.success && scData.invoice) {
+                  const enhancedInvoice: InvoiceData = {
+                    ...scData.invoice,
+                    displayAmount: totalWithTip,
+                    displayCurrency: displayCurrency,
+                    satAmount: finalTotalInSats,
+                    memo: memo,
+                    tipAmount: effectiveTipPercent > 0 ? tipAmount : 0,
+                    tipCurrency: displayCurrency,
+                    tipPercent: effectiveTipPercent,
+                  }
+                  setInvoice(enhancedInvoice)
+                  if (onInvoiceChange) {
+                    console.log(
+                      "📋 Self-custodial invoice created (direct, no escrow):",
+                      scData.invoice.paymentHash?.substring(0, 16) + "...",
+                    )
+                    onInvoiceChange(enhancedInvoice)
+                  }
+                  return
+                }
+                throw new Error("Invalid response from server")
+              }
+              // 409 => custodial account; fall through to escrow path.
+              console.log("↪️ LN-address account is custodial; using escrow path.")
+            } catch (scErr: unknown) {
+              // Network/other error on the direct path: fall through to escrow.
+              console.warn(
+                "Self-custodial direct receive failed; falling back to escrow:",
+                scErr instanceof Error ? scErr.message : scErr,
+              )
+            }
+          }
+
           // Get NWC connection URI for server-side forwarding (if NWC is active)
           let nwcConnectionUri: string | null = null
           if (activeNWC && nwcClientReady && getActiveNWCUri) {
