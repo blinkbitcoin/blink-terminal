@@ -7,8 +7,7 @@
 
 import { useState, useEffect, useRef } from "react"
 
-// Expiry preset options (must match lib/voucher-expiry.js)
-// Note: 15m and 1h removed from UI but kept in voucher-expiry.js for backward compatibility
+// Expiry preset options (must match lib/voucher-expiry.ts)
 
 interface ExpiryOption {
   id: string
@@ -17,6 +16,10 @@ interface ExpiryOption {
 }
 
 const EXPIRY_OPTIONS: ExpiryOption[] = [
+  { id: "15m", label: "15 min", description: "15 minutes" },
+  { id: "1h", label: "1 hour", description: "1 hour" },
+  { id: "3h", label: "3 hours", description: "3 hours" },
+  { id: "12h", label: "12 hours", description: "12 hours" },
   { id: "24h", label: "24 hours", description: "24 hours" },
   { id: "72h", label: "72 hours", description: "72 hours" },
   { id: "7d", label: "7 days", description: "7 days" },
