@@ -77,6 +77,9 @@ interface POSProps {
   tipsEnabled: boolean
   tipPresets: number[]
   tipRecipients?: TipRecipient[]
+  /** True when the active receive wallet is a self-custodial (Spark) LN address.
+      Such receivers have no escrow, so tips can't be forwarded — suppress them. */
+  isSparkLnAddress?: boolean
   soundEnabled: boolean
   onInvoiceStateChange?: (showing: boolean) => void
   onInvoiceChange?: (invoice: InvoiceData | null) => void
@@ -157,6 +160,7 @@ const POS = forwardRef<POSRef, POSProps>(
       tipsEnabled,
       tipPresets,
       tipRecipients = [],
+      isSparkLnAddress = false,
       soundEnabled,
       onInvoiceStateChange,
       onInvoiceChange,
@@ -1161,9 +1165,12 @@ const POS = forwardRef<POSRef, POSProps>(
         return
       }
 
-      // Show tip overlay if tips are enabled and we haven't skipped it
+      // Show tip overlay if tips are enabled and we haven't skipped it.
+      // Self-custodial (Spark) receivers have no escrow to forward tips, so the
+      // tip dialog is suppressed for them (tipRecipients is also emptied upstream).
       if (
         tipsEnabled &&
+        !isSparkLnAddress &&
         tipRecipients &&
         tipRecipients.length > 0 &&
         !shouldSkipTipDialog &&

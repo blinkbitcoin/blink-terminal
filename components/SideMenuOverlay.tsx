@@ -31,6 +31,7 @@ interface SideMenuOverlayProps {
   numberFormat: NumberFormatPreference
   activeSplitProfile: SplitProfile | null
   activeTipProfile: TipProfile | null
+  isSparkLnAddress: boolean
   soundEnabled: boolean
   soundTheme: SoundThemeName
   showInstallPrompt: boolean
@@ -68,6 +69,7 @@ export default function SideMenuOverlay({
   numberFormat,
   activeSplitProfile,
   activeTipProfile,
+  isSparkLnAddress,
   soundEnabled,
   soundTheme,
   showInstallPrompt,
@@ -308,10 +310,17 @@ export default function SideMenuOverlay({
               </div>
             </button>
 
-            {/* Payment Splits */}
+            {/* Payment Splits - disabled for self-custodial (Spark) wallets,
+                which have no escrow and cannot forward/split tips. */}
             <button
-              onClick={() => setShowTipSettings(true)}
-              className={`w-full rounded-lg p-4 ${getMenuTileClasses()} transition-colors`}
+              onClick={() => {
+                if (!isSparkLnAddress) setShowTipSettings(true)
+              }}
+              disabled={isSparkLnAddress}
+              aria-disabled={isSparkLnAddress}
+              className={`w-full rounded-lg p-4 ${getMenuTileClasses()} transition-colors ${
+                isSparkLnAddress ? "opacity-50 cursor-not-allowed" : ""
+              }`}
             >
               <div className="flex items-center justify-between">
                 <span className="text-sm font-medium text-gray-900 dark:text-white">
@@ -319,19 +328,32 @@ export default function SideMenuOverlay({
                 </span>
                 <div className="flex items-center text-sm text-gray-500 dark:text-gray-400">
                   <span>{activeSplitProfile?.label || "None"}</span>
-                  <span className="ml-1">›</span>
+                  {!isSparkLnAddress && <span className="ml-1">›</span>}
                 </div>
               </div>
+              {isSparkLnAddress && (
+                <div className="mt-1 text-left text-xs text-gray-500 dark:text-gray-400">
+                  Not available for self-custodial Lightning address wallets
+                </div>
+              )}
             </button>
 
-            {/* Tip Settings / Tip & Commission Settings */}
+            {/* Tip Settings / Tip & Commission Settings - disabled for
+                self-custodial (Spark) wallets (tips can't be forwarded). */}
             <button
-              onClick={() =>
-                voucherWallet
-                  ? setShowPercentSettings(true)
-                  : setShowTipProfileSettings(true)
-              }
-              className={`w-full rounded-lg p-4 ${getMenuTileClasses()} transition-colors`}
+              onClick={() => {
+                if (isSparkLnAddress) return
+                if (voucherWallet) {
+                  setShowPercentSettings(true)
+                } else {
+                  setShowTipProfileSettings(true)
+                }
+              }}
+              disabled={isSparkLnAddress}
+              aria-disabled={isSparkLnAddress}
+              className={`w-full rounded-lg p-4 ${getMenuTileClasses()} transition-colors ${
+                isSparkLnAddress ? "opacity-50 cursor-not-allowed" : ""
+              }`}
             >
               <div className="flex items-center justify-between">
                 <span className="text-sm font-medium text-gray-900 dark:text-white">
@@ -339,9 +361,14 @@ export default function SideMenuOverlay({
                 </span>
                 <div className="flex items-center text-sm text-gray-500 dark:text-gray-400">
                   <span>{activeTipProfile?.name || "Custom"}</span>
-                  <span className="ml-1">›</span>
+                  {!isSparkLnAddress && <span className="ml-1">›</span>}
                 </div>
               </div>
+              {isSparkLnAddress && (
+                <div className="mt-1 text-left text-xs text-gray-500 dark:text-gray-400">
+                  Not available for self-custodial Lightning address wallets
+                </div>
+              )}
             </button>
 
             {/* Sound Effects */}
