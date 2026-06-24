@@ -974,6 +974,7 @@ export default function Dashboard() {
           activeTipProfile={activeTipProfile}
           commissionEnabled={commissionEnabled}
           commissionPresets={commissionPresets}
+          isSparkLnAddress={isSparkLnAddress}
           setShowPercentSettings={setShowPercentSettings}
           setShowTipProfileSettings={setShowTipProfileSettings}
           setShowCommissionSettings={setShowCommissionSettings}
