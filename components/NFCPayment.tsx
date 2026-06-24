@@ -112,8 +112,17 @@ export const useNFC = ({
   useEffect(() => {
     if (typeof window === "undefined") return
 
-    setIsNfcSupported("NDEFReader" in window)
+    const nfcSupported = "NDEFReader" in window
+    setIsNfcSupported(nfcSupported)
     ;(async () => {
+      // Skip the permission query entirely when Web NFC is unsupported (e.g.
+      // desktop Chrome). Querying { name: "nfc" } there throws
+      // "Web NFC is not enabled", which clutters the dev error overlay.
+      if (!nfcSupported) {
+        setHasNFCPermission(false)
+        return
+      }
+
       if (!("permissions" in navigator)) {
         console.error("Permissions API not supported")
         return

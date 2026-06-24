@@ -6,13 +6,18 @@ import {
   getLnAddressDomain,
 } from "../../../lib/config/api"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
+import { resolveReceiver, ReceiverNotFoundError } from "../../../lib/receiver-resolver"
 
 /**
  * API endpoint to validate a Blink Lightning Address and get wallet ID
  *
  * This endpoint:
- * 1. Validates the Blink username/lightning address exists
- * 2. Returns the default wallet ID for that account
+ * 1. Validates the Blink username/lightning address exists (custodial OR
+ *    self-custodial / Spark, via the shared custodial-first → LNURL fallback).
+ * 2. For custodial accounts, returns the default BTC wallet ID.
+ * 3. For self-custodial (Spark) accounts there is no custodial wallet ID;
+ *    returns `walletId: null` with `selfCustodial: true`. Forwarding to such an
+ *    address is done by Lightning address (username@blink.sv), not by wallet id.
  *
  * Used for connecting wallets via Lightning Address instead of API key.
  */
@@ -56,6 +61,38 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
           "Invalid username format. Use only letters, numbers, and underscores (3-50 characters).",
       })
     }
+
+    // Resolve custodial-first → LNURL fallback. A self-custodial (Spark)
+    // account has no custodial wallet, so the custodial BTC-wallet lookup below
+    // would 404 it; the resolver recognizes it via its Lightning address.
+    let receiver
+    try {
+      receiver = await resolveReceiver(username, { apiUrl: getApiUrl() })
+    } catch (resolveError: unknown) {
+      if (resolveError instanceof ReceiverNotFoundError) {
+        return res.status(404).json({
+          error: "Blink account not found. Please check the username.",
+        })
+      }
+      throw resolveError
+    }
+
+    // Self-custodial (Spark): no custodial wallet id. Forwarding uses the
+    // Lightning address, so return the username/address with a null walletId.
+    if (receiver.type === "lnaddress") {
+      console.log(`Validated self-custodial LN address: ${receiver.lightningAddress}`)
+      return res.status(200).json({
+        success: true,
+        username: receiver.username,
+        walletId: null,
+        walletCurrency: "BTC",
+        lightningAddress: `${receiver.username}@${getLnAddressDomain()}`,
+        selfCustodial: true,
+      })
+    }
+
+    // Custodial: fall through to the precise BTC-wallet lookup below (handles
+    // BTC vs USD-only accounts).
 
     // Query Blink public API to get account's BTC wallet
     // We specifically request the BTC wallet because lnInvoiceCreateOnBehalfOfRecipient

@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react"
 
-import { getApiUrl, getEnvironment } from "../config/api"
+import { getEnvironment } from "../config/api"
 
 interface ValidationError {
   message: string
@@ -42,32 +42,21 @@ export function usePublicPOSValidation({
       setValidationError(null)
 
       const currentEnv = getEnvironment()
-      const apiUrl = getApiUrl()
 
-      console.log(
-        `[PublicPOS] Validating user '${username}' on ${currentEnv} (${apiUrl})`,
-      )
+      console.log(`[PublicPOS] Validating user '${username}' on ${currentEnv}`)
 
       try {
-        const response = await fetch(apiUrl, {
+        // Resolve via custodial-first → LNURL fallback so self-custodial
+        // (Spark) usernames are recognized even without a custodial wallet.
+        const response = await fetch("/api/blink/resolve-receiver", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            query: `
-              query AccountDefaultWallet($username: Username!) {
-                accountDefaultWallet(username: $username) {
-                  id
-                  walletCurrency
-                }
-              }
-            `,
-            variables: { username },
-          }),
+          body: JSON.stringify({ username, environment: currentEnv }),
         })
 
         const data = await response.json()
 
-        if (data.errors || !data.data?.accountDefaultWallet?.id) {
+        if (!response.ok || !data.exists) {
           console.log(`[PublicPOS] User '${username}' not found on ${currentEnv}`)
 
           const envLabel =
@@ -85,11 +74,9 @@ export function usePublicPOSValidation({
         } else {
           console.log(
             `[PublicPOS] User '${username}' validated on ${currentEnv}:`,
-            data.data.accountDefaultWallet,
+            data.type,
           )
-          setValidatedWalletCurrency(
-            data.data.accountDefaultWallet.walletCurrency || "BTC",
-          )
+          setValidatedWalletCurrency(data.walletCurrency || "BTC")
           setValidationError(null)
         }
       } catch (error) {

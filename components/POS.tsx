@@ -1306,21 +1306,37 @@ const POS = forwardRef<POSRef, POSProps>(
             currentEnvironment,
           )
 
-          const response = await fetch("/api/blink/public-invoice", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              username: publicUsername,
-              amount: finalTotalInSats,
-              memo: memo || `Payment to ${publicUsername}`,
-              walletCurrency: "BTC",
-              environment: currentEnvironment, // Pass environment to API
-            }),
+          const publicInvoiceBody = JSON.stringify({
+            username: publicUsername,
+            amount: finalTotalInSats,
+            memo: memo || `Payment to ${publicUsername}`,
+            walletCurrency: "BTC",
+            environment: currentEnvironment, // Pass environment to API
           })
 
-          const data = await response.json()
+          // Custodial-first: try the custodial on-behalf-of endpoint. If the
+          // username is not a custodial Blink account (404), fall back to the
+          // Lightning-address (LNURL-pay) endpoint, which serves self-custodial
+          // (Spark) accounts and returns a LUD-21 verifyUrl for settlement.
+          let response = await fetch("/api/blink/public-invoice", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: publicInvoiceBody,
+          })
+          let data = await response.json()
+
+          if (response.status === 404) {
+            console.log(
+              "↪️ Custodial lookup missed; trying self-custodial LN-address path for:",
+              publicUsername,
+            )
+            response = await fetch("/api/blink/public-invoice-lnaddress", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: publicInvoiceBody,
+            })
+            data = await response.json()
+          }
 
           console.log("Public invoice response:", data)
 

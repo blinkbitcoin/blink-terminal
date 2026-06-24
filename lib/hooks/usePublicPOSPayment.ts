@@ -7,6 +7,7 @@ import {
 } from "react"
 
 import { getApiUrl } from "../config/api"
+import { verifyLnurlPayment } from "../lnurl"
 
 import type { PaymentData } from "./useBlinkWebSocket"
 
@@ -23,6 +24,12 @@ export interface CurrentInvoice {
   tipAmount?: number
   tipCurrency?: string
   tipPercent?: number
+  /**
+   * LUD-21 verify URL. Present for self-custodial (Spark) recipients invoiced
+   * via the Lightning-address path. When set, settlement is detected by polling
+   * this URL instead of Blink's GraphQL lnInvoicePaymentStatus.
+   */
+  verifyUrl?: string
 }
 
 // Re-export the shared PaymentData type for consumers of this hook
@@ -81,28 +88,39 @@ export function usePublicPOSPayment({
       }
 
       try {
-        // Query Blink API directly for payment status (public query)
-        const response = await fetch(getApiUrl(), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            query: `
-              query LnInvoicePaymentStatus($input: LnInvoicePaymentStatusInput!) {
-                lnInvoicePaymentStatus(input: $input) {
-                  status
+        let paid = false
+
+        if (currentInvoice.verifyUrl) {
+          // Self-custodial (Spark) path: poll the LUD-21 verify URL. Note the
+          // LNURL server populates `settled` from the Spark SSP webhook (no
+          // synchronous Spark status pull), so detection may lag slightly.
+          const verifyResult = await verifyLnurlPayment(currentInvoice.verifyUrl)
+          paid = verifyResult.settled === true
+        } else {
+          // Custodial path: query Blink GraphQL for payment status (public query).
+          const response = await fetch(getApiUrl(), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              query: `
+                query LnInvoicePaymentStatus($input: LnInvoicePaymentStatusInput!) {
+                  lnInvoicePaymentStatus(input: $input) {
+                    status
+                  }
                 }
-              }
-            `,
-            variables: {
-              input: { paymentRequest: currentInvoice.paymentRequest },
-            },
-          }),
-        })
+              `,
+              variables: {
+                input: { paymentRequest: currentInvoice.paymentRequest },
+              },
+            }),
+          })
 
-        const data = await response.json()
-        const status: string | undefined = data.data?.lnInvoicePaymentStatus?.status
+          const data = await response.json()
+          const status: string | undefined = data.data?.lnInvoicePaymentStatus?.status
+          paid = status === "PAID"
+        }
 
-        if (status === "PAID") {
+        if (paid) {
           console.log("✅ Public invoice payment received!")
 
           // Set payment data for animation with the richer invoice context so
