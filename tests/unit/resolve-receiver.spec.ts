@@ -27,8 +27,25 @@ jest.mock("../../lib/receiver-resolver", () => {
       this.name = "ReceiverNotFoundError"
     }
   }
+  // Real (pure) normalizeIdentifier so the handler's SSRF domain guard works.
+  function normalizeIdentifier(raw: string): { username: string; domain?: string } {
+    if (!raw || typeof raw !== "string") throw new Error("Identifier is required")
+    let value = raw.trim()
+    if (value.toLowerCase().startsWith("lightning:")) {
+      value = value.slice("lightning:".length).trim()
+    }
+    if (value.includes("@")) {
+      const parts = value.split("@")
+      if (parts.length !== 2 || !parts[0] || !parts[1]) {
+        throw new Error(`Invalid Lightning address format: ${raw}`)
+      }
+      return { username: parts[0], domain: parts[1].toLowerCase() }
+    }
+    return { username: value }
+  }
   return {
     resolveReceiver: (...a: unknown[]) => mockResolveReceiver(...a),
+    normalizeIdentifier,
     ReceiverNotFoundError,
   }
 })
@@ -128,5 +145,13 @@ describe("resolve-receiver", () => {
     const { req, res } = mockReqRes({ username: "alice" })
     await handler(req, res)
     expect(res._status).toBe(502)
+  })
+
+  it("SSRF: rejects an explicit non-Blink domain without resolving", async () => {
+    const { req, res } = mockReqRes({ username: "attacker@evil.com" })
+    await handler(req, res)
+    expect(res._status).toBe(400)
+    expect(res._json.error).toMatch(/not a Blink address/i)
+    expect(mockResolveReceiver).not.toHaveBeenCalled()
   })
 })

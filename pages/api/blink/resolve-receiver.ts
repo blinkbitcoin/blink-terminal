@@ -27,10 +27,21 @@ import type { NextApiRequest, NextApiResponse } from "next"
 
 import { getApiUrlForEnvironment, type EnvironmentName } from "../../../lib/config/api"
 import { withRateLimit, RATE_LIMIT_PUBLIC } from "../../../lib/rate-limit"
-import { resolveReceiver, ReceiverNotFoundError } from "../../../lib/receiver-resolver"
+import {
+  resolveReceiver,
+  normalizeIdentifier,
+  ReceiverNotFoundError,
+} from "../../../lib/receiver-resolver"
 
 // Production Lightning-address domain. Staging is deferred (see spark_term_plan.md).
 const LN_ADDRESS_DOMAIN = "blink.sv"
+
+// Allowed Blink Lightning-address domains. Any explicit non-Blink domain is
+// rejected before any LNURL fetch to prevent this unauthenticated endpoint from
+// being used as an SSRF / open LNURL proxy (resolveReceiver skips the custodial
+// probe for non-Blink domains and would otherwise fetch attacker-controlled
+// `.well-known/lnurlp` metadata).
+const ALLOWED_BLINK_DOMAINS = ["blink.sv"]
 
 async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "POST") {
@@ -46,6 +57,24 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
     if (!username || typeof username !== "string") {
       return res.status(400).json({ error: "Username is required" })
+    }
+
+    // SSRF guard: reject any explicit non-Blink domain before touching the
+    // network. Bare usernames and `user@blink.sv` are allowed; `user@evil.com`
+    // is not.
+    let parsedIdentifier
+    try {
+      parsedIdentifier = normalizeIdentifier(username)
+    } catch {
+      return res.status(400).json({ error: "Invalid username or Lightning address" })
+    }
+    if (
+      parsedIdentifier.domain &&
+      !ALLOWED_BLINK_DOMAINS.includes(parsedIdentifier.domain)
+    ) {
+      return res.status(400).json({
+        error: `'${username}' is not a Blink address. Only ${LN_ADDRESS_DOMAIN} addresses are supported.`,
+      })
     }
 
     const validEnvironment: EnvironmentName =
