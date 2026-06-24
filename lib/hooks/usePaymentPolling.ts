@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react"
 
 import { useNFC, type UseNFCReturn } from "../../components/NFCPayment"
+import { verifyLnurlPayment } from "../lnurl"
 
 import type { PaymentData } from "./useBlinkWebSocket"
 import type { SoundTheme } from "./useSoundSettings"
@@ -19,6 +20,12 @@ export interface PaymentPollingInvoice {
   tipAmount?: number
   tipCurrency?: string
   tipPercent?: number
+  /**
+   * LUD-21 verify URL. Present for self-custodial (Spark) direct-receive
+   * invoices (no BlinkPOS escrow). When set, settlement is detected by polling
+   * this URL instead of /api/payment-status (which keys off the escrow record).
+   */
+  verifyUrl?: string
 }
 
 /** @deprecated Use PaymentData from useBlinkWebSocket instead */
@@ -82,11 +89,12 @@ export function usePaymentPolling({
       pollingIntervalRef.current = null
     }
 
-    // Start polling if we have a payment hash to watch
-    if (currentInvoice?.paymentHash) {
+    // Start polling if we have a payment hash (escrow path) or a LUD-21 verify
+    // URL (self-custodial direct-receive path) to watch.
+    if (currentInvoice?.paymentHash || currentInvoice?.verifyUrl) {
       console.log(
         "🔄 Starting payment status polling for:",
-        currentInvoice.paymentHash.substring(0, 16) + "...",
+        currentInvoice.paymentHash?.substring(0, 16) + "..." || currentInvoice.verifyUrl,
       )
       pollingStartTimeRef.current = Date.now()
 
@@ -102,12 +110,26 @@ export function usePaymentPolling({
         }
 
         try {
-          const response = await fetch(
-            `/api/payment-status/${currentInvoice.paymentHash}`,
-          )
-          const data = await response.json()
+          let completed = false
+          let expired = false
 
-          if (data.status === "completed") {
+          if (currentInvoice.verifyUrl) {
+            // Self-custodial (Spark) direct receive: poll the LUD-21 verify URL.
+            // (Settlement is populated server-side via the Spark SSP webhook, so
+            // it may lag slightly behind the actual payment.)
+            const verifyResult = await verifyLnurlPayment(currentInvoice.verifyUrl)
+            completed = verifyResult.settled === true
+          } else {
+            // Escrow path: read the BlinkPOS forwarding record status.
+            const response = await fetch(
+              `/api/payment-status/${currentInvoice.paymentHash}`,
+            )
+            const data = await response.json()
+            completed = data.status === "completed"
+            expired = data.status === "expired"
+          }
+
+          if (completed) {
             console.log("✅ Payment completed detected via polling!")
 
             // Stop polling
@@ -146,7 +168,7 @@ export function usePaymentPolling({
 
             // Refresh transaction data
             fetchData()
-          } else if (data.status === "expired") {
+          } else if (expired) {
             console.log("⏰ Payment expired")
             if (pollingIntervalRef.current) {
               clearInterval(pollingIntervalRef.current)
@@ -172,7 +194,7 @@ export function usePaymentPolling({
         pollingIntervalRef.current = null
       }
     }
-  }, [currentInvoice?.paymentHash])
+  }, [currentInvoice?.paymentHash, currentInvoice?.verifyUrl])
 
   // Setup NFC for Boltcard payments
   const nfcState: UseNFCReturn = useNFC({

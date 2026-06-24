@@ -76,8 +76,9 @@ function ensureHandlersRegistered(): void {
     // (including those generated during earlier callbacks) are exported.
     try {
       const { otelSdk } = await import("../instrumentation.node")
-      await otelSdk.shutdown()
-      logger.info("OTEL SDK shut down")
+      // otelSdk is undefined when tracing is disabled (no OTLP endpoint).
+      await otelSdk?.shutdown()
+      if (otelSdk) logger.info("OTEL SDK shut down")
     } catch (_err) {
       // OTEL may not be initialised (e.g. tests, edge runtime) — that's fine.
     }

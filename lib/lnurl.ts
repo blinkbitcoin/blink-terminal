@@ -46,6 +46,13 @@ export interface LnurlInvoiceResponse {
   paymentRequest: string
   paymentHash?: string
   successAction?: unknown
+  /**
+   * LUD-21 verify URL, when the LNURL server advertises one. Used by the POS to
+   * poll payment status without an authenticated GraphQL call. Self-custodial
+   * (Spark) recipients on blink-lnurl-server require this path for settlement
+   * detection.
+   */
+  verify?: string
 }
 
 export interface LnurlFullInvoiceResponse extends LnurlInvoiceResponse {
@@ -81,6 +88,74 @@ interface LnurlCallbackResponse {
   pr?: string
   paymentHash?: string
   successAction?: unknown
+  // LUD-21: URL to poll payment status (settled/preimage) for this invoice.
+  verify?: string
+}
+
+// =============================================================================
+// Resilient fetch
+// =============================================================================
+
+const DEFAULT_FETCH_TIMEOUT_MS = 4000
+const DEFAULT_FETCH_RETRIES = 2 // total attempts = retries + 1
+const RETRY_BACKOFF_MS = 300
+
+/**
+ * fetch() with a per-attempt timeout and retry-with-backoff.
+ *
+ * Server-side calls to the Blink LNURL host (blink.sv / lnurl.blink.sv) via
+ * Node's undici fetch intermittently fail with "fetch failed" (transient
+ * connection/keep-alive races), even though the host is healthy. A single blip
+ * must not surface to the user as "address not found", so we retry transient
+ * failures. Each attempt uses a fresh connection (Connection: close) to avoid
+ * reusing a half-broken pooled socket.
+ *
+ * @param url - URL to fetch
+ * @param init - fetch init (headers are merged with `Connection: close`)
+ * @param retries - number of retries after the first attempt
+ * @param timeoutMs - per-attempt timeout in milliseconds
+ */
+export async function fetchWithRetry(
+  url: string,
+  init: RequestInit = {},
+  retries: number = DEFAULT_FETCH_RETRIES,
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
+): Promise<Response> {
+  let lastError: unknown
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+
+    try {
+      const response = await fetch(url, {
+        ...init,
+        signal: controller.signal,
+        headers: {
+          // Avoid reusing a stale pooled keep-alive socket on retries.
+          Connection: "close",
+          ...(init.headers || {}),
+        },
+      })
+      clearTimeout(timer)
+      return response
+    } catch (err) {
+      clearTimeout(timer)
+      lastError = err
+
+      // Last attempt: give up.
+      if (attempt === retries) break
+
+      // Backoff before retrying (linear).
+      await new Promise((resolve) =>
+        setTimeout(resolve, RETRY_BACKOFF_MS * (attempt + 1)),
+      )
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(`fetch failed for ${url}: ${String(lastError)}`)
 }
 
 // =============================================================================
@@ -207,7 +282,7 @@ export function validateNpubCashAddress(address: string): NpubCashValidationResu
 export async function fetchLnurlPayMetadata(
   lnurlEndpoint: string,
 ): Promise<LnurlPayMetadata> {
-  const response: Response = await fetch(lnurlEndpoint, {
+  const response: Response = await fetchWithRetry(lnurlEndpoint, {
     headers: {
       Accept: "application/json",
     },
@@ -264,7 +339,7 @@ export async function requestInvoiceFromCallback(
     url.searchParams.set("comment", comment)
   }
 
-  const response: Response = await fetch(url.toString(), {
+  const response: Response = await fetchWithRetry(url.toString(), {
     headers: {
       Accept: "application/json",
     },
@@ -288,6 +363,7 @@ export async function requestInvoiceFromCallback(
     paymentRequest: data.pr,
     paymentHash: data.paymentHash,
     successAction: data.successAction,
+    verify: data.verify,
   }
 }
 
@@ -346,7 +422,62 @@ export async function getInvoiceFromLightningAddress(
     paymentRequest: invoiceData.paymentRequest,
     paymentHash: invoiceData.paymentHash,
     successAction: invoiceData.successAction,
+    verify: invoiceData.verify,
     metadata: lnurlData,
+  }
+}
+
+/**
+ * LUD-21 verify response.
+ * See https://github.com/lnurl/luds/blob/luds/21.md
+ */
+export interface LnurlVerifyResult {
+  /** True once the LNURL server has observed the invoice as paid. */
+  settled: boolean
+  /** Payment preimage, present once settled. */
+  preimage?: string
+  /** The bolt11 payment request the verify URL refers to. */
+  pr?: string
+}
+
+/**
+ * Poll a LUD-21 verify URL to check whether an invoice has been paid.
+ *
+ * Note for self-custodial (Spark) recipients on blink-lnurl-server: the verify
+ * endpoint is populated by the Spark SSP webhook (there is no synchronous Spark
+ * status pull server-side), so `settled` only flips to true once that webhook
+ * lands. Polling tolerates the lag; do not expect sub-second confirmation.
+ *
+ * @param verifyUrl - The LUD-21 verify URL returned alongside the invoice
+ * @returns Parsed verify result
+ */
+export async function verifyLnurlPayment(verifyUrl: string): Promise<LnurlVerifyResult> {
+  const response: Response = await fetchWithRetry(verifyUrl, {
+    headers: {
+      Accept: "application/json",
+    },
+  })
+
+  if (!response.ok) {
+    throw new Error(`LNURL verify returned ${response.status}: ${response.statusText}`)
+  }
+
+  const data: {
+    status?: string
+    reason?: string
+    settled?: boolean
+    preimage?: string | null
+    pr?: string
+  } = await response.json()
+
+  if (data.status === "ERROR") {
+    throw new Error(`LNURL verify error: ${data.reason || "Unknown error"}`)
+  }
+
+  return {
+    settled: data.settled === true,
+    preimage: data.preimage ?? undefined,
+    pr: data.pr,
   }
 }
 
@@ -390,5 +521,6 @@ export default {
   fetchLnurlPayMetadata,
   requestInvoiceFromCallback,
   getInvoiceFromLightningAddress,
+  verifyLnurlPayment,
   probeNpubCashAddress,
 }

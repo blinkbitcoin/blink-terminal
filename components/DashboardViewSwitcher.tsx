@@ -79,6 +79,7 @@ interface DashboardViewSwitcherProps {
   tipsEnabled: boolean
   tipPresets: number[]
   activeSplitProfile: SplitProfile | null
+  isSparkLnAddress: boolean
   setShowingInvoice: (showing: boolean) => void
   setCurrentInvoice: (invoice: InvoiceData | null) => void
   nfcState: UseNFCReturn | null
@@ -185,6 +186,7 @@ export default function DashboardViewSwitcher({
   tipsEnabled,
   tipPresets,
   activeSplitProfile,
+  isSparkLnAddress,
   setShowingInvoice,
   setCurrentInvoice,
   nfcState,
@@ -309,7 +311,8 @@ export default function DashboardViewSwitcher({
         reconnectAttempts={reconnectAttempts}
         tipsEnabled={tipsEnabled}
         tipPresets={tipPresets}
-        tipRecipients={activeSplitProfile?.recipients || []}
+        tipRecipients={isSparkLnAddress ? [] : activeSplitProfile?.recipients || []}
+        isSparkLnAddress={isSparkLnAddress}
         soundEnabled={soundEnabled}
         onInvoiceStateChange={setShowingInvoice}
         onInvoiceChange={(invoiceData: unknown) => {

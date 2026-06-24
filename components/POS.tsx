@@ -77,6 +77,9 @@ interface POSProps {
   tipsEnabled: boolean
   tipPresets: number[]
   tipRecipients?: TipRecipient[]
+  /** True when the active receive wallet is a self-custodial (Spark) LN address.
+      Such receivers have no escrow, so tips can't be forwarded — suppress them. */
+  isSparkLnAddress?: boolean
   soundEnabled: boolean
   onInvoiceStateChange?: (showing: boolean) => void
   onInvoiceChange?: (invoice: InvoiceData | null) => void
@@ -157,6 +160,7 @@ const POS = forwardRef<POSRef, POSProps>(
       tipsEnabled,
       tipPresets,
       tipRecipients = [],
+      isSparkLnAddress = false,
       soundEnabled,
       onInvoiceStateChange,
       onInvoiceChange,
@@ -1161,9 +1165,12 @@ const POS = forwardRef<POSRef, POSProps>(
         return
       }
 
-      // Show tip overlay if tips are enabled and we haven't skipped it
+      // Show tip overlay if tips are enabled and we haven't skipped it.
+      // Self-custodial (Spark) receivers have no escrow to forward tips, so the
+      // tip dialog is suppressed for them (tipRecipients is also emptied upstream).
       if (
         tipsEnabled &&
+        !isSparkLnAddress &&
         tipRecipients &&
         tipRecipients.length > 0 &&
         !shouldSkipTipDialog &&
@@ -1306,21 +1313,37 @@ const POS = forwardRef<POSRef, POSProps>(
             currentEnvironment,
           )
 
-          const response = await fetch("/api/blink/public-invoice", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              username: publicUsername,
-              amount: finalTotalInSats,
-              memo: memo || `Payment to ${publicUsername}`,
-              walletCurrency: "BTC",
-              environment: currentEnvironment, // Pass environment to API
-            }),
+          const publicInvoiceBody = JSON.stringify({
+            username: publicUsername,
+            amount: finalTotalInSats,
+            memo: memo || `Payment to ${publicUsername}`,
+            walletCurrency: "BTC",
+            environment: currentEnvironment, // Pass environment to API
           })
 
-          const data = await response.json()
+          // Custodial-first: try the custodial on-behalf-of endpoint. If the
+          // username is not a custodial Blink account (404), fall back to the
+          // Lightning-address (LNURL-pay) endpoint, which serves self-custodial
+          // (Spark) accounts and returns a LUD-21 verifyUrl for settlement.
+          let response = await fetch("/api/blink/public-invoice", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: publicInvoiceBody,
+          })
+          let data = await response.json()
+
+          if (response.status === 404) {
+            console.log(
+              "↪️ Custodial lookup missed; trying self-custodial LN-address path for:",
+              publicUsername,
+            )
+            response = await fetch("/api/blink/public-invoice-lnaddress", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: publicInvoiceBody,
+            })
+            data = await response.json()
+          }
 
           console.log("Public invoice response:", data)
 
@@ -1365,6 +1388,65 @@ const POS = forwardRef<POSRef, POSProps>(
           // Tip is the difference between total invoice and base (ensures base + tip = total)
           const tipInSats =
             effectiveTipPercent > 0 ? Math.max(0, finalTotalInSats - baseInSats) : 0
+
+          // SELF-CUSTODIAL (Spark) DIRECT RECEIVE:
+          // When the active receiving wallet is a Blink LN-address wallet, try the
+          // direct LN-address endpoint first. For a self-custodial (Spark) account
+          // it mints an invoice directly on the merchant's Lightning address (no
+          // BlinkPOS escrow, no forwarding) and returns a LUD-21 verify URL for
+          // settlement detection. For a custodial account it responds 409, and we
+          // fall back to the escrow create-invoice path below.
+          if (hasBlinkLnAddressWallet && activeBlinkAccount?.username) {
+            const scResponse = await fetch("/api/blink/public-invoice-lnaddress", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                username: activeBlinkAccount.username,
+                amount: finalTotalInSats,
+                memo: memo || `Payment to ${activeBlinkAccount.username}`,
+                environment: getEnvironment(),
+              }),
+            })
+
+            // ONLY a confirmed custodial 409 falls through to the escrow path.
+            // For any other outcome we must NOT mint a BlinkPOS escrow invoice:
+            // a known/possibly-Spark receiver has no custodial BTC wallet, so an
+            // escrow invoice could never be forwarded (forward-ln-address would
+            // fail with "Could not resolve recipient BTC wallet"), stranding the
+            // customer-paid funds in BlinkPOS. Surface the error instead — it
+            // propagates to the outer catch and is shown to the operator.
+            if (scResponse.status === 409) {
+              // Custodial account; fall through to the escrow create-invoice path.
+              console.log("↪️ LN-address account is custodial; using escrow path.")
+            } else {
+              const scData = await scResponse.json().catch(() => ({}))
+              if (!scResponse.ok) {
+                throw new Error(scData.error || `Server error: ${scResponse.status}`)
+              }
+              if (!scData.success || !scData.invoice) {
+                throw new Error("Invalid response from server")
+              }
+              const enhancedInvoice: InvoiceData = {
+                ...scData.invoice,
+                displayAmount: totalWithTip,
+                displayCurrency: displayCurrency,
+                satAmount: finalTotalInSats,
+                memo: memo,
+                tipAmount: effectiveTipPercent > 0 ? tipAmount : 0,
+                tipCurrency: displayCurrency,
+                tipPercent: effectiveTipPercent,
+              }
+              setInvoice(enhancedInvoice)
+              if (onInvoiceChange) {
+                console.log(
+                  "📋 Self-custodial invoice created (direct, no escrow):",
+                  scData.invoice.paymentHash?.substring(0, 16) + "...",
+                )
+                onInvoiceChange(enhancedInvoice)
+              }
+              return
+            }
+          }
 
           // Get NWC connection URI for server-side forwarding (if NWC is active)
           let nwcConnectionUri: string | null = null

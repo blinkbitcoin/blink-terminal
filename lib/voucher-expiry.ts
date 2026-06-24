@@ -20,11 +20,12 @@ interface VoucherForStatus {
 }
 
 // Expiry preset options
-// Note: 15m and 1h kept for backward compatibility with existing vouchers
 const EXPIRY_PRESETS: ExpiryPreset[] = [
-  // Legacy options (kept for backward compatibility with existing vouchers)
+  // Short options (shown in UI)
   { id: "15m", label: "15 min", ms: 15 * 60 * 1000 },
   { id: "1h", label: "1 hour", ms: 60 * 60 * 1000 },
+  { id: "3h", label: "3 hours", ms: 3 * 60 * 60 * 1000 },
+  { id: "12h", label: "12 hours", ms: 12 * 60 * 60 * 1000 },
   // Current options (shown in UI)
   { id: "24h", label: "24 hours", ms: 24 * 60 * 60 * 1000 },
   { id: "72h", label: "72 hours", ms: 72 * 60 * 60 * 1000 },

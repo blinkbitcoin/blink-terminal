@@ -15,6 +15,7 @@ import { usePaycodeState } from "../lib/hooks/usePaycodeState"
 import { usePaymentPolling } from "../lib/hooks/usePaymentPolling"
 import { usePrintReceipt } from "../lib/hooks/usePrintReceipt"
 import { usePWAInstall, type BeforeInstallPromptEvent } from "../lib/hooks/usePWAInstall"
+import { useReceiverType } from "../lib/hooks/useReceiverType"
 import { useServerSync, getVoucherWalletKey } from "../lib/hooks/useServerSync"
 import { useSoundSettings } from "../lib/hooks/useSoundSettings"
 import { useSplitProfileActions } from "../lib/hooks/useSplitProfileActions"
@@ -534,6 +535,20 @@ export default function Dashboard() {
     useCustomWeights,
   })
 
+  // Self-custodial (Spark) detection. Spark receivers have no escrow account, so
+  // tip forwarding and payment splits are impossible — suppress those UIs.
+  const { isSparkLnAddress } = useReceiverType(activeBlinkAccount)
+
+  // If the active receive wallet is (or becomes) a self-custodial Spark LN
+  // address while a split profile is active, force-deactivate it so no
+  // un-forwardable tip is added to the invoice. This also clears tipsEnabled and
+  // tipRecipient (handled inside setActiveSplitProfileById).
+  useEffect(() => {
+    if (isSparkLnAddress && activeSplitProfile) {
+      setActiveSplitProfileById(null)
+    }
+  }, [isSparkLnAddress, activeSplitProfile, setActiveSplitProfileById])
+
   // Transaction search ref (state is in useTransactionState hook)
   const txSearchInputRef = useRef<HTMLInputElement>(null)
 
@@ -842,6 +857,7 @@ export default function Dashboard() {
           numberFormat={numberFormat}
           activeSplitProfile={activeSplitProfile}
           activeTipProfile={activeTipProfile}
+          isSparkLnAddress={isSparkLnAddress}
           soundEnabled={soundEnabled}
           soundTheme={soundTheme}
           showInstallPrompt={showInstallPrompt}
@@ -958,6 +974,7 @@ export default function Dashboard() {
           activeTipProfile={activeTipProfile}
           commissionEnabled={commissionEnabled}
           commissionPresets={commissionPresets}
+          isSparkLnAddress={isSparkLnAddress}
           setShowPercentSettings={setShowPercentSettings}
           setShowTipProfileSettings={setShowTipProfileSettings}
           setShowCommissionSettings={setShowCommissionSettings}
@@ -1001,8 +1018,9 @@ export default function Dashboard() {
         />
       )}
 
-      {/* Split Settings Overlay */}
-      {showTipSettings && !showCreateSplitProfile && (
+      {/* Split Settings Overlay - hidden for self-custodial (Spark) wallets,
+          which have no escrow and cannot forward/split tips. */}
+      {showTipSettings && !showCreateSplitProfile && !isSparkLnAddress && (
         <SplitSettingsOverlay
           authMode={authMode}
           activeSplitProfile={activeSplitProfile}
@@ -1292,6 +1310,7 @@ export default function Dashboard() {
           activeBlinkAccount={activeBlinkAccount}
           voucherExpiry={voucherExpiry}
           activeSplitProfile={activeSplitProfile}
+          isSparkLnAddress={isSparkLnAddress}
           voucherWalletBalanceLoading={voucherWalletBalanceLoading}
           isBlinkClassic={isBlinkClassic}
           currentVoucherCurrencyMode={currentVoucherCurrencyMode}
@@ -1348,6 +1367,7 @@ export default function Dashboard() {
           tipsEnabled={tipsEnabled}
           tipPresets={tipPresets}
           activeSplitProfile={activeSplitProfile}
+          isSparkLnAddress={isSparkLnAddress}
           setShowingInvoice={setShowingInvoice}
           setCurrentInvoice={setCurrentInvoice}
           nfcState={nfcState}

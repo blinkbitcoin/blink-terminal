@@ -27,6 +27,7 @@ interface OwnerAgentDisplayProps {
   activeBlinkAccount: LocalBlinkAccount | null
   voucherExpiry: VoucherExpiry
   activeSplitProfile: SplitProfile | null
+  isSparkLnAddress: boolean
   voucherWalletBalanceLoading: boolean
   isBlinkClassic: boolean
   currentVoucherCurrencyMode: VoucherCurrencyMode
@@ -52,6 +53,7 @@ export default function OwnerAgentDisplay({
   activeBlinkAccount,
   voucherExpiry,
   activeSplitProfile,
+  isSparkLnAddress,
   voucherWalletBalanceLoading,
   isBlinkClassic,
   currentVoucherCurrencyMode,
@@ -228,6 +230,7 @@ export default function OwnerAgentDisplay({
       {/* On Voucher/MultiVoucher: Show Capacity indicator on right */}
       <div className="flex items-center gap-2 min-h-[18px]">
         {activeSplitProfile &&
+          !isSparkLnAddress &&
           currentView !== "voucher" &&
           currentView !== "multivoucher" &&
           currentView !== "vouchermanager" && (
