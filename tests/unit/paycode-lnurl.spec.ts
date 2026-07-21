@@ -81,6 +81,16 @@ describe("paycode-lnurl", () => {
       expect(result.lightningAddress).toBe("alice@blink.sv")
     })
 
+    it("normalizes a mis-cased username to lowercase for the LNURL and web URL", () => {
+      // A paycode's uppercased QR fallback can route back with a mis-cased name;
+      // resolution is case-sensitive, so the endpoint/webUrl must be lowercase.
+      const result = buildStaticPaycode("ALICE", domain, appUrl)
+      expect(result.lnurlPayEndpoint).toBe("https://blink.sv/.well-known/lnurlp/alice")
+      expect(result.webUrl).toBe("https://terminal.blinkbtc.com/alice")
+      // The QR display value remains uppercase (host case-insensitive).
+      expect(result.qrValue).toContain("TERMINAL.BLINKBTC.COM/ALICE?LIGHTNING=")
+    })
+
     it("respects a staging lightning-address domain", () => {
       const result = buildStaticPaycode(
         "bob",

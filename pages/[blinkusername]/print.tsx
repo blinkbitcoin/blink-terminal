@@ -31,9 +31,12 @@ export const getServerSideProps: GetServerSideProps<PrintPageProps> = async (con
     return { notFound: true }
   }
 
+  // Normalize to lowercase: Blink usernames are lowercase and resolution is
+  // case-sensitive. The printed QR uppercases its value for compactness, so the
+  // web-fallback URL can arrive here as e.g. /ALICE — canonicalize before use.
   return {
     props: {
-      username: blinkusername,
+      username: blinkusername.toLowerCase(),
     },
   }
 }

@@ -70,18 +70,30 @@ export function buildStaticPaycode(
   lnAddressDomain: string,
   webUrlBase: string = `https://${lnAddressDomain}`,
 ): StaticPaycode {
+  // Blink usernames are lowercase and resolution is case-sensitive; normalize
+  // defensively so a mis-cased input can never produce a non-resolving LNURL or
+  // fallback path. (Callers should already pass a normalized name.)
+  const normalizedUsername = username.toLowerCase()
   const normalizedWebBase = webUrlBase.replace(/\/+$/, "")
-  const lnurlPayEndpoint = `https://${lnAddressDomain}/.well-known/lnurlp/${username}`
+  const lnurlPayEndpoint = `https://${lnAddressDomain}/.well-known/lnurlp/${normalizedUsername}`
   const lnurl = encodeLnurl(lnurlPayEndpoint)
-  const webUrl = `${normalizedWebBase}/${username}`
+  const webUrl = `${normalizedWebBase}/${normalizedUsername}`
 
   return {
     lnurl,
-    // Wrapped fallback URL, uppercased (QR alphanumeric mode + Blink-mobile
-    // compatibility). Same shape for custodial and self-custodial users.
+    // Wrapped web-fallback URL, uppercased. Uppercasing keeps the trailing
+    // bech32 LNURL in QR alphanumeric mode; the URL host is case-insensitive
+    // and the path is re-normalized to lowercase on arrival (SSR), so casing
+    // here is display-only and does not affect resolution.
+    //
+    // #3583 note: blink-mobile#3583 (fixed-amount LNURLs losing their amount via
+    // the intraledger optimization) does NOT apply here — this paycode is
+    // VARIABLE-amount only (minSendable !== maxSendable), so there is no fixed
+    // amount for that optimization to drop. The `?lightning=` wrapper is the
+    // standard BIP-21 unified-QR form and behaves correctly for variable amounts.
     qrValue: `${webUrl}?lightning=${lnurl}`.toUpperCase(),
     lnurlPayEndpoint,
     webUrl,
-    lightningAddress: `${username.toLowerCase()}@${lnAddressDomain}`,
+    lightningAddress: `${normalizedUsername}@${lnAddressDomain}`,
   }
 }
