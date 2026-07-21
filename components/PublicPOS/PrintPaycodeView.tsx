@@ -25,9 +25,8 @@ const qrImageSettings = (size: number) => ({
  * PrintPaycodeView - Printable static QR view for a Blink username.
  *
  * Single source of truth for the paycode UI. Rendered in THREE places:
- *  1. Standalone route `/[username]/print` (no `onBack` — shows a history-aware
- *     Back button that returns to the previous page, falling back to
- *     `/[username]`).
+ *  1. Standalone route `/[username]/print` (no `onBack` — the Back button
+ *     navigates to the payee's public POS page `/[username]`).
  *  2. Authenticated Settings → Paycodes overlay (`onBack` = close overlay).
  *  3. Public POS side-menu → Paycodes overlay (`onBack` = close overlay).
  *
@@ -96,10 +95,13 @@ export default function PrintPaycodeView({
   // (LUD-16) endpoint on getLnAddressDomain() (blink.sv), which is
   // provider-agnostic — it resolves both custodial wallets and self-custodial
   // (Spark) accounts. The web fallback URL uses the Terminal app origin
-  // (getAppUrl()).
+  // (getAppUrl()). Both depend on the current environment, so include them in
+  // the memo deps to avoid a stale QR/webUrl if the environment changes.
+  const lnAddressDomain = getLnAddressDomain()
+  const appUrl = getAppUrl()
   const paycode = useMemo(
-    () => buildStaticPaycode(username, getLnAddressDomain(), getAppUrl()),
-    [username],
+    () => buildStaticPaycode(username, lnAddressDomain, appUrl),
+    [username, lnAddressDomain, appUrl],
   )
 
   const bgClasses =
@@ -116,10 +118,16 @@ export default function PrintPaycodeView({
         ? "bg-white border-b border-blink-classic-border-light"
         : "bg-gray-50 dark:bg-blink-dark shadow dark:shadow-black"
 
-  const copyLnurl = () => {
-    navigator.clipboard.writeText(paycode.lnurl)
-    setCopied(true)
-    window.setTimeout(() => setCopied(false), 1500)
+  const copyLnurl = async () => {
+    // Clipboard API is unavailable in non-secure contexts / some in-app
+    // browsers; guard so a failure never breaks the view.
+    try {
+      await navigator.clipboard?.writeText(paycode.lnurl)
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1500)
+    } catch (error: unknown) {
+      console.error("Failed to copy LNURL:", error)
+    }
   }
 
   const generatePdf = async (): Promise<void> => {

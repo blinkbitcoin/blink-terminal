@@ -92,7 +92,7 @@ describe("PrintPaycodeView", () => {
     ).not.toBeInTheDocument()
   })
 
-  it("encodes the wrapped ?lightning= QR value (lowercased path)", () => {
+  it("wraps in ?lightning= and uppercases the QR value", () => {
     render(<PrintPaycodeView username="alice" />)
     const value = screen.getByTestId("qr-svg").getAttribute("data-value") || ""
     expect(value.startsWith("HTTPS://")).toBe(true)

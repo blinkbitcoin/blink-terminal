@@ -54,11 +54,30 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       qrDataUrlLength: qrDataUrl?.length,
     })
 
-    // Validate input
-    if (!lightningAddress || typeof lightningAddress !== "string") {
+    // Validate input. lightningAddress must be a real `localpart@domain` (it is
+    // used to render text and to derive the default webUrl/username), so reject
+    // anything that isn't — avoids log injection, malformed PDFs, and
+    // inconsistent defaults.
+    if (
+      !lightningAddress ||
+      typeof lightningAddress !== "string" ||
+      !/^[a-zA-Z0-9_.-]{1,50}@[a-zA-Z0-9.-]{1,253}$/.test(lightningAddress)
+    ) {
       return res.status(400).json({
         error: "Missing or invalid lightningAddress",
         hint: "Provide a valid Lightning address (e.g., username@blink.sv)",
+      })
+    }
+
+    // username is optional; when present it must match the Blink username
+    // charset. Fall back to the lightningAddress localpart otherwise.
+    if (
+      username !== undefined &&
+      (typeof username !== "string" || !/^[a-zA-Z0-9_]{1,50}$/.test(username))
+    ) {
+      return res.status(400).json({
+        error: "Invalid username",
+        hint: "username must be 1-50 chars of [a-zA-Z0-9_]",
       })
     }
 
@@ -85,16 +104,17 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
     console.log(`📄 Generating Paycode PDF for ${lightningAddress}`)
 
-    // Create document element
-    const localpart = lightningAddress.split("@")[0]
+    // Create document element (usernames are lowercase; normalize the defaults)
+    const localpart = lightningAddress.split("@")[0].toLowerCase()
+    const safeUsername = (username || localpart).toLowerCase()
     const documentElement = React.createElement(PaycodeDocument, {
       paycode: {
         lightningAddress,
         qrDataUrl,
         amount: amount || undefined,
         displayAmount: displayAmount || undefined,
-        webUrl: webUrl || `https://terminal.blinkbtc.com/${localpart}`,
-        username: username || localpart,
+        webUrl: webUrl || `https://terminal.blinkbtc.com/${safeUsername}`,
+        username: safeUsername,
       },
     })
 
