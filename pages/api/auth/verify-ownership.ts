@@ -17,7 +17,7 @@
  *   kind: 22242,
  *   content: "blinkpos:timestamp:nonce",  // The challenge
  *   tags: [
- *     ["relay", "https://track.twentyone.ist"],
+ *     ["relay", "https://terminal.blinkbtc.com"],
  *     ["challenge", "blinkpos:timestamp:nonce"]
  *   ],
  *   pubkey: "...",

@@ -1,12 +1,12 @@
 import type { GetServerSideProps } from "next"
 import Head from "next/head"
 
-import PublicPOSDashboard from "../components/PublicPOSDashboard"
+import PublicPOSDashboard from "../../components/PublicPOSDashboard"
 
 /**
  * Public POS Page - Pay any Blink user directly
  *
- * URL: track.twentyone.ist/[blinkusername]
+ * URL: terminal.blinkbtc.com/[blinkusername]
  *
  * Features:
  * - No authentication required
@@ -43,10 +43,13 @@ export const getServerSideProps: GetServerSideProps<PublicPOSPageProps> = async 
     return { notFound: true }
   }
 
+  // Normalize to lowercase: Blink usernames are lowercase and resolution is
+  // case-sensitive. A paycode's uppercased web-fallback URL can route here as
+  // e.g. /ALICE — canonicalize so validation and invoicing use the real name.
   // Pass username to client - validation happens there
   return {
     props: {
-      username: blinkusername,
+      username: blinkusername.toLowerCase(),
       // walletCurrency will be determined client-side after validation
     },
   }

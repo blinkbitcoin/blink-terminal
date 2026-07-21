@@ -1,13 +1,15 @@
 /**
  * usePaycodeState Hook
  *
- * Manages state for the Paycode feature which allows users to generate
- * static payment codes (QR codes) that can be printed and reused.
+ * Manages visibility state for the authenticated Paycode menu, which renders
+ * the shared PrintPaycodeView (identical to the `/[username]/print` page).
  *
- * State includes:
- * - Show/hide paycode modal
- * - Amount for the paycode (in sats, or empty for any amount)
- * - PDF generation loading state
+ * The paycode UI is variable-amount only and owns its own PDF-generation state
+ * internally, so this hook tracks visibility only.
+ *
+ * NOTE: amount + PDF-generation state were removed when the Paycodes menu and
+ * the print page were unified. The fixed-amount LNURL API remains available for
+ * possible future reintroduction of fixed amounts.
  *
  * @module lib/hooks/usePaycodeState
  */
@@ -26,22 +28,6 @@ export interface UsePaycodeStateReturn {
   openPaycode: () => void
   closePaycode: () => void
   togglePaycode: () => void
-
-  // Amount state
-  paycodeAmount: string
-  setPaycodeAmount: (amount: string) => void
-  clearPaycodeAmount: () => void
-  hasPaycodeAmount: boolean
-
-  // PDF generation state
-  paycodeGeneratingPdf: boolean
-  setPaycodeGeneratingPdf: (generating: boolean) => void
-  startPdfGeneration: () => void
-  finishPdfGeneration: () => void
-
-  // Combined actions
-  resetPaycode: () => void
-  openPaycodeWithAmount: (amount: string) => void
 }
 
 // ============================================================================
@@ -49,57 +35,20 @@ export interface UsePaycodeStateReturn {
 // ============================================================================
 
 /**
- * Hook for managing paycode (static payment code) state
+ * Hook for managing paycode menu visibility.
  *
- * @returns Paycode state and actions
+ * @returns Paycode visibility state and actions
  *
  * @example
  * ```tsx
- * const {
- *   showPaycode,
- *   openPaycode,
- *   closePaycode,
- *   paycodeAmount,
- *   setPaycodeAmount,
- *   paycodeGeneratingPdf,
- *   startPdfGeneration,
- *   finishPdfGeneration
- * } = usePaycodeState();
+ * const { showPaycode, openPaycode, closePaycode } = usePaycodeState();
  *
- * // Open paycode modal
- * <button onClick={openPaycode}>Generate Paycode</button>
- *
- * // Set amount for paycode
- * <input
- *   value={paycodeAmount}
- *   onChange={(e) => setPaycodeAmount(e.target.value)}
- * />
- *
- * // Generate PDF
- * <button
- *   onClick={async () => {
- *     startPdfGeneration();
- *     await generatePdf();
- *     finishPdfGeneration();
- *   }}
- *   disabled={paycodeGeneratingPdf}
- * >
- *   {paycodeGeneratingPdf ? 'Generating...' : 'Download PDF'}
- * </button>
+ * <button onClick={openPaycode}>Paycodes</button>
+ * {showPaycode && <PaycodesOverlay username={username} onBack={closePaycode} />}
  * ```
  */
 export function usePaycodeState(): UsePaycodeStateReturn {
-  // ---------------------------------------------------------------------------
-  // State
-  // ---------------------------------------------------------------------------
-
   const [showPaycode, setShowPaycodeState] = useState<boolean>(false)
-  const [paycodeAmount, setPaycodeAmountState] = useState<string>("")
-  const [paycodeGeneratingPdf, setPaycodeGeneratingPdfState] = useState<boolean>(false)
-
-  // ---------------------------------------------------------------------------
-  // Callbacks - Visibility
-  // ---------------------------------------------------------------------------
 
   const setShowPaycode = useCallback((show: boolean) => {
     setShowPaycodeState(show)
@@ -117,82 +66,12 @@ export function usePaycodeState(): UsePaycodeStateReturn {
     setShowPaycodeState((prev) => !prev)
   }, [])
 
-  // ---------------------------------------------------------------------------
-  // Callbacks - Amount
-  // ---------------------------------------------------------------------------
-
-  const setPaycodeAmount = useCallback((amount: string) => {
-    setPaycodeAmountState(amount)
-  }, [])
-
-  const clearPaycodeAmount = useCallback(() => {
-    setPaycodeAmountState("")
-  }, [])
-
-  // ---------------------------------------------------------------------------
-  // Callbacks - PDF Generation
-  // ---------------------------------------------------------------------------
-
-  const setPaycodeGeneratingPdf = useCallback((generating: boolean) => {
-    setPaycodeGeneratingPdfState(generating)
-  }, [])
-
-  const startPdfGeneration = useCallback(() => {
-    setPaycodeGeneratingPdfState(true)
-  }, [])
-
-  const finishPdfGeneration = useCallback(() => {
-    setPaycodeGeneratingPdfState(false)
-  }, [])
-
-  // ---------------------------------------------------------------------------
-  // Callbacks - Combined Actions
-  // ---------------------------------------------------------------------------
-
-  const resetPaycode = useCallback(() => {
-    setShowPaycodeState(false)
-    setPaycodeAmountState("")
-    setPaycodeGeneratingPdfState(false)
-  }, [])
-
-  const openPaycodeWithAmount = useCallback((amount: string) => {
-    setPaycodeAmountState(amount)
-    setShowPaycodeState(true)
-  }, [])
-
-  // ---------------------------------------------------------------------------
-  // Derived State
-  // ---------------------------------------------------------------------------
-
-  const hasPaycodeAmount = paycodeAmount !== ""
-
-  // ---------------------------------------------------------------------------
-  // Return
-  // ---------------------------------------------------------------------------
-
   return {
-    // Visibility
     showPaycode,
     setShowPaycode,
     openPaycode,
     closePaycode,
     togglePaycode,
-
-    // Amount
-    paycodeAmount,
-    setPaycodeAmount,
-    clearPaycodeAmount,
-    hasPaycodeAmount,
-
-    // PDF generation
-    paycodeGeneratingPdf,
-    setPaycodeGeneratingPdf,
-    startPdfGeneration,
-    finishPdfGeneration,
-
-    // Combined actions
-    resetPaycode,
-    openPaycodeWithAmount,
   }
 }
 

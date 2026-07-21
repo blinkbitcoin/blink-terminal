@@ -36,13 +36,15 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 
   try {
-    const { lightningAddress, qrDataUrl, amount, displayAmount, webUrl } = req.body as {
-      lightningAddress: string
-      qrDataUrl: string
-      amount?: number
-      displayAmount?: string
-      webUrl?: string
-    }
+    const { lightningAddress, qrDataUrl, amount, displayAmount, webUrl, username } =
+      req.body as {
+        lightningAddress: string
+        qrDataUrl: string
+        amount?: number
+        displayAmount?: string
+        webUrl?: string
+        username?: string
+      }
 
     console.log("📄 Paycode PDF API called with:", {
       lightningAddress,
@@ -52,11 +54,30 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       qrDataUrlLength: qrDataUrl?.length,
     })
 
-    // Validate input
-    if (!lightningAddress || typeof lightningAddress !== "string") {
+    // Validate input. lightningAddress must be a real `localpart@domain` (it is
+    // used to render text and to derive the default webUrl/username), so reject
+    // anything that isn't — avoids log injection, malformed PDFs, and
+    // inconsistent defaults.
+    if (
+      !lightningAddress ||
+      typeof lightningAddress !== "string" ||
+      !/^[a-zA-Z0-9_.-]{1,50}@[a-zA-Z0-9.-]{1,253}$/.test(lightningAddress)
+    ) {
       return res.status(400).json({
         error: "Missing or invalid lightningAddress",
         hint: "Provide a valid Lightning address (e.g., username@blink.sv)",
+      })
+    }
+
+    // username is optional; when present it must match the Blink username
+    // charset. Fall back to the lightningAddress localpart otherwise.
+    if (
+      username !== undefined &&
+      (typeof username !== "string" || !/^[a-zA-Z0-9_]{1,50}$/.test(username))
+    ) {
+      return res.status(400).json({
+        error: "Invalid username",
+        hint: "username must be 1-50 chars of [a-zA-Z0-9_]",
       })
     }
 
@@ -67,19 +88,33 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       })
     }
 
+    // SSRF guard: this is a public endpoint and the value is handed to the PDF
+    // renderer's <Image src=...>, which will FETCH remote/file URLs. Only accept
+    // inline base64 image data URLs so an attacker cannot coerce server-side
+    // requests to arbitrary hosts.
+    if (!/^data:image\/(png|jpe?g|webp);base64,[A-Za-z0-9+/]+={0,2}$/.test(qrDataUrl)) {
+      return res.status(400).json({
+        error: "Invalid qrDataUrl",
+        hint: "qrDataUrl must be an inline data:image/(png|jpeg|webp);base64,... URL",
+      })
+    }
+
     // Dynamically import PDF module
     const { PaycodeDocument } = await getPdfModule()
 
     console.log(`📄 Generating Paycode PDF for ${lightningAddress}`)
 
-    // Create document element
+    // Create document element (usernames are lowercase; normalize the defaults)
+    const localpart = lightningAddress.split("@")[0].toLowerCase()
+    const safeUsername = (username || localpart).toLowerCase()
     const documentElement = React.createElement(PaycodeDocument, {
       paycode: {
         lightningAddress,
         qrDataUrl,
         amount: amount || undefined,
         displayAmount: displayAmount || undefined,
-        webUrl: webUrl || `https://pay.blink.sv/${lightningAddress.split("@")[0]}`,
+        webUrl: webUrl || `https://terminal.blinkbtc.com/${safeUsername}`,
+        username: safeUsername,
       },
     })
 

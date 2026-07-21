@@ -2,7 +2,7 @@
  * LNURL-pay Metadata Endpoint
  *
  * Provides LNURL-pay metadata for any Blink username.
- * Enables Lightning Address support: username@track.twentyone.ist
+ * Enables Lightning Address support: username@terminal.blinkbtc.com
  *
  * GET /api/lnurlp/[username]
  * Returns LNURL-pay metadata according to LUD-06

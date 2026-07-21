@@ -8,7 +8,9 @@ import { useState, useEffect, type Dispatch, type SetStateAction } from "react"
  * - Currency settings overlay + search filter with debounce
  * - Regional settings overlay
  * - Sound settings overlay
- * - Paycode overlay + amount + PDF generation state
+ * - Paycode overlay (visibility only; the paycode UI is the shared
+ *   PrintPaycodeView, which owns its own PDF-generation state and is
+ *   variable-amount only)
  */
 
 interface UsePublicPOSMenuStateReturn {
@@ -25,10 +27,6 @@ interface UsePublicPOSMenuStateReturn {
   setShowSoundSettings: Dispatch<SetStateAction<boolean>>
   showPaycode: boolean
   setShowPaycode: Dispatch<SetStateAction<boolean>>
-  paycodeAmount: string
-  setPaycodeAmount: Dispatch<SetStateAction<string>>
-  paycodeGeneratingPdf: boolean
-  setPaycodeGeneratingPdf: Dispatch<SetStateAction<boolean>>
 }
 
 export function usePublicPOSMenuState(): UsePublicPOSMenuStateReturn {
@@ -39,8 +37,6 @@ export function usePublicPOSMenuState(): UsePublicPOSMenuStateReturn {
   const [showRegionalSettings, setShowRegionalSettings] = useState(false)
   const [showSoundSettings, setShowSoundSettings] = useState(false)
   const [showPaycode, setShowPaycode] = useState(false)
-  const [paycodeAmount, setPaycodeAmount] = useState("")
-  const [paycodeGeneratingPdf, setPaycodeGeneratingPdf] = useState(false)
 
   // Debounce currency filter (150ms delay)
   useEffect(() => {
@@ -72,9 +68,5 @@ export function usePublicPOSMenuState(): UsePublicPOSMenuStateReturn {
     setShowSoundSettings,
     showPaycode,
     setShowPaycode,
-    paycodeAmount,
-    setPaycodeAmount,
-    paycodeGeneratingPdf,
-    setPaycodeGeneratingPdf,
   }
 }

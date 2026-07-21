@@ -4,6 +4,10 @@
  * GET /api/paycode/lnurlp/callback/[username]?amount=X (in millisatoshis)
  *
  * Following LUD-06 spec: https://github.com/lnurl/luds/blob/luds/06.md
+ *
+ * RESERVED FOR FUTURE USE: paired with /api/paycode/lnurlp/[username]. Retained
+ * for possible reintroduction of fixed-amount paycodes after the Paycodes menu
+ * and print page were unified into the variable-amount-only PrintPaycodeView.
  */
 
 import type { NextApiRequest, NextApiResponse } from "next"

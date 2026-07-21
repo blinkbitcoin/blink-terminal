@@ -5,6 +5,15 @@
  * GET /api/paycode/lnurlp/[username]?amount=1000 (optional, in sats)
  *
  * Following LUD-06 spec: https://github.com/lnurl/luds/blob/luds/06.md
+ *
+ * RESERVED FOR FUTURE USE: fixed-amount paycodes were removed from the UI when
+ * the Paycodes menu and the `/[username]/print` page were unified into the
+ * shared, variable-amount-only PrintPaycodeView. This route (and its callback
+ * sibling) is intentionally retained so fixed amounts can be reintroduced
+ * without re-implementing the server side.
+ * NOTE: the upstream fetch below currently targets pay.blink.sv, which resolves
+ * custodial accounts only — reintroducing fixed amounts for self-custodial
+ * (Spark) users would require pointing this at the LN-address domain (blink.sv).
  */
 
 import type { NextApiRequest, NextApiResponse } from "next"

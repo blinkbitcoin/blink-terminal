@@ -420,14 +420,7 @@ export default function Dashboard() {
   } = useCommissionSettings()
 
   // Paycode state - extracted to usePaycodeState hook
-  const {
-    showPaycode,
-    setShowPaycode,
-    paycodeAmount,
-    setPaycodeAmount,
-    paycodeGeneratingPdf,
-    setPaycodeGeneratingPdf,
-  } = usePaycodeState()
+  const { showPaycode, setShowPaycode } = usePaycodeState()
 
   // NOTE: activeTipProfile is now managed by useTipSettings hook above
 
@@ -941,15 +934,8 @@ export default function Dashboard() {
       {/* Paycodes Overlay */}
       {showPaycode && activeBlinkAccount?.username && (
         <PaycodesOverlay
-          activeBlinkAccount={activeBlinkAccount}
-          paycodeAmount={paycodeAmount}
-          paycodeGeneratingPdf={paycodeGeneratingPdf}
-          darkMode={darkMode}
-          setShowPaycode={setShowPaycode}
-          setPaycodeAmount={setPaycodeAmount}
-          setPaycodeGeneratingPdf={setPaycodeGeneratingPdf}
-          getSubmenuBgClasses={getSubmenuBgClasses}
-          getSubmenuHeaderClasses={getSubmenuHeaderClasses}
+          username={activeBlinkAccount.username}
+          onBack={() => setShowPaycode(false)}
         />
       )}
 

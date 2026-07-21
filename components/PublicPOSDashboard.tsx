@@ -230,10 +230,6 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
     setShowSoundSettings,
     showPaycode,
     setShowPaycode,
-    paycodeAmount,
-    setPaycodeAmount,
-    paycodeGeneratingPdf,
-    setPaycodeGeneratingPdf,
   } = usePublicPOSMenuState()
 
   // Touch + keyboard navigation
@@ -427,13 +423,6 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
         <PublicPOSPaycodeOverlay
           onClose={() => setShowPaycode(false)}
           username={username}
-          darkMode={darkMode}
-          paycodeAmount={paycodeAmount}
-          setPaycodeAmount={setPaycodeAmount}
-          paycodeGeneratingPdf={paycodeGeneratingPdf}
-          setPaycodeGeneratingPdf={setPaycodeGeneratingPdf}
-          getSubmenuBgClasses={getSubmenuBgClasses}
-          getSubmenuHeaderClasses={getSubmenuHeaderClasses}
         />
       )}
 

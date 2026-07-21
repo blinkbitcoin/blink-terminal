@@ -441,7 +441,6 @@ describe("useDashboardState", () => {
       const { result } = renderHook(() => useDashboardState())
 
       expect("showPaycode" in result.current.paycode).toBe(true)
-      expect("paycodeAmount" in result.current.paycode).toBe(true)
     })
 
     it("should expose paycode actions", () => {
