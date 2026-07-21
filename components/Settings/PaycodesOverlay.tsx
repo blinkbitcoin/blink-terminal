@@ -13,5 +13,13 @@ interface PaycodesOverlayProps {
 }
 
 export default function PaycodesOverlay({ username, onBack }: PaycodesOverlayProps) {
-  return <PrintPaycodeView username={username} onBack={onBack} title="Paycodes" />
+  // Username already resolved by the authenticated dashboard — skip re-validation.
+  return (
+    <PrintPaycodeView
+      username={username}
+      onBack={onBack}
+      title="Paycodes"
+      skipValidation
+    />
+  )
 }

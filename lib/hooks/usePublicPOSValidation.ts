@@ -11,6 +11,13 @@ interface ValidationError {
 
 interface UsePublicPOSValidationParams {
   username: string
+  /**
+   * When false, skips the network validation entirely (no request, no spinner,
+   * no error). Use in contexts where the username is already known valid — e.g.
+   * the authenticated Settings → Paycodes overlay or the Public POS side-menu,
+   * where the parent page already resolved the username. Defaults to true.
+   */
+  enabled?: boolean
 }
 
 interface UsePublicPOSValidationReturn {
@@ -31,12 +38,21 @@ interface UsePublicPOSValidationReturn {
  */
 export function usePublicPOSValidation({
   username,
+  enabled = true,
 }: UsePublicPOSValidationParams): UsePublicPOSValidationReturn {
   const [validationError, setValidationError] = useState<ValidationError | null>(null)
-  const [validating, setValidating] = useState(true) // Start true - validate on mount
+  // Start "validating" only when enabled; skipped contexts render immediately.
+  const [validating, setValidating] = useState(enabled)
   const [validatedWalletCurrency, setValidatedWalletCurrency] = useState("BTC")
 
   useEffect(() => {
+    if (!enabled) {
+      // Known-valid username (overlay context): no request, no spinner.
+      setValidating(false)
+      setValidationError(null)
+      return
+    }
+
     const validateUser = async () => {
       setValidating(true)
       setValidationError(null)
@@ -93,7 +109,7 @@ export function usePublicPOSValidation({
     }
 
     validateUser()
-  }, [username])
+  }, [username, enabled])
 
   return { validationError, validating, validatedWalletCurrency }
 }

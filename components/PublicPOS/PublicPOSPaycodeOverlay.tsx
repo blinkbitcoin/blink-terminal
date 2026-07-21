@@ -16,5 +16,13 @@ export default function PublicPOSPaycodeOverlay({
   onClose,
   username,
 }: PublicPOSPaycodeOverlayProps) {
-  return <PrintPaycodeView username={username} onBack={onClose} title="Paycodes" />
+  // Username already validated by the public POS dashboard — skip re-validation.
+  return (
+    <PrintPaycodeView
+      username={username}
+      onBack={onClose}
+      title="Paycodes"
+      skipValidation
+    />
+  )
 }

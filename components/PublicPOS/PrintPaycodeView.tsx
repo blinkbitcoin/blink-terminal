@@ -50,38 +50,46 @@ interface PrintPaycodeViewProps {
   username: string
   /**
    * When provided, the header shows a "‹ Back" button that calls this instead
-   * of the standalone history-aware navigation. Use in overlay contexts to
-   * close the overlay.
+   * of the standalone navigation. Use in overlay contexts to close the overlay.
    */
   onBack?: () => void
   /** Header title. Defaults to "Printable Paycode". */
   title?: string
+  /**
+   * Skip the client-side username validation network call. Set true in overlay
+   * contexts where the username is already known valid (parent already
+   * resolved it). Defaults to false (standalone route validates).
+   */
+  skipValidation?: boolean
 }
 
 export default function PrintPaycodeView({
   username,
   onBack,
   title = "Printable Paycode",
+  skipValidation = false,
 }: PrintPaycodeViewProps) {
   const router = useRouter()
   const { theme } = useTheme()
-  const { validationError, validating } = usePublicPOSValidation({ username })
+  const { validationError, validating } = usePublicPOSValidation({
+    username,
+    enabled: !skipValidation,
+  })
 
   const [generatingPdf, setGeneratingPdf] = useState(false)
   const [copied, setCopied] = useState(false)
+  const [pdfError, setPdfError] = useState<string | null>(null)
 
-  // Back navigation: overlay contexts pass `onBack`; the standalone route uses
-  // browser history when available, else falls back to the public POS page.
+  // Back navigation: overlay contexts close via `onBack`. The standalone route
+  // navigates to the payee's public POS page — a predictable destination that
+  // avoids the unreliable window.history.length heuristic (deep-links from
+  // wallet in-app browsers would otherwise jump outside the app).
   const handleBack = () => {
     if (onBack) {
       onBack()
       return
     }
-    if (typeof window !== "undefined" && window.history.length > 1) {
-      router.back()
-    } else {
-      router.push(`/${username}`)
-    }
+    router.push(`/${username}`)
   }
 
   // Build the static paycode. The LNURL targets the Blink Lightning-address
@@ -116,6 +124,7 @@ export default function PrintPaycodeView({
 
   const generatePdf = async (): Promise<void> => {
     setGeneratingPdf(true)
+    setPdfError(null)
     try {
       // Render the QR (wrapped value, level H) to a canvas, then composite the
       // Bitcoin logo into the center so the PDF matches the on-screen/print QR.
@@ -176,7 +185,7 @@ export default function PrintPaycodeView({
       document.body.removeChild(link)
     } catch (error: unknown) {
       console.error("Error generating PDF:", error)
-      alert("Failed to generate PDF. Please try again.")
+      setPdfError("Failed to generate PDF. Please try again.")
     } finally {
       setGeneratingPdf(false)
     }
@@ -328,6 +337,13 @@ export default function PrintPaycodeView({
               >
                 {copied ? "Copied!" : "Copy Paycode LNURL"}
               </button>
+
+              {/* Inline PDF error (replaces alert) */}
+              {pdfError && (
+                <p role="alert" className="text-sm text-red-600 dark:text-red-400">
+                  {pdfError}
+                </p>
+              )}
             </div>
           </div>
         )}
