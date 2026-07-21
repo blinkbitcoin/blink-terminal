@@ -236,7 +236,7 @@ class NostrConnectService {
     const baseUrl: string =
       typeof window !== "undefined"
         ? window.location.origin
-        : "https://track.twentyone.ist"
+        : "https://terminal.blinkbtc.com"
 
     const uri: string = createNostrConnectURI({
       clientPubkey: clientPubkey,

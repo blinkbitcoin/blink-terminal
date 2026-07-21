@@ -6,7 +6,7 @@ import type { NextApiRequest, NextApiResponse } from "next"
  * Creates Lightning invoices directly to any Blink user's wallet.
  * No authentication required - invoices go directly to the recipient.
  *
- * Used by the Public POS at track.twentyone.ist/[blinkusername]
+ * Used by the Public POS at terminal.blinkbtc.com/[blinkusername]
  *
  * Supports environment switching (production/staging) via environment parameter.
  * Staging uses signet (not real sats) for testing.

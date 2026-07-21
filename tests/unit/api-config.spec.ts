@@ -74,6 +74,40 @@ describe("API Configuration", () => {
     })
   })
 
+  describe("getAppUrl()", () => {
+    let savedBaseUrl: string | undefined
+    beforeEach(() => {
+      // getAppUrl() prefers NEXT_PUBLIC_BASE_URL; unset it so tests exercise
+      // the environment's configured appUrl deterministically.
+      savedBaseUrl = process.env.NEXT_PUBLIC_BASE_URL
+      delete process.env.NEXT_PUBLIC_BASE_URL
+    })
+    afterEach(() => {
+      if (savedBaseUrl === undefined) {
+        delete process.env.NEXT_PUBLIC_BASE_URL
+      } else {
+        process.env.NEXT_PUBLIC_BASE_URL = savedBaseUrl
+      }
+    })
+
+    it("should return the Terminal app origin in production by default", async () => {
+      const { getAppUrl } = await import("../../lib/config/api")
+      expect(getAppUrl()).toBe("https://terminal.blinkbtc.com")
+    })
+
+    it("should preserve the staging app origin when in staging", async () => {
+      localStorage.setItem("blink_environment", "staging")
+      const { getAppUrl } = await import("../../lib/config/api")
+      expect(getAppUrl()).toBe("https://pay.staging.blink.sv")
+    })
+
+    it("is distinct from getPayUrl() so the pay backend is unchanged", async () => {
+      const { getAppUrl, getPayUrl } = await import("../../lib/config/api")
+      expect(getPayUrl()).toBe("https://pay.blink.sv")
+      expect(getAppUrl()).toBe("https://terminal.blinkbtc.com")
+    })
+  })
+
   describe("isStaging()", () => {
     it("should return false by default", async () => {
       const { isStaging } = await import("../../lib/config/api")

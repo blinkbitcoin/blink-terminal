@@ -25,6 +25,13 @@ export interface EnvironmentConfig {
   apiUrl: string
   dashboardUrl: string
   payUrl: string
+  /**
+   * The Terminal app's own public origin (where this deployment is served).
+   * Used to build human-facing web fallback URLs (e.g. the printable-paycode
+   * page's `webUrl`). Distinct from `payUrl`, which is the Blink LNURL/pay
+   * backend that actually resolves and mints invoices.
+   */
+  appUrl: string
   wsUrl: string
   lnAddressDomain: string
   validDomains: string[]
@@ -49,9 +56,10 @@ const ENVIRONMENTS: Record<EnvironmentName, EnvironmentConfig> = {
     apiUrl: "https://api.blink.sv/graphql",
     dashboardUrl: "https://dashboard.blink.sv",
     payUrl: "https://pay.blink.sv",
+    appUrl: "https://terminal.blinkbtc.com",
     wsUrl: "wss://ws.blink.sv/graphql",
     lnAddressDomain: "blink.sv",
-    validDomains: ["blink.sv", "pay.blink.sv", "galoy.io"],
+    validDomains: ["blink.sv", "pay.blink.sv", "terminal.blinkbtc.com", "galoy.io"],
     description: "Live environment with real sats",
   },
   staging: {
@@ -59,6 +67,9 @@ const ENVIRONMENTS: Record<EnvironmentName, EnvironmentConfig> = {
     apiUrl: "https://api.staging.blink.sv/graphql",
     dashboardUrl: "https://dashboard.staging.blink.sv",
     payUrl: "https://pay.staging.blink.sv",
+    // Staging app origin intentionally preserves the current pay host until a
+    // dedicated staging Terminal domain exists.
+    appUrl: "https://pay.staging.blink.sv",
     wsUrl: "wss://ws.staging.blink.sv/graphql",
     lnAddressDomain: "pay.staging.blink.sv",
     validDomains: ["staging.blink.sv", "pay.staging.blink.sv"],
@@ -179,6 +190,23 @@ export function getDashboardUrl(): string {
  */
 export function getPayUrl(): string {
   return getEnvironmentConfig().payUrl
+}
+
+/**
+ * Get the Terminal app's own public origin for the current environment.
+ *
+ * Used for human-facing web fallback URLs (e.g. the printable-paycode page's
+ * `webUrl`) and app self-references. This is NOT the Blink pay/LNURL backend —
+ * use `getPayUrl()` for anything that must resolve LNURL-pay or mint invoices.
+ *
+ * Prefers `NEXT_PUBLIC_BASE_URL` when set (allows self-hosters/staging to
+ * override), else falls back to the environment's configured `appUrl`.
+ * @returns App origin URL (no trailing slash)
+ */
+export function getAppUrl(): string {
+  const override = process.env.NEXT_PUBLIC_BASE_URL
+  const base = override && override.length > 0 ? override : getEnvironmentConfig().appUrl
+  return base.replace(/\/+$/, "")
 }
 
 /**
