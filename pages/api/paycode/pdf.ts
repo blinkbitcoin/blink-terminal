@@ -69,6 +69,17 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       })
     }
 
+    // SSRF guard: this is a public endpoint and the value is handed to the PDF
+    // renderer's <Image src=...>, which will FETCH remote/file URLs. Only accept
+    // inline base64 image data URLs so an attacker cannot coerce server-side
+    // requests to arbitrary hosts.
+    if (!/^data:image\/(png|jpe?g|webp);base64,[A-Za-z0-9+/]+={0,2}$/.test(qrDataUrl)) {
+      return res.status(400).json({
+        error: "Invalid qrDataUrl",
+        hint: "qrDataUrl must be an inline data:image/(png|jpeg|webp);base64,... URL",
+      })
+    }
+
     // Dynamically import PDF module
     const { PaycodeDocument } = await getPdfModule()
 
