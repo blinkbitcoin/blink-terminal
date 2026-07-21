@@ -81,8 +81,8 @@ describe("paycode-lnurl", () => {
       expect(result.lightningAddress).toBe("alice@blink.sv")
     })
 
-    it("normalizes a mis-cased username to lowercase for the LNURL and web URL", () => {
-      // A paycode's uppercased QR fallback can route back with a mis-cased name;
+    it("normalizes a mixed-case username to lowercase for the LNURL and web URL", () => {
+      // A paycode's uppercased QR fallback can route back with a mixed-case name;
       // resolution is case-sensitive, so the endpoint/webUrl must be lowercase.
       const result = buildStaticPaycode("ALICE", domain, appUrl)
       expect(result.lnurlPayEndpoint).toBe("https://blink.sv/.well-known/lnurlp/alice")

@@ -71,8 +71,8 @@ export function buildStaticPaycode(
   webUrlBase: string = `https://${lnAddressDomain}`,
 ): StaticPaycode {
   // Blink usernames are lowercase and resolution is case-sensitive; normalize
-  // defensively so a mis-cased input can never produce a non-resolving LNURL or
-  // fallback path. (Callers should already pass a normalized name.)
+  // defensively so a mixed-case input can never produce a non-resolving LNURL
+  // or fallback path. (Callers should already pass a normalized name.)
   const normalizedUsername = username.toLowerCase()
   const normalizedWebBase = webUrlBase.replace(/\/+$/, "")
   const lnurlPayEndpoint = `https://${lnAddressDomain}/.well-known/lnurlp/${normalizedUsername}`
