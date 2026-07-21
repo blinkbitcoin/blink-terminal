@@ -36,13 +36,15 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 
   try {
-    const { lightningAddress, qrDataUrl, amount, displayAmount, webUrl } = req.body as {
-      lightningAddress: string
-      qrDataUrl: string
-      amount?: number
-      displayAmount?: string
-      webUrl?: string
-    }
+    const { lightningAddress, qrDataUrl, amount, displayAmount, webUrl, username } =
+      req.body as {
+        lightningAddress: string
+        qrDataUrl: string
+        amount?: number
+        displayAmount?: string
+        webUrl?: string
+        username?: string
+      }
 
     console.log("📄 Paycode PDF API called with:", {
       lightningAddress,
@@ -73,13 +75,15 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     console.log(`📄 Generating Paycode PDF for ${lightningAddress}`)
 
     // Create document element
+    const localpart = lightningAddress.split("@")[0]
     const documentElement = React.createElement(PaycodeDocument, {
       paycode: {
         lightningAddress,
         qrDataUrl,
         amount: amount || undefined,
         displayAmount: displayAmount || undefined,
-        webUrl: webUrl || `https://pay.blink.sv/${lightningAddress.split("@")[0]}`,
+        webUrl: webUrl || `https://terminal.blinkbtc.com/${localpart}`,
+        username: username || localpart,
       },
     })
 

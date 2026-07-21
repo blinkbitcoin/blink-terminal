@@ -1,12 +1,12 @@
 import type { GetServerSideProps } from "next"
 import Head from "next/head"
 
-import PublicPOSDashboard from "../components/PublicPOSDashboard"
+import PublicPOSDashboard from "../../components/PublicPOSDashboard"
 
 /**
  * Public POS Page - Pay any Blink user directly
  *
- * URL: track.twentyone.ist/[blinkusername]
+ * URL: terminal.blinkbtc.com/[blinkusername]
  *
  * Features:
  * - No authentication required
