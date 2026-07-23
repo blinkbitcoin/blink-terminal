@@ -81,6 +81,14 @@ export function usePaymentPolling({
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null)
   const pollingStartTimeRef = useRef<number | null>(null)
 
+  // Keep latest invoice/callbacks in refs so the poll always reads fresh
+  // values without restarting the interval (the effect below deliberately
+  // keys only on paymentHash/verifyUrl).
+  const invoiceRef = useRef(currentInvoice)
+  invoiceRef.current = currentInvoice
+  const pollDepsRef = useRef({ triggerPaymentAnimation, fetchData, merchant })
+  pollDepsRef.current = { triggerPaymentAnimation, fetchData, merchant }
+
   // Poll for payment status when we have a pending invoice
   useEffect(() => {
     // Clear any existing polling
@@ -98,7 +106,18 @@ export function usePaymentPolling({
       )
       pollingStartTimeRef.current = Date.now()
 
+      // Per-invoice guards (scoped to this effect run):
+      // - inFlight prevents overlapping requests on slow networks
+      // - settled prevents a second overlapping response from double-firing
+      //   the success path (animation, POS clear, fetchData)
+      let inFlight = false
+      let settled = false
+
       const pollPaymentStatus = async (): Promise<void> => {
+        if (inFlight || settled) {
+          return
+        }
+
         // Check if we've exceeded the timeout
         if (Date.now() - (pollingStartTimeRef.current ?? 0) > POLLING_TIMEOUT_MS) {
           console.log("⏱️ Payment polling timeout reached (15 min) - stopping")
@@ -109,6 +128,13 @@ export function usePaymentPolling({
           return
         }
 
+        // Skip network work while the tab is hidden; payment is re-checked
+        // on focus/visibility by the POS and on the next visible tick here.
+        if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+          return
+        }
+
+        inFlight = true
         try {
           let completed = false
           let expired = false
@@ -131,6 +157,7 @@ export function usePaymentPolling({
 
           if (completed) {
             console.log("✅ Payment completed detected via polling!")
+            settled = true
 
             // Stop polling
             if (pollingIntervalRef.current) {
@@ -138,27 +165,33 @@ export function usePaymentPolling({
               pollingIntervalRef.current = null
             }
 
+            // Read the latest invoice/callbacks from refs (not the effect
+            // closure) so the success screen + receipt show current fiat,
+            // tip, merchant etc. even if they changed since polling started.
+            const invoice = invoiceRef.current ?? currentInvoice
+            const {
+              triggerPaymentAnimation: triggerAnimation,
+              fetchData: refreshData,
+              merchant: currentMerchant,
+            } = pollDepsRef.current
+
             // Trigger payment animation with the richer invoice context so the
             // success screen + receipt can show fiat, payment hash, tip, etc.
-            triggerPaymentAnimation({
-              amount: currentInvoice.satoshis || currentInvoice.amount || 0,
+            triggerAnimation({
+              amount: invoice.satoshis || invoice.amount || 0,
               currency: "BTC",
-              memo: currentInvoice.memo || `Payment received`,
+              memo: invoice.memo || `Payment received`,
               isForwarded: true,
-              satAmount:
-                currentInvoice.satAmount ||
-                currentInvoice.satoshis ||
-                currentInvoice.amount ||
-                0,
-              displayAmount: currentInvoice.displayAmount,
-              displayCurrency: currentInvoice.displayCurrency,
-              paymentHash: currentInvoice.paymentHash,
-              paymentRequest: currentInvoice.paymentRequest,
+              satAmount: invoice.satAmount || invoice.satoshis || invoice.amount || 0,
+              displayAmount: invoice.displayAmount,
+              displayCurrency: invoice.displayCurrency,
+              paymentHash: invoice.paymentHash,
+              paymentRequest: invoice.paymentRequest,
               timestamp: Date.now(),
-              merchant,
-              tipAmount: currentInvoice.tipAmount,
-              tipCurrency: currentInvoice.tipCurrency,
-              tipPercent: currentInvoice.tipPercent,
+              merchant: currentMerchant,
+              tipAmount: invoice.tipAmount,
+              tipCurrency: invoice.tipCurrency,
+              tipPercent: invoice.tipPercent,
             })
 
             // Clear POS invoice
@@ -167,7 +200,7 @@ export function usePaymentPolling({
             }
 
             // Refresh transaction data
-            fetchData()
+            refreshData()
           } else if (expired) {
             console.log("⏰ Payment expired")
             if (pollingIntervalRef.current) {
@@ -179,6 +212,8 @@ export function usePaymentPolling({
         } catch (error: unknown) {
           console.error("Payment status poll error:", error)
           // Continue polling despite errors
+        } finally {
+          inFlight = false
         }
       }
 

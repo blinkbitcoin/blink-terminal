@@ -1022,7 +1022,13 @@ async function getHybridStore(): Promise<HybridStore> {
       instance = store
       registerShutdownHandlers()
       return store
-    })()
+    })().catch((error) => {
+      // Reset on failure so the next caller retries instead of awaiting
+      // a permanently cached rejection (e.g. transient PG unavailability
+      // at startup would otherwise poison the process until restart).
+      initPromise = null
+      throw error
+    })
   }
   return initPromise
 }

@@ -1,8 +1,13 @@
 /**
  * selectContent - chooses the orange-pill footer for a receipt.
  *
- * Pure, deterministic-by-seed selection logic. No I/O. Given a mode and the
- * receipt date, returns a {@link FooterContent} payload (or null when off).
+ * Deterministic-by-seed selection logic. Given a mode and the receipt date,
+ * returns a {@link FooterContent} payload (or null when off).
+ *
+ * The quotes/calendar dataset (~290 KB of JSON) is loaded lazily via dynamic
+ * import the first time a footer is actually needed (i.e. at print time), so
+ * it is code-split out of the main client bundle instead of being paid on
+ * every first load — including by users who never enable the feature.
  *
  * Selection rules:
  * - "ondate": prefer a curated QR link for the receipt's date; if the day has
@@ -17,8 +22,6 @@
  * @module lib/orangepill/selectContent
  */
 
-import calendarData from "./data/calendar.json"
-import quotesData from "./data/quotes.json"
 import {
   DEFAULT_STATIC_URL,
   type CalendarData,
@@ -29,8 +32,47 @@ import {
   type SelectFooterOptions,
 } from "./types"
 
-const QUOTES = quotesData as Quote[]
-const CALENDAR = calendarData as CalendarData
+// ─── Lazy dataset loading ─────────────────────────────────────────
+
+interface OrangePillDataset {
+  quotes: Quote[]
+  calendar: CalendarData
+  /** Flattened curated links (with their day's events) for shuffle mode. */
+  allLinks: Array<{ link: CalendarLink; events: string[] }>
+}
+
+let datasetPromise: Promise<OrangePillDataset> | null = null
+
+/** Load (and cache) the quotes/calendar dataset via dynamic import. */
+function loadDataset(): Promise<OrangePillDataset> {
+  if (!datasetPromise) {
+    datasetPromise = Promise.all([
+      import("./data/quotes.json"),
+      import("./data/calendar.json"),
+    ])
+      .then(([quotesModule, calendarModule]) => {
+        const quotes = quotesModule.default as Quote[]
+        const calendar = calendarModule.default as CalendarData
+        const allLinks: Array<{ link: CalendarLink; events: string[] }> = []
+        for (const key of Object.keys(calendar)) {
+          const day = calendar[key]
+          for (const link of day.links) {
+            allLinks.push({ link, events: day.events })
+          }
+        }
+        return { quotes, calendar, allLinks }
+      })
+      .catch((error) => {
+        // Reset so a transient load failure (e.g. offline chunk fetch) can
+        // be retried on the next print instead of being cached forever.
+        datasetPromise = null
+        throw error
+      })
+  }
+  return datasetPromise
+}
+
+// ─── Selection helpers (pure) ─────────────────────────────────────
 
 /**
  * Small, stable string hash (FNV-1a) used to derive a deterministic index from
@@ -70,9 +112,9 @@ function splitEvent(event: string): { year: string | null; text: string } {
 }
 
 /** Build a quote footer from a seeded/random pick. */
-function quoteFooter(seed?: string): FooterContent | null {
-  if (QUOTES.length === 0) return null
-  const q = QUOTES[pickIndex(QUOTES.length, seed)]
+function quoteFooter(quotes: Quote[], seed?: string): FooterContent | null {
+  if (quotes.length === 0) return null
+  const q = quotes[pickIndex(quotes.length, seed)]
   const lines = [`"${q.text}"`]
   return {
     kind: "quote",
@@ -138,8 +180,12 @@ function linkFooter(link: CalendarLink, events: string[] = []): FooterContent {
 /**
  * Build the "on this day" footer for a date, with graceful fallbacks.
  */
-function onDateFooter(date: Date, seed?: string): FooterContent | null {
-  const day = CALENDAR[dateKey(date)]
+function onDateFooter(
+  data: OrangePillDataset,
+  date: Date,
+  seed?: string,
+): FooterContent | null {
+  const day = data.calendar[dateKey(date)]
 
   // 1. Prefer a curated link (QR).
   if (day && day.links.length > 0) {
@@ -159,29 +205,8 @@ function onDateFooter(date: Date, seed?: string): FooterContent | null {
   }
 
   // 3. Fall back to a quote.
-  return quoteFooter(seed)
+  return quoteFooter(data.quotes, seed)
 }
-
-/**
- * Flattened list of all curated links across the calendar (with their day's
- * events, for coherent body text). Built once at module load.
- */
-const ALL_LINKS: Array<{ link: CalendarLink; events: string[] }> = (() => {
-  const out: Array<{ link: CalendarLink; events: string[] }> = []
-  for (const key of Object.keys(CALENDAR)) {
-    const day = CALENDAR[key]
-    for (const link of day.links) {
-      out.push({ link, events: day.events })
-    }
-  }
-  return out
-})()
-
-/**
- * Size of the combined shuffle pool (curated links + quotes). The first
- * ALL_LINKS.length indices map to links; the rest map to quotes.
- */
-const SHUFFLE_POOL_SIZE = ALL_LINKS.length + QUOTES.length
 
 /**
  * Build a random education footer from the whole pool (curated links + quotes),
@@ -189,15 +214,16 @@ const SHUFFLE_POOL_SIZE = ALL_LINKS.length + QUOTES.length
  *
  * When `seed` is omitted the pick is fully random (a fresh bit per print).
  */
-function shuffleFooter(seed?: string): FooterContent | null {
-  if (SHUFFLE_POOL_SIZE === 0) return null
-  const idx = pickIndex(SHUFFLE_POOL_SIZE, seed)
-  if (idx < ALL_LINKS.length) {
-    const entry = ALL_LINKS[idx]
+function shuffleFooter(data: OrangePillDataset, seed?: string): FooterContent | null {
+  const poolSize = data.allLinks.length + data.quotes.length
+  if (poolSize === 0) return null
+  const idx = pickIndex(poolSize, seed)
+  if (idx < data.allLinks.length) {
+    const entry = data.allLinks[idx]
     return linkFooter(entry.link, entry.events)
   }
   // Map the remainder onto the quotes pool.
-  const q = QUOTES[idx - ALL_LINKS.length]
+  const q = data.quotes[idx - data.allLinks.length]
   return {
     kind: "quote",
     lines: [`"${q.text}"`],
@@ -208,16 +234,19 @@ function shuffleFooter(seed?: string): FooterContent | null {
 /**
  * Select the footer content for a receipt.
  *
+ * Async because the dataset is dynamically imported on first use (and cached
+ * afterwards); "off" and "static" resolve without touching the dataset.
+ *
  * @param mode - the configured orange-pill mode
  * @param date - the receipt's date
  * @param options - seed (for determinism) and static URL
  * @returns the footer payload, or null when the footer should be omitted
  */
-export function selectFooter(
+export async function selectFooter(
   mode: OrangePillMode,
   date: Date = new Date(),
   options: SelectFooterOptions = {},
-): FooterContent | null {
+): Promise<FooterContent | null> {
   const { seed, staticUrl } = options
 
   switch (mode) {
@@ -225,10 +254,10 @@ export function selectFooter(
       return null
 
     case "quote":
-      return quoteFooter(seed)
+      return quoteFooter((await loadDataset()).quotes, seed)
 
     case "shuffle":
-      return shuffleFooter(seed)
+      return shuffleFooter(await loadDataset(), seed)
 
     case "static": {
       const url = staticUrl || DEFAULT_STATIC_URL
@@ -246,7 +275,7 @@ export function selectFooter(
     }
 
     case "ondate":
-      return onDateFooter(date, seed)
+      return onDateFooter(await loadDataset(), date, seed)
 
     default:
       return null

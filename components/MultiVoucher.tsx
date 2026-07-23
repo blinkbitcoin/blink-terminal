@@ -134,6 +134,16 @@ interface MultiVoucherProps {
   usdExchangeRate?: ExchangeRateData | null
   usdWalletId?: string | null
   initialExpiry?: string
+  /**
+   * Push notification of the current total amount (sats + USD cents, amount
+   * x quantity) and currency mode. Replaces the Dashboard's former 300ms
+   * polling of the imperative getters for the capacity indicator.
+   */
+  onAmountChange?: (
+    amountInSats: number,
+    amountInUsdCents: number,
+    currencyMode: VoucherCurrencyMode,
+  ) => void
 }
 
 /** Step names for the wizard flow */
@@ -194,6 +204,7 @@ const MultiVoucher = forwardRef<MultiVoucherHandle, MultiVoucherProps>(
       usdExchangeRate = null,
       usdWalletId = null,
       initialExpiry = DEFAULT_EXPIRY,
+      onAmountChange,
     },
     ref,
   ) => {
@@ -1035,6 +1046,54 @@ const MultiVoucher = forwardRef<MultiVoucherHandle, MultiVoucherProps>(
       }
     }
 
+    // Sats per voucher for the current entered amount (0 when not resolvable).
+    const computeSatsPerVoucher = (): number => {
+      if (!amount || amount === "" || amount === "0") return 0
+      const numericAmount = parseFloat(amount)
+      if (isNaN(numericAmount) || numericAmount <= 0) return 0
+
+      if (isBitcoinCurrency(displayCurrency)) return Math.round(numericAmount)
+      if (!exchangeRate?.satPriceInCurrency) return 0
+
+      const currency = getCurrencyById(displayCurrency, currencies)
+      const fractionDigits = currency?.fractionDigits ?? 2
+      const amountInMinorUnits = numericAmount * Math.pow(10, fractionDigits)
+      return Math.round(amountInMinorUnits / exchangeRate.satPriceInCurrency)
+    }
+
+    // Current total amount in sats (amount x quantity, for capacity indicator)
+    const computeAmountInSats = (): number => computeSatsPerVoucher() * quantity
+
+    // Current total amount in USD cents (amount x quantity)
+    const computeAmountInUsdCents = (): number => {
+      const satsPerVoucher = computeSatsPerVoucher()
+      if (satsPerVoucher <= 0 || !usdExchangeRate?.satPriceInCurrency) return 0
+      const centsPerVoucher = Math.round(
+        satsPerVoucher * usdExchangeRate.satPriceInCurrency,
+      )
+      return centsPerVoucher * quantity // Total for all vouchers
+    }
+
+    // Push amount changes to the parent (capacity indicator) instead of
+    // being polled via the imperative handle on a timer.
+    useEffect(() => {
+      onAmountChange?.(
+        computeAmountInSats(),
+        computeAmountInUsdCents(),
+        voucherCurrencyMode as VoucherCurrencyMode,
+      )
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [
+      amount,
+      quantity,
+      displayCurrency,
+      exchangeRate,
+      usdExchangeRate,
+      currencies,
+      voucherCurrencyMode,
+      onAmountChange,
+    ])
+
     // Expose handlers for keyboard navigation
     useImperativeHandle(ref, () => ({
       handleDigitPress,
@@ -1051,57 +1110,8 @@ const MultiVoucher = forwardRef<MultiVoucherHandle, MultiVoucherProps>(
       },
       hasValidAmount: (): boolean => isValidAmount(),
       getCurrentStep: (): StepName => currentStep,
-      // Get current total amount in sats (for capacity indicator in Dashboard)
-      // Returns amount × quantity for multi-voucher
-      getAmountInSats: (): number => {
-        if (!amount || amount === "" || amount === "0") return 0
-        const numericAmount = parseFloat(amount)
-        if (isNaN(numericAmount) || numericAmount <= 0) return 0
-
-        let amountPerVoucher: number
-        if (isBitcoinCurrency(displayCurrency)) {
-          amountPerVoucher = Math.round(numericAmount)
-        } else if (exchangeRate?.satPriceInCurrency) {
-          const currency = getCurrencyById(displayCurrency, currencies)
-          const fractionDigits = currency?.fractionDigits ?? 2
-          const amountInMinorUnits = numericAmount * Math.pow(10, fractionDigits)
-          amountPerVoucher = Math.round(
-            amountInMinorUnits / exchangeRate.satPriceInCurrency,
-          )
-        } else {
-          return 0
-        }
-        return amountPerVoucher * quantity // Total for all vouchers
-      },
-      // Get current total amount in USD cents (for capacity indicator when in USD mode)
-      // Returns amount × quantity for multi-voucher
-      getAmountInUsdCents: (): number => {
-        if (!amount || amount === "" || amount === "0") return 0
-        const numericAmount = parseFloat(amount)
-        if (isNaN(numericAmount) || numericAmount <= 0) return 0
-
-        // First get sats per voucher
-        let amountPerVoucherSats = 0
-        if (isBitcoinCurrency(displayCurrency)) {
-          amountPerVoucherSats = Math.round(numericAmount)
-        } else if (exchangeRate?.satPriceInCurrency) {
-          const currency = getCurrencyById(displayCurrency, currencies)
-          const fractionDigits = currency?.fractionDigits ?? 2
-          const amountInMinorUnits = numericAmount * Math.pow(10, fractionDigits)
-          amountPerVoucherSats = Math.round(
-            amountInMinorUnits / exchangeRate.satPriceInCurrency,
-          )
-        }
-
-        // Convert sats to USD cents using USD exchange rate
-        if (amountPerVoucherSats > 0 && usdExchangeRate?.satPriceInCurrency) {
-          const centsPerVoucher = Math.round(
-            amountPerVoucherSats * usdExchangeRate.satPriceInCurrency,
-          )
-          return centsPerVoucher * quantity // Total for all vouchers
-        }
-        return 0
-      },
+      getAmountInSats: computeAmountInSats,
+      getAmountInUsdCents: computeAmountInUsdCents,
       // Get current voucher currency mode
       getVoucherCurrencyMode: (): string => voucherCurrencyMode,
       getSelectedExpiry: (): string => selectedExpiry,

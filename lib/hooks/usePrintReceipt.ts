@@ -120,13 +120,24 @@ export function usePrintReceipt({
       // Seeded by payment hash so re-prints of the same receipt are identical —
       // except "shuffle", which is intentionally random on every print so each
       // customer gets a different education bit.
-      const footerContent =
-        orangePillMode === "off"
-          ? null
-          : selectFooter(orangePillMode, new Date(payment.timestamp ?? Date.now()), {
+      // The dataset behind selectFooter is lazily code-split; if the chunk
+      // can't be fetched (e.g. offline kiosk), print without the footer
+      // rather than failing the receipt.
+      let footerContent = null
+      if (orangePillMode !== "off") {
+        try {
+          footerContent = await selectFooter(
+            orangePillMode,
+            new Date(payment.timestamp ?? Date.now()),
+            {
               seed: orangePillMode === "shuffle" ? undefined : payment.paymentHash,
               staticUrl: staticQRUrl,
-            })
+            },
+          )
+        } catch (error) {
+          console.error("Orange-pill footer unavailable, printing without it:", error)
+        }
+      }
 
       const receipt: ReceiptData = {
         amount,

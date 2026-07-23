@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react"
+import { useCallback, useEffect, useRef } from "react"
 
 import { useAccountManagement } from "../lib/hooks/useAccountManagement"
 import { useBlinkWebSocket } from "../lib/hooks/useBlinkWebSocket"
@@ -408,6 +408,17 @@ export default function Dashboard() {
     setCurrentVoucherCurrencyMode,
   } = useVoucherWalletState()
 
+  // Voucher/MultiVoucher push their current amount here (capacity indicator).
+  // Replaces the former 300ms polling of the child imperative getters.
+  const handleVoucherAmountChange = useCallback(
+    (amountInSats: number, amountInUsdCents: number, currencyMode: "BTC" | "USD") => {
+      setCurrentAmountInSats(amountInSats)
+      setCurrentAmountInUsdCents(amountInUsdCents)
+      setCurrentVoucherCurrencyMode(currencyMode)
+    },
+    [setCurrentAmountInSats, setCurrentAmountInUsdCents, setCurrentVoucherCurrencyMode],
+  )
+
   // Commission settings - extracted to useCommissionSettings hook
   const {
     commissionEnabled,
@@ -647,8 +658,6 @@ export default function Dashboard() {
     lastPayment,
     // Refs
     posPaymentReceivedRef,
-    voucherRef,
-    multiVoucherRef,
   })
 
   // Transaction operations - extracted to useTransactionActions hook
@@ -1376,6 +1385,7 @@ export default function Dashboard() {
           setVoucherCurrencyMode={setVoucherCurrencyMode}
           usdExchangeRate={usdExchangeRate}
           voucherExpiry={voucherExpiry}
+          onVoucherAmountChange={handleVoucherAmountChange}
           voucherRef={voucherRef}
           setShowingVoucherQR={setShowingVoucherQR}
           multiVoucherRef={multiVoucherRef}

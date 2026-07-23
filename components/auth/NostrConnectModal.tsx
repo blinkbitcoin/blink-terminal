@@ -15,7 +15,7 @@
  */
 
 import { QRCodeSVG } from "qrcode.react"
-import { useState, useEffect, useCallback } from "react"
+import { useState, useEffect, useCallback, useRef } from "react"
 
 import NostrConnectService from "../../lib/nostr/NostrConnectService"
 import NostrConnectServiceNDK from "../../lib/nostr/NostrConnectServiceNDK"
@@ -115,13 +115,25 @@ export default function NostrConnectModal({
   const [securityRejection, setSecurityRejection] =
     useState<SecurityRejectionInfo | null>(null)
 
-  // Timer refs
-  const slowTimerRef: { current: ReturnType<typeof setTimeout> | null } = {
-    current: null,
-  }
-  const approvalPollRef: { current: ReturnType<typeof setInterval> | null } = {
-    current: null,
-  }
+  // Timer refs (real refs so timers survive re-renders and can be
+  // cleared from any code path, including unmount)
+  const slowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const approvalPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  // Clear any pending timers on unmount to avoid leaked intervals and
+  // setState-after-unmount from the approval poll
+  useEffect(() => {
+    return () => {
+      if (slowTimerRef.current) {
+        clearTimeout(slowTimerRef.current)
+        slowTimerRef.current = null
+      }
+      if (approvalPollRef.current) {
+        clearInterval(approvalPollRef.current)
+        approvalPollRef.current = null
+      }
+    }
+  }, [])
 
   const startWaitingForConnection = useCallback(async () => {
     logAuth("NostrConnectModal", "Waiting for NIP-46 connection...")

@@ -385,8 +385,11 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
     useEffect(() => {
       fetchVouchers()
 
-      // Poll every 10 seconds for updates
-      pollingIntervalRef.current = setInterval(fetchVouchers, 10000)
+      // Poll every 10 seconds for updates (skipping ticks while hidden)
+      pollingIntervalRef.current = setInterval(() => {
+        if (document.visibilityState === "hidden") return
+        fetchVouchers()
+      }, 10000)
 
       return () => {
         if (pollingIntervalRef.current) {
