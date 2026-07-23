@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 
 import { getWsUrl } from "../config/api"
 import { parseTxTimestamp } from "../time-utils"
@@ -58,64 +58,76 @@ export function useBlinkWebSocket(
   const [showAnimation, setShowAnimation] = useState<boolean>(false)
   const [connected, setConnected] = useState<boolean>(false)
   const [reconnectAttempts, setReconnectAttempts] = useState<number>(0)
+  // Bumping this nonce re-runs the connection effect, i.e. actually creates
+  // a new WebSocket. (Previously reconnects only incremented
+  // reconnectAttempts, which nothing listened to — reconnection was a no-op.)
+  const [connectionNonce, setConnectionNonce] = useState<number>(0)
+  // Ref mirror of reconnectAttempts so backoff math never reads a stale closure
+  const reconnectAttemptsRef = useRef<number>(0)
+  // Pending reconnect timer, cleared on new connection attempt / unmount
+  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Track last user activity without triggering re-renders.
   // Previously this was useState, which caused a full Dashboard re-render on
   // every click/keydown/touchstart because Date.now() always produces a new value.
   const lastActivityRef = useRef<number>(Date.now())
 
-  // Function to create WebSocket connection
-  const createConnection = (): WebSocket | null => {
-    if (!apiKey || !username) return null
-
-    const wsUrl: string = getWsUrl()
-    console.log("🔗 Direct Blink WebSocket: Connecting to", wsUrl, {
-      attempts: reconnectAttempts,
-    })
-
-    // Connect directly to Blink WebSocket (environment-aware)
-    const ws = new WebSocket(wsUrl, "graphql-transport-ws")
-
-    return ws
+  const resetReconnectAttempts = (): void => {
+    reconnectAttemptsRef.current = 0
+    setReconnectAttempts(0)
   }
+
+  // Force a fresh connection attempt (resets backoff). Stable identity so
+  // it can be used in effect deps.
+  const forceReconnect = useCallback((): void => {
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current)
+      reconnectTimeoutRef.current = null
+    }
+    reconnectAttemptsRef.current = 0
+    setReconnectAttempts(0)
+    setConnectionNonce((n) => n + 1)
+  }, [])
 
   // Function to handle reconnection with exponential backoff
   const scheduleReconnect = (): void => {
-    // BTCPayServer pattern: Only give up after 10 consecutive failures
-    if (reconnectAttempts >= 10) {
-      console.log(
-        "❌ WebSocket connection abandoned after 10 consecutive failures - possible service outage.",
-      )
-      const delay = 60000 // 1 minute delay after 10 failures
-      console.log(
-        `🔄 Scheduling reconnect in ${delay}ms (attempt ${reconnectAttempts + 1}) - service outage mode`,
-      )
+    // A reconnect is already scheduled (e.g. onerror followed by onclose)
+    if (reconnectTimeoutRef.current) return
 
-      setTimeout(() => {
-        setReconnectAttempts((prev) => prev + 1)
-      }, delay)
-      return
+    const attempts = reconnectAttemptsRef.current
+    // BTCPayServer pattern: after 10 consecutive failures, back off to 1 min
+    const isOutage = attempts >= 10
+    const delay = isOutage ? 60000 : Math.min(1000 * Math.pow(2, attempts), 30000) // Max 30 seconds
+
+    if (isOutage) {
+      console.log(
+        "❌ WebSocket connection failed 10+ consecutive times - possible service outage.",
+      )
     }
+    console.log(`🔄 Scheduling reconnect in ${delay}ms (attempt ${attempts + 1})`)
 
-    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000) // Max 30 seconds
-    console.log(
-      `🔄 Scheduling reconnect in ${delay}ms (attempt ${reconnectAttempts + 1})`,
-    )
-
-    setTimeout(() => {
-      setReconnectAttempts((prev) => prev + 1)
+    reconnectTimeoutRef.current = setTimeout(() => {
+      reconnectTimeoutRef.current = null
+      reconnectAttemptsRef.current += 1
+      setReconnectAttempts(reconnectAttemptsRef.current)
+      setConnectionNonce((n) => n + 1) // re-run the connection effect
     }, delay)
   }
 
   useEffect(() => {
     if (!apiKey || !username) return
 
-    const ws = createConnection()
-    if (!ws) return
+    const wsUrl: string = getWsUrl()
+    console.log("🔗 Direct Blink WebSocket: Connecting to", wsUrl, {
+      attempts: reconnectAttemptsRef.current,
+    })
+
+    // Connect directly to Blink WebSocket (environment-aware)
+    const ws = new WebSocket(wsUrl, "graphql-transport-ws")
 
     ws.onopen = () => {
       console.log("🟢 Direct Blink WebSocket: Connected")
       setConnected(true)
-      setReconnectAttempts(0) // Reset attempts on successful connection
+      resetReconnectAttempts() // Reset attempts on successful connection
 
       // Send connection init with API key
       const initMessage = {
@@ -135,7 +147,7 @@ export function useBlinkWebSocket(
         console.log("📨 Direct Blink WebSocket: Message received:", message.type)
 
         // BTCPayServer pattern: Reset error count on successful message
-        setReconnectAttempts(0)
+        resetReconnectAttempts()
 
         if (message.type === "connection_ack") {
           console.log("✅ Direct Blink WebSocket: Authenticated")
@@ -245,19 +257,31 @@ export function useBlinkWebSocket(
 
     // Cleanup
     return () => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.close()
+      // Detach handlers first so a socket torn down by this cleanup can't
+      // fire scheduleReconnect / setState after the effect is gone.
+      ws.onopen = null
+      ws.onmessage = null
+      ws.onclose = null
+      ws.onerror = null
+      // Close CONNECTING sockets too (previously leaked)
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close(1000)
+      }
+      // Any reconnect scheduled by this connection is obsolete
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current)
+        reconnectTimeoutRef.current = null
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [apiKey, username])
+  }, [apiKey, username, connectionNonce])
 
   // Activity-based reconnection - detect when user becomes active
   useEffect(() => {
     const handleVisibilityChange = (): void => {
       if (!document.hidden && !connected && apiKey && username) {
         console.log("🎯 Tab became visible and not connected - triggering reconnect")
-        setReconnectAttempts((prev) => prev + 1)
+        forceReconnect()
       }
     }
 
@@ -265,7 +289,7 @@ export function useBlinkWebSocket(
       lastActivityRef.current = Date.now()
       if (!connected && apiKey && username) {
         console.log("🎯 Window focused and not connected - triggering reconnect")
-        setReconnectAttempts((prev) => prev + 1)
+        forceReconnect()
       }
     }
 
@@ -289,12 +313,12 @@ export function useBlinkWebSocket(
       window.removeEventListener("keydown", handleUserActivity)
       window.removeEventListener("touchstart", handleUserActivity)
     }
-  }, [connected, apiKey, username])
+  }, [connected, apiKey, username, forceReconnect])
 
   // Manual reconnection function
   const manualReconnect = (): void => {
     console.log("🔄 Manual reconnect triggered")
-    setReconnectAttempts((prev) => prev + 1)
+    forceReconnect()
   }
 
   // Function to manually trigger payment animation (for forwarded payments)

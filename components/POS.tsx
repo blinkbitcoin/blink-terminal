@@ -1,4 +1,10 @@
-import React, { useState, useEffect, forwardRef, useImperativeHandle } from "react"
+import React, {
+  useState,
+  useEffect,
+  useRef,
+  forwardRef,
+  useImperativeHandle,
+} from "react"
 import QRCode from "react-qr-code"
 
 import { unlockAudioContext, playSound } from "../lib/audio-utils"
@@ -725,8 +731,17 @@ const POS = forwardRef<POSRef, POSProps>(
       }
     }, [showTipDialog, showCustomTipInput])
 
+    // Tracks the latest exchange-rate request so stale responses are ignored
+    const exchangeRateRequestRef = useRef(0)
+
     const fetchExchangeRate = async () => {
       if (isBitcoinCurrency(displayCurrency)) return
+
+      // Monotonic request id: only the most recently issued request may
+      // apply its result, so a slow response for a previously selected
+      // currency can't overwrite the current one (fiat→sats conversion
+      // derives from this rate).
+      const requestId = ++exchangeRateRequestRef.current
 
       setLoadingRate(true)
       try {
@@ -750,6 +765,9 @@ const POS = forwardRef<POSRef, POSProps>(
 
         const data = await response.json()
 
+        // A newer request was issued while this one was in flight — drop it
+        if (requestId !== exchangeRateRequestRef.current) return
+
         if (data.success) {
           setExchangeRate({
             satPriceInCurrency: data.satPriceInCurrency,
@@ -760,12 +778,15 @@ const POS = forwardRef<POSRef, POSProps>(
           throw new Error(data.error || "Failed to fetch exchange rate")
         }
       } catch (err: unknown) {
+        if (requestId !== exchangeRateRequestRef.current) return
         console.error("Exchange rate error:", err)
         setError(
           `Failed to fetch ${displayCurrency} exchange rate: ${(err as Error).message}`,
         )
       } finally {
-        setLoadingRate(false)
+        if (requestId === exchangeRateRequestRef.current) {
+          setLoadingRate(false)
+        }
       }
     }
 
@@ -1501,7 +1522,14 @@ const POS = forwardRef<POSRef, POSProps>(
             }),
           }
 
-          console.log("Creating invoice with request body:", requestBody)
+          // Redact secrets (API key, NWC connection URI) from logs
+          console.log("Creating invoice with request body:", {
+            ...requestBody,
+            ...(requestBody.apiKey && {
+              apiKey: `${String(requestBody.apiKey).substring(0, 8)}...`,
+            }),
+            ...(requestBody.nwcConnectionUri && { nwcConnectionUri: "[redacted]" }),
+          })
 
           const response = await fetch("/api/blink/create-invoice", {
             method: "POST",
