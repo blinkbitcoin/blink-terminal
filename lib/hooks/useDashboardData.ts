@@ -54,16 +54,6 @@ interface _NWCTransaction {
 }
 
 /**
- * Ref handle for voucher/multivoucher child components
- */
-interface VoucherRefHandle {
-  getAmountInSats?: () => number
-  getAmountInUsdCents?: () => number
-  getVoucherCurrencyMode?: () => string
-  [key: string]: unknown
-}
-
-/**
  * Params for useDashboardData hook
  */
 export interface UseDashboardDataParams {
@@ -113,8 +103,6 @@ export interface UseDashboardDataParams {
   lastPayment: PaymentData | null
   // Refs (created in Dashboard, passed in)
   posPaymentReceivedRef: MutableRefObject<(() => void) | null>
-  voucherRef: MutableRefObject<VoucherRefHandle | null>
-  multiVoucherRef: MutableRefObject<VoucherRefHandle | null>
 }
 
 /**
@@ -186,8 +174,6 @@ export function useDashboardData({
   lastPayment,
   // Refs (created in Dashboard, passed in)
   posPaymentReceivedRef,
-  voucherRef,
-  multiVoucherRef,
 }: UseDashboardDataParams): UseDashboardDataReturn {
   // --- fetchApiKey ---
   const fetchApiKey = async (): Promise<string | null> => {
@@ -573,30 +559,16 @@ export function useDashboardData({
     }
   }, [voucherWallet?.apiKey, currentView, fetchVoucherWalletBalance])
 
-  // Poll for current amount from child components (for capacity indicator)
+  // Reset the capacity-indicator amount when leaving voucher views.
+  // While ON a voucher view, the amount is pushed by Voucher/MultiVoucher via
+  // their onAmountChange callback (previously this was a 300ms poll of the
+  // child components' imperative getters).
   useEffect(() => {
     if (currentView !== "voucher" && currentView !== "multivoucher") {
       setCurrentAmountInSats(0)
       setCurrentAmountInUsdCents(0)
       setCurrentVoucherCurrencyMode("BTC")
-      return
     }
-
-    const pollAmount = (): void => {
-      const ref = currentView === "voucher" ? voucherRef.current : multiVoucherRef.current
-      const amountSats = ref?.getAmountInSats?.() || 0
-      const amountUsdCents = ref?.getAmountInUsdCents?.() || 0
-      const currencyMode = (ref?.getVoucherCurrencyMode?.() ||
-        "BTC") as VoucherCurrencyMode
-      setCurrentAmountInSats(amountSats)
-      setCurrentAmountInUsdCents(amountUsdCents)
-      setCurrentVoucherCurrencyMode(currencyMode)
-    }
-
-    pollAmount() // Initial
-    const interval = setInterval(pollAmount, 300) // Poll every 300ms
-
-    return () => clearInterval(interval)
   }, [currentView])
 
   // Fetch balance when Send Wallet overlay opens

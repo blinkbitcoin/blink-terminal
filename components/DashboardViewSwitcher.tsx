@@ -109,6 +109,12 @@ interface DashboardViewSwitcherProps {
   setVoucherCurrencyMode: (mode: VoucherCurrencyMode) => void
   usdExchangeRate: number | null
   voucherExpiry: string
+  /** Push handler for the current voucher amount (capacity indicator). */
+  onVoucherAmountChange: (
+    amountInSats: number,
+    amountInUsdCents: number,
+    currencyMode: VoucherCurrencyMode,
+  ) => void
   // Voucher-specific
   voucherRef: React.RefObject<VoucherHandle>
   setShowingVoucherQR: (showing: boolean) => void
@@ -210,6 +216,7 @@ export default function DashboardViewSwitcher({
   setVoucherCurrencyMode,
   usdExchangeRate,
   voucherExpiry,
+  onVoucherAmountChange,
   // Voucher-specific
   voucherRef,
   setShowingVoucherQR,
@@ -361,6 +368,7 @@ export default function DashboardViewSwitcher({
           usdWalletId={voucherWalletUsdId}
           initialExpiry={voucherExpiry}
           onInternalTransition={onInternalTransition}
+          onAmountChange={onVoucherAmountChange}
         />
       </div>
     )
@@ -390,6 +398,7 @@ export default function DashboardViewSwitcher({
         usdWalletId={voucherWalletUsdId}
         initialExpiry={voucherExpiry}
         onInternalTransition={onInternalTransition}
+        onAmountChange={onVoucherAmountChange}
       />
     )
   }

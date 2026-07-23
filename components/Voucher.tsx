@@ -84,6 +84,16 @@ interface VoucherProps {
   usdExchangeRate?: ExchangeRateData | null
   usdWalletId?: string | null
   initialExpiry?: string
+  /**
+   * Push notification of the current entered amount (sats + USD cents) and
+   * currency mode. Replaces the Dashboard's former 300ms polling of the
+   * imperative getters for the capacity indicator.
+   */
+  onAmountChange?: (
+    amountInSats: number,
+    amountInUsdCents: number,
+    currencyMode: VoucherCurrencyMode,
+  ) => void
 }
 
 /** Methods exposed via the forwarded ref */
@@ -131,6 +141,7 @@ const Voucher = forwardRef<VoucherHandle, VoucherProps>(
       usdExchangeRate = null,
       usdWalletId = null,
       initialExpiry = DEFAULT_EXPIRY,
+      onAmountChange,
     },
     ref,
   ) => {
@@ -317,8 +328,9 @@ const Voucher = forwardRef<VoucherHandle, VoucherProps>(
         // Poll immediately
         pollVoucherStatus(voucher.id)
 
-        // Then poll every 2 seconds
+        // Then poll every 2 seconds (skipping ticks while the tab is hidden)
         pollingIntervalRef.current = setInterval(() => {
+          if (document.visibilityState === "hidden") return
           pollVoucherStatus(voucher.id)
         }, 2000)
 
@@ -809,6 +821,47 @@ const Voucher = forwardRef<VoucherHandle, VoucherProps>(
       return createVoucherInternal(false, null)
     }
 
+    // Current amount in sats (for capacity indicator in Dashboard)
+    const computeAmountInSats = (): number => {
+      if (!amount || amount === "" || amount === "0") return 0
+      const numericAmount = parseFloat(amount)
+      if (isNaN(numericAmount) || numericAmount <= 0) return 0
+
+      if (isBitcoinCurrency(displayCurrency)) return Math.round(numericAmount)
+      if (!exchangeRate?.satPriceInCurrency) return 0
+
+      const currency = getCurrencyById(displayCurrency, currencies)
+      const fractionDigits = currency?.fractionDigits ?? 2
+      const amountInMinorUnits = numericAmount * Math.pow(10, fractionDigits)
+      return Math.round(amountInMinorUnits / exchangeRate.satPriceInCurrency)
+    }
+
+    // Current amount in USD cents (for capacity indicator when in USD mode)
+    const computeAmountInUsdCents = (): number => {
+      const amountInSats = computeAmountInSats()
+      if (amountInSats <= 0 || !usdExchangeRate?.satPriceInCurrency) return 0
+      return Math.round(amountInSats * usdExchangeRate.satPriceInCurrency)
+    }
+
+    // Push amount changes to the parent (capacity indicator) instead of
+    // being polled via the imperative handle on a timer.
+    useEffect(() => {
+      onAmountChange?.(
+        computeAmountInSats(),
+        computeAmountInUsdCents(),
+        voucherCurrencyMode as VoucherCurrencyMode,
+      )
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [
+      amount,
+      displayCurrency,
+      exchangeRate,
+      usdExchangeRate,
+      currencies,
+      voucherCurrencyMode,
+      onAmountChange,
+    ])
+
     // Expose numpad handlers for keyboard navigation
     useImperativeHandle(ref, () => ({
       handleDigitPress,
@@ -818,45 +871,8 @@ const Voucher = forwardRef<VoucherHandle, VoucherProps>(
       hasVoucher: () => !!voucher,
       hasValidAmount: () => isValidAmount(),
       isRedeemed: () => redeemed,
-      // Get current amount in sats (for capacity indicator in Dashboard)
-      getAmountInSats: (): number => {
-        if (!amount || amount === "" || amount === "0") return 0
-        const numericAmount = parseFloat(amount)
-        if (isNaN(numericAmount) || numericAmount <= 0) return 0
-
-        if (isBitcoinCurrency(displayCurrency)) {
-          return Math.round(numericAmount)
-        } else if (exchangeRate?.satPriceInCurrency) {
-          const currency = getCurrencyById(displayCurrency, currencies)
-          const fractionDigits = currency?.fractionDigits ?? 2
-          const amountInMinorUnits = numericAmount * Math.pow(10, fractionDigits)
-          return Math.round(amountInMinorUnits / exchangeRate.satPriceInCurrency)
-        }
-        return 0
-      },
-      // Get current amount in USD cents (for capacity indicator when in USD mode)
-      getAmountInUsdCents: (): number => {
-        if (!amount || amount === "" || amount === "0") return 0
-        const numericAmount = parseFloat(amount)
-        if (isNaN(numericAmount) || numericAmount <= 0) return 0
-
-        // First get sats
-        let amountInSats = 0
-        if (isBitcoinCurrency(displayCurrency)) {
-          amountInSats = Math.round(numericAmount)
-        } else if (exchangeRate?.satPriceInCurrency) {
-          const currency = getCurrencyById(displayCurrency, currencies)
-          const fractionDigits = currency?.fractionDigits ?? 2
-          const amountInMinorUnits = numericAmount * Math.pow(10, fractionDigits)
-          amountInSats = Math.round(amountInMinorUnits / exchangeRate.satPriceInCurrency)
-        }
-
-        // Convert sats to USD cents using USD exchange rate
-        if (amountInSats > 0 && usdExchangeRate?.satPriceInCurrency) {
-          return Math.round(amountInSats * usdExchangeRate.satPriceInCurrency)
-        }
-        return 0
-      },
+      getAmountInSats: computeAmountInSats,
+      getAmountInUsdCents: computeAmountInUsdCents,
       // Get current voucher currency mode
       getVoucherCurrencyMode: () => voucherCurrencyMode as VoucherCurrencyMode,
       // Expiry state for external rendering
