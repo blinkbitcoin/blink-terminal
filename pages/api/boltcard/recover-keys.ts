@@ -185,4 +185,4 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 }
 
-export default withRateLimit(handler, RATE_LIMIT_WRITE)
+export default withRateLimit(handler, RATE_LIMIT_WRITE, "boltcard/recover-keys")

@@ -145,4 +145,4 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 }
 
-export default withRateLimit(handler, RATE_LIMIT_PUBLIC)
+export default withRateLimit(handler, RATE_LIMIT_PUBLIC, "lnurlp/[username]/callback")

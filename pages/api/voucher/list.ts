@@ -123,4 +123,4 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 }
 
-export default withRateLimit(handler, RATE_LIMIT_READ)
+export default withRateLimit(handler, RATE_LIMIT_READ, "voucher/list")

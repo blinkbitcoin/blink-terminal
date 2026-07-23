@@ -141,4 +141,8 @@ async function extractPaymentHash(invoice: string): Promise<string | null> {
   }
 }
 
-export default withRateLimit(handler, RATE_LIMIT_WRITE)
+export default withRateLimit(
+  handler,
+  RATE_LIMIT_WRITE,
+  "boltcard/lnurlw/[cardId]/callback",
+)

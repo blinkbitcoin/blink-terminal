@@ -98,4 +98,4 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 }
 
-export default withRateLimit(handler, RATE_LIMIT_AUTH)
+export default withRateLimit(handler, RATE_LIMIT_AUTH, "auth/nostr-login")

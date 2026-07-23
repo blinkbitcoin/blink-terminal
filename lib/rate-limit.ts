@@ -207,8 +207,6 @@ function getClientIp(req: NextApiRequest): string {
 // Public API
 // ---------------------------------------------------------------------------
 
-let limiterSeq = 0
-
 /**
  * Wrap a Next.js API handler with rate limiting.
  *
@@ -216,16 +214,23 @@ let limiterSeq = 0
  * import { withRateLimit, RATE_LIMIT_AUTH } from "../../../lib/rate-limit"
  *
  * function handler(req, res) { ... }
- * export default withRateLimit(handler, RATE_LIMIT_AUTH)
+ * export default withRateLimit(handler, RATE_LIMIT_AUTH, "auth/login")
  * ```
+ *
+ * `routeName` should be the route path relative to pages/api (convention:
+ * the file path without extension). It keys the shared Redis counter, so it
+ * must be stable and unique per route — a module-load sequence number was
+ * used before, but import order differs per bundle/instance, which could
+ * make two different routes share one Redis counter.
  */
 export function withRateLimit(
   handler: NextApiHandler,
   opts: RateLimitOptions,
+  routeName: string,
 ): NextApiHandler {
   const limiter = createRateLimiter(opts)
-  // Stable per-wrap key so Redis counters are isolated per route group.
-  const key = `${opts.max}:${opts.windowMs ?? DEFAULT_WINDOW_MS}:${limiterSeq++}`
+  // Stable per-route key so Redis counters are isolated per route.
+  const key = `${routeName}:${opts.max}:${opts.windowMs ?? DEFAULT_WINDOW_MS}`
 
   return async (req: NextApiRequest, res: NextApiResponse) => {
     const ip = getClientIp(req)

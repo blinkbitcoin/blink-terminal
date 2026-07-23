@@ -157,7 +157,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 }
 
-export default withRateLimit(handler, RATE_LIMIT_WRITE)
+export default withRateLimit(handler, RATE_LIMIT_WRITE, "transaction/receipt-pdf")
 
 // Disable body parser limit for safety
 export const config = {
