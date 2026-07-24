@@ -184,6 +184,34 @@ interface NetworkRef {
 }
 
 /**
+ * Fetch Nostr profiles for a list of npubs in parallel.
+ * Returns a map of npub -> profile for the successful fetches only, so the
+ * caller can merge them into state with a single update.
+ */
+async function fetchProfilesBatch(
+  npubs: string[],
+): Promise<Record<string, NostrProfile>> {
+  const results = await Promise.all(
+    npubs.map(async (npub) => {
+      try {
+        const response = await fetch(
+          `/api/network/profiles?npub=${encodeURIComponent(npub)}`,
+        )
+        const data = await response.json()
+        if (data.success && data.profile) {
+          return [npub, data.profile as NostrProfile] as const
+        }
+      } catch (err: unknown) {
+        console.error(`Error fetching profile for ${npub}:`, err)
+      }
+      return null
+    }),
+  )
+
+  return Object.fromEntries(results.filter((r) => r !== null))
+}
+
+/**
  * Convert hex public key to npub format
  * @param hexPubkey - 64 character hex public key
  * @returns npub encoded key or null if invalid
@@ -338,31 +366,16 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       }
     }
 
-    // Fetch Nostr profiles for community leaders
+    // Fetch Nostr profiles for community leaders (in parallel, merged in one
+    // state update — previously one awaited request + setState per leader)
     const fetchLeaderProfiles = async (communitiesList: NetworkCommunity[]) => {
       const uniqueLeaders = [
         ...new Set(communitiesList.map((c) => c.leader_npub).filter(Boolean)),
-      ]
+      ].filter((npub) => !leaderProfiles[npub])
 
-      for (const leaderNpub of uniqueLeaders) {
-        // Skip if already fetched
-        if (leaderProfiles[leaderNpub]) continue
-
-        try {
-          const response = await fetch(
-            `/api/network/profiles?npub=${encodeURIComponent(leaderNpub)}`,
-          )
-          const data = await response.json()
-
-          if (data.success && data.profile) {
-            setLeaderProfiles((prev) => ({
-              ...prev,
-              [leaderNpub]: data.profile,
-            }))
-          }
-        } catch (err: unknown) {
-          console.error(`Error fetching profile for ${leaderNpub}:`, err)
-        }
+      const fetched = await fetchProfilesBatch(uniqueLeaders)
+      if (Object.keys(fetched).length > 0) {
+        setLeaderProfiles((prev) => ({ ...prev, ...fetched }))
       }
     }
 
@@ -567,29 +580,16 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       }
     }
 
-    // Fetch Nostr profiles for community members
+    // Fetch Nostr profiles for community members (in parallel, merged in one
+    // state update — previously one awaited request + setState per member)
     const fetchMemberProfiles = async (members: Array<{ user_npub: string }>) => {
-      const uniqueNpubs = [...new Set(members.map((m) => m.user_npub).filter(Boolean))]
+      const uniqueNpubs = [
+        ...new Set(members.map((m) => m.user_npub).filter(Boolean)),
+      ].filter((npub) => !memberProfiles[npub])
 
-      for (const npub of uniqueNpubs) {
-        // Skip if already fetched
-        if (memberProfiles[npub]) continue
-
-        try {
-          const response = await fetch(
-            `/api/network/profiles?npub=${encodeURIComponent(npub)}`,
-          )
-          const data = await response.json()
-
-          if (data.success && data.profile) {
-            setMemberProfiles((prev) => ({
-              ...prev,
-              [npub]: data.profile,
-            }))
-          }
-        } catch (err: unknown) {
-          console.error(`Error fetching profile for ${npub}:`, err)
-        }
+      const fetched = await fetchProfilesBatch(uniqueNpubs)
+      if (Object.keys(fetched).length > 0) {
+        setMemberProfiles((prev) => ({ ...prev, ...fetched }))
       }
     }
 

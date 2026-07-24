@@ -136,11 +136,21 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
         })
       }
 
-      // Validate amount
+      // Validate amount: whole sats, bounded like public-invoice (0.1 BTC max)
       const numericAmount = parseFloat(String(amount))
       if (isNaN(numericAmount) || numericAmount <= 0) {
         return res.status(400).json({
           error: "Invalid amount: must be a positive number",
+        })
+      }
+      if (!Number.isInteger(numericAmount)) {
+        return res.status(400).json({
+          error: "Invalid amount: must be a whole number of sats",
+        })
+      }
+      if (numericAmount > 10000000) {
+        return res.status(400).json({
+          error: "Maximum amount is 10,000,000 sats (0.1 BTC)",
         })
       }
 
@@ -304,4 +314,4 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   })
 }
 
-export default withRateLimit(handler, RATE_LIMIT_WRITE)
+export default withRateLimit(handler, RATE_LIMIT_WRITE, "blink/create-invoice")

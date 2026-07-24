@@ -211,4 +211,4 @@ function getServerUrl(req: NextApiRequest) {
   return `${protocol}://${host}`
 }
 
-export default withRateLimit(handler, RATE_LIMIT_READ)
+export default withRateLimit(handler, RATE_LIMIT_READ, "boltcard/keys/[registrationId]")

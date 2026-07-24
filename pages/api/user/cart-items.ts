@@ -322,4 +322,4 @@ async function handlePatch(
   })
 }
 
-export default withRateLimit(handler, RATE_LIMIT_READ)
+export default withRateLimit(handler, RATE_LIMIT_READ, "user/cart-items")

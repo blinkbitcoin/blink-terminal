@@ -324,4 +324,4 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   return res.status(405).json({ error: "Method not allowed" })
 }
 
-export default withRateLimit(handler, RATE_LIMIT_WRITE)
+export default withRateLimit(handler, RATE_LIMIT_WRITE, "network/consent")
