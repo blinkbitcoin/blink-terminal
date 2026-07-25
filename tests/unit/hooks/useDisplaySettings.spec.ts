@@ -310,6 +310,54 @@ describe("useDisplaySettings", () => {
   })
 
   // ==========================================================================
+  // Enabled Themes Tests (logo-tap cycle set)
+  // ==========================================================================
+
+  describe("Enabled Themes", () => {
+    it("defaults to the two Blink themes", () => {
+      const { result } = renderHook(() => useDisplaySettings())
+      expect(result.current.enabledThemes).toEqual([
+        "blink-classic-dark",
+        "blink-classic-light",
+      ])
+    })
+
+    it("persists a new set as JSON in canonical order", () => {
+      const { result } = renderHook(() => useDisplaySettings())
+
+      act(() => {
+        // Provide out of order; canonical order should be enforced.
+        result.current.setEnabledThemes(["light", "blink-classic-dark"])
+      })
+
+      expect(result.current.enabledThemes).toEqual(["blink-classic-dark", "light"])
+      expect(localStorage.setItem).toHaveBeenCalledWith(
+        "blinkpos-enabled-themes",
+        JSON.stringify(["blink-classic-dark", "light"]),
+      )
+    })
+
+    it("never persists an empty set (falls back to defaults)", () => {
+      const { result } = renderHook(() => useDisplaySettings())
+
+      act(() => {
+        result.current.setEnabledThemes([])
+      })
+
+      expect(result.current.enabledThemes).toEqual([
+        "blink-classic-dark",
+        "blink-classic-light",
+      ])
+    })
+
+    it("hydrates from a stored JSON array", () => {
+      localStorage.setItem("blinkpos-enabled-themes", JSON.stringify(["dark", "light"]))
+      const { result } = renderHook(() => useDisplaySettings())
+      expect(result.current.enabledThemes).toEqual(["dark", "light"])
+    })
+  })
+
+  // ==========================================================================
   // Currency Filter Tests
   // ==========================================================================
 
