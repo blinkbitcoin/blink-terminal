@@ -9,7 +9,7 @@ import type {
   NostrProfile,
 } from "../lib/hooks/useCombinedAuth"
 import type { SplitProfile } from "../lib/hooks/useSplitProfiles"
-import type { Theme } from "../lib/hooks/useTheme"
+import { type Theme, THEME_LABELS } from "../lib/hooks/useTheme"
 import type { TipProfile } from "../lib/hooks/useTipSettings"
 import type { VoucherWallet } from "../lib/hooks/useVoucherWalletState"
 import { FORMAT_LABELS, type NumberFormatPreference } from "../lib/number-format"
@@ -39,7 +39,7 @@ interface SideMenuOverlayProps {
   setShowKeyManagement: (show: boolean) => void
   setShowAccountSettings: (show: boolean) => void
   setShowVoucherWalletSettings: (show: boolean) => void
-  cycleTheme: () => void
+  setShowThemeCycle: (show: boolean) => void
   setShowCurrencySettings: (show: boolean) => void
   setShowRegionalSettings: (show: boolean) => void
   setShowTipSettings: (show: boolean) => void
@@ -77,7 +77,7 @@ export default function SideMenuOverlay({
   setShowKeyManagement,
   setShowAccountSettings,
   setShowVoucherWalletSettings,
-  cycleTheme,
+  setShowThemeCycle,
   setShowCurrencySettings,
   setShowRegionalSettings,
   setShowTipSettings,
@@ -260,9 +260,12 @@ export default function SideMenuOverlay({
               </div>
             </button>
 
-            {/* Theme Selection */}
+            {/* Theme Selection — opens the selectable theme-cycle overlay */}
             <button
-              onClick={cycleTheme}
+              onClick={() => {
+                setShowThemeCycle(true)
+                setSideMenuOpen(false)
+              }}
               className={`w-full rounded-lg p-4 ${getMenuTileClasses()} transition-colors`}
             >
               <div className="flex items-center justify-between">
@@ -270,16 +273,7 @@ export default function SideMenuOverlay({
                   Theme
                 </span>
                 <div className="flex items-center text-sm text-gray-500 dark:text-gray-400">
-                  <span>
-                    {theme === "dark"
-                      ? "Dark"
-                      : theme === "blink-classic-dark"
-                        ? "BC Dark"
-                        : theme === "light"
-                          ? "Light"
-                          : "BC Light"}
-                  </span>
-                  <span className="ml-1 text-xs">(tap to change)</span>
+                  <span>{THEME_LABELS[theme]}</span>
                 </div>
               </div>
             </button>

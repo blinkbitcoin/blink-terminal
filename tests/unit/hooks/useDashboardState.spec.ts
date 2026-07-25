@@ -24,22 +24,31 @@ Object.defineProperty(window, "matchMedia", {
   })),
 })
 
-// Mock the useTheme hook that useThemeStyles depends on
-jest.mock("../../../lib/hooks/useTheme", () => ({
-  useTheme: jest.fn(() => ({
-    theme: "dark",
-    darkMode: true,
-    isBlinkClassic: false,
-    isBlinkClassicDark: false,
-    isBlinkClassicLight: false,
-  })),
-  THEMES: {
-    "dark": "dark",
-    "light": "light",
-    "blink-classic-dark": "blink-classic-dark",
-    "blink-classic-light": "blink-classic-light",
-  },
-}))
+// Mock the useTheme hook that useThemeStyles depends on. useDisplaySettings /
+// usePublicPOSSettings also import the pure enabled-themes helpers from this
+// module, so the mock must provide them too.
+jest.mock("../../../lib/hooks/useTheme", () => {
+  const defaultEnabled = ["blink-classic-dark", "blink-classic-light"]
+  return {
+    useTheme: jest.fn(() => ({
+      theme: "dark",
+      darkMode: true,
+      isBlinkClassic: false,
+      isBlinkClassicDark: false,
+      isBlinkClassicLight: false,
+    })),
+    THEMES: {
+      "dark": "dark",
+      "light": "light",
+      "blink-classic-dark": "blink-classic-dark",
+      "blink-classic-light": "blink-classic-light",
+    },
+    THEME_ORDER: ["blink-classic-dark", "blink-classic-light", "dark", "light"],
+    DEFAULT_ENABLED_THEMES: defaultEnabled,
+    normalizeEnabledThemes: jest.fn(() => [...defaultEnabled]),
+    parseEnabledThemes: jest.fn(() => [...defaultEnabled]),
+  }
+})
 
 describe("useDashboardState", () => {
   beforeEach(() => {

@@ -1,4 +1,4 @@
-import { useRef } from "react"
+import { useRef, useState, useCallback } from "react"
 
 import { useCurrencies } from "../lib/hooks/useCurrencies"
 import { usePrintReceipt } from "../lib/hooks/usePrintReceipt"
@@ -25,6 +25,7 @@ import PublicPOSPaycodeOverlay from "./PublicPOS/PublicPOSPaycodeOverlay"
 import PublicPOSRegionalOverlay from "./PublicPOS/PublicPOSRegionalOverlay"
 import PublicPOSSideMenu from "./PublicPOS/PublicPOSSideMenu"
 import PublicPOSSoundOverlay from "./PublicPOS/PublicPOSSoundOverlay"
+import PublicPOSThemeCycleOverlay from "./PublicPOS/PublicPOSThemeCycleOverlay"
 import PublicPOSValidationOverlay from "./PublicPOS/PublicPOSValidationOverlay"
 import StagingBanner from "./StagingBanner"
 
@@ -54,7 +55,7 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
     removeFromPopular,
     isPopularCurrency,
   } = useCurrencies()
-  const { theme, cycleTheme, darkMode } = useTheme()
+  const { theme, cycleTheme, setTheme, darkMode } = useTheme()
 
   // Username validation - validates against current environment (production or staging)
   const {
@@ -146,6 +147,8 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
     setBitcoinFormat,
     numpadLayout,
     setNumpadLayout,
+    enabledThemes,
+    setEnabledThemes,
     amountDisplay,
     setAmountDisplay,
     soundEnabled,
@@ -157,6 +160,13 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
     orangePillStaticUrl,
     setOrangePillStaticUrl,
   } = usePublicPOSSettings()
+
+  // Selectable theme-cycle overlay + subset-aware logo cycle.
+  const [showThemeCycle, setShowThemeCycle] = useState(false)
+  const cycleEnabledThemes = useCallback(
+    () => cycleTheme(enabledThemes),
+    [cycleTheme, enabledThemes],
+  )
 
   // View navigation state
   const {
@@ -272,7 +282,7 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
             <div className="flex items-center justify-between py-4">
               {/* Blink Logo - Left (tap to cycle theme) */}
               <button
-                onClick={cycleTheme}
+                onClick={cycleEnabledThemes}
                 className="flex items-center focus:outline-none"
                 aria-label="Cycle theme"
               >
@@ -343,7 +353,7 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
         <PublicPOSSideMenu
           onClose={() => setSideMenuOpen(false)}
           theme={theme}
-          cycleTheme={cycleTheme}
+          onShowThemeCycle={() => setShowThemeCycle(true)}
           displayCurrency={displayCurrency}
           numberFormat={numberFormat}
           soundEnabled={soundEnabled}
@@ -411,6 +421,21 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
           setSoundEnabled={setSoundEnabled}
           soundTheme={soundTheme}
           setSoundTheme={setSoundTheme}
+          getSubmenuBgClasses={getSubmenuBgClasses}
+          getSubmenuHeaderClasses={getSubmenuHeaderClasses}
+          getSelectionTileClasses={getSelectionTileClasses}
+          getSelectionTileActiveClasses={getSelectionTileActiveClasses}
+        />
+      )}
+
+      {/* Theme cycle (selectable) overlay */}
+      {showThemeCycle && (
+        <PublicPOSThemeCycleOverlay
+          theme={theme}
+          enabledThemes={enabledThemes}
+          setEnabledThemes={setEnabledThemes}
+          setTheme={setTheme}
+          onClose={() => setShowThemeCycle(false)}
           getSubmenuBgClasses={getSubmenuBgClasses}
           getSubmenuHeaderClasses={getSubmenuHeaderClasses}
           getSelectionTileClasses={getSelectionTileClasses}
@@ -503,7 +528,7 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
               soundEnabled={soundEnabled}
               darkMode={darkMode}
               theme={theme}
-              cycleTheme={cycleTheme}
+              cycleTheme={cycleEnabledThemes}
               isViewTransitioning={isViewTransitioning}
               exchangeRate={exchangeRate}
             />
@@ -529,7 +554,7 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
             onInvoiceChange={handleInvoiceChange}
             darkMode={darkMode}
             theme={theme}
-            cycleTheme={cycleTheme}
+            cycleTheme={cycleEnabledThemes}
             nfcState={nfcState}
             activeBlinkAccount={{
               id: "public",

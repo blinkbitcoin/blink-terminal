@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 
 import { useAccountManagement } from "../lib/hooks/useAccountManagement"
 import { useBlinkWebSocket } from "../lib/hooks/useBlinkWebSocket"
@@ -49,6 +49,7 @@ import PercentSettingsOverlay from "./Settings/PercentSettingsOverlay"
 import RegionalSettingsOverlay from "./Settings/RegionalSettingsOverlay"
 import SoundThemesOverlay from "./Settings/SoundThemesOverlay"
 import SplitSettingsOverlay from "./Settings/SplitSettingsOverlay"
+import ThemeCycleOverlay from "./Settings/ThemeCycleOverlay"
 import TipProfileSettingsOverlay from "./Settings/TipProfileSettingsOverlay"
 import VoucherWalletOverlay from "./Settings/VoucherWalletOverlay"
 import WalletsOverlay from "./Settings/WalletsOverlay"
@@ -118,7 +119,7 @@ export default function Dashboard() {
     removeFromPopular,
     isPopularCurrency,
   } = useCurrencies()
-  const { cycleTheme } = useTheme()
+  const { cycleTheme, setTheme } = useTheme()
 
   // Theme styling utilities - extracted to useThemeStyles hook
   const {
@@ -176,6 +177,8 @@ export default function Dashboard() {
     setBitcoinFormat,
     numpadLayout,
     setNumpadLayout,
+    enabledThemes,
+    setEnabledThemes,
     amountDisplay,
     setAmountDisplay,
     orangePillMode,
@@ -227,6 +230,15 @@ export default function Dashboard() {
     closeAllOverlays: _closeAllOverlays,
     closeAllSettings: _closeAllSettings,
   } = useUIVisibility()
+
+  // Selectable theme-cycle overlay (opened from the side menu Theme tile).
+  const [showThemeCycle, setShowThemeCycle] = useState(false)
+
+  // Logo-tap cycles through only the enabled (selected) themes.
+  const cycleEnabledThemes = useCallback(
+    () => cycleTheme(enabledThemes),
+    [cycleTheme, enabledThemes],
+  )
 
   // Wallet state (API key and wallet list) managed by useWalletState hook
   const { apiKey, setApiKey, wallets, setWallets } = useWalletState()
@@ -834,7 +846,7 @@ export default function Dashboard() {
       {!showingInvoice && !showingVoucherQR && (
         <MobileHeader
           theme={theme}
-          cycleTheme={cycleTheme}
+          cycleTheme={cycleEnabledThemes}
           currentView={currentView}
           handleViewTransition={handleViewTransition}
           isViewTransitioning={isViewTransitioning}
@@ -867,7 +879,7 @@ export default function Dashboard() {
           setShowKeyManagement={setShowKeyManagement}
           setShowAccountSettings={setShowAccountSettings}
           setShowVoucherWalletSettings={setShowVoucherWalletSettings}
-          cycleTheme={cycleTheme}
+          setShowThemeCycle={setShowThemeCycle}
           setShowCurrencySettings={setShowCurrencySettings}
           setShowRegionalSettings={setShowRegionalSettings}
           setShowTipSettings={setShowTipSettings}
@@ -929,7 +941,7 @@ export default function Dashboard() {
           nostrProfile={nostrProfile}
           darkMode={darkMode}
           theme={theme}
-          cycleTheme={cycleTheme}
+          cycleTheme={cycleEnabledThemes}
           setShowNetworkOverlay={setShowNetworkOverlay}
           setSideMenuOpen={setSideMenuOpen}
           transitionColorIndex={transitionColorIndex}
@@ -956,6 +968,21 @@ export default function Dashboard() {
           setSoundEnabled={setSoundEnabled}
           setSoundTheme={setSoundTheme}
           setShowSoundThemes={setShowSoundThemes}
+          getSubmenuBgClasses={getSubmenuBgClasses}
+          getSubmenuHeaderClasses={getSubmenuHeaderClasses}
+          getSelectionTileClasses={getSelectionTileClasses}
+          getSelectionTileActiveClasses={getSelectionTileActiveClasses}
+        />
+      )}
+
+      {/* Theme cycle (selectable) overlay */}
+      {showThemeCycle && (
+        <ThemeCycleOverlay
+          theme={theme}
+          enabledThemes={enabledThemes}
+          setEnabledThemes={setEnabledThemes}
+          setTheme={setTheme}
+          setShowThemeCycle={setShowThemeCycle}
           getSubmenuBgClasses={getSubmenuBgClasses}
           getSubmenuHeaderClasses={getSubmenuHeaderClasses}
           getSelectionTileClasses={getSelectionTileClasses}
@@ -1340,7 +1367,7 @@ export default function Dashboard() {
           currencies={currencies}
           darkMode={darkMode}
           theme={theme}
-          cycleTheme={cycleTheme}
+          cycleTheme={cycleEnabledThemes}
           soundEnabled={soundEnabled}
           exchangeRate={exchangeRate}
           isViewTransitioning={isViewTransitioning}

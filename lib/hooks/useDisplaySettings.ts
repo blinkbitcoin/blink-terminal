@@ -25,6 +25,8 @@ import {
 } from "../number-format"
 import type { OrangePillMode } from "../orangepill"
 
+import { type Theme, normalizeEnabledThemes, parseEnabledThemes } from "./useTheme"
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -63,6 +65,10 @@ export interface UseDisplaySettingsReturn {
   numpadLayout: NumpadLayout
   setNumpadLayout: (layout: NumpadLayout) => void
 
+  // Themes included in the logo-tap cycle (subset of THEME_ORDER, >= 1)
+  enabledThemes: Theme[]
+  setEnabledThemes: (themes: Theme[]) => void
+
   // Amount display state (fiat-primary vs sats-primary)
   amountDisplay: AmountDisplay
   setAmountDisplay: (preference: AmountDisplay) => void
@@ -95,6 +101,7 @@ const STORAGE_KEYS = {
   BITCOIN_FORMAT: "blinkpos-bitcoin-format",
   NUMPAD_LAYOUT: "blinkpos-numpad-layout",
   AMOUNT_DISPLAY: "blinkpos-amount-display",
+  ENABLED_THEMES: "blinkpos-enabled-themes",
   ORANGE_PILL_MODE: "blinkpos-orangepill-mode",
   ORANGE_PILL_STATIC_URL: "blinkpos-orangepill-static-url",
 } as const
@@ -190,6 +197,14 @@ export function useDisplaySettings(): UseDisplaySettingsReturn {
     getFromStorage(STORAGE_KEYS.NUMPAD_LAYOUT, DEFAULT_NUMPAD_LAYOUT),
   )
 
+  const [enabledThemes, setEnabledThemesState] = useState<Theme[]>(() =>
+    parseEnabledThemes(
+      typeof window === "undefined"
+        ? null
+        : window.localStorage.getItem(STORAGE_KEYS.ENABLED_THEMES),
+    ),
+  )
+
   const [amountDisplay, setAmountDisplayState] = useState<AmountDisplay>(() =>
     getFromStorage(STORAGE_KEYS.AMOUNT_DISPLAY, DEFAULT_AMOUNT_DISPLAY),
   )
@@ -242,6 +257,17 @@ export function useDisplaySettings(): UseDisplaySettingsReturn {
   const setNumpadLayout = useCallback((layout: NumpadLayout) => {
     setNumpadLayoutState(layout)
     setToStorage(STORAGE_KEYS.NUMPAD_LAYOUT, layout)
+  }, [])
+
+  // ---------------------------------------------------------------------------
+  // Callbacks - Enabled Themes (logo-tap cycle set)
+  // ---------------------------------------------------------------------------
+
+  const setEnabledThemes = useCallback((themes: Theme[]) => {
+    // Keep canonical order and never persist an empty set.
+    const next = normalizeEnabledThemes(themes)
+    setEnabledThemesState(next)
+    setToStorage(STORAGE_KEYS.ENABLED_THEMES, JSON.stringify(next))
   }, [])
 
   // ---------------------------------------------------------------------------
@@ -375,6 +401,10 @@ export function useDisplaySettings(): UseDisplaySettingsReturn {
     // Numpad layout
     numpadLayout,
     setNumpadLayout,
+
+    // Enabled themes (logo-tap cycle set)
+    enabledThemes,
+    setEnabledThemes,
 
     // Amount display
     amountDisplay,

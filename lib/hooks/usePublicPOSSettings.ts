@@ -1,4 +1,10 @@
-import { useState, useEffect, type Dispatch, type SetStateAction } from "react"
+import {
+  useState,
+  useEffect,
+  useCallback,
+  type Dispatch,
+  type SetStateAction,
+} from "react"
 
 import type { SoundThemeName } from "../audio-utils"
 import {
@@ -10,6 +16,8 @@ import {
 } from "../number-format"
 import type { OrangePillMode } from "../orangepill"
 
+import { type Theme, normalizeEnabledThemes, parseEnabledThemes } from "./useTheme"
+
 interface UsePublicPOSSettingsReturn {
   displayCurrency: string
   setDisplayCurrency: Dispatch<SetStateAction<string>>
@@ -19,6 +27,8 @@ interface UsePublicPOSSettingsReturn {
   setBitcoinFormat: Dispatch<SetStateAction<BitcoinFormatPreference>>
   numpadLayout: NumpadLayoutPreference
   setNumpadLayout: Dispatch<SetStateAction<NumpadLayoutPreference>>
+  enabledThemes: Theme[]
+  setEnabledThemes: (themes: Theme[]) => void
   amountDisplay: AmountDisplayPreference
   setAmountDisplay: Dispatch<SetStateAction<AmountDisplayPreference>>
   soundEnabled: boolean
@@ -72,6 +82,22 @@ export function usePublicPOSSettings(): UsePublicPOSSettingsReturn {
     }
     return "calculator"
   })
+
+  const [enabledThemes, setEnabledThemesState] = useState<Theme[]>(() =>
+    parseEnabledThemes(
+      typeof window !== "undefined"
+        ? localStorage.getItem("publicpos-enabledThemes")
+        : null,
+    ),
+  )
+
+  const setEnabledThemes = useCallback((themes: Theme[]) => {
+    const next = normalizeEnabledThemes(themes)
+    setEnabledThemesState(next)
+    if (typeof window !== "undefined") {
+      localStorage.setItem("publicpos-enabledThemes", JSON.stringify(next))
+    }
+  }, [])
 
   const [amountDisplay, setAmountDisplay] = useState<AmountDisplayPreference>(() => {
     if (typeof window !== "undefined") {
@@ -171,6 +197,8 @@ export function usePublicPOSSettings(): UsePublicPOSSettingsReturn {
     setBitcoinFormat,
     numpadLayout,
     setNumpadLayout,
+    enabledThemes,
+    setEnabledThemes,
     amountDisplay,
     setAmountDisplay,
     soundEnabled,
