@@ -2,11 +2,18 @@ import type { GetServerSideProps } from "next"
 import Head from "next/head"
 
 import PublicPOSDashboard from "../../components/PublicPOSDashboard"
+import { parsePosUrlParams, type PosUrlParams } from "../../lib/pos-url-params"
 
 /**
  * Public POS Page - Pay any Blink user directly
  *
  * URL: terminal.blinkbtc.com/[blinkusername]
+ *
+ * Query params (pay.blink.sv parity, see lib/pos-url-params.ts):
+ * - display: display currency code (fiat codes, or SAT/BTC for sats)
+ * - amount: amount in the display currency's major units (pre-filled, editable)
+ * - memo: invoice memo
+ * Example: /alice?amount=21&memo=coffee&display=USD
  *
  * Features:
  * - No authentication required
@@ -23,6 +30,7 @@ import PublicPOSDashboard from "../../components/PublicPOSDashboard"
 
 interface PublicPOSPageProps {
   username: string
+  urlParams: PosUrlParams
 }
 
 // SSR: Only validate username format, not existence
@@ -50,12 +58,15 @@ export const getServerSideProps: GetServerSideProps<PublicPOSPageProps> = async 
   return {
     props: {
       username: blinkusername.toLowerCase(),
+      // Query params are sanitized SSR-side; invalid values come back undefined
+      // so the client keeps its defaults (USD display, empty amount, no memo).
+      urlParams: parsePosUrlParams(context.query),
       // walletCurrency will be determined client-side after validation
     },
   }
 }
 
-export default function PublicPOS({ username }: PublicPOSPageProps) {
+export default function PublicPOS({ username, urlParams }: PublicPOSPageProps) {
   return (
     <>
       <Head>
@@ -75,7 +86,7 @@ export default function PublicPOS({ username }: PublicPOSPageProps) {
         />
       </Head>
 
-      <PublicPOSDashboard username={username} />
+      <PublicPOSDashboard username={username} urlParams={urlParams} />
     </>
   )
 }

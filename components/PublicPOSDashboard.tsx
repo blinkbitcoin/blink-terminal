@@ -1,4 +1,4 @@
-import { useRef, useState, useCallback } from "react"
+import { useRef, useState, useCallback, useEffect } from "react"
 
 import { useCurrencies } from "../lib/hooks/useCurrencies"
 import { usePrintReceipt } from "../lib/hooks/usePrintReceipt"
@@ -15,6 +15,7 @@ import { usePublicPOSValidation } from "../lib/hooks/usePublicPOSValidation"
 import { usePublicPOSViewState } from "../lib/hooks/usePublicPOSViewState"
 import { useTheme } from "../lib/hooks/useTheme"
 import type { CartCheckoutData } from "../lib/hooks/useViewNavigation"
+import type { PosUrlParams } from "../lib/pos-url-params"
 
 import ItemCart from "./ItemCart"
 import { useNFC } from "./NFCPayment"
@@ -43,13 +44,20 @@ import StagingBanner from "./StagingBanner"
 
 interface PublicPOSDashboardProps {
   username: string
+  /** Pre-filled POS params from the URL query (amount/memo/display), already
+      sanitized SSR-side. Undefined fields keep their defaults. */
+  urlParams?: PosUrlParams
 }
 
-export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps) {
+export default function PublicPOSDashboard({
+  username,
+  urlParams,
+}: PublicPOSDashboardProps) {
   const {
     currencies,
     loading: currenciesLoading,
     getAllCurrencies,
+    getAllCurrenciesFlat,
     popularCurrencyIds: _popularCurrencyIds,
     addToPopular,
     removeFromPopular,
@@ -159,7 +167,29 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
     setOrangePillMode,
     orangePillStaticUrl,
     setOrangePillStaticUrl,
-  } = usePublicPOSSettings()
+  } = usePublicPOSSettings(urlParams?.display)
+
+  // One-time validation of the ?display= URL param against the loaded currency
+  // list: fiat codes the backend doesn't know fall back to USD. (Bitcoin
+  // displays are always valid and never reach this check's fallback.)
+  const displayParamCheckedRef = useRef(false)
+  useEffect(() => {
+    if (displayParamCheckedRef.current || !urlParams?.display || currenciesLoading) {
+      return
+    }
+    displayParamCheckedRef.current = true
+    const known = getAllCurrenciesFlat()
+    // Only validate once the fiat list actually loaded; it always contains BTC.
+    if (known.length > 1 && !known.some((c) => c.id === displayCurrency)) {
+      setDisplayCurrency("USD")
+    }
+  }, [
+    currenciesLoading,
+    urlParams?.display,
+    displayCurrency,
+    getAllCurrenciesFlat,
+    setDisplayCurrency,
+  ])
 
   // Selectable theme-cycle overlay + subset-aware logo cycle.
   const [showThemeCycle, setShowThemeCycle] = useState(false)
@@ -569,6 +599,9 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
             // Public POS specific props
             isPublicPOS={true}
             publicUsername={username}
+            // URL pre-fill (?amount= / ?memo=); editable after seeding
+            initialAmount={urlParams?.amount}
+            initialMemo={urlParams?.memo}
           />
         )}
       </main>
