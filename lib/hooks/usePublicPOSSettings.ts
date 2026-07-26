@@ -49,9 +49,16 @@ interface UsePublicPOSSettingsReturn {
  * - Number format, Bitcoin format, numpad layout
  * - Sound enabled/theme
  * - All localStorage persistence (publicpos-* keys)
+ *
+ * @param initialDisplayCurrency - Optional per-link initial display currency
+ *   (from the `?display=` URL param, already normalized SSR-side). Unlike the
+ *   persisted settings, the display currency is deliberately NOT persisted: it
+ *   is a per-link/per-session choice, not a merchant preference.
  */
-export function usePublicPOSSettings(): UsePublicPOSSettingsReturn {
-  const [displayCurrency, setDisplayCurrency] = useState("USD")
+export function usePublicPOSSettings(
+  initialDisplayCurrency?: string,
+): UsePublicPOSSettingsReturn {
+  const [displayCurrency, setDisplayCurrency] = useState(initialDisplayCurrency ?? "USD")
 
   const [numberFormat, setNumberFormat] = useState<NumberFormatPreference>(() => {
     if (typeof window !== "undefined") {

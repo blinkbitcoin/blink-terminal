@@ -112,6 +112,11 @@ interface POSProps {
   triggerPaymentAnimation?: (data: PaymentData) => void
   isPublicPOS?: boolean
   publicUsername?: string | null
+  /** URL pre-fill (public POS): amount in display-currency major units and
+      invoice memo from the `?amount=` / `?memo=` query params. Seeded once at
+      mount; both stay fully editable (pay.blink.sv parity). */
+  initialAmount?: string
+  initialMemo?: string
 }
 
 export interface POSRef {
@@ -187,10 +192,12 @@ const POS = forwardRef<POSRef, POSProps>(
       triggerPaymentAnimation,
       isPublicPOS = false,
       publicUsername = null,
+      initialAmount,
+      initialMemo,
     },
     ref,
   ) => {
-    const [amount, setAmount] = useState<string>("")
+    const [amount, setAmount] = useState<string>(initialAmount ?? "")
     const [total, setTotal] = useState<number>(0)
     const [items, setItems] = useState<number[]>([])
     const [invoice, setInvoice] = useState<InvoiceData | null>(null)
@@ -209,8 +216,10 @@ const POS = forwardRef<POSRef, POSProps>(
     const [customTipValue, setCustomTipValue] = useState<string>("")
     const [tipOptionIndex, setTipOptionIndex] = useState<number>(0) // Keyboard navigation index
 
-    // Cart memo (when coming from item cart)
-    const [cartMemo, setCartMemo] = useState<string>("")
+    // Cart memo (when coming from item cart, or seeded from the ?memo= URL
+    // param on the public POS — matching the native app's deep-link pre-fill).
+    // Flows into the invoice memo as "<memo> = <amount> (<sats> sats)".
+    const [cartMemo, setCartMemo] = useState<string>(initialMemo ?? "")
 
     // BC Theme helpers
     const isBlinkClassic =
