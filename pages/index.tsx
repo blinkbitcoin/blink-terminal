@@ -11,13 +11,12 @@ import { useCombinedAuth } from "../lib/hooks/useCombinedAuth"
  *
  * Authentication States:
  * 1. Loading: Show spinner while checking auth
- * 2. Not authenticated: Redirect to /signin
+ * 2. Not authenticated: Redirect to /setuppwa
  * 3. Nostr auth but no wallet (Blink or NWC): Show WalletSetup
  * 4. Fully authenticated with wallet: Show Dashboard
  *
  * User Journey:
- * - Unauthenticated users (including after logout) are redirected to /signin
- * - From /signin users can choose to use Public POS (/setuppwa) or sign in
+ * - Unauthenticated users (including after logout) are redirected to /setuppwa
  * - Authenticated users see Dashboard or WalletSetup
  */
 export default function Home() {
@@ -75,12 +74,12 @@ export default function Home() {
     }
   }, [authMode, hasServerSession, showSessionModal])
 
-  // Redirect unauthenticated users to /signin
+  // Redirect unauthenticated users to /setuppwa
   useEffect(() => {
     if (!loading && !isAuthenticated) {
-      console.log("[Home] Not authenticated - redirecting to /signin")
+      console.log("[Home] Not authenticated - redirecting to /setuppwa")
       setRedirecting(true)
-      router.replace("/signin")
+      router.replace("/setuppwa")
     }
   }, [loading, isAuthenticated, router])
 
