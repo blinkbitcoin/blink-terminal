@@ -6,7 +6,7 @@ import { FORMAT_LABELS, type NumberFormatPreference } from "../../lib/number-for
 /**
  * PublicPOSSideMenu - Side menu overlay for PublicPOSDashboard
  *
- * Simplified menu with: Sign in, Switch Account, Theme, Display Currency,
+ * Simplified menu with: Switch Account, Theme, Display Currency,
  * Regional, Paycodes, Sound Effects
  */
 
@@ -69,41 +69,6 @@ export default function PublicPOSSideMenu({
         {/* Menu Content */}
         <div className="max-w-md mx-auto px-4 py-6">
           <div className="space-y-4">
-            {/* Profile - Links to sign in */}
-            <Link
-              href="/signin"
-              className={`block w-full rounded-lg p-4 ${getMenuTileClasses()} transition-colors`}
-            >
-              <div className="flex items-center gap-3">
-                <div
-                  className={`w-10 h-10 rounded-full flex items-center justify-center bg-blink-accent/20`}
-                >
-                  <svg
-                    className="w-5 h-5 text-blink-accent"
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth="2"
-                      d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"
-                    />
-                  </svg>
-                </div>
-                <div className="flex-1">
-                  <p className="text-base font-medium text-blink-accent">
-                    Sign in to Blink Bitcoin Terminal
-                  </p>
-                  <p className="text-sm text-gray-500 dark:text-gray-400">
-                    Access full features
-                  </p>
-                </div>
-                <span className="text-gray-400">›</span>
-              </div>
-            </Link>
-
             {/* Switch Account - Go to /setuppwa to choose different username */}
             <Link
               href="/setuppwa"
