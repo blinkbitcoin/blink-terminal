@@ -66,8 +66,10 @@ export function usePublicPOSSettings(
       return initialDisplayCurrency
     }
     // Any fiat code is valid here (public POS is multi-currency), so we only
-    // guard against a missing/empty value. Unknown fiat codes are reset to USD
-    // at runtime by PublicPOSDashboard's one-time ?display= validation.
+    // guard against a missing/empty value. A stale/unknown stored code is
+    // accepted as-is; the ?display= param path additionally validates against
+    // the loaded currency list in PublicPOSDashboard, but that check does not
+    // run when restoring from localStorage without a param.
     if (typeof window !== "undefined") {
       try {
         const stored = localStorage.getItem(PUBLICPOS_DISPLAY_CURRENCY_KEY)
