@@ -97,6 +97,7 @@ export interface UseDisplaySettingsReturn {
 // ============================================================================
 
 const STORAGE_KEYS = {
+  DISPLAY_CURRENCY: "blinkpos-display-currency",
   NUMBER_FORMAT: "blinkpos-number-format",
   BITCOIN_FORMAT: "blinkpos-bitcoin-format",
   NUMPAD_LAYOUT: "blinkpos-numpad-layout",
@@ -110,6 +111,23 @@ const DEFAULT_NUMBER_FORMAT: NumberFormat = "auto"
 const DEFAULT_BITCOIN_FORMAT: BitcoinFormat = "sats"
 const DEFAULT_NUMPAD_LAYOUT: NumpadLayout = "calculator"
 const DEFAULT_DISPLAY_CURRENCY: DisplayCurrency = "USD"
+
+/**
+ * Whether this device already has a persisted display-currency choice.
+ *
+ * Used by login-time effects to decide whether to seed the display currency
+ * from the account/server (first run only) or leave the device choice intact.
+ */
+export function hasStoredDisplayCurrency(): boolean {
+  if (typeof window === "undefined") {
+    return false
+  }
+  try {
+    return localStorage.getItem(STORAGE_KEYS.DISPLAY_CURRENCY) !== null
+  } catch {
+    return false
+  }
+}
 
 // ============================================================================
 // Helper Functions
@@ -181,9 +199,13 @@ export function useDisplaySettings(): UseDisplaySettingsReturn {
   // State
   // ---------------------------------------------------------------------------
 
-  const [displayCurrency, setDisplayCurrencyState] = useState<DisplayCurrency>(
-    DEFAULT_DISPLAY_CURRENCY,
-  )
+  const [displayCurrency, setDisplayCurrencyState] = useState<DisplayCurrency>(() => {
+    const stored = getFromStorage<string>(
+      STORAGE_KEYS.DISPLAY_CURRENCY,
+      DEFAULT_DISPLAY_CURRENCY,
+    )
+    return stored === "USD" || stored === "BTC" ? stored : DEFAULT_DISPLAY_CURRENCY
+  })
 
   const [numberFormat, setNumberFormatState] = useState<NumberFormat>(() =>
     getFromStorage(STORAGE_KEYS.NUMBER_FORMAT, DEFAULT_NUMBER_FORMAT),
@@ -226,10 +248,15 @@ export function useDisplaySettings(): UseDisplaySettingsReturn {
 
   const setDisplayCurrency = useCallback((currency: DisplayCurrency) => {
     setDisplayCurrencyState(currency)
+    setToStorage(STORAGE_KEYS.DISPLAY_CURRENCY, currency)
   }, [])
 
   const toggleDisplayCurrency = useCallback(() => {
-    setDisplayCurrencyState((prev) => (prev === "USD" ? "BTC" : "USD"))
+    setDisplayCurrencyState((prev) => {
+      const next = prev === "USD" ? "BTC" : "USD"
+      setToStorage(STORAGE_KEYS.DISPLAY_CURRENCY, next)
+      return next
+    })
   }, [])
 
   // ---------------------------------------------------------------------------

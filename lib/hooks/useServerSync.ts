@@ -3,7 +3,12 @@ import { useEffect, useRef, useCallback } from "react"
 import { initTransactionLabels } from "../../components/TransactionDetail"
 import { getApiUrl } from "../config/api"
 
-import type { NumberFormat, NumpadLayout, DisplayCurrency } from "./useDisplaySettings"
+import {
+  hasStoredDisplayCurrency,
+  type NumberFormat,
+  type NumpadLayout,
+  type DisplayCurrency,
+} from "./useDisplaySettings"
 import type { SoundTheme } from "./useSoundSettings"
 import type {
   VoucherWallet,
@@ -242,7 +247,11 @@ export function useServerSync({
               JSON.stringify(serverPrefs.tipPresets),
             )
           }
-          if (serverPrefs.displayCurrency) {
+          // Seed display currency from server prefs on first run only. A
+          // persisted device choice is authoritative and must survive login
+          // (persist last selected currency per device). Outbound sync below
+          // still propagates local changes to the server.
+          if (serverPrefs.displayCurrency && !hasStoredDisplayCurrency()) {
             setDisplayCurrency(serverPrefs.displayCurrency as DisplayCurrency)
           }
           if (serverPrefs.numberFormat) {

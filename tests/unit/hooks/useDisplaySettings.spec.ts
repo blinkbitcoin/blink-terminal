@@ -6,7 +6,10 @@
 
 import { renderHook, act } from "@testing-library/react"
 
-import { useDisplaySettings } from "../../../lib/hooks/useDisplaySettings"
+import {
+  useDisplaySettings,
+  hasStoredDisplayCurrency,
+} from "../../../lib/hooks/useDisplaySettings"
 import type { NumberFormatPreference } from "../../../lib/number-format"
 
 // ============================================================================
@@ -102,6 +105,22 @@ describe("useDisplaySettings", () => {
       expect(result.current.bitcoinFormat).toBe("bip177")
       expect(result.current.numpadLayout).toBe("telephone")
     })
+
+    it("should load persisted display currency from localStorage", () => {
+      mockLocalStorage["blinkpos-display-currency"] = "BTC"
+
+      const { result } = renderHook(() => useDisplaySettings())
+
+      expect(result.current.displayCurrency).toBe("BTC")
+    })
+
+    it("should ignore an invalid persisted display currency", () => {
+      mockLocalStorage["blinkpos-display-currency"] = "EUR"
+
+      const { result } = renderHook(() => useDisplaySettings())
+
+      expect(result.current.displayCurrency).toBe("USD")
+    })
   })
 
   // ==========================================================================
@@ -159,6 +178,44 @@ describe("useDisplaySettings", () => {
       expect(result.current.displayCurrency).toBe("USD")
     })
 
+    it("should persist display currency to localStorage on set", () => {
+      const { result } = renderHook(() => useDisplaySettings())
+
+      act(() => {
+        result.current.setDisplayCurrency("BTC")
+      })
+
+      expect(window.localStorage.setItem).toHaveBeenCalledWith(
+        "blinkpos-display-currency",
+        "BTC",
+      )
+      expect(mockLocalStorage["blinkpos-display-currency"]).toBe("BTC")
+    })
+
+    it("should persist display currency to localStorage on toggle", () => {
+      const { result } = renderHook(() => useDisplaySettings())
+
+      act(() => {
+        result.current.toggleDisplayCurrency()
+      })
+
+      expect(mockLocalStorage["blinkpos-display-currency"]).toBe("BTC")
+    })
+
+    it("should restore the persisted choice after a remount (switch account)", () => {
+      const first = renderHook(() => useDisplaySettings())
+
+      act(() => {
+        first.result.current.setDisplayCurrency("BTC")
+      })
+
+      first.unmount()
+
+      // Fresh mount simulates signing back in after a switch-account.
+      const second = renderHook(() => useDisplaySettings())
+      expect(second.result.current.displayCurrency).toBe("BTC")
+    })
+
     it("should toggle multiple times correctly", () => {
       const { result } = renderHook(() => useDisplaySettings())
 
@@ -178,6 +235,21 @@ describe("useDisplaySettings", () => {
         result.current.toggleDisplayCurrency()
       })
       expect(result.current.displayCurrency).toBe("BTC")
+    })
+  })
+
+  // ==========================================================================
+  // hasStoredDisplayCurrency helper
+  // ==========================================================================
+
+  describe("hasStoredDisplayCurrency", () => {
+    it("returns false when no choice is stored", () => {
+      expect(hasStoredDisplayCurrency()).toBe(false)
+    })
+
+    it("returns true once a choice is stored", () => {
+      mockLocalStorage["blinkpos-display-currency"] = "BTC"
+      expect(hasStoredDisplayCurrency()).toBe(true)
     })
   })
 
