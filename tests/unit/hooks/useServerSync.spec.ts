@@ -12,10 +12,17 @@
 
 import { renderHook, waitFor } from "@testing-library/react"
 
-// Avoid pulling the heavy TransactionDetail component graph; the hook only
-// calls initTransactionLabels() for a side effect we don't assert on here.
+// Avoid pulling the heavy TransactionDetail component graph. The hook awaits
+// initTransactionLabels() *after* deciding whether to seed the display
+// currency, so tests use it as a deterministic "effect settled" signal.
+let resolveLabelsCalled: () => void
+let labelsCalled: Promise<void>
+const initTransactionLabels = jest.fn().mockImplementation(() => {
+  resolveLabelsCalled()
+  return Promise.resolve()
+})
 jest.mock("../../../components/TransactionDetail", () => ({
-  initTransactionLabels: jest.fn().mockResolvedValue(undefined),
+  initTransactionLabels: () => initTransactionLabels(),
 }))
 
 import { useServerSync } from "../../../lib/hooks/useServerSync"
@@ -62,10 +69,26 @@ function mockSyncResponse(body: Record<string, unknown>): void {
   })
 }
 
+/**
+ * Wait until the fetch effect has fully settled: the display-currency decision
+ * runs before `await initTransactionLabels()`, so once that has been called and
+ * pending microtasks flush, any `setDisplayCurrency` call has already happened.
+ */
+async function waitForEffectSettled(): Promise<void> {
+  await labelsCalled
+  // Flush any microtasks queued after the seed decision.
+  await Promise.resolve()
+  await Promise.resolve()
+}
+
 describe("useServerSync display-currency seeding", () => {
   beforeEach(() => {
     localStorage.clear()
     ;(global.fetch as jest.Mock).mockReset()
+    initTransactionLabels.mockClear()
+    labelsCalled = new Promise<void>((resolve) => {
+      resolveLabelsCalled = resolve
+    })
   })
 
   it("does not seed from server defaults on a fresh device (no lastSynced)", async () => {
@@ -78,11 +101,8 @@ describe("useServerSync display-currency seeding", () => {
     const setDisplayCurrency = jest.fn()
     renderHook(() => useServerSync(makeParams({ setDisplayCurrency })))
 
-    await waitFor(() => expect(global.fetch).toHaveBeenCalled())
-    // Give the resolved fetch microtasks a chance to run.
-    await waitFor(() => {
-      expect(setDisplayCurrency).not.toHaveBeenCalled()
-    })
+    await waitForEffectSettled()
+    expect(setDisplayCurrency).not.toHaveBeenCalled()
   })
 
   it("seeds from server prefs for a genuinely-synced user (lastSynced present)", async () => {
@@ -109,9 +129,7 @@ describe("useServerSync display-currency seeding", () => {
     const setDisplayCurrency = jest.fn()
     renderHook(() => useServerSync(makeParams({ setDisplayCurrency })))
 
-    await waitFor(() => expect(global.fetch).toHaveBeenCalled())
-    await waitFor(() => {
-      expect(setDisplayCurrency).not.toHaveBeenCalled()
-    })
+    await waitForEffectSettled()
+    expect(setDisplayCurrency).not.toHaveBeenCalled()
   })
 })
