@@ -51,14 +51,35 @@ interface UsePublicPOSSettingsReturn {
  * - All localStorage persistence (publicpos-* keys)
  *
  * @param initialDisplayCurrency - Optional per-link initial display currency
- *   (from the `?display=` URL param, already normalized SSR-side). Unlike the
- *   persisted settings, the display currency is deliberately NOT persisted: it
- *   is a per-link/per-session choice, not a merchant preference.
+ *   (from the `?display=` URL param, already normalized SSR-side). When present
+ *   it takes precedence and becomes the new persisted device default. When
+ *   absent, the last display currency chosen on this device is restored from
+ *   localStorage (`publicpos-display-currency`), falling back to USD.
  */
+const PUBLICPOS_DISPLAY_CURRENCY_KEY = "publicpos-display-currency"
+
 export function usePublicPOSSettings(
   initialDisplayCurrency?: string,
 ): UsePublicPOSSettingsReturn {
-  const [displayCurrency, setDisplayCurrency] = useState(initialDisplayCurrency ?? "USD")
+  const [displayCurrency, setDisplayCurrency] = useState(() => {
+    if (initialDisplayCurrency) {
+      return initialDisplayCurrency
+    }
+    // Any fiat code is valid here (public POS is multi-currency), so we only
+    // guard against a missing/empty value. A stale/unknown stored code is
+    // accepted as-is; the ?display= param path additionally validates against
+    // the loaded currency list in PublicPOSDashboard, but that check does not
+    // run when restoring from localStorage without a param.
+    if (typeof window !== "undefined") {
+      try {
+        const stored = localStorage.getItem(PUBLICPOS_DISPLAY_CURRENCY_KEY)
+        return stored && stored.length > 0 ? stored : "USD"
+      } catch {
+        return "USD"
+      }
+    }
+    return "USD"
+  })
 
   const [numberFormat, setNumberFormat] = useState<NumberFormatPreference>(() => {
     if (typeof window !== "undefined") {
@@ -147,6 +168,12 @@ export function usePublicPOSSettings(
   })
 
   // Persist all settings to localStorage
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      localStorage.setItem(PUBLICPOS_DISPLAY_CURRENCY_KEY, displayCurrency)
+    }
+  }, [displayCurrency])
+
   useEffect(() => {
     if (typeof window !== "undefined") {
       localStorage.setItem("publicpos-soundEnabled", JSON.stringify(soundEnabled))

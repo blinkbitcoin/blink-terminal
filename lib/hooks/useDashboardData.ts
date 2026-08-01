@@ -6,7 +6,7 @@ import type { ListTransactionsParams } from "../nwc/NWCClient"
 
 import type { PaymentData } from "./useBlinkWebSocket"
 import type { CombinedUser } from "./useCombinedAuth"
-import type { DisplayCurrency } from "./useDisplaySettings"
+import { hasStoredDisplayCurrency, type DisplayCurrency } from "./useDisplaySettings"
 import type { LocalNWCConnection, NWCOperationResult } from "./useNWC"
 import type { LocalBlinkAccount } from "./useProfile"
 import type { VoucherWallet, VoucherCurrencyMode } from "./useVoucherWalletState"
@@ -531,10 +531,12 @@ export function useDashboardData({
     if (user) {
       // ✅ REMOVED: fetchData() - transactions now load ONLY when user clicks "Transactions" tab
 
-      // Set display currency from user preference
-      if (user.preferredCurrency) {
+      // Seed display currency from the account preference on first run only.
+      // Once the device has a persisted choice, it is authoritative and must
+      // not be overwritten on login (persist last selected currency per device).
+      if (user.preferredCurrency && !hasStoredDisplayCurrency()) {
         console.log(
-          `Setting display currency to user preference: ${user.preferredCurrency}`,
+          `Seeding display currency from user preference: ${user.preferredCurrency}`,
         )
         setDisplayCurrency(user.preferredCurrency as DisplayCurrency)
       }
