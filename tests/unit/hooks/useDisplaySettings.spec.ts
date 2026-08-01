@@ -247,9 +247,14 @@ describe("useDisplaySettings", () => {
       expect(hasStoredDisplayCurrency()).toBe(false)
     })
 
-    it("returns true once a choice is stored", () => {
+    it("returns true once a valid choice is stored", () => {
       mockLocalStorage["blinkpos-display-currency"] = "BTC"
       expect(hasStoredDisplayCurrency()).toBe(true)
+    })
+
+    it("returns false for an invalid stored value so seeding is not blocked", () => {
+      mockLocalStorage["blinkpos-display-currency"] = "EUR"
+      expect(hasStoredDisplayCurrency()).toBe(false)
     })
   })
 

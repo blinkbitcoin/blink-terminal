@@ -51,6 +51,20 @@ describe("usePublicPOSSettings display currency", () => {
     expect(result.current.displayCurrency).toBe("BTC")
   })
 
+  it("falls back to USD when the stored value is empty", () => {
+    mockLocalStorage[KEY] = ""
+    const { result } = renderHook(() => usePublicPOSSettings())
+    expect(result.current.displayCurrency).toBe("USD")
+  })
+
+  it("falls back to USD when reading localStorage throws", () => {
+    ;(window.localStorage.getItem as jest.Mock).mockImplementationOnce(() => {
+      throw new Error("blocked")
+    })
+    const { result } = renderHook(() => usePublicPOSSettings())
+    expect(result.current.displayCurrency).toBe("USD")
+  })
+
   it("prefers the ?display= param over the persisted device choice", () => {
     mockLocalStorage[KEY] = "BTC"
     const { result } = renderHook(() => usePublicPOSSettings("EUR"))
