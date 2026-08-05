@@ -1,136 +1,152 @@
-import {
-  getParams,
-  type LNURLWithdrawParams,
-  type LNURLResponse,
-  type LNURLChannelParams,
-  type LNURLAuthParams,
-  type LNURLPayParams,
-} from "js-lnurl"
+import { bech32 } from "bech32"
 import type { NextApiRequest, NextApiResponse } from "next"
 
-import { withRateLimit, RATE_LIMIT_PUBLIC } from "../../lib/rate-limit"
+import { baseLogger } from "@/lib/logger"
+import { withRateLimit, RATE_LIMIT_PUBLIC } from "@/lib/rate-limit"
+import {
+  SafeFetchError,
+  safeFetchJson,
+  safeFetchJsonResponse,
+} from "@/lib/server/safe-fetch-json"
 
-type LNURLResult =
-  | LNURLResponse
-  | LNURLChannelParams
-  | LNURLWithdrawParams
-  | LNURLAuthParams
-  | LNURLPayParams
+type WithdrawRequestParams = {
+  tag: "withdrawRequest"
+  callback: string
+  k1: string
+}
+
+const MAX_LNURL_LENGTH = 2048
+const MAX_K1_LENGTH = 128
+const BOLT11_REGEX = /^ln[a-z0-9]{20,2000}$/i
+
+const decodeLnurlToUrl = (lnurl: string): URL | null => {
+  const trimmed = lnurl.trim()
+
+  if (/^lnurl1[a-z0-9]+$/i.test(trimmed)) {
+    try {
+      const { words } = bech32.decode(trimmed.toLowerCase(), MAX_LNURL_LENGTH * 2)
+      const decoded = Buffer.from(bech32.fromWords(words)).toString("utf8")
+      return new URL(decoded)
+    } catch {
+      return null
+    }
+  }
+
+  if (/^lnurlw:\/\//i.test(trimmed)) {
+    try {
+      return new URL(`https://${trimmed.slice("lnurlw://".length)}`)
+    } catch {
+      return null
+    }
+  }
+
+  try {
+    return new URL(trimmed)
+  } catch {
+    return null
+  }
+}
+
+const isRecord = (data: unknown): data is Record<string, unknown> =>
+  typeof data === "object" && data !== null && !Array.isArray(data)
+
+const isWithdrawRequestParams = (data: unknown): data is WithdrawRequestParams =>
+  isRecord(data) &&
+  data.tag === "withdrawRequest" &&
+  typeof data.callback === "string" &&
+  typeof data.k1 === "string"
 
 async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" })
   }
 
-  try {
-    const { lnurl, paymentRequest } = req.body as {
-      lnurl: string
-      paymentRequest: string
-    }
-
-    if (!lnurl) {
-      return res.status(400).json({ error: "Missing lnurl parameter" })
-    }
-
-    if (!paymentRequest) {
-      return res.status(400).json({ error: "Missing paymentRequest parameter" })
-    }
-
-    console.log("Processing LNURL withdraw request for Boltcard...")
-    console.log("LNURL:", lnurl)
-    console.log("Payment Request (invoice):", paymentRequest.substring(0, 50) + "...")
-
-    // Parse the LNURL to get the withdraw parameters
-    let lnurlParams: LNURLResult
+  // Pages Router pre-parses JSON bodies; normalize non-object bodies here.
+  let body: unknown = req.body
+  if (typeof body === "string") {
     try {
-      lnurlParams = await getParams(lnurl)
-    } catch (parseError: unknown) {
-      const parseMessage =
-        parseError instanceof Error ? parseError.message : "Unknown error"
-      console.error("Failed to parse LNURL:", parseMessage)
-      console.log("Raw LNURL that failed:", lnurl)
+      body = JSON.parse(body)
+    } catch {
+      return res.status(400).json({ error: "Invalid JSON body" })
+    }
+  }
 
-      // Check if this looks like a Boltcard URL with missing/invalid params
-      if (lnurl.includes("/api/boltcard/lnurlw/")) {
-        // Extract more details about what's wrong
-        const urlMatch = lnurl.match(/[?&]p=([^&]*)/)
-        const cmacMatch = lnurl.match(/[?&]c=([^&]*)/)
+  if (!isRecord(body)) {
+    return res.status(400).json({ error: "Invalid JSON body" })
+  }
 
-        const diagnosis: string[] = []
-        if (!urlMatch || !urlMatch[1]) {
-          diagnosis.push("missing p (PICCData) parameter")
-        } else if (urlMatch[1].length !== 32) {
-          diagnosis.push(
-            `p parameter has wrong length (${urlMatch[1].length} chars, expected 32)`,
-          )
-        }
-        if (!cmacMatch || !cmacMatch[1]) {
-          diagnosis.push("missing c (CMAC) parameter")
-        } else if (cmacMatch[1].length !== 16) {
-          diagnosis.push(
-            `c parameter has wrong length (${cmacMatch[1].length} chars, expected 16)`,
-          )
-        }
+  const { lnurl, paymentRequest } = body
 
-        return res.status(400).json({
-          error: "Card authentication failed",
-          reason: `Boltcard URL validation failed: ${diagnosis.join(", ")}. The card may need to be reprogrammed with correct SUN/SDM settings.`,
-          details: parseMessage,
-        })
-      }
+  if (
+    typeof lnurl !== "string" ||
+    lnurl.length === 0 ||
+    lnurl.length > MAX_LNURL_LENGTH
+  ) {
+    return res.status(400).json({ error: "Missing or invalid lnurl parameter" })
+  }
 
-      return res.status(400).json({
-        error: "Failed to parse LNURL",
-        reason: parseMessage,
-      })
+  if (typeof paymentRequest !== "string" || !BOLT11_REGEX.test(paymentRequest)) {
+    return res.status(400).json({ error: "Missing or invalid paymentRequest parameter" })
+  }
+
+  const serviceUrl = decodeLnurlToUrl(lnurl)
+  if (!serviceUrl || serviceUrl.protocol !== "https:") {
+    return res.status(400).json({ error: "Invalid lnurl" })
+  }
+
+  try {
+    // 1. Fetch LNURL service params through the egress-safe fetcher (never trust
+    //    query-string params: js-lnurl.getParams is gone).
+    const serviceResponse = await safeFetchJsonResponse(serviceUrl.toString())
+    const params = serviceResponse.data
+
+    if (!isWithdrawRequestParams(params) || params.k1.length > MAX_K1_LENGTH) {
+      return res
+        .status(400)
+        .json({ error: "Not a properly configured lnurl withdraw tag" })
     }
 
-    // Validate that it's a withdraw request (Boltcard)
+    // 2. The callback must be https and stay on the (post-redirect) service host.
+    let callbackUrl: URL
+    try {
+      callbackUrl = new URL(params.callback)
+    } catch {
+      return res.status(400).json({ error: "Invalid callback URL" })
+    }
+
     if (
-      !("tag" in lnurlParams) ||
-      (lnurlParams as LNURLWithdrawParams).tag !== "withdrawRequest"
+      callbackUrl.protocol !== "https:" ||
+      callbackUrl.hostname !== new URL(serviceResponse.url).hostname
     ) {
-      console.log("LNURL params received:", JSON.stringify(lnurlParams, null, 2))
-      return res.status(400).json({
-        error: "Not a properly configured LNURL withdraw tag",
-        reason:
-          "This is not a valid Boltcard or LNURL-withdraw compatible card. The card may have authentication issues (missing or invalid p/c parameters).",
-        received:
-          "tag" in lnurlParams ? (lnurlParams as LNURLWithdrawParams).tag : "no tag",
-      })
+      return res.status(400).json({ error: "Invalid callback URL" })
     }
 
-    const withdrawParams = lnurlParams as LNURLWithdrawParams
-    const { callback, k1 } = withdrawParams
+    callbackUrl.searchParams.set("k1", params.k1)
+    callbackUrl.searchParams.set("pr", paymentRequest)
 
-    // Build the callback URL with the required parameters
-    const urlObject = new URL(callback)
-    const searchParams = urlObject.searchParams
-    searchParams.set("k1", k1)
-    searchParams.set("pr", paymentRequest)
+    // 3. Relay ONLY LUD-03 {status, reason} — kills the read-back channel.
+    const callbackResponse = await safeFetchJson(callbackUrl.toString())
+    const status =
+      isRecord(callbackResponse) && typeof callbackResponse.status === "string"
+        ? callbackResponse.status
+        : ""
 
-    const url = urlObject.toString()
-
-    console.log("Calling Boltcard callback URL...")
-
-    // Make the request to the Boltcard service
-    const result = await fetch(url)
-    const data = await result.json()
-
-    console.log("Boltcard callback response:", data)
-
-    if (result.ok) {
-      return res.status(200).json(data)
-    } else {
-      return res.status(400).json(data)
+    if (status.toUpperCase() === "OK") {
+      return res.status(200).json({ status: "OK" })
     }
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : "Unknown error"
-    console.error("Error processing LNURL request:", error)
-    return res.status(500).json({
-      error: "Failed to process LNURL request",
-      message,
-    })
+
+    const reason =
+      isRecord(callbackResponse) && typeof callbackResponse.reason === "string"
+        ? callbackResponse.reason.slice(0, 280)
+        : "Withdraw request failed"
+    return res.status(400).json({ status: "ERROR", reason })
+  } catch (error) {
+    if (error instanceof SafeFetchError) {
+      return res.status(400).json({ error: "LNURL service unreachable or not allowed" })
+    }
+
+    baseLogger.error({ err: error }, "Error processing LNURL request")
+    return res.status(500).json({ error: "Failed to process LNURL request" })
   }
 }
 
