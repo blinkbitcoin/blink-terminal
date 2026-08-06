@@ -737,7 +737,7 @@ const ItemCart = forwardRef<ItemCartHandle, ItemCartProps>(
 
     // Calculate navigation indices based on current filtered items
     // Layout: [Search, AddItem] -> [Items...] -> [C, OK]
-    // C and OK are only navigatable if there are items to select
+    // C and OK are only navigable if there are items to select
     const getNavIndices = useCallback((): NavIndices => {
       const itemCount = filteredItems.length
       const hasItems = itemCount > 0
@@ -749,7 +749,7 @@ const ItemCart = forwardRef<ItemCartHandle, ItemCartProps>(
         clear: 2 + itemCount,
         ok: 2 + itemCount + 1,
         total: 2 + itemCount + 2,
-        hasItems, // C and OK only navigatable when there are items
+        hasItems, // C and OK only navigable when there are items
       }
     }, [filteredItems.length])
 
@@ -848,7 +848,7 @@ const ItemCart = forwardRef<ItemCartHandle, ItemCartProps>(
               if (indices.hasItems) {
                 setKeyboardNavIndex(indices.firstItem)
               }
-              // If no items, stay in top row (C and OK are not navigatable)
+              // If no items, stay in top row (C and OK are not navigable)
             } else if (
               keyboardNavIndex >= indices.firstItem &&
               keyboardNavIndex < indices.lastItem
