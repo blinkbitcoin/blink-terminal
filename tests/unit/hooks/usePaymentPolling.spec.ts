@@ -16,6 +16,17 @@ jest.mock("../../../lib/lnurl", () => ({
   verifyLnurlPayment: (...a: unknown[]) => mockVerifyLnurlPayment(...a),
 }))
 
+// Feature flag: toggled per-test. Default is disabled (direct/no-escrow),
+// matching the interim production default.
+const mockSplitEnabled = jest.fn(() => false)
+jest.mock("../../../lib/config/features", () => ({
+  isSplitPaymentsEnabled: () => mockSplitEnabled(),
+}))
+
+jest.mock("../../../lib/config/api", () => ({
+  getApiUrl: () => "https://api.blink.sv/graphql",
+}))
+
 // useNFC touches browser NFC APIs; stub it out.
 jest.mock("../../../components/NFCPayment", () => ({
   useNFC: () => ({ nfcSupported: false }),
@@ -45,6 +56,7 @@ function renderPolling(invoice: PaymentPollingInvoice, onAnimate: jest.Mock) {
 
 beforeEach(() => {
   jest.clearAllMocks()
+  mockSplitEnabled.mockReturnValue(false)
   jest.useFakeTimers()
 })
 
@@ -106,8 +118,44 @@ describe("usePaymentPolling - self-custodial (verify URL)", () => {
   })
 })
 
-describe("usePaymentPolling - escrow path (no verify URL)", () => {
+describe("usePaymentPolling - direct path (splits disabled, no verify URL)", () => {
+  it("polls public lnInvoicePaymentStatus by payment request and triggers on PAID", async () => {
+    mockSplitEnabled.mockReturnValue(false)
+    const fetchSpy = jest.fn(async () => ({
+      json: async () => ({ data: { lnInvoicePaymentStatus: { status: "PAID" } } }),
+    }))
+    global.fetch = fetchSpy as unknown as typeof fetch
+    const onAnimate = jest.fn()
+
+    renderPolling(
+      {
+        paymentHash: "hash-direct",
+        paymentRequest: "lnbc-direct",
+        satAmount: 100,
+      },
+      onAnimate,
+    )
+
+    await act(async () => {
+      await Promise.resolve()
+      await jest.advanceTimersByTimeAsync(0)
+    })
+
+    // Direct path hits the Blink GraphQL endpoint, NOT the escrow status route.
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "https://api.blink.sv/graphql",
+      expect.objectContaining({ method: "POST" }),
+    )
+    const body = JSON.parse((fetchSpy.mock.calls[0][1] as { body: string }).body)
+    expect(body.variables.input.paymentRequest).toBe("lnbc-direct")
+    expect(mockVerifyLnurlPayment).not.toHaveBeenCalled()
+    expect(onAnimate).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe("usePaymentPolling - escrow path (splits enabled, no verify URL)", () => {
   it("polls /api/payment-status and triggers on completed", async () => {
+    mockSplitEnabled.mockReturnValue(true)
     const fetchSpy = jest.fn(async () => ({
       json: async () => ({ status: "completed" }),
     }))

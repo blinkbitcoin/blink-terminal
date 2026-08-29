@@ -10,6 +10,7 @@ import QRCode from "react-qr-code"
 import { unlockAudioContext, playSound } from "../lib/audio-utils"
 import type { Wallet } from "../lib/blink-api"
 import { getEnvironment } from "../lib/config/api"
+import { isSplitPaymentsEnabled } from "../lib/config/features"
 import {
   formatDisplayAmount as formatCurrency,
   getCurrencyById,
@@ -508,8 +509,15 @@ const POS = forwardRef<POSRef, POSProps>(
     }, [cartCheckoutData, onCartCheckoutProcessed])
 
     // Check if invoice was paid when app regains focus (handles webhook forwarding case)
+    //
+    // This path is only relevant to the legacy escrow/forwarding flow: it queries
+    // the BlinkPOS wallet via /api/blink/check-payment and (for NWC merchants)
+    // forwards funds from BlinkPOS. With the intermediate account removed (Split
+    // Payments disabled), invoices are minted directly on the merchant wallet and
+    // settlement is detected by usePaymentPolling, so this block is skipped.
     useEffect(() => {
       if (!invoice?.paymentHash) return
+      if (!isSplitPaymentsEnabled()) return
 
       const checkPaymentOnFocus = async () => {
         try {

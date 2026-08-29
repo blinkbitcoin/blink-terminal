@@ -1,6 +1,8 @@
 import { useEffect, useRef } from "react"
 
 import { useNFC, type UseNFCReturn } from "../../components/NFCPayment"
+import { getApiUrl } from "../config/api"
+import { isSplitPaymentsEnabled } from "../config/features"
 import { verifyLnurlPayment } from "../lnurl"
 
 import type { PaymentData } from "./useBlinkWebSocket"
@@ -140,13 +142,37 @@ export function usePaymentPolling({
           let expired = false
 
           if (currentInvoice.verifyUrl) {
-            // Self-custodial (Spark) direct receive: poll the LUD-21 verify URL.
-            // (Settlement is populated server-side via the Spark SSP webhook, so
-            // it may lag slightly behind the actual payment.)
+            // Self-custodial (Spark) / direct LNURL-pay receive: poll the LUD-21
+            // verify URL. (Settlement is populated server-side via the SSP
+            // webhook, so it may lag slightly behind the actual payment.)
             const verifyResult = await verifyLnurlPayment(currentInvoice.verifyUrl)
             completed = verifyResult.settled === true
+          } else if (!isSplitPaymentsEnabled() && currentInvoice.paymentRequest) {
+            // Direct (no-escrow) receive for API-key / NWC merchants: the invoice
+            // is on the merchant's own wallet, so there is no escrow record to
+            // read. Poll Blink's public lnInvoicePaymentStatus query by payment
+            // request (same mechanism the public POS uses).
+            const response = await fetch(getApiUrl(), {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                query: `
+                  query LnInvoicePaymentStatus($input: LnInvoicePaymentStatusInput!) {
+                    lnInvoicePaymentStatus(input: $input) {
+                      status
+                    }
+                  }
+                `,
+                variables: {
+                  input: { paymentRequest: currentInvoice.paymentRequest },
+                },
+              }),
+            })
+            const data = await response.json()
+            completed = data.data?.lnInvoicePaymentStatus?.status === "PAID"
           } else {
-            // Escrow path: read the BlinkPOS forwarding record status.
+            // Legacy escrow path (dormant while Split Payments disabled): read the
+            // BlinkPOS forwarding record status.
             const response = await fetch(
               `/api/payment-status/${currentInvoice.paymentHash}`,
             )

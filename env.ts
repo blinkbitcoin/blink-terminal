@@ -71,6 +71,10 @@ export const env = createEnv({
     NEXT_PUBLIC_BASE_URL: z.string().url().optional(),
     NEXT_PUBLIC_GIT_COMMIT: z.string().optional(),
     NEXT_PUBLIC_USE_NDK_NIP46: z.enum(["true", "false"]).optional(),
+    // Split Payments (tip splitting) requires the intermediate BlinkPOS escrow
+    // account (compliance concern) and is disabled by default. Set to "true" to
+    // re-enable the dormant escrow + forwarding path. See lib/config/features.ts.
+    NEXT_PUBLIC_SPLIT_PAYMENTS_ENABLED: z.enum(["true", "false"]).optional(),
   },
 
   runtimeEnv: {
@@ -120,5 +124,6 @@ export const env = createEnv({
     NEXT_PUBLIC_BASE_URL: process.env.NEXT_PUBLIC_BASE_URL,
     NEXT_PUBLIC_GIT_COMMIT: process.env.NEXT_PUBLIC_GIT_COMMIT,
     NEXT_PUBLIC_USE_NDK_NIP46: process.env.NEXT_PUBLIC_USE_NDK_NIP46,
+    NEXT_PUBLIC_SPLIT_PAYMENTS_ENABLED: process.env.NEXT_PUBLIC_SPLIT_PAYMENTS_ENABLED,
   },
 })
