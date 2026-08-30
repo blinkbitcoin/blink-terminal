@@ -254,7 +254,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
       if (currency !== "BTC" && currency !== "USD") {
         return res.status(400).json({
-          error: "Unsupported currency. Only BTC is supported.",
+          error: "Unsupported currency. Only BTC or USD is supported.",
         })
       }
 
@@ -362,7 +362,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
           )
         } else {
           return res.status(400).json({
-            error: "Unsupported currency. Only BTC is supported through BlinkPOS.",
+            error: "Unsupported currency. Only BTC or USD is supported through BlinkPOS.",
           })
         }
 

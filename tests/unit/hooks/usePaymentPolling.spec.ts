@@ -151,6 +151,84 @@ describe("usePaymentPolling - direct path (splits disabled, no verify URL)", () 
     expect(mockVerifyLnurlPayment).not.toHaveBeenCalled()
     expect(onAnimate).toHaveBeenCalledTimes(1)
   })
+
+  it("polls by payment request even without a payment hash (e.g. NWC wallet omitting payment_hash)", async () => {
+    const fetchSpy = jest.fn(async () => ({
+      json: async () => ({ data: { lnInvoicePaymentStatus: { status: "PAID" } } }),
+    }))
+    global.fetch = fetchSpy as unknown as typeof fetch
+    const onAnimate = jest.fn()
+
+    renderPolling(
+      {
+        // No paymentHash, no verifyUrl — only the payment request.
+        paymentRequest: "lnbc-nohash",
+        satAmount: 210,
+      },
+      onAnimate,
+    )
+
+    await act(async () => {
+      await Promise.resolve()
+      await jest.advanceTimersByTimeAsync(0)
+    })
+
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "https://api.blink.sv/graphql",
+      expect.objectContaining({ method: "POST" }),
+    )
+    const body = JSON.parse((fetchSpy.mock.calls[0][1] as { body: string }).body)
+    expect(body.variables.input.paymentRequest).toBe("lnbc-nohash")
+    expect(onAnimate).toHaveBeenCalledTimes(1)
+    expect(onAnimate.mock.calls[0][0]).toMatchObject({ satAmount: 210 })
+  })
+
+  it("restarts polling on a new invoice with a different payment request", async () => {
+    const fetchSpy = jest.fn(async () => ({
+      json: async () => ({ data: { lnInvoicePaymentStatus: { status: "PENDING" } } }),
+    }))
+    global.fetch = fetchSpy as unknown as typeof fetch
+    const onAnimate = jest.fn()
+
+    const { rerender } = renderHook(
+      ({ invoice }: { invoice: PaymentPollingInvoice }) => {
+        const posPaymentReceivedRef = useRef<(() => void) | null>(null)
+        return usePaymentPolling({
+          currentInvoice: invoice,
+          triggerPaymentAnimation: onAnimate,
+          posPaymentReceivedRef,
+          fetchData: jest.fn(),
+          soundEnabled: false,
+          soundTheme: "default",
+          merchant: "yasar",
+        })
+      },
+      { initialProps: { invoice: { paymentRequest: "lnbc-first" } } },
+    )
+
+    await act(async () => {
+      await Promise.resolve()
+      await jest.advanceTimersByTimeAsync(0)
+    })
+
+    let body = JSON.parse(
+      (fetchSpy.mock.calls[fetchSpy.mock.calls.length - 1][1] as { body: string }).body,
+    )
+    expect(body.variables.input.paymentRequest).toBe("lnbc-first")
+
+    // Switch to a new invoice: same (absent) hash/verifyUrl, new payment request.
+    rerender({ invoice: { paymentRequest: "lnbc-second" } })
+
+    await act(async () => {
+      await Promise.resolve()
+      await jest.advanceTimersByTimeAsync(1000)
+    })
+
+    body = JSON.parse(
+      (fetchSpy.mock.calls[fetchSpy.mock.calls.length - 1][1] as { body: string }).body,
+    )
+    expect(body.variables.input.paymentRequest).toBe("lnbc-second")
+  })
 })
 
 describe("usePaymentPolling - escrow path (splits enabled, no verify URL)", () => {
