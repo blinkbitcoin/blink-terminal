@@ -3,12 +3,132 @@ import type { NextApiRequest, NextApiResponse } from "next"
 import AuthManager from "../../../lib/auth"
 import BlinkAPI from "../../../lib/blink-api"
 import { getApiUrlForEnvironment } from "../../../lib/config/api"
+import { isSplitPaymentsEnabled } from "../../../lib/config/features"
+import { getInvoiceFromLightningAddress } from "../../../lib/lnurl"
+import NWCClient from "../../../lib/nwc/NWCClient"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
 import { getHybridStore } from "../../../lib/storage/hybrid-store"
 import { getTracer, withSpan, getActiveTraceId } from "../../../lib/tracing"
 import { createInvoiceSchema, validateBody } from "../../../lib/validation"
 
 const tracer = getTracer("bbt-payment")
+
+/**
+ * Direct (non-escrow) invoice creation for the authed POS.
+ *
+ * With the intermediate BlinkPOS account removed, the authed POS mints invoices
+ * directly on the merchant's own wallet — exactly like the public POS. There is
+ * no escrow and no forwarding, so tips/splits are not applied here (the feature
+ * is disabled while `isSplitPaymentsEnabled()` is false).
+ *
+ * Returns the invoice plus, where the destination is an LNURL-pay endpoint
+ * (Blink Lightning address / npub.cash), a LUD-21 `verifyUrl` so the client can
+ * poll settlement without our escrow record.
+ */
+async function createDirectMerchantInvoice(params: {
+  amountSats: number
+  memo: string
+  apiUrl: string
+  apiKey?: string
+  userWalletId?: string
+  blinkLnAddress?: boolean
+  blinkLnAddressUsername?: string | null
+  npubCashActive?: boolean
+  npubCashLightningAddress?: string | null
+  nwcActive?: boolean
+  nwcConnectionUri?: string | null
+}): Promise<{
+  paymentRequest: string
+  paymentHash?: string
+  satoshis?: number
+  verifyUrl?: string
+}> {
+  const {
+    amountSats,
+    memo,
+    apiUrl,
+    apiKey,
+    userWalletId,
+    blinkLnAddress,
+    blinkLnAddressUsername,
+    npubCashActive,
+    npubCashLightningAddress,
+    nwcActive,
+    nwcConnectionUri,
+  } = params
+
+  // 1) Blink Lightning-address merchant (custodial or self-custodial/Spark) —
+  //    mint via LNURL-pay directly on the merchant's address. Returns a LUD-21
+  //    verify URL for settlement polling.
+  if (blinkLnAddress && blinkLnAddressUsername) {
+    const invoice = await getInvoiceFromLightningAddress(
+      `${blinkLnAddressUsername}@blink.sv`,
+      amountSats,
+      memo,
+    )
+    return {
+      paymentRequest: invoice.paymentRequest,
+      paymentHash: invoice.paymentHash,
+      satoshis: amountSats,
+      verifyUrl: invoice.verify,
+    }
+  }
+
+  // 2) npub.cash merchant — LNURL-pay against their lightning address.
+  if (npubCashActive && npubCashLightningAddress) {
+    const invoice = await getInvoiceFromLightningAddress(
+      npubCashLightningAddress,
+      amountSats,
+      memo,
+    )
+    return {
+      paymentRequest: invoice.paymentRequest,
+      paymentHash: invoice.paymentHash,
+      satoshis: amountSats,
+      verifyUrl: invoice.verify,
+    }
+  }
+
+  // 3) NWC merchant — make the invoice on the merchant's own wallet.
+  if (nwcActive && nwcConnectionUri) {
+    const nwcClient = new NWCClient(nwcConnectionUri)
+    try {
+      const result = await nwcClient.makeInvoice({
+        amount: amountSats * 1000, // NWC uses millisats
+        description: memo,
+        expiry: 3600,
+      })
+      if (result.error || !result.result?.invoice) {
+        throw new Error(result.error?.message || "NWC make_invoice failed")
+      }
+      return {
+        paymentRequest: result.result.invoice,
+        paymentHash: result.result.payment_hash,
+        satoshis: amountSats,
+      }
+    } finally {
+      nwcClient.close()
+    }
+  }
+
+  // 4) Blink API-key merchant — mint directly on the merchant's own BTC wallet.
+  if (apiKey && userWalletId) {
+    const merchantApi = new BlinkAPI(apiKey, apiUrl)
+    const invoice = await merchantApi.createLnInvoice(userWalletId, amountSats, memo)
+    if (!invoice?.paymentRequest) {
+      throw new Error("Failed to create invoice on merchant wallet")
+    }
+    return {
+      paymentRequest: invoice.paymentRequest,
+      paymentHash: invoice.paymentHash,
+      satoshis: invoice.satoshis ?? amountSats,
+    }
+  }
+
+  throw new Error(
+    "No usable merchant destination (api key + wallet, NWC, Blink LN address, or npub.cash) provided",
+  )
+}
 
 async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "POST") {
@@ -113,6 +233,108 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
         })
       }
 
+      // Validate amount: whole sats, bounded like public-invoice (0.1 BTC max).
+      // Shared by both the direct (no-escrow) and legacy escrow paths below.
+      const numericAmount = parseFloat(String(amount))
+      if (isNaN(numericAmount) || numericAmount <= 0) {
+        return res.status(400).json({
+          error: "Invalid amount: must be a positive number",
+        })
+      }
+      if (!Number.isInteger(numericAmount)) {
+        return res.status(400).json({
+          error: "Invalid amount: must be a whole number of sats",
+        })
+      }
+      if (numericAmount > 10000000) {
+        return res.status(400).json({
+          error: "Maximum amount is 10,000,000 sats (0.1 BTC)",
+        })
+      }
+
+      if (currency !== "BTC" && currency !== "USD") {
+        return res.status(400).json({
+          error: "Unsupported currency. Only BTC or USD is supported.",
+        })
+      }
+
+      // ─── DIRECT (no-escrow) PATH ──────────────────────────────────────────
+      // The intermediate BlinkPOS account has been removed for compliance. While
+      // Split Payments is disabled, the authed POS mints invoices directly on the
+      // merchant's own wallet (like the public POS): no escrow, no forwarding, no
+      // tips. The escrow path below is retained but dormant behind the flag.
+      if (!isSplitPaymentsEnabled()) {
+        rootSpan.setAttribute("invoice.mode", "direct")
+
+        // Each active merchant mode requires its companion destination fields.
+        // Fail with a clear 400 instead of a generic 502 (or silently falling
+        // through to another destination inside createDirectMerchantInvoice).
+        if (blinkLnAddress && !blinkLnAddressUsername) {
+          return res.status(400).json({
+            error: "Missing blinkLnAddressUsername for Blink lightning-address merchant",
+          })
+        }
+        if (npubCashActive && !npubCashLightningAddress) {
+          return res.status(400).json({
+            error: "Missing npubCashLightningAddress for npub.cash merchant",
+          })
+        }
+        if (nwcActive && !nwcConnectionUri) {
+          return res.status(400).json({
+            error: "Missing nwcConnectionUri for NWC merchant",
+          })
+        }
+        if (apiKey && !userWalletId && !walletId) {
+          return res.status(400).json({
+            error: "Missing userWalletId for API-key merchant",
+          })
+        }
+
+        try {
+          const direct = await createDirectMerchantInvoice({
+            amountSats: Math.round(numericAmount),
+            memo: memo || "",
+            apiUrl,
+            apiKey,
+            userWalletId: userWalletId || walletId || undefined,
+            blinkLnAddress,
+            blinkLnAddressUsername,
+            npubCashActive,
+            npubCashLightningAddress,
+            nwcActive,
+            nwcConnectionUri,
+          })
+
+          rootSpan.setAttribute("invoice.payment_hash", direct.paymentHash || "")
+          rootSpan.setAttribute("invoice.satoshis", direct.satoshis || 0)
+
+          return res.status(200).json({
+            success: true,
+            invoice: {
+              paymentRequest: direct.paymentRequest,
+              paymentHash: direct.paymentHash,
+              satoshis: direct.satoshis ?? Math.round(numericAmount),
+              amount: Math.round(numericAmount),
+              currency,
+              memo: memo || "",
+              // Direct-receive settlement detection: LUD-21 verify URL when the
+              // destination is an LNURL-pay address; otherwise the client polls
+              // the public lnInvoicePaymentStatus query by payment request.
+              ...(direct.verifyUrl && { verifyUrl: direct.verifyUrl }),
+            },
+          })
+        } catch (directError: unknown) {
+          const message =
+            directError instanceof Error ? directError.message : "Unknown error"
+          console.error("❌ Direct invoice creation failed:", message)
+          return res.status(502).json({
+            error: "Failed to create invoice on merchant wallet.",
+            details: process.env.NODE_ENV === "development" ? message : undefined,
+          })
+        }
+      }
+      // ─── LEGACY ESCROW PATH (dormant while Split Payments disabled) ────────
+
       // Get BlinkPOS credentials from environment.
       // A single pair of env vars is used across staging and production; each
       // deployment is responsible for setting these to the credentials that
@@ -133,24 +355,6 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
         console.error("Missing BlinkPOS environment variables")
         return res.status(500).json({
           error: "BlinkPOS configuration missing",
-        })
-      }
-
-      // Validate amount: whole sats, bounded like public-invoice (0.1 BTC max)
-      const numericAmount = parseFloat(String(amount))
-      if (isNaN(numericAmount) || numericAmount <= 0) {
-        return res.status(400).json({
-          error: "Invalid amount: must be a positive number",
-        })
-      }
-      if (!Number.isInteger(numericAmount)) {
-        return res.status(400).json({
-          error: "Invalid amount: must be a whole number of sats",
-        })
-      }
-      if (numericAmount > 10000000) {
-        return res.status(400).json({
-          error: "Maximum amount is 10,000,000 sats (0.1 BTC)",
         })
       }
 
@@ -183,7 +387,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
           )
         } else {
           return res.status(400).json({
-            error: "Unsupported currency. Only BTC is supported through BlinkPOS.",
+            error: "Unsupported currency. Only BTC or USD is supported through BlinkPOS.",
           })
         }
 

@@ -1,6 +1,8 @@
 import { useEffect, useRef } from "react"
 
 import { useNFC, type UseNFCReturn } from "../../components/NFCPayment"
+import { getApiUrl } from "../config/api"
+import { isSplitPaymentsEnabled } from "../config/features"
 import { verifyLnurlPayment } from "../lnurl"
 
 import type { PaymentData } from "./useBlinkWebSocket"
@@ -82,8 +84,9 @@ export function usePaymentPolling({
   const pollingStartTimeRef = useRef<number | null>(null)
 
   // Keep latest invoice/callbacks in refs so the poll always reads fresh
-  // values without restarting the interval (the effect below deliberately
-  // keys only on paymentHash/verifyUrl).
+  // values without restarting the interval on every render (the effect below
+  // only restarts when the invoice identity — hash / verify URL / payment
+  // request — actually changes).
   const invoiceRef = useRef(currentInvoice)
   invoiceRef.current = currentInvoice
   const pollDepsRef = useRef({ triggerPaymentAnimation, fetchData, merchant })
@@ -97,13 +100,28 @@ export function usePaymentPolling({
       pollingIntervalRef.current = null
     }
 
-    // Start polling if we have a payment hash (escrow path) or a LUD-21 verify
-    // URL (self-custodial direct-receive path) to watch.
-    if (currentInvoice?.paymentHash || currentInvoice?.verifyUrl) {
-      console.log(
-        "🔄 Starting payment status polling for:",
-        currentInvoice.paymentHash?.substring(0, 16) + "..." || currentInvoice.verifyUrl,
-      )
+    const splitsEnabled = isSplitPaymentsEnabled()
+
+    // Set true by the effect cleanup so a stale in-flight request (issued
+    // for a previous invoice) cannot settle and clear a replacement invoice.
+    let cancelled = false
+
+    // Start polling if we have anything to watch: a payment hash (escrow
+    // path), a LUD-21 verify URL (LNURL direct-receive path), or — in direct
+    // (no-escrow) mode only — a payment request (some NWC wallets omit the
+    // hash). In escrow mode a hash-less invoice has nothing to poll against.
+    if (
+      currentInvoice?.paymentHash ||
+      currentInvoice?.verifyUrl ||
+      (!splitsEnabled && currentInvoice?.paymentRequest)
+    ) {
+      const logTarget = currentInvoice.paymentHash
+        ? currentInvoice.paymentHash.substring(0, 16) + "..."
+        : currentInvoice.verifyUrl ||
+          (currentInvoice.paymentRequest
+            ? currentInvoice.paymentRequest.substring(0, 16) + "..."
+            : "unknown")
+      console.log("🔄 Starting payment status polling for:", logTarget)
       pollingStartTimeRef.current = Date.now()
 
       // Per-invoice guards (scoped to this effect run):
@@ -139,20 +157,58 @@ export function usePaymentPolling({
           let completed = false
           let expired = false
 
-          if (currentInvoice.verifyUrl) {
-            // Self-custodial (Spark) direct receive: poll the LUD-21 verify URL.
-            // (Settlement is populated server-side via the Spark SSP webhook, so
-            // it may lag slightly behind the actual payment.)
-            const verifyResult = await verifyLnurlPayment(currentInvoice.verifyUrl)
+          // Read the live invoice from the ref (not the effect closure) so an
+          // in-flight poll always targets the current invoice.
+          const pollInvoice = invoiceRef.current ?? currentInvoice
+          if (!pollInvoice) {
+            return
+          }
+
+          if (pollInvoice.verifyUrl) {
+            // Self-custodial (Spark) / direct LNURL-pay receive: poll the LUD-21
+            // verify URL. (Settlement is populated server-side via the SSP
+            // webhook, so it may lag slightly behind the actual payment.)
+            const verifyResult = await verifyLnurlPayment(pollInvoice.verifyUrl)
             completed = verifyResult.settled === true
-          } else {
-            // Escrow path: read the BlinkPOS forwarding record status.
-            const response = await fetch(
-              `/api/payment-status/${currentInvoice.paymentHash}`,
-            )
+          } else if (!splitsEnabled && pollInvoice.paymentRequest) {
+            // Direct (no-escrow) receive for API-key / NWC merchants: the invoice
+            // is on the merchant's own wallet, so there is no escrow record to
+            // read. Poll Blink's public lnInvoicePaymentStatus query by payment
+            // request (same mechanism the public POS uses).
+            const response = await fetch(getApiUrl(), {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                query: `
+                  query LnInvoicePaymentStatus($input: LnInvoicePaymentStatusInput!) {
+                    lnInvoicePaymentStatus(input: $input) {
+                      status
+                    }
+                  }
+                `,
+                variables: {
+                  input: { paymentRequest: pollInvoice.paymentRequest },
+                },
+              }),
+            })
+            const data = await response.json()
+            completed = data.data?.lnInvoicePaymentStatus?.status === "PAID"
+          } else if (pollInvoice.paymentHash) {
+            // Legacy escrow path (dormant while Split Payments disabled): read the
+            // BlinkPOS forwarding record status.
+            const response = await fetch(`/api/payment-status/${pollInvoice.paymentHash}`)
             const data = await response.json()
             completed = data.status === "completed"
             expired = data.status === "expired"
+          } else {
+            // Nothing to poll for this invoice (e.g. escrow mode with no hash).
+            return
+          }
+
+          // Ignore a stale response: the effect was cleaned up (invoice
+          // switched or component unmounted) while the request was in flight.
+          if (cancelled) {
+            return
           }
 
           if (completed) {
@@ -168,7 +224,7 @@ export function usePaymentPolling({
             // Read the latest invoice/callbacks from refs (not the effect
             // closure) so the success screen + receipt show current fiat,
             // tip, merchant etc. even if they changed since polling started.
-            const invoice = invoiceRef.current ?? currentInvoice
+            const invoice = pollInvoice
             const {
               triggerPaymentAnimation: triggerAnimation,
               fetchData: refreshData,
@@ -224,12 +280,20 @@ export function usePaymentPolling({
 
     // Cleanup on unmount or when invoice changes
     return () => {
+      cancelled = true
       if (pollingIntervalRef.current) {
         clearInterval(pollingIntervalRef.current)
         pollingIntervalRef.current = null
       }
     }
-  }, [currentInvoice?.paymentHash, currentInvoice?.verifyUrl])
+    // paymentRequest is part of the key: it uniquely identifies an invoice and
+    // is the only field guaranteed present on the direct (no-escrow) path, so a
+    // new invoice always restarts polling even without a hash or verify URL.
+  }, [
+    currentInvoice?.paymentHash,
+    currentInvoice?.verifyUrl,
+    currentInvoice?.paymentRequest,
+  ])
 
   // Setup NFC for Boltcard payments
   const nfcState: UseNFCReturn = useNFC({

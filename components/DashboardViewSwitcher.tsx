@@ -1,6 +1,7 @@
 import React from "react"
 
 import type { Wallet } from "../lib/blink-api"
+import { isSplitPaymentsEnabled } from "../lib/config/features"
 import type { CurrencyMetadata } from "../lib/currency-utils"
 import type { PaymentData } from "../lib/hooks/useBlinkWebSocket"
 import type { CombinedUser } from "../lib/hooks/useCombinedAuth"
@@ -316,9 +317,13 @@ export default function DashboardViewSwitcher({
         connected={connected}
         manualReconnect={manualReconnect}
         reconnectAttempts={reconnectAttempts}
-        tipsEnabled={tipsEnabled}
+        tipsEnabled={isSplitPaymentsEnabled() ? tipsEnabled : false}
         tipPresets={tipPresets}
-        tipRecipients={isSparkLnAddress ? [] : activeSplitProfile?.recipients || []}
+        tipRecipients={
+          !isSplitPaymentsEnabled() || isSparkLnAddress
+            ? []
+            : activeSplitProfile?.recipients || []
+        }
         isSparkLnAddress={isSparkLnAddress}
         soundEnabled={soundEnabled}
         onInvoiceStateChange={setShowingInvoice}
