@@ -278,7 +278,7 @@ export default function DashboardViewSwitcher({
 
   if (currentView === "cart") {
     return (
-      <div className="h-[calc(100vh-180px)] min-h-[400px]">
+      <div className="h-[calc(100dvh-180px)] min-h-[400px]">
         <ItemCart
           ref={cartRef}
           displayCurrency={displayCurrency}
@@ -351,7 +351,7 @@ export default function DashboardViewSwitcher({
 
   if (currentView === "multivoucher") {
     return (
-      <div className="h-[calc(100vh-180px)] min-h-[400px]">
+      <div className="h-[calc(100dvh-180px)] min-h-[400px]">
         <MultiVoucher
           ref={multiVoucherRef}
           voucherWallet={voucherWallet}
@@ -410,7 +410,7 @@ export default function DashboardViewSwitcher({
 
   if (currentView === "vouchermanager") {
     return (
-      <div className="h-[calc(100vh-180px)] min-h-[400px]">
+      <div className="h-[calc(100dvh-180px)] min-h-[400px]">
         <VoucherManager
           ref={voucherManagerRef}
           voucherWallet={voucherWallet}

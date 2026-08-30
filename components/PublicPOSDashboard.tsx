@@ -483,7 +483,7 @@ export default function PublicPOSDashboard({
 
       {/* Main Content */}
       <main
-        className={`max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mobile-content ${isFixedView ? "h-[calc(100vh-80px)] overflow-hidden py-2" : "py-6"}`}
+        className={`max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mobile-content ${isFixedView ? "h-[calc(100dvh-80px)] overflow-hidden py-2" : "py-6"}`}
         onTouchStart={handleTouchStart}
         onTouchMove={handleTouchMove}
         onTouchEnd={handleTouchEnd}
@@ -543,7 +543,7 @@ export default function PublicPOSDashboard({
 
         {/* Conditional Content Based on Current View */}
         {currentView === "cart" ? (
-          <div className="h-[calc(100vh-160px)] min-h-[400px]">
+          <div className="h-[calc(100dvh-160px)] min-h-[400px]">
             <ItemCart
               ref={cartRef}
               displayCurrency={displayCurrency}
