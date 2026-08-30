@@ -80,10 +80,6 @@ export default function PublicPOS({ username, urlParams }: PublicPOSPageProps) {
         <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)" />
         <link rel="icon" href="/icons/icon-ios-192x192.png" />
         <link rel="apple-touch-icon" href="/icons/icon-ios-192x192.png" />
-        <meta
-          name="viewport"
-          content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"
-        />
       </Head>
 
       <PublicPOSDashboard username={username} urlParams={urlParams} />

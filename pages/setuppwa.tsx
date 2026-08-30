@@ -33,10 +33,6 @@ export default function SetupPWA() {
         <meta name="theme-color" content={isDark ? "#000000" : "#ffffff"} />
         <link rel="icon" href="/icons/icon-ios-192x192.png" />
         <link rel="apple-touch-icon" href="/icons/icon-ios-192x192.png" />
-        <meta
-          name="viewport"
-          content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"
-        />
         <meta name="apple-mobile-web-app-capable" content="yes" />
         <meta
           name="apple-mobile-web-app-status-bar-style"
