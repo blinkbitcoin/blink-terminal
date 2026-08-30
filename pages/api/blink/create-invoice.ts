@@ -265,6 +265,31 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       // tips. The escrow path below is retained but dormant behind the flag.
       if (!isSplitPaymentsEnabled()) {
         rootSpan.setAttribute("invoice.mode", "direct")
+
+        // Each active merchant mode requires its companion destination fields.
+        // Fail with a clear 400 instead of a generic 502 (or silently falling
+        // through to another destination inside createDirectMerchantInvoice).
+        if (blinkLnAddress && !blinkLnAddressUsername) {
+          return res.status(400).json({
+            error: "Missing blinkLnAddressUsername for Blink lightning-address merchant",
+          })
+        }
+        if (npubCashActive && !npubCashLightningAddress) {
+          return res.status(400).json({
+            error: "Missing npubCashLightningAddress for npub.cash merchant",
+          })
+        }
+        if (nwcActive && !nwcConnectionUri) {
+          return res.status(400).json({
+            error: "Missing nwcConnectionUri for NWC merchant",
+          })
+        }
+        if (apiKey && !userWalletId && !walletId) {
+          return res.status(400).json({
+            error: "Missing userWalletId for API-key merchant",
+          })
+        }
+
         try {
           const direct = await createDirectMerchantInvoice({
             amountSats: Math.round(numericAmount),

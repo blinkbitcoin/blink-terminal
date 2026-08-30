@@ -229,4 +229,52 @@ describe("create-invoice (direct mode)", () => {
     await handler(req, res)
     expect(res._status).toBe(502)
   })
+
+  it("400s when blinkLnAddress is set without blinkLnAddressUsername", async () => {
+    const { req, res } = mockReqRes({
+      amount: 5000,
+      currency: "BTC",
+      blinkLnAddress: true,
+    })
+    await handler(req, res)
+    expect(res._status).toBe(400)
+    expect(res._json.error).toMatch(/blinkLnAddressUsername/)
+    expect(mockGetInvoice).not.toHaveBeenCalled()
+  })
+
+  it("400s when npubCashActive is set without npubCashLightningAddress", async () => {
+    const { req, res } = mockReqRes({
+      amount: 3000,
+      currency: "BTC",
+      npubCashActive: true,
+    })
+    await handler(req, res)
+    expect(res._status).toBe(400)
+    expect(res._json.error).toMatch(/npubCashLightningAddress/)
+    expect(mockGetInvoice).not.toHaveBeenCalled()
+  })
+
+  it("400s when nwcActive is set without nwcConnectionUri", async () => {
+    const { req, res } = mockReqRes({
+      amount: 2000,
+      currency: "BTC",
+      nwcActive: true,
+    })
+    await handler(req, res)
+    expect(res._status).toBe(400)
+    expect(res._json.error).toMatch(/nwcConnectionUri/)
+    expect(mockMakeInvoice).not.toHaveBeenCalled()
+  })
+
+  it("400s when apiKey is set without a wallet id", async () => {
+    const { req, res } = mockReqRes({
+      amount: 5000,
+      currency: "BTC",
+      apiKey: "merchant-key",
+    })
+    await handler(req, res)
+    expect(res._status).toBe(400)
+    expect(res._json.error).toMatch(/userWalletId/)
+    expect(mockCreateLnInvoice).not.toHaveBeenCalled()
+  })
 })
