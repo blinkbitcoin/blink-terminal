@@ -100,20 +100,28 @@ export function usePaymentPolling({
       pollingIntervalRef.current = null
     }
 
+    const splitsEnabled = isSplitPaymentsEnabled()
+
+    // Set true by the effect cleanup so a stale in-flight request (issued
+    // for a previous invoice) cannot settle and clear a replacement invoice.
+    let cancelled = false
+
     // Start polling if we have anything to watch: a payment hash (escrow
-    // path), a LUD-21 verify URL (LNURL direct-receive path), or a payment
-    // request (direct no-escrow path, where some NWC wallets omit the hash).
+    // path), a LUD-21 verify URL (LNURL direct-receive path), or — in direct
+    // (no-escrow) mode only — a payment request (some NWC wallets omit the
+    // hash). In escrow mode a hash-less invoice has nothing to poll against.
     if (
       currentInvoice?.paymentHash ||
       currentInvoice?.verifyUrl ||
-      currentInvoice?.paymentRequest
+      (!splitsEnabled && currentInvoice?.paymentRequest)
     ) {
-      console.log(
-        "🔄 Starting payment status polling for:",
-        currentInvoice.paymentHash?.substring(0, 16) + "..." ||
-          currentInvoice.verifyUrl ||
-          currentInvoice.paymentRequest?.substring(0, 16) + "...",
-      )
+      const logTarget = currentInvoice.paymentHash
+        ? currentInvoice.paymentHash.substring(0, 16) + "..."
+        : currentInvoice.verifyUrl ||
+          (currentInvoice.paymentRequest
+            ? currentInvoice.paymentRequest.substring(0, 16) + "..."
+            : "unknown")
+      console.log("🔄 Starting payment status polling for:", logTarget)
       pollingStartTimeRef.current = Date.now()
 
       // Per-invoice guards (scoped to this effect run):
@@ -162,7 +170,7 @@ export function usePaymentPolling({
             // webhook, so it may lag slightly behind the actual payment.)
             const verifyResult = await verifyLnurlPayment(pollInvoice.verifyUrl)
             completed = verifyResult.settled === true
-          } else if (!isSplitPaymentsEnabled() && pollInvoice.paymentRequest) {
+          } else if (!splitsEnabled && pollInvoice.paymentRequest) {
             // Direct (no-escrow) receive for API-key / NWC merchants: the invoice
             // is on the merchant's own wallet, so there is no escrow record to
             // read. Poll Blink's public lnInvoicePaymentStatus query by payment
@@ -185,13 +193,22 @@ export function usePaymentPolling({
             })
             const data = await response.json()
             completed = data.data?.lnInvoicePaymentStatus?.status === "PAID"
-          } else {
+          } else if (pollInvoice.paymentHash) {
             // Legacy escrow path (dormant while Split Payments disabled): read the
             // BlinkPOS forwarding record status.
             const response = await fetch(`/api/payment-status/${pollInvoice.paymentHash}`)
             const data = await response.json()
             completed = data.status === "completed"
             expired = data.status === "expired"
+          } else {
+            // Nothing to poll for this invoice (e.g. escrow mode with no hash).
+            return
+          }
+
+          // Ignore a stale response: the effect was cleaned up (invoice
+          // switched or component unmounted) while the request was in flight.
+          if (cancelled) {
+            return
           }
 
           if (completed) {
@@ -263,6 +280,7 @@ export function usePaymentPolling({
 
     // Cleanup on unmount or when invoice changes
     return () => {
+      cancelled = true
       if (pollingIntervalRef.current) {
         clearInterval(pollingIntervalRef.current)
         pollingIntervalRef.current = null
