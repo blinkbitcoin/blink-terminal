@@ -187,7 +187,7 @@ function MyApp({ Component, pageProps }: AppProps) {
         <meta httpEquiv="Expires" content="0" />
         <meta
           name="viewport"
-          content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"
+          content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
         />
       </Head>
       {/* Staging environment indicator banner */}

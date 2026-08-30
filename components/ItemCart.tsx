@@ -1425,7 +1425,10 @@ const ItemCart = forwardRef<ItemCartHandle, ItemCartProps>(
               </div>
 
               {/* Fixed bottom row: C and OK buttons */}
-              <div className="flex-shrink-0 pt-3 max-w-md mx-auto w-full">
+              <div
+                className="flex-shrink-0 pt-3 max-w-md mx-auto w-full"
+                style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+              >
                 {(() => {
                   const clearIndex = 2 + filteredItems.length
                   const okIndex = 2 + filteredItems.length + 1
