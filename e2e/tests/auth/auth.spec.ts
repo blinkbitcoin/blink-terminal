@@ -236,6 +236,83 @@ test.describe("Authentication", () => {
     })
   })
 
+  // The "Sign in with Password" option renders only when the password-auth flag
+  // is enabled AND an encrypted account is stored locally (a returning user).
+  // Runs only in the feature-enabled configuration; each test seeds the
+  // stored-account state so the button appears, then exercises the form up to
+  // (but not through) the authentication boundary — no real credential needed.
+  test.describe("Password Sign-In Flow", () => {
+    test.skip(
+      !passwordAuthEnabled,
+      "in-app password auth disabled (Nostr-only by default); set NEXT_PUBLIC_ENABLE_PASSWORD_AUTH=true to run",
+    )
+
+    // Seed a stored encrypted account so hasStoredEncryptedNsec() is true on
+    // mount, then reload so NostrLoginForm reads it. The value only needs to be
+    // present (its shape is not decrypted in these UI-behavior tests).
+    async function seedStoredAccount(page: import("@playwright/test").Page) {
+      await page.evaluate(() => {
+        localStorage.setItem(
+          "blinkpos_encrypted_nsec",
+          JSON.stringify({ ciphertext: "test", iv: "test", salt: "test" }),
+        )
+      })
+      await page.reload()
+      await page.waitForLoadState("domcontentloaded")
+    }
+
+    test.afterEach(async ({ page }) => {
+      await page
+        .evaluate(() => localStorage.removeItem("blinkpos_encrypted_nsec"))
+        .catch(() => {})
+    })
+
+    test("shows the password sign-in option for a returning user", async ({ page }) => {
+      await seedStoredAccount(page)
+
+      const passwordSignInBtn = page.locator('button:has-text("Sign in with Password")')
+      await expect(passwordSignInBtn).toBeVisible()
+    })
+
+    test("opens the password form when the option is clicked", async ({ page }) => {
+      await seedStoredAccount(page)
+
+      await page.locator('button:has-text("Sign in with Password")').click()
+
+      // Welcome-back view with a password input
+      await expect(page.locator("#loginPassword")).toBeVisible()
+      const submitBtn = page.locator('button[type="submit"]:has-text("Sign In")')
+      await expect(submitBtn).toBeVisible()
+    })
+
+    test("enables submit only after a password is entered", async ({ page }) => {
+      await seedStoredAccount(page)
+      await page.locator('button:has-text("Sign in with Password")').click()
+
+      const passwordInput = page.locator("#loginPassword")
+      const submitBtn = page.locator('button[type="submit"]:has-text("Sign In")')
+
+      // Disabled while empty, enabled once a password is typed
+      await expect(submitBtn).toBeDisabled()
+      await passwordInput.fill("some-password")
+      await expect(submitBtn).toBeEnabled()
+    })
+
+    test("returns to the main sign-in options via back", async ({ page }) => {
+      await seedStoredAccount(page)
+      await page.locator('button:has-text("Sign in with Password")').click()
+      await expect(page.locator("#loginPassword")).toBeVisible()
+
+      await page.locator('button:has-text("Back to sign-in options")').click()
+
+      // Back on the main view: an external Nostr method is offered again
+      const remoteSignerBtn = page.locator(
+        'button:has-text("Connect with Remote Signer"), button:has-text("Connect with Nostr Connect")',
+      )
+      await expect(remoteSignerBtn.first()).toBeVisible()
+    })
+  })
+
   test.describe("Remote Signer Flow", () => {
     test("should open Nostr Connect modal when button clicked", async ({ page }) => {
       const connectBtn = page.locator(
