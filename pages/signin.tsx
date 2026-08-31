@@ -26,8 +26,12 @@ export default function SignIn() {
   // Redirect authenticated users away from sign-in page
   useEffect(() => {
     if (!loading && isAuthenticated) {
-      // Use redirect param if provided, otherwise go to home
-      const destination = redirect && typeof redirect === "string" ? redirect : "/"
+      // Only honor same-origin internal paths from ?redirect= to avoid open
+      // redirects: must start with a single "/" (rejects absolute URLs and
+      // protocol-relative "//host" / "/\host" values). Otherwise go home.
+      const isSafeInternalPath = (p: unknown): p is string =>
+        typeof p === "string" && /^\/(?![/\\])/.test(p)
+      const destination = isSafeInternalPath(redirect) ? redirect : "/"
       router.replace(destination)
     }
   }, [loading, isAuthenticated, redirect, router])
