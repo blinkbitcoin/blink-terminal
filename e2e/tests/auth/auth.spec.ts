@@ -13,18 +13,19 @@ test.describe("Authentication", () => {
 
   test.describe("Login Page Display", () => {
     test("should display login page with sign-in options", async ({ page }) => {
-      // The modern login page should have sign-in method buttons
-      // Look for "Connect with Remote Signer" or "Create New Account" buttons
+      // Sign-in is Nostr-only by default: the Remote Signer (Nostr Connect)
+      // button is always available. The in-app password/create-account options
+      // are gated behind NEXT_PUBLIC_ENABLE_PASSWORD_AUTH (off by default).
       const remoteSignerBtn = page.locator(
         'button:has-text("Connect with Remote Signer"), button:has-text("Connect with Nostr Connect")',
       )
-      const createAccountBtn = page.locator('button:has-text("Create New Account")')
 
-      // At least one authentication method should be visible
-      const hasRemoteSigner = await remoteSignerBtn.isVisible().catch(() => false)
-      const hasCreateAccount = await createAccountBtn.isVisible().catch(() => false)
+      const hasRemoteSigner = await remoteSignerBtn
+        .first()
+        .isVisible()
+        .catch(() => false)
 
-      expect(hasRemoteSigner || hasCreateAccount).toBeTruthy()
+      expect(hasRemoteSigner).toBeTruthy()
     })
 
     test("should display Blink branding", async ({ page }) => {
@@ -33,9 +34,16 @@ test.describe("Authentication", () => {
       await expect(logo.first()).toBeVisible()
     })
 
-    test("should have Create New Account button", async ({ page }) => {
+    test("should not show in-app password auth options by default (Nostr-only)", async ({
+      page,
+    }) => {
+      // NEXT_PUBLIC_ENABLE_PASSWORD_AUTH is off by default, so the in-app
+      // password sign-in and account-creation options must not be rendered.
       const createAccountBtn = page.locator('button:has-text("Create New Account")')
-      await expect(createAccountBtn).toBeVisible()
+      const passwordSignInBtn = page.locator('button:has-text("Sign in with Password")')
+
+      await expect(createAccountBtn).toHaveCount(0)
+      await expect(passwordSignInBtn).toHaveCount(0)
     })
 
     test("should have Connect with Remote Signer button", async ({ page }) => {
@@ -140,7 +148,11 @@ test.describe("Authentication", () => {
     })
   })
 
-  test.describe("Create Account Flow", () => {
+  // In-app account creation (and password sign-in) is gated behind
+  // NEXT_PUBLIC_ENABLE_PASSWORD_AUTH, which is off by default so sign-in is
+  // Nostr-only. These tests are skipped unless the flag is enabled; they remain
+  // as coverage for when the in-app password path is re-enabled.
+  test.describe.skip("Create Account Flow", () => {
     test("should open create account form when button clicked", async ({ page }) => {
       const createAccountBtn = page.locator('button:has-text("Create New Account")')
 

@@ -13,6 +13,7 @@
  */
 
 import Image from "next/image"
+import Link from "next/link"
 import { useRouter } from "next/router"
 import { useState, useEffect, useRef, useCallback } from "react"
 
@@ -549,6 +550,16 @@ export default function SetupPWAForm() {
             )}
           </div>
         )}
+
+        {/* Sign in link */}
+        <div className="mt-8">
+          <Link
+            href="/signin"
+            className={`text-sm transition-colors ${isDark ? "text-gray-500 hover:text-gray-300" : "text-gray-500 hover:text-gray-700"}`}
+          >
+            Sign in for full features
+          </Link>
+        </div>
       </div>
 
       {/* Footer */}

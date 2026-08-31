@@ -10,7 +10,11 @@ import { BasePage } from "./BasePage"
  * The modern BBT login page uses multiple Nostr authentication methods:
  * - NIP-46 Remote Signer (Nostr Connect)
  * - Browser Extension (keys.band, Alby)
- * - In-app account creation with password
+ * - NIP-55 external signer (Amber)
+ *
+ * In-app account creation and password sign-in are gated behind
+ * NEXT_PUBLIC_ENABLE_PASSWORD_AUTH (off by default), so those locators/helpers
+ * only resolve when that flag is enabled.
  */
 export class AuthPage extends BasePage {
   // Main auth buttons
