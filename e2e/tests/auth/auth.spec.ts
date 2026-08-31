@@ -324,20 +324,20 @@ test.describe("Authentication", () => {
     // Seed a stored encrypted account so hasStoredEncryptedNsec() is true on
     // mount, then reload so NostrLoginForm reads it. The value only needs to be
     // present (its shape is not decrypted in these UI-behavior tests).
-    async function seedStoredAccount(page: import("@playwright/test").Page) {
-      await page.evaluate(() => {
+    async function seedStoredAccount(page: Page) {
+      await page.evaluate((key) => {
         localStorage.setItem(
-          "blinkpos_encrypted_nsec",
+          key,
           JSON.stringify({ ciphertext: "test", iv: "test", salt: "test" }),
         )
-      })
+      }, ENCRYPTED_NSEC_KEY)
       await page.reload()
       await page.waitForLoadState("domcontentloaded")
     }
 
     test.afterEach(async ({ page }) => {
       await page
-        .evaluate(() => localStorage.removeItem("blinkpos_encrypted_nsec"))
+        .evaluate((key) => localStorage.removeItem(key), ENCRYPTED_NSEC_KEY)
         .catch(() => {})
     })
 
