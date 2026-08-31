@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test"
+import { test, expect, type Page } from "@playwright/test"
 
 import { AuthPage } from "../../page-objects"
 // TEST_CREDENTIALS removed (unused)
@@ -6,6 +6,61 @@ import { AuthPage } from "../../page-objects"
 // In-app password/create-account UI is gated behind this build/runtime flag.
 // Default off = Nostr-only sign-in; on = the CI "password-auth" job.
 const passwordAuthEnabled = process.env.NEXT_PUBLIC_ENABLE_PASSWORD_AUTH === "true"
+
+// A "success" sign-in sets isAuthenticated locally (before any network call) and
+// the /signin page then redirects the now-authenticated user away. We assert on
+// leaving /signin as the observable success signal.
+async function expectSignedInRedirect(page: Page) {
+  await page.waitForURL((url) => !url.pathname.startsWith("/signin"), {
+    timeout: 15000,
+  })
+}
+
+// Stub the NIP-98 server-session endpoints. The password/create success paths
+// fire a background NIP-98 login (non-fatal); stubbing keeps it deterministic
+// and quiet without affecting the local auth-state transition under test.
+async function stubAuthApi(page: Page) {
+  await page.route("**/api/auth/**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ success: true }),
+    }),
+  )
+}
+
+// localStorage keys written when a generated account is created / signed in.
+const SESSION_KEYS = [
+  "blinkpos_pubkey",
+  "blinkpos_signin_method",
+  "blinkpos_profiles",
+  "blinkpos_active_profile",
+]
+const ENCRYPTED_NSEC_KEY = "blinkpos_encrypted_nsec"
+
+// Drive the real create-account flow once to mint a genuine encrypted nsec for
+// `password` (using the app's own crypto), then convert the resulting
+// authenticated state into a "returning user" state: keep the encrypted nsec but
+// drop the in-memory/session keys and reload. The stored fixture is therefore
+// guaranteed decryptable by `password` without hardcoding any ciphertext.
+async function mintReturningUserAccount(page: Page, password: string) {
+  await page.locator('button:has-text("Create New Account")').click()
+  await page.locator("#password").fill(password)
+  await page.locator("#confirmPassword").fill(password)
+  await page.locator('button[type="submit"]:has-text("Create Account")').click()
+
+  // Account creation authenticates locally and navigates off /signin.
+  await expectSignedInRedirect(page)
+
+  // Keep the encrypted nsec, clear session/profile so the user is "returning".
+  await page.evaluate((keys) => {
+    keys.forEach((k) => localStorage.removeItem(k))
+  }, SESSION_KEYS)
+
+  // Back to the sign-in page as an unauthenticated returning user.
+  await page.goto("/signin")
+  await page.waitForLoadState("domcontentloaded")
+}
 
 test.describe("Authentication", () => {
   let authPage: AuthPage
@@ -234,6 +289,25 @@ test.describe("Authentication", () => {
       const backBtn = page.locator('button:has-text("Back"), button:has-text("← Back")')
       await expect(backBtn.first()).toBeVisible()
     })
+
+    test("creates the account and signs in on submit", async ({ page }) => {
+      await stubAuthApi(page)
+
+      await page.locator('button:has-text("Create New Account")').click()
+      await page.locator("#password").fill("e2e-valid-pass-123")
+      await page.locator("#confirmPassword").fill("e2e-valid-pass-123")
+
+      const submitBtn = page.locator('button[type="submit"]:has-text("Create Account")')
+      await expect(submitBtn).toBeEnabled()
+      await submitBtn.click()
+
+      // Keypair is generated, encrypted, stored, and the user is authenticated
+      // locally — the sign-in page then redirects away.
+      await expectSignedInRedirect(page)
+      await page.evaluate((key) => {
+        if (!localStorage.getItem(key)) throw new Error("encrypted nsec not stored")
+      }, ENCRYPTED_NSEC_KEY)
+    })
   })
 
   // The "Sign in with Password" option renders only when the password-auth flag
@@ -310,6 +384,34 @@ test.describe("Authentication", () => {
         'button:has-text("Connect with Remote Signer"), button:has-text("Connect with Nostr Connect")',
       )
       await expect(remoteSignerBtn.first()).toBeVisible()
+    })
+
+    test("rejects a wrong password with an error", async ({ page }) => {
+      await stubAuthApi(page)
+      // Mint a real encrypted nsec valid for the correct password.
+      await mintReturningUserAccount(page, "correct-horse-battery")
+
+      await page.locator('button:has-text("Sign in with Password")').click()
+      await page.locator("#loginPassword").fill("wrong-password")
+      await page.locator('button[type="submit"]:has-text("Sign In")').click()
+
+      // Decryption fails -> inline error, and we stay on /signin.
+      await expect(page.getByText("Incorrect password")).toBeVisible()
+      await expect(page).toHaveURL(/\/signin/)
+    })
+
+    test("signs in with the correct password", async ({ page }) => {
+      await stubAuthApi(page)
+      const password = "correct-horse-battery"
+      await mintReturningUserAccount(page, password)
+
+      await page.locator('button:has-text("Sign in with Password")').click()
+      await page.locator("#loginPassword").fill(password)
+      await page.locator('button[type="submit"]:has-text("Sign In")').click()
+
+      // Decryption succeeds, the session key is set, auth state flips, and the
+      // sign-in page redirects the now-authenticated user away.
+      await expectSignedInRedirect(page)
     })
   })
 
