@@ -150,9 +150,14 @@ test.describe("Authentication", () => {
 
   // In-app account creation (and password sign-in) is gated behind
   // NEXT_PUBLIC_ENABLE_PASSWORD_AUTH, which is off by default so sign-in is
-  // Nostr-only. These tests are skipped unless the flag is enabled; they remain
-  // as coverage for when the in-app password path is re-enabled.
-  test.describe.skip("Create Account Flow", () => {
+  // Nostr-only. These tests run only when the flag is enabled (feature-on
+  // build/config); otherwise they are skipped at runtime with a clear reason.
+  const passwordAuthEnabled = process.env.NEXT_PUBLIC_ENABLE_PASSWORD_AUTH === "true"
+  test.describe("Create Account Flow", () => {
+    test.skip(
+      !passwordAuthEnabled,
+      "in-app password auth disabled (Nostr-only by default); set NEXT_PUBLIC_ENABLE_PASSWORD_AUTH=true to run",
+    )
     test("should open create account form when button clicked", async ({ page }) => {
       const createAccountBtn = page.locator('button:has-text("Create New Account")')
 
