@@ -14,23 +14,26 @@ import { useCombinedAuth } from "../lib/hooks/useCombinedAuth"
  *
  * Features:
  * - Renders NostrLoginForm for Nostr authentication
- * - Redirects authenticated users to /
+ * - Redirects authenticated users to a validated ?redirect= target when
+ *   provided (same-origin path only, never back to /signin), otherwise to /
  * - Shows "Back to Public POS" link for users who changed their mind
- * - Accepts optional ?redirect= query param for post-auth navigation
  */
 export default function SignIn() {
   const router = useRouter()
+  const { isReady } = router
   const { loading, isAuthenticated } = useCombinedAuth()
   const { redirect } = router.query
 
-  // Redirect authenticated users away from sign-in page. The ?redirect= target
-  // is validated to a safe same-origin path (and never back to /signin) to
-  // avoid open redirects and redirect loops — see lib/auth/safe-redirect.
+  // Redirect authenticated users away from sign-in page. Wait for router.isReady
+  // so the ?redirect= query param is available (it is undefined on the first
+  // client render) — otherwise a "/signin?redirect=/foo" visit could drop /foo
+  // and fall back to /. The target is validated to a safe same-origin path (and
+  // never back to /signin) to avoid open redirects and loops — see
+  // lib/auth/safe-redirect.
   useEffect(() => {
-    if (!loading && isAuthenticated) {
-      router.replace(safeInternalRedirect(redirect))
-    }
-  }, [loading, isAuthenticated, redirect, router])
+    if (!isReady || loading || !isAuthenticated) return
+    router.replace(safeInternalRedirect(redirect))
+  }, [isReady, loading, isAuthenticated, redirect, router])
 
   // Show loading while checking auth or redirecting
   if (loading || isAuthenticated) {
