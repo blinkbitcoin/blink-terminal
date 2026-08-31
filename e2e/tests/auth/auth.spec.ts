@@ -3,6 +3,10 @@ import { test, expect } from "@playwright/test"
 import { AuthPage } from "../../page-objects"
 // TEST_CREDENTIALS removed (unused)
 
+// In-app password/create-account UI is gated behind this build/runtime flag.
+// Default off = Nostr-only sign-in; on = the CI "password-auth" job.
+const passwordAuthEnabled = process.env.NEXT_PUBLIC_ENABLE_PASSWORD_AUTH === "true"
+
 test.describe("Authentication", () => {
   let authPage: AuthPage
 
@@ -13,19 +17,14 @@ test.describe("Authentication", () => {
 
   test.describe("Login Page Display", () => {
     test("should display login page with sign-in options", async ({ page }) => {
-      // Sign-in is Nostr-only by default: the Remote Signer (Nostr Connect)
-      // button is always available. The in-app password/create-account options
-      // are gated behind NEXT_PUBLIC_ENABLE_PASSWORD_AUTH (off by default).
+      // Sign-in always offers the Remote Signer (Nostr Connect) method,
+      // regardless of the password-auth flag. Use auto-waiting visibility so the
+      // assertion is robust against client-side hydration timing.
       const remoteSignerBtn = page.locator(
         'button:has-text("Connect with Remote Signer"), button:has-text("Connect with Nostr Connect")',
       )
 
-      const hasRemoteSigner = await remoteSignerBtn
-        .first()
-        .isVisible()
-        .catch(() => false)
-
-      expect(hasRemoteSigner).toBeTruthy()
+      await expect(remoteSignerBtn.first()).toBeVisible()
     })
 
     test("should display Blink branding", async ({ page }) => {
@@ -37,6 +36,12 @@ test.describe("Authentication", () => {
     test("should not show in-app password auth options by default (Nostr-only)", async ({
       page,
     }) => {
+      // Only meaningful in the default (flag-off) configuration; when password
+      // auth is enabled these options are expected to render.
+      test.skip(
+        passwordAuthEnabled,
+        "password auth enabled; these options are expected to be visible",
+      )
       // NEXT_PUBLIC_ENABLE_PASSWORD_AUTH is off by default, so the in-app
       // password sign-in and account-creation options must not be rendered.
       const createAccountBtn = page.locator('button:has-text("Create New Account")')
@@ -150,92 +155,84 @@ test.describe("Authentication", () => {
 
   // In-app account creation (and password sign-in) is gated behind
   // NEXT_PUBLIC_ENABLE_PASSWORD_AUTH, which is off by default so sign-in is
-  // Nostr-only. These tests run only when the flag is enabled (feature-on
-  // build/config); otherwise they are skipped at runtime with a clear reason.
-  const passwordAuthEnabled = process.env.NEXT_PUBLIC_ENABLE_PASSWORD_AUTH === "true"
+  // Nostr-only. This suite runs only when the flag is enabled (the CI
+  // "password-auth" job / a local run with the flag set); otherwise it is
+  // skipped at runtime with a clear reason. When it runs, the assertions are
+  // unconditional so an unpropagated flag or a missing button fails loudly
+  // rather than silently passing.
   test.describe("Create Account Flow", () => {
     test.skip(
       !passwordAuthEnabled,
       "in-app password auth disabled (Nostr-only by default); set NEXT_PUBLIC_ENABLE_PASSWORD_AUTH=true to run",
     )
+
     test("should open create account form when button clicked", async ({ page }) => {
       const createAccountBtn = page.locator('button:has-text("Create New Account")')
+      await expect(createAccountBtn).toBeVisible()
 
-      if (await createAccountBtn.isVisible()) {
-        await createAccountBtn.click()
+      await createAccountBtn.click()
 
-        // Should now show password input fields
-        const passwordInput = page.locator('input[type="password"]').first()
-        await expect(passwordInput).toBeVisible({ timeout: 5000 })
-      }
+      // Should now show password input fields
+      const passwordInput = page.locator('input[type="password"]').first()
+      await expect(passwordInput).toBeVisible({ timeout: 5000 })
     })
 
     test("should validate password requirements", async ({ page }) => {
       const createAccountBtn = page.locator('button:has-text("Create New Account")')
+      await expect(createAccountBtn).toBeVisible()
+      await createAccountBtn.click()
 
-      if (await createAccountBtn.isVisible()) {
-        await createAccountBtn.click()
-        await page.waitForTimeout(500)
+      const passwordInput = page
+        .locator('#password, input[placeholder*="password"]')
+        .first()
+      const confirmInput = page
+        .locator('#confirmPassword, input[placeholder*="Confirm"]')
+        .first()
+      const submitBtn = page.locator('button[type="submit"]:has-text("Create Account")')
 
-        // Should show password fields
-        const passwordInput = page
-          .locator('#password, input[placeholder*="password"]')
-          .first()
-        const confirmInput = page
-          .locator('#confirmPassword, input[placeholder*="Confirm"]')
-          .first()
-        const submitBtn = page.locator('button[type="submit"]:has-text("Create Account")')
+      await expect(passwordInput).toBeVisible()
+      await expect(confirmInput).toBeVisible()
 
-        if ((await passwordInput.isVisible()) && (await confirmInput.isVisible())) {
-          // Enter short password (less than 8 chars)
-          await passwordInput.fill("short")
-          await confirmInput.fill("short")
+      // Enter short password (less than 8 chars)
+      await passwordInput.fill("short")
+      await confirmInput.fill("short")
 
-          // Submit button should be disabled or show error on submit
-          const isDisabled = await submitBtn.isDisabled()
-          expect(isDisabled).toBeTruthy()
-        }
-      }
+      // Submit button should be disabled while the password is too short
+      await expect(submitBtn).toBeDisabled()
     })
 
     test("should show error when passwords do not match", async ({ page }) => {
       const createAccountBtn = page.locator('button:has-text("Create New Account")')
+      await expect(createAccountBtn).toBeVisible()
+      await createAccountBtn.click()
 
-      if (await createAccountBtn.isVisible()) {
-        await createAccountBtn.click()
-        await page.waitForTimeout(500)
+      const passwordInput = page
+        .locator('#password, input[placeholder*="password"]')
+        .first()
+      const confirmInput = page
+        .locator('#confirmPassword, input[placeholder*="Confirm"]')
+        .first()
+      const submitBtn = page.locator('button[type="submit"]:has-text("Create Account")')
 
-        const passwordInput = page
-          .locator('#password, input[placeholder*="password"]')
-          .first()
-        const confirmInput = page
-          .locator('#confirmPassword, input[placeholder*="Confirm"]')
-          .first()
-        const submitBtn = page.locator('button[type="submit"]:has-text("Create Account")')
+      await expect(passwordInput).toBeVisible()
+      await expect(confirmInput).toBeVisible()
 
-        if ((await passwordInput.isVisible()) && (await confirmInput.isVisible())) {
-          // Enter matching passwords
-          await passwordInput.fill("validpassword123")
-          await confirmInput.fill("differentpassword")
+      // Enter mismatched passwords
+      await passwordInput.fill("validpassword123")
+      await confirmInput.fill("differentpassword")
 
-          // Submit button should be disabled when passwords don't match
-          const isDisabled = await submitBtn.isDisabled()
-          expect(isDisabled).toBeTruthy()
-        }
-      }
+      // Submit button should be disabled when passwords don't match
+      await expect(submitBtn).toBeDisabled()
     })
 
     test("should have back button to return to main view", async ({ page }) => {
       const createAccountBtn = page.locator('button:has-text("Create New Account")')
+      await expect(createAccountBtn).toBeVisible()
+      await createAccountBtn.click()
 
-      if (await createAccountBtn.isVisible()) {
-        await createAccountBtn.click()
-        await page.waitForTimeout(500)
-
-        // Should have back button
-        const backBtn = page.locator('button:has-text("Back"), button:has-text("← Back")')
-        await expect(backBtn.first()).toBeVisible()
-      }
+      // Should have back button
+      const backBtn = page.locator('button:has-text("Back"), button:has-text("← Back")')
+      await expect(backBtn.first()).toBeVisible()
     })
   })
 

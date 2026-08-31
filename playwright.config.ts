@@ -100,6 +100,11 @@ export default defineConfig({
     env: {
       // Force staging environment for E2E tests
       BLINK_ENVIRONMENT: "staging",
+      // Forward the in-app password-auth flag to the dev server so the
+      // "Create Account Flow" suite can render its UI when enabled. Defaults
+      // off (Nostr-only) to match the default sign-in configuration.
+      NEXT_PUBLIC_ENABLE_PASSWORD_AUTH:
+        process.env.NEXT_PUBLIC_ENABLE_PASSWORD_AUTH ?? "false",
     },
   },
 
