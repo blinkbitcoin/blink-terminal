@@ -4,6 +4,7 @@ import { useRouter } from "next/router"
 import { useEffect } from "react"
 
 import NostrLoginForm from "../components/auth/NostrLoginForm"
+import { safeInternalRedirect } from "../lib/auth/safe-redirect"
 import { useCombinedAuth } from "../lib/hooks/useCombinedAuth"
 
 /**
@@ -22,16 +23,12 @@ export default function SignIn() {
   const { loading, isAuthenticated } = useCombinedAuth()
   const { redirect } = router.query
 
-  // Redirect authenticated users away from sign-in page
+  // Redirect authenticated users away from sign-in page. The ?redirect= target
+  // is validated to a safe same-origin path (and never back to /signin) to
+  // avoid open redirects and redirect loops — see lib/auth/safe-redirect.
   useEffect(() => {
     if (!loading && isAuthenticated) {
-      // Only honor same-origin internal paths from ?redirect= to avoid open
-      // redirects: must start with a single "/" (rejects absolute URLs and
-      // protocol-relative "//host" / "/\host" values). Otherwise go home.
-      const isSafeInternalPath = (p: unknown): p is string =>
-        typeof p === "string" && /^\/(?![/\\])/.test(p)
-      const destination = isSafeInternalPath(redirect) ? redirect : "/"
-      router.replace(destination)
+      router.replace(safeInternalRedirect(redirect))
     }
   }, [loading, isAuthenticated, redirect, router])
 
