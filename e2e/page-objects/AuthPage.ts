@@ -80,10 +80,14 @@ export class AuthPage extends BasePage {
   }
 
   /**
-   * Navigate to the login page
+   * Navigate to the login page.
+   *
+   * The dedicated sign-in UI lives at /signin. The root path (/) redirects
+   * unauthenticated users to /setuppwa (Public POS), which has no sign-in
+   * form, so tests must target /signin directly.
    */
   async goto() {
-    await super.goto("/")
+    await super.goto("/signin")
     await this.waitForLoad()
   }
 
