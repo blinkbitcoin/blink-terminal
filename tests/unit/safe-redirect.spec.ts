@@ -28,6 +28,14 @@ describe("lib/auth/safe-redirect", () => {
       ["protocol-relative //host", "//evil.example"],
       ["backslash-relative /\\host", "/\\evil.example"],
       ["double-backslash /\\\\host", "/\\\\evil.example"],
+      // ASCII control chars: the URL parser strips TAB/LF/CR, which would
+      // otherwise collapse "/\t/host" to "//host" and escape the origin.
+      ["tab control char", "/\t/evil.example"],
+      ["newline control char", "/\n/evil.example"],
+      ["carriage-return control char", "/\r/evil.example"],
+      ["tab then //host", "/\t//evil.example"],
+      ["NUL control char", "/\u0000/evil.example"],
+      ["DEL control char", "/\u007f/evil.example"],
       // Scheme-based
       ["javascript: scheme", "javascript:alert(1)"],
       ["data: scheme", "data:text/html,<script>1</script>"],
@@ -35,8 +43,9 @@ describe("lib/auth/safe-redirect", () => {
       ["empty string", ""],
       ["bare word (relative)", "foo"],
       ["relative path", "foo/bar"],
-      // Loop back to the sign-in route (any query/hash, any case)
+      // Loop back to the sign-in route (any trailing slash / query / hash, case)
       ["exact /signin", "/signin"],
+      ["/signin trailing slash", "/signin/"],
       ["/signin with query", "/signin?redirect=/x"],
       ["/signin with hash", "/signin#top"],
       ["/SignIn (case-insensitive)", "/SignIn"],
@@ -66,6 +75,7 @@ describe("lib/auth/safe-redirect", () => {
     it("falls back to / for unsafe or non-string values", () => {
       expect(safeInternalRedirect("https://evil.example")).toBe("/")
       expect(safeInternalRedirect("//evil.example")).toBe("/")
+      expect(safeInternalRedirect("/\t/evil.example")).toBe("/")
       expect(safeInternalRedirect("/signin")).toBe("/")
       expect(safeInternalRedirect(undefined)).toBe("/")
       expect(safeInternalRedirect(["/a", "/b"])).toBe("/")
