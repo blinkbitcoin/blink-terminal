@@ -16,6 +16,7 @@ import {
   isStaging,
   getEnvironmentConfig,
 } from "../../lib/config/api"
+import { isPasswordAuthEnabled } from "../../lib/config/features"
 import { useNostrAuth } from "../../lib/hooks/useNostrAuth"
 import { useTheme } from "../../lib/hooks/useTheme"
 import NostrAuthService from "../../lib/nostr/NostrAuthService"
@@ -1101,8 +1102,8 @@ export default function NostrLoginForm() {
 
           {/* Sign-in Methods */}
           <div className="space-y-4">
-            {/* Password Sign-In (if account exists) */}
-            {hasStoredAccount && (
+            {/* Password Sign-In (if account exists) — gated: Nostr-only by default */}
+            {isPasswordAuthEnabled() && hasStoredAccount && (
               <>
                 <button
                   onClick={() => setAuthMode("password")}
@@ -1316,27 +1317,29 @@ export default function NostrLoginForm() {
               </details>
             )}
 
-            {/* Create New Account Button */}
-            <button
-              onClick={() => setAuthMode("create")}
-              disabled={signingIn}
-              className="group relative w-full flex justify-center items-center py-4 px-6 border-2 border-emerald-500 text-lg font-medium rounded-xl text-emerald-600 dark:text-emerald-400 bg-transparent hover:bg-emerald-50 dark:hover:bg-emerald-900/20 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-            >
-              <svg
-                className="w-6 h-6 mr-3"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
+            {/* Create New Account Button — gated: Nostr-only by default */}
+            {isPasswordAuthEnabled() && (
+              <button
+                onClick={() => setAuthMode("create")}
+                disabled={signingIn}
+                className="group relative w-full flex justify-center items-center py-4 px-6 border-2 border-emerald-500 text-lg font-medium rounded-xl text-emerald-600 dark:text-emerald-400 bg-transparent hover:bg-emerald-50 dark:hover:bg-emerald-900/20 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth="2"
-                  d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z"
-                />
-              </svg>
-              Create New Account
-            </button>
+                <svg
+                  className="w-6 h-6 mr-3"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth="2"
+                    d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z"
+                  />
+                </svg>
+                Create New Account
+              </button>
+            )}
 
             {/* iOS hint - show when no extension detected */}
             {isIOS && !hasExtension && (
@@ -1429,10 +1432,12 @@ export default function NostrLoginForm() {
                   your Nostr keys on mobile. For iOS, use the Nostash extension for
                   Safari.
                 </p>
-                <p className="mt-2">
-                  <strong>Create New Account</strong> generates a Nostr identity protected
-                  by your password - works everywhere!
-                </p>
+                {isPasswordAuthEnabled() && (
+                  <p className="mt-2">
+                    <strong>Create New Account</strong> generates a Nostr identity
+                    protected by your password - works everywhere!
+                  </p>
+                )}
               </div>
             </details>
           </div>

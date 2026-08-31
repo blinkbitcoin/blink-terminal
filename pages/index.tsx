@@ -17,6 +17,9 @@ import { useCombinedAuth } from "../lib/hooks/useCombinedAuth"
  *
  * User Journey:
  * - Unauthenticated users (including after logout) are redirected to /setuppwa
+ *   (the Public POS entry point) — NOT directly to /signin, by design.
+ * - From /setuppwa (and the public /[username] page) users can reach /signin
+ *   to sign in for full features.
  * - Authenticated users see Dashboard or WalletSetup
  */
 export default function Home() {

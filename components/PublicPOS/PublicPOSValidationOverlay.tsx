@@ -74,6 +74,14 @@ export default function PublicPOSValidationOverlay({
             </p>
 
             <div className="mt-6 flex gap-3">
+              {validationError.canSwitchEnv && (
+                <Link
+                  href="/signin"
+                  className="flex-1 px-4 py-2 text-center rounded-lg bg-blink-accent hover:bg-blue-600 text-white text-sm font-medium transition-colors"
+                >
+                  Switch Environment
+                </Link>
+              )}
               <Link
                 href="/setuppwa"
                 className={`flex-1 px-4 py-2 text-center rounded-lg text-sm font-medium transition-colors ${

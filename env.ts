@@ -75,6 +75,10 @@ export const env = createEnv({
     // account (compliance concern) and is disabled by default. Set to "true" to
     // re-enable the dormant escrow + forwarding path. See lib/config/features.ts.
     NEXT_PUBLIC_SPLIT_PAYMENTS_ENABLED: z.enum(["true", "false"]).optional(),
+    // In-app password auth (password sign-in + create-account) is disabled by
+    // default so sign-in is Nostr-only. Set to "true" to re-enable the dormant
+    // in-app password UI. See lib/config/features.ts.
+    NEXT_PUBLIC_ENABLE_PASSWORD_AUTH: z.enum(["true", "false"]).optional(),
   },
 
   runtimeEnv: {
@@ -125,5 +129,6 @@ export const env = createEnv({
     NEXT_PUBLIC_GIT_COMMIT: process.env.NEXT_PUBLIC_GIT_COMMIT,
     NEXT_PUBLIC_USE_NDK_NIP46: process.env.NEXT_PUBLIC_USE_NDK_NIP46,
     NEXT_PUBLIC_SPLIT_PAYMENTS_ENABLED: process.env.NEXT_PUBLIC_SPLIT_PAYMENTS_ENABLED,
+    NEXT_PUBLIC_ENABLE_PASSWORD_AUTH: process.env.NEXT_PUBLIC_ENABLE_PASSWORD_AUTH,
   },
 })
