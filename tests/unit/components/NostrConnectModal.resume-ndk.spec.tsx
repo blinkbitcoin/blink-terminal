@@ -123,7 +123,7 @@ describe("NostrConnectModal — foreground resume under production NDK mode", ()
 
     // The resume read the legacy service's liveness…
     expect(legacy().isConnected).toHaveBeenCalled()
-    // …and never consulted NDK — whose empty state would have mis-triggered a restore/reset.
+    // …and never consulted NDK — whose empty state would have wrongly triggered a restore/reset.
     expect(ndk().restoreSession).not.toHaveBeenCalled()
     // The valid Amber connection was NOT reset: no return to the idle options view.
     expect(
