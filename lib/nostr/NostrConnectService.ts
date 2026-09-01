@@ -270,6 +270,14 @@ class NostrConnectService {
   ): Promise<ConnectionResult> {
     const clientSecretKey: Uint8Array = this.getOrCreateClientKey()
 
+    // v65: attempt ownership. This attempt takes the next ticket; only the LATEST attempt may
+    // publish signer/session/state into the singleton or clear it on failure. A superseded
+    // attempt's late settle (its fromURI resolving after a newer attempt started) closes its
+    // candidate signer and returns a "superseded" result WITHOUT touching shared state.
+    connectionAttemptCounter++
+    const thisAttempt: number = connectionAttemptCounter
+    const isCurrentAttempt = (): boolean => thisAttempt === connectionAttemptCounter
+
     try {
       this.connectionState = "connecting"
       console.log(
@@ -278,8 +286,9 @@ class NostrConnectService {
         "s)...",
       )
 
-      // BunkerSigner.fromURI waits for the connect response from the remote signer
-      this.signer = await BunkerSigner.fromURI(
+      // BunkerSigner.fromURI waits for the connect response from the remote signer.
+      // Kept LOCAL: the singleton is assigned only if this attempt is still current.
+      const candidate: BunkerSignerInstance = await BunkerSigner.fromURI(
         clientSecretKey,
         uri,
         {
@@ -292,15 +301,54 @@ class NostrConnectService {
         timeout,
       )
 
+      if (!isCurrentAttempt()) {
+        // A newer attempt (or a disconnect/cancel) superseded this one while fromURI was
+        // pending. Close the stale candidate's sockets and stay out of the shared state.
+        console.warn(
+          "[NostrConnect] Superseded connect attempt — closing stale candidate",
+        )
+        try {
+          await candidate.close()
+        } catch {
+          // best-effort cleanup
+        }
+        return { success: false, error: "Connection attempt superseded" }
+      }
+      this.signer = candidate
+
       console.log("[NostrConnect] Connection established, getting public key...")
 
       // Get the user's public key from the remote signer
-      const publicKey: string = await this.signer!.getPublicKey()
+      const publicKey: string = await candidate.getPublicKey()
+
+      // Re-check currency after the network round-trip: a superseding attempt may have
+      // started while getPublicKey was in flight.
+      if (!isCurrentAttempt()) {
+        console.warn("[NostrConnect] Superseded after connect — closing stale candidate")
+        try {
+          await candidate.close()
+        } catch {
+          // best-effort cleanup
+        }
+        return { success: false, error: "Connection attempt superseded" }
+      }
 
       // Add stabilization delay to let WebSocket connections settle
       // This helps prevent the first signing attempt from failing
       console.log("[NostrConnect] Adding post-connect stabilization delay...")
       await new Promise<void>((resolve) => setTimeout(resolve, POST_CONNECT_DELAY))
+
+      if (!isCurrentAttempt()) {
+        console.warn(
+          "[NostrConnect] Superseded during stabilization — closing stale candidate",
+        )
+        try {
+          await candidate.close()
+        } catch {
+          // best-effort cleanup
+        }
+        return { success: false, error: "Connection attempt superseded" }
+      }
 
       this.connectionState = "connected"
       this.userPublicKey = publicKey
@@ -308,8 +356,8 @@ class NostrConnectService {
       // Store session for persistence
       this.storeSession({
         publicKey,
-        signerPubkey: this.signer!.bp.pubkey!,
-        relays: this.signer!.bp.relays!,
+        signerPubkey: candidate.bp.pubkey!,
+        relays: candidate.bp.relays!,
       })
 
       console.log("[NostrConnect] Successfully connected!")
@@ -317,8 +365,12 @@ class NostrConnectService {
 
       return { success: true, publicKey }
     } catch (err: unknown) {
-      this.connectionState = "disconnected"
-      this.signer = null
+      // Only the CURRENT attempt may fail the singleton — a superseded attempt's rejection
+      // must not mark a newer (possibly healthy) connection disconnected or clear its signer.
+      if (isCurrentAttempt()) {
+        this.connectionState = "disconnected"
+        this.signer = null
+      }
 
       const error = err instanceof Error ? err : new Error(String(err))
       console.error("[NostrConnect] Connection failed:", error)
@@ -796,6 +848,13 @@ class NostrConnectService {
     console.log("[NostrConnect] Attempting to restore session...")
     console.log("[NostrConnect] Session pubkey:", session.publicKey.slice(0, 16) + "...")
 
+    // v65: attempt ownership — restore takes a ticket like any connect attempt and only
+    // publishes/clears singleton state while it is still the latest one. Declared before the
+    // try so the catch can consult it.
+    connectionAttemptCounter++
+    const thisAttempt: number = connectionAttemptCounter
+    const isCurrentAttempt = (): boolean => thisAttempt === connectionAttemptCounter
+
     try {
       const clientSecretKey: Uint8Array = this.getOrCreateClientKey()
 
@@ -812,14 +871,34 @@ class NostrConnectService {
       const pool: SimplePoolInstance = this.getPool(true)
       console.log("[NostrConnect] v49: Using fresh SimplePool for session restore")
 
-      this.signer = BunkerSigner.fromBunker(clientSecretKey, bunkerPointer, { pool })
+      const candidate: BunkerSignerInstance = BunkerSigner.fromBunker(
+        clientSecretKey,
+        bunkerPointer,
+        { pool },
+      )
 
       // Verify connection is alive with a ping
       console.log("[NostrConnect] Verifying connection with ping...")
-      await this.signer!.ping()
+      await candidate.ping()
 
       // Verify public key matches
-      const publicKey: string = await this.signer!.getPublicKey()
+      const publicKey: string = await candidate.getPublicKey()
+
+      // A newer attempt (or disconnect) superseded this restore while the network calls were
+      // in flight — close the candidate and publish nothing.
+      if (!isCurrentAttempt()) {
+        console.warn(
+          "[NostrConnect] Superseded restore attempt — closing stale candidate",
+        )
+        try {
+          await candidate.close()
+        } catch {
+          // best-effort cleanup
+        }
+        return { success: false, error: "Restore attempt superseded" }
+      }
+      this.signer = candidate
+
       if (publicKey !== session.publicKey) {
         console.warn("[NostrConnect] Public key mismatch, clearing session")
         this.clearSession()
@@ -842,9 +921,13 @@ class NostrConnectService {
     } catch (err: unknown) {
       const error = err instanceof Error ? err : new Error(String(err))
       console.warn("[NostrConnect] Failed to restore session:", error.message)
-      this.clearSession()
-      this.connectionState = "disconnected"
-      this.signer = null
+      // Only the CURRENT attempt may clear the singleton/session — a superseded restore
+      // failing late must not disconnect a newer connection.
+      if (isCurrentAttempt()) {
+        this.clearSession()
+        this.connectionState = "disconnected"
+        this.signer = null
+      }
       return { success: false, error: "Session expired or invalid" }
     }
   }
@@ -854,6 +937,10 @@ class NostrConnectService {
    */
   static async disconnect(): Promise<void> {
     console.log("[NostrConnect] Disconnecting...")
+
+    // Invalidate any pending connect/restore attempt FIRST: its late settle must see itself
+    // superseded and stay out of the singleton (v65 attempt ownership).
+    connectionAttemptCounter++
 
     if (this.signer) {
       try {

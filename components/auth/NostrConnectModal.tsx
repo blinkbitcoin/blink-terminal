@@ -123,12 +123,14 @@ export default function NostrConnectModal({
   // Single-flight guard for the foreground-resume path so a burst of
   // visibilitychange/focus events doesn't fire the NIP-98 sign request twice.
   const resumeInFlightRef = useRef<boolean>(false)
-  // Attempt-scoped authentication ownership. A Boolean in-flight flag conflates two
-  // different re-entries (round-3 review): a DUPLICATE live invocation (visibility burst,
-  // retry while running — must no-op) and an OBSOLETE invocation superseded by a session
-  // restore (the old request hung on a dead socket — its auth must be replaced, not blocked).
-  // 0 means idle; any positive value is the token of the currently-owned attempt.
-  const authAttemptRef = useRef<number>(0)
+  // Attempt-scoped authentication ownership. Round-3 replaced the Boolean guard with a
+  // token; round-4 review found the token had an ABA hole: resetting it to 0 on idle let a
+  // later attempt reuse token 1, reviving a superseded token-1 continuation. The counter is
+  // now STRICTLY MONOTONIC (never reset), and the active owner is a separate nullable slot —
+  // null means idle. No token is ever reused, so a stale continuation can never become
+  // current again.
+  const authAttemptSeqRef = useRef<number>(0)
+  const authActiveTokenRef = useRef<number | null>(null)
   // Whether a fresh waitForConnection() attempt is pending (BunkerSigner.fromURI has not
   // settled). A pending attempt OWNS the flow — the foreground resume must leave it alone.
   const connectInFlightRef = useRef<boolean>(false)
@@ -252,14 +254,16 @@ export default function NostrConnectModal({
   ) => {
     // Duplicate live invocation (visibility burst, retry while running): no-op. A session
     // restore instead passes supersede — the obsolete attempt's auth is REPLACED, not blocked.
-    if (authAttemptRef.current !== 0 && opts?.supersede !== true) {
+    if (authActiveTokenRef.current !== null && opts?.supersede !== true) {
       logAuth("NostrConnectModal", "Sign-in already in flight — ignoring duplicate entry")
       return
     }
-    // Every attempt gets a fresh token; a superseding call's token increment is what retires
-    // the hung predecessor (its continuation goes inert the next time it checks currency).
-    const attempt = ++authAttemptRef.current
-    const isCurrent = () => attempt === authAttemptRef.current
+    // Every attempt gets a fresh, never-reused token; a superseding call's token increment is
+    // what retires the hung predecessor (its continuation goes inert the next time it checks
+    // currency). The counter is never reset, so no stale token can collide with a future one.
+    const attempt = ++authAttemptSeqRef.current
+    authActiveTokenRef.current = attempt
+    const isCurrent = () => attempt === authActiveTokenRef.current
     // Set in the success branch so the finally does not zero the token before the deferred
     // completion timeout runs — that timeout owns the release on success.
     let completedSuccessfully = false
@@ -315,7 +319,7 @@ export default function NostrConnectModal({
         // AND the guard release on success (finally skips it for completed attempts).
         setTimeout(() => {
           if (!isCurrent()) return
-          authAttemptRef.current = 0
+          authActiveTokenRef.current = null
           onSuccess?.(pubkey)
         }, 600)
       } else {
@@ -336,7 +340,7 @@ export default function NostrConnectModal({
       // Only the CURRENT attempt may release the guard — a superseded attempt settling must
       // not free the slot its replacement still owns. On success the release is deferred to
       // the completion timeout below (which owns the final isCurrent check + onSuccess).
-      if (isCurrent() && !completedSuccessfully) authAttemptRef.current = 0
+      if (isCurrent() && !completedSuccessfully) authActiveTokenRef.current = null
     }
   }
 
@@ -415,18 +419,21 @@ export default function NostrConnectModal({
       }
       // action === "restart" (or a failed restore): reset so the user can reopen the signer.
       // Bumping the flow generation first makes any still-pending attempt/restore continuation
-      // a no-op, and zeroing the auth token supersedes any hung sign request — its eventual
-      // timeout must not flip this fresh idle UI to an error.
+      // a no-op, and releasing the auth slot supersedes any hung sign request — its eventual
+      // timeout must not flip this fresh idle UI to an error. disconnect() invalidates the
+      // SERVICE-side pending attempt too (round-4 review), not just the modal refs.
       flowGenRef.current += 1
-      authAttemptRef.current = 0
+      authActiveTokenRef.current = null
       setStage("idle")
       setConnectedPubkey(null)
+      service.disconnect().catch(() => undefined)
     } catch (error: unknown) {
       logAuthError("NostrConnectModal", "Foreground resume failed:", error)
       flowGenRef.current += 1
-      authAttemptRef.current = 0
+      authActiveTokenRef.current = null
       setStage("idle")
       setConnectedPubkey(null)
+      service.disconnect().catch(() => undefined)
     } finally {
       resumeInFlightRef.current = false
     }
@@ -721,26 +728,30 @@ export default function NostrConnectModal({
   const handleCancel = () => {
     logAuth("NostrConnectModal", "User cancelled")
     // Bump the flow generation: any still-pending connect/restore continuation must become
-    // a no-op rather than resurrecting a flow the user just cancelled. Zeroing the auth
-    // token likewise retires any hung sign request so its late timeout can't error the UI.
+    // a no-op rather than resurrecting a flow the user just cancelled. Releasing the auth
+    // slot likewise retires any hung sign request so its late timeout can't error the UI.
     flowGenRef.current += 1
-    authAttemptRef.current = 0
+    authActiveTokenRef.current = null
     // Clean disconnect
     if (slowTimerRef.current) {
       clearTimeout(slowTimerRef.current)
     }
     // Stop approval polling
     stopApprovalPolling()
-    // Disconnect using appropriate service
+    // Disconnect the flow-active service AND the legacy deeplink service: the nostrconnect://
+    // flow lives on NostrConnectService regardless of USE_NDK (there is no NDK
+    // waitForConnection), so under production NDK mode getService() alone would leave the
+    // legacy attempt alive. disconnect() also invalidates any pending attempt (round-4).
     const service = getService()
     service.disconnect()
+    if (service !== NostrConnectService) NostrConnectService.disconnect()
     onCancel?.()
   }
 
   const handleBackToOptions = () => {
     // Same guard as cancel: leaving the flow supersedes any in-flight attempt or hung sign.
     flowGenRef.current += 1
-    authAttemptRef.current = 0
+    authActiveTokenRef.current = null
     setStage("idle")
     setShowSlowWarning(false)
     setErrorMessage("")

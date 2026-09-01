@@ -38,7 +38,7 @@ jest.mock("../../../lib/nostr/NostrConnectService", () => ({
     hasStoredSession: jest.fn(() => false),
     restoreSession: jest.fn(async () => ({ success: false })),
     waitForConnection: jest.fn(async () => ({ success: false })),
-    disconnect: jest.fn(),
+    disconnect: jest.fn(async () => undefined),
     getConnectionState: jest.fn(() => "disconnected"),
   },
 }))
@@ -48,7 +48,7 @@ jest.mock("../../../lib/nostr/NostrConnectServiceNDK", () => ({
     isConnected: jest.fn(() => false),
     hasStoredSession: jest.fn(() => false),
     restoreSession: jest.fn(async () => ({ success: false })),
-    disconnect: jest.fn(),
+    disconnect: jest.fn(async () => undefined),
     getConnectionState: jest.fn(() => "disconnected"),
   },
 }))
@@ -262,6 +262,132 @@ describe("NostrConnectModal — same-device NIP-46 resume (review blockers)", ()
     })
     expect(onSuccess).toHaveBeenCalledTimes(1)
     expect(screen.queryByRole("button", { name: /Try Again/i })).toBeNull()
+  })
+
+  /**
+   * ABA regression (round-4 review): auth tokens must NEVER be reused. Sequence: sign A hangs
+   * → foreground restart resets the flow (old code zeroed the token) → fresh attempt starts
+   * sign B (old code reused token 1 — A's late settle would then read CURRENT and mutate B's
+   * flow). The counter is now strictly monotonic, so A can never become current again.
+   */
+  it("a hung attempt's late settle stays inert across a restart + fresh attempt (no token reuse)", async () => {
+    const deferreds: Array<{
+      resolve: (v: { success: boolean }) => void
+      reject: (e: Error) => void
+    }> = []
+    const signIn = jest.fn(
+      () =>
+        new Promise<{ success: boolean }>((resolve, reject) => {
+          deferreds.push({ resolve, reject })
+        }),
+    )
+    const onSuccess = jest.fn()
+    legacy().waitForConnection.mockResolvedValue({ success: true, publicKey: PUBKEY })
+
+    render(
+      <NostrConnectModal
+        uri="nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example&secret=s&name=Blink%20POS"
+        signInWithNostrConnect={signIn}
+        onSuccess={onSuccess}
+      />,
+    )
+
+    // Attempt A: connect → sign hangs.
+    await act(async () => {
+      fireClick(openInAmberButton())
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(1)
+
+    // Foreground with a dead socket and NO stored session → restart to idle. The old code
+    // zeroed the auth token here, setting up the ABA reuse.
+    legacy().isConnected.mockReturnValue(false)
+    legacy().hasStoredSession.mockReturnValue(false)
+    await foreground()
+    await act(async () => flush())
+    expect(openInAmberButton()).toBeTruthy() // back at the idle options view
+
+    // Fresh attempt B (same mounted modal): connect → sign B runs.
+    legacy().isConnected.mockReturnValue(true)
+    await act(async () => {
+      fireClick(openInAmberButton())
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(2)
+
+    // A settles LATE with success. Under token reuse A now shares B's token and would fire
+    // onSuccess. With monotonic tokens it must be fully inert.
+    await act(async () => {
+      deferreds[0].resolve({ success: true })
+      await new Promise((r) => setTimeout(r, 650))
+    })
+    expect(onSuccess).not.toHaveBeenCalled()
+
+    // B completes → exactly one success.
+    await act(async () => {
+      deferreds[1].resolve({ success: true })
+      await new Promise((r) => setTimeout(r, 650))
+    })
+    expect(onSuccess).toHaveBeenCalledTimes(1)
+    expect(onSuccess).toHaveBeenCalledWith(PUBKEY)
+  })
+
+  /**
+   * Restore path, stale LATE SUCCESS variant: the round-3 test covered a late REJECTION of the
+   * hung original; this covers the other arm — the hung original settling with SUCCESS after
+   * the replacement already completed must likewise change nothing.
+   */
+  it("a hung original's late SUCCESS after a successful restore+re-auth is inert", async () => {
+    const deferreds: Array<{
+      resolve: (v: { success: boolean }) => void
+      reject: (e: Error) => void
+    }> = []
+    const signIn = jest.fn(
+      () =>
+        new Promise<{ success: boolean }>((resolve, reject) => {
+          deferreds.push({ resolve, reject })
+        }),
+    )
+    const onSuccess = jest.fn()
+    legacy().waitForConnection.mockResolvedValue({ success: true, publicKey: PUBKEY })
+    legacy().hasStoredSession.mockReturnValue(true)
+    legacy().restoreSession.mockResolvedValue({ success: true, publicKey: PUBKEY })
+
+    render(
+      <NostrConnectModal
+        uri="nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example&secret=s&name=Blink%20POS"
+        signInWithNostrConnect={signIn}
+        onSuccess={onSuccess}
+      />,
+    )
+
+    await act(async () => {
+      fireClick(openInAmberButton())
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(1)
+
+    legacy().isConnected.mockReturnValue(false)
+    await act(async () => {
+      await foreground()
+      await flushThroughConnectDelay()
+    })
+    expect(legacy().restoreSession).toHaveBeenCalledTimes(1)
+    expect(signIn).toHaveBeenCalledTimes(2)
+
+    // Replacement completes.
+    await act(async () => {
+      deferreds[1].resolve({ success: true })
+      await new Promise((r) => setTimeout(r, 650))
+    })
+    expect(onSuccess).toHaveBeenCalledTimes(1)
+
+    // The hung ORIGINAL settles late with SUCCESS — must not double-fire onSuccess.
+    await act(async () => {
+      deferreds[0].resolve({ success: true })
+      await new Promise((r) => setTimeout(r, 650))
+    })
+    expect(onSuccess).toHaveBeenCalledTimes(1)
   })
 
   /** Restore failure: the modal resets to idle so the user can reopen the signer — and the
