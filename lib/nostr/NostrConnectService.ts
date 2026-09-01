@@ -152,16 +152,23 @@ let connectionAttemptCounter = 0
 // Every writer MUST follow the protocol the three existing writers implement
 // (waitForConnection, restoreSession, disconnect):
 //
-//   1. Take a ticket: `connectionAttemptCounter++; const thisAttempt = counter`.
+//   1. Take a ticket: `connectionAttemptCounter++` and capture it in
+//      `const thisAttempt = connectionAttemptCounter`.
 //      (disconnect only increments — invalidating every pending attempt.)
 //   2. Work on LOCAL candidates only (signer/pool). Never touch the shared
 //      statics before ownership is confirmed.
-//   3. Re-check currency (`thisAttempt === connectionAttemptCounter`) after
-//      EVERY await, at minimum immediately before publishing.
+//   3. Re-check currency (`thisAttempt === connectionAttemptCounter`)
+//      IMMEDIATELY BEFORE any shared-state publish — that is the invariant the
+//      tests pin. Extra checks after long awaits are an optimization (fail
+//      fast, close candidates sooner), not the guarantee.
 //   4. If superseded: close the local candidates, return without touching
 //      shared state.
-//   5. Publish atomically at a single success point (signer + pool + state +
-//      pubkey + session together, no awaits in between).
+//   5. Publish the in-memory statics together at a single success point
+//      (signer + pool + state + pubkey, no awaits in between). Session
+//      persistence via storeSession() follows the publish; it is synchronous
+//      but NOT atomic with it — a storage failure after publish leaves a live
+//      connection with no stored session (fails toward re-auth, never toward
+//      a stale session).
 //   6. On teardown: detach synchronously (null the statics before any await),
 //      then close the detached resources.
 //
