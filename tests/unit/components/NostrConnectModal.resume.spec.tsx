@@ -38,6 +38,7 @@ jest.mock("../../../lib/nostr/NostrConnectService", () => ({
     hasStoredSession: jest.fn(() => false),
     restoreSession: jest.fn(async () => ({ success: false })),
     waitForConnection: jest.fn(async () => ({ success: false })),
+    connectWithBunkerURL: jest.fn(() => new Promise(() => {})),
     disconnect: jest.fn(async () => undefined),
     getConnectionState: jest.fn(() => "disconnected"),
   },
@@ -475,6 +476,58 @@ describe("NostrConnectModal — same-device NIP-46 resume (review blockers)", ()
     // No pubkey was ever obtained, so sign-in must not run; the modal returns to idle.
     expect(signIn).not.toHaveBeenCalled()
     expect(legacy().restoreSession).not.toHaveBeenCalled()
+  })
+
+  /**
+   * Round-5 verified follow-up: the foreground recovery is deeplink-only. A pending BUNKER
+   * flow shares the same stage values but recovers via its own approval polling — a focus
+   * return must not reset its UI, restore a different signer, or start a sign-in under it.
+   */
+  it("leaves a pending bunker flow untouched on foreground", async () => {
+    // A stale stored session exists — the old logic would have restored it over the
+    // pending bunker continuation.
+    legacy().isConnected.mockReturnValue(false)
+    legacy().hasStoredSession.mockReturnValue(true)
+    legacy().restoreSession.mockResolvedValue({ success: true, publicKey: PUBKEY })
+
+    const signIn = jest.fn(async () => ({ success: true }))
+    renderModal(signIn)
+
+    // Enter the bunker flow: reveal the input, paste a URL, submit. The (mocked) legacy
+    // connectWithBunkerURL stays pending — the exact backgrounded-continuation state.
+    await act(async () => {
+      fireClick(screen.getByRole("button", { name: /paste bunker URL instead/i }))
+      await flush()
+    })
+    const input = screen.getByPlaceholderText("bunker://...")
+    await act(async () => {
+      // React's onChange via native input event.
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        "value",
+      )?.set
+      setter?.call(input, "bunker://pubkey?relay=wss%3A%2F%2Fr&secret=s")
+      input.dispatchEvent(new Event("input", { bubbles: true }))
+      await flush()
+    })
+    await act(async () => {
+      fireClick(screen.getByRole("button", { name: /Connect with Bunker URL/i }))
+      await flush()
+    })
+
+    // Foreground return while the bunker continuation is pending.
+    await foreground()
+    await act(async () => flush())
+
+    // Deeplink-only recovery must not have touched the bunker flow.
+    expect(legacy().restoreSession).not.toHaveBeenCalled()
+    expect(signIn).not.toHaveBeenCalled()
+    // The modal is still in the bunker connection flow — NOT reset to the idle options view.
+    expect(
+      screen
+        .queryAllByRole("button")
+        .some((b) => /Open in Amber/i.test(b.textContent ?? "")),
+    ).toBe(false)
   })
 })
 

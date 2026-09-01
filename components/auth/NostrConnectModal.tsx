@@ -134,6 +134,11 @@ export default function NostrConnectModal({
   // Whether a fresh waitForConnection() attempt is pending (BunkerSigner.fromURI has not
   // settled). A pending attempt OWNS the flow — the foreground resume must leave it alone.
   const connectInFlightRef = useRef<boolean>(false)
+  // Which connection flow is active (round-5 review): the foreground-resume recovery is
+  // designed for the direct nostrconnect:// DEEPLINK flow only. The bunker flow (legacy or
+  // NDK) shares the same stage values but recovers via its own approval polling — a focus
+  // return must not reset its UI or restore a different signer under its continuation.
+  const flowKindRef = useRef<"deeplink" | "bunker" | null>(null)
   // Monotonic flow generation: every intentional reset/restart bumps it, and every long
   // async continuation (connect settle, session restore) captures it up front and bails
   // WITHOUT mutating state if it has moved — a superseded waiter must never resurrect the
@@ -157,6 +162,10 @@ export default function NostrConnectModal({
 
   const startWaitingForConnection = useCallback(async () => {
     logAuth("NostrConnectModal", "Waiting for NIP-46 connection...")
+
+    // This is the direct nostrconnect:// deeplink flow — the only one the foreground
+    // resume may act on.
+    flowKindRef.current = "deeplink"
 
     // A new attempt supersedes any prior one: bump the generation so a still-pending
     // earlier attempt's continuation cannot mutate state when it eventually settles, and
@@ -360,6 +369,11 @@ export default function NostrConnectModal({
    * doesn't double-fire the sign request.
    */
   const resumeOnForeground = useCallback(async () => {
+    // Round-5 review: this recovery applies ONLY to the direct nostrconnect:// deeplink
+    // flow. The bunker flow (legacy or NDK) shares the same stage values but has its own
+    // approval-polling recovery — a focus return must not reset its UI or restore a
+    // different signer while its continuation is active.
+    if (flowKindRef.current !== "deeplink") return
     // IMPORTANT (review blocker 1): the direct nostrconnect:// / Amber deeplink flow is
     // LEGACY-service-only — the connection is established by NostrConnectService
     // (startWaitingForConnection hardcodes it; there is no NDK waitForConnection). We must
@@ -424,6 +438,7 @@ export default function NostrConnectModal({
       // SERVICE-side pending attempt too (round-4 review), not just the modal refs.
       flowGenRef.current += 1
       authActiveTokenRef.current = null
+      flowKindRef.current = null
       setStage("idle")
       setConnectedPubkey(null)
       service.disconnect().catch(() => undefined)
@@ -431,6 +446,7 @@ export default function NostrConnectModal({
       logAuthError("NostrConnectModal", "Foreground resume failed:", error)
       flowGenRef.current += 1
       authActiveTokenRef.current = null
+      flowKindRef.current = null
       setStage("idle")
       setConnectedPubkey(null)
       service.disconnect().catch(() => undefined)
@@ -468,6 +484,9 @@ export default function NostrConnectModal({
       "NostrConnectModal",
       `Connecting with bunker URL (using ${USE_NDK ? "NDK" : "nostr-tools"})...`,
     )
+    // Bunker flow: the foreground resume must leave it alone (round-5 review) — it
+    // recovers via its own approval polling.
+    flowKindRef.current = "bunker"
     setStage("connected") // Go straight to 'connected' stage (showing progress stepper)
     setErrorMessage("")
     setAwaitingApproval(false)
@@ -654,6 +673,8 @@ export default function NostrConnectModal({
       "NostrConnectModal",
       `Manual retry after approval (using ${USE_NDK ? "NDK" : "nostr-tools"})...`,
     )
+    // Only ever reached from a bunker flow; keep the marker accurate across the retry.
+    flowKindRef.current = "bunker"
 
     try {
       let result: {
@@ -732,6 +753,7 @@ export default function NostrConnectModal({
     // slot likewise retires any hung sign request so its late timeout can't error the UI.
     flowGenRef.current += 1
     authActiveTokenRef.current = null
+    flowKindRef.current = null
     // Clean disconnect
     if (slowTimerRef.current) {
       clearTimeout(slowTimerRef.current)
@@ -752,6 +774,7 @@ export default function NostrConnectModal({
     // Same guard as cancel: leaving the flow supersedes any in-flight attempt or hung sign.
     flowGenRef.current += 1
     authActiveTokenRef.current = null
+    flowKindRef.current = null
     setStage("idle")
     setShowSlowWarning(false)
     setErrorMessage("")

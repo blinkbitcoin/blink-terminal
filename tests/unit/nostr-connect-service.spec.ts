@@ -18,10 +18,11 @@
 // Deferred signer factory: each BunkerSigner.fromURI/fromBunker call returns a controllable
 // candidate whose getPublicKey/close are tracked per attempt.
 interface FakeSigner {
-  bp: { pubkey: string; relays: string[] }
+  bp: { pubkey: string; relays: string[]; secret?: string }
   getPublicKey: jest.Mock
   ping: jest.Mock
   signEvent: jest.Mock
+  connect: jest.Mock
   close: jest.Mock
 }
 
@@ -30,6 +31,7 @@ const makeFakeSigner = (pubkey: string): FakeSigner => ({
   getPublicKey: jest.fn(async () => "user-" + pubkey),
   ping: jest.fn(async () => undefined),
   signEvent: jest.fn(),
+  connect: jest.fn(async () => undefined),
   close: jest.fn(async () => undefined),
 })
 
@@ -98,6 +100,11 @@ describe("NostrConnectService — overlapping attempt ownership (round-4)", () =
   beforeEach(() => {
     signerQueue.length = 0
     localStorage.clear()
+    // Reset the singleton's static state so tests don't leak into each other.
+    NostrConnectService.signer = null
+    NostrConnectService.pool = null
+    NostrConnectService.connectionState = "disconnected"
+    NostrConnectService.userPublicKey = null
   })
 
   /**
@@ -220,5 +227,150 @@ describe("NostrConnectService — overlapping attempt ownership (round-4)", () =
     expect(NostrConnectService.signer).toBe(signerB)
     expect(NostrConnectService.connectionState).toBe("connected")
     expect(NostrConnectService.userPublicKey).toBe("user-signerB")
+  })
+
+  /**
+   * Round-5 HIGH: an older disconnect() whose signer.close() is still pending must not erase
+   * a newer successful connection. disconnect() now detaches synchronously and closes only
+   * the detached resources.
+   */
+  it("a deferred disconnect close cannot erase a newer successful connection", async () => {
+    // Establish connection A.
+    const signerA = makeFakeSigner("signerA")
+    signerQueue.push(() => signerA)
+    await NostrConnectService.waitForConnection(URI)
+    expect(NostrConnectService.signer).toBe(signerA)
+
+    // A's close() resolves only when the test releases it.
+    let releaseClose: () => void = () => {}
+    signerA.close = jest.fn(() => new Promise<void>((r) => (releaseClose = r)))
+
+    // Disconnect (fire-and-forget, exactly like the modal's restart path) — its synchronous
+    // detach runs now; its awaited close hangs.
+    const disconnectA = NostrConnectService.disconnect()
+    await flush()
+    expect(NostrConnectService.signer).toBeNull() // detached synchronously
+
+    // Connection B starts and SUCCEEDS while A's close is still pending.
+    const signerB = makeFakeSigner("signerB")
+    signerQueue.push(() => signerB)
+    await NostrConnectService.waitForConnection(URI)
+    expect(NostrConnectService.signer).toBe(signerB)
+    expect(NostrConnectService.connectionState).toBe("connected")
+
+    // A's close now resolves — it must not touch B's signer, state, or session.
+    releaseClose()
+    await disconnectA
+    await flush()
+
+    expect(NostrConnectService.signer).toBe(signerB)
+    expect(NostrConnectService.connectionState).toBe("connected")
+    expect(NostrConnectService.userPublicKey).toBe("user-signerB")
+    const storedSession = JSON.parse(
+      localStorage.getItem("blinkpos_nip46_session") ?? "null",
+    )
+    expect(storedSession?.publicKey).toBe("user-signerB")
+    expect(signerB.close).not.toHaveBeenCalled()
+  })
+
+  /**
+   * Round-5 verified follow-up: a stale connectWithBunkerURL continuation settling after a
+   * newer waitForConnection winner must neither overwrite nor clear it.
+   */
+  it("a stale bunker continuation cannot overwrite or clear a newer winner", async () => {
+    const nip46 = jest.requireMock("nostr-tools/nip46") as {
+      parseBunkerInput: jest.Mock
+    }
+    nip46.parseBunkerInput.mockResolvedValue({
+      pubkey: "bunkerSigner",
+      relays: ["wss://r.example"],
+      secret: "s3cret",
+    })
+
+    // Bunker attempt A: its connect() hangs until released.
+    let releaseConnect: () => void = () => {}
+    const bunkerSigner = makeFakeSigner("bunkerSigner")
+    bunkerSigner.connect = jest.fn(() => new Promise<void>((r) => (releaseConnect = r)))
+    signerQueue.push(() => bunkerSigner)
+
+    const bunkerAttempt = NostrConnectService.connectWithBunkerURL("bunker://x")
+    await flush()
+
+    // Newer waitForConnection B wins while the bunker connect is pending.
+    const signerB = makeFakeSigner("signerB")
+    signerQueue.push(() => signerB)
+    await NostrConnectService.waitForConnection(URI)
+    expect(NostrConnectService.signer).toBe(signerB)
+
+    // The bunker attempt now completes its network phase — but it is superseded: it must
+    // close its candidate and leave B untouched.
+    releaseConnect()
+    const bunkerResult = await bunkerAttempt
+    await flush()
+
+    expect(bunkerResult.success).toBe(false)
+    expect(bunkerResult.error).toMatch(/superseded/i)
+    expect(bunkerSigner.close).toHaveBeenCalled()
+    expect(NostrConnectService.signer).toBe(signerB)
+    expect(NostrConnectService.connectionState).toBe("connected")
+    expect(NostrConnectService.userPublicKey).toBe("user-signerB")
+  })
+
+  /** Round-5 verified follow-up: failure paths must close the candidate (no socket leaks). */
+  it("closes the candidate when a CURRENT attempt's getPublicKey fails", async () => {
+    const signerA = makeFakeSigner("signerA")
+    signerA.getPublicKey = jest.fn(async () => {
+      throw new Error("no response")
+    })
+    signerQueue.push(() => signerA)
+
+    const result = await NostrConnectService.waitForConnection(URI)
+
+    expect(result.success).toBe(false)
+    expect(signerA.close).toHaveBeenCalled()
+    expect(NostrConnectService.signer).toBeNull()
+    expect(NostrConnectService.connectionState).toBe("disconnected")
+  })
+
+  it("closes the candidate when a restore's ping fails", async () => {
+    localStorage.setItem(
+      "blinkpos_nip46_session",
+      JSON.stringify({
+        publicKey: "user-signerOld",
+        signerPubkey: "signerOld",
+        relays: ["wss://r.example"],
+      }),
+    )
+    const signerOld = makeFakeSigner("signerOld")
+    signerOld.ping = jest.fn(async () => {
+      throw new Error("dead socket")
+    })
+    signerQueue.push(() => signerOld)
+
+    const result = await NostrConnectService.restoreSession()
+
+    expect(result.success).toBe(false)
+    expect(signerOld.close).toHaveBeenCalled()
+  })
+
+  it("closes the candidate on a restore public-key mismatch", async () => {
+    localStorage.setItem(
+      "blinkpos_nip46_session",
+      JSON.stringify({
+        publicKey: "user-EXPECTED",
+        signerPubkey: "signerOld",
+        relays: ["wss://r.example"],
+      }),
+    )
+    // The candidate answers with a DIFFERENT pubkey than the stored session.
+    const signerOld = makeFakeSigner("signerOld")
+    signerQueue.push(() => signerOld)
+
+    const result = await NostrConnectService.restoreSession()
+
+    expect(result.success).toBe(false)
+    expect(result.error).toMatch(/invalid/i)
+    expect(signerOld.close).toHaveBeenCalled()
+    expect(NostrConnectService.signer).toBeNull()
   })
 })
