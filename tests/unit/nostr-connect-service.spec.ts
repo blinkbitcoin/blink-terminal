@@ -316,6 +316,48 @@ describe("NostrConnectService — overlapping attempt ownership (round-4)", () =
     expect(NostrConnectService.userPublicKey).toBe("user-signerB")
   })
 
+  /**
+   * Copilot review: waitForConnection must not publish the signer EARLY (before getPublicKey /
+   * stabilization). Otherwise a supersede after that point closes the candidate but leaves
+   * `signer` pointing at the closed instance. The singleton is published atomically at the
+   * single success point, so it is null until then and never a closed/superseded signer.
+   */
+  it("never exposes a not-yet-published or superseded signer via the singleton", async () => {
+    // Attempt A: fromURI resolves immediately, but getPublicKey hangs until released.
+    let releasePubkey: () => void = () => {}
+    const signerA = makeFakeSigner("signerA")
+    signerA.getPublicKey = jest.fn(
+      () =>
+        new Promise<string>((r) => {
+          releasePubkey = () => r("user-signerA")
+        }),
+    )
+    signerQueue.push(() => signerA)
+
+    const attemptA = NostrConnectService.waitForConnection(URI)
+    await flush()
+    // A's fromURI has resolved and it is blocked in getPublicKey — the singleton must NOT
+    // already hold signerA (no early publish).
+    expect(NostrConnectService.signer).toBeNull()
+
+    // B starts and wins while A is still blocked.
+    const signerB = makeFakeSigner("signerB")
+    signerQueue.push(() => signerB)
+    await NostrConnectService.waitForConnection(URI)
+    expect(NostrConnectService.signer).toBe(signerB)
+
+    // A now completes getPublicKey — superseded, so it closes and publishes nothing; the
+    // singleton must still be B, never the closed signerA.
+    releasePubkey()
+    const resultA = await attemptA
+    await flush()
+
+    expect(resultA.success).toBe(false)
+    expect(signerA.close).toHaveBeenCalled()
+    expect(NostrConnectService.signer).toBe(signerB)
+    expect(NostrConnectService.connectionState).toBe("connected")
+  })
+
   /** Round-5 verified follow-up: failure paths must close the candidate (no socket leaks). */
   it("closes the candidate when a CURRENT attempt's getPublicKey fails", async () => {
     const signerA = makeFakeSigner("signerA")

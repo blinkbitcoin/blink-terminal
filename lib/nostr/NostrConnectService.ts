@@ -320,7 +320,10 @@ class NostrConnectService {
         }
         return { success: false, error: "Connection attempt superseded" }
       }
-      this.signer = created
+      // NOTE: the singleton is NOT assigned here. Publishing early left `this.signer`
+      // pointing at a closed instance if a later supersede check fired (Copilot review);
+      // everything below works on the local `created` and the singleton is published
+      // atomically at the single success point with state/pubkey/session.
 
       console.log("[NostrConnect] Connection established, getting public key...")
 
@@ -356,6 +359,9 @@ class NostrConnectService {
         return { success: false, error: "Connection attempt superseded" }
       }
 
+      // Single atomic publish point: signer, state, pubkey and session land together, so no
+      // caller can ever observe a signer without a matching connected state.
+      this.signer = created
       this.connectionState = "connected"
       this.userPublicKey = publicKey
 
