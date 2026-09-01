@@ -1,14 +1,17 @@
 /**
  * NostrConnectModal — same-device mobile NIP-46 resume regressions (PR #61 review blockers).
  *
- * Blocker 1: the direct nostrconnect:// / Amber deeplink flow is LEGACY-service-only
- * (NostrConnectService.waitForConnection). The foreground resume must inspect THAT service,
- * not getService()/NDK — under USE_NDK=true (production) the wrong service made the resume
- * reset a valid Amber connection to idle.
+ * Blocker 1 (legacy-vs-NDK service selection) lives in NostrConnectModal.resume-ndk.spec.tsx
+ * — the USE_NDK flag is a module-level const, so it must be set before the component's module
+ * loads; a dedicated file does that.
  *
  * Blocker 2: a foreground return while the authentication is already in flight must NOT start
  * a second NIP-98 request (duplicate signer prompts / racing login). The guard lives at the
  * handleConnectionSuccess boundary (authInFlightRef), protecting every caller.
+ *
+ * Round-2 blocker: a foreground return while a fresh waitForConnection() attempt is still
+ * PENDING must leave it alone (it owns the flow), and a superseded attempt must never mutate
+ * state when it eventually settles (flow generation guard).
  *
  * @jest-environment jsdom
  */
@@ -22,10 +25,9 @@ Object.defineProperty(window.navigator, "userAgent", {
   configurable: true,
 })
 
-// --- mock the two NIP-46 services; the resume must consult the LEGACY one ---
-// jest.mock factories run when the component (imported at the top) is required, before any
-// const in this file initializes. So the mock surfaces are created inside the factories and
-// read back in tests via jest.requireMock — the one reliable way to reach them.
+// jest.mock factories run when the component (required below) is loaded, before any const in
+// this file initializes. Mock surfaces are created inside the factories and read back in tests
+// via jest.requireMock — the one reliable way to reach them.
 jest.mock("../../../lib/nostr/NostrConnectService", () => ({
   __esModule: true,
   default: {
@@ -87,6 +89,8 @@ const foreground = async () => {
   })
 }
 
+const PUBKEY = "a".repeat(64)
+
 const renderModal = (signInWithNostrConnect = jest.fn()) =>
   render(
     <NostrConnectModal
@@ -107,40 +111,6 @@ describe("NostrConnectModal — same-device NIP-46 resume (review blockers)", ()
   })
 
   /**
-   * Blocker 1: with NDK enabled (production), the resume must consult the LEGACY service.
-   * A valid Amber connection on the legacy service must NOT be reset to idle just because
-   * the NDK service knows nothing about it.
-   */
-  it("consults the legacy service (not NDK) for the resume decision under USE_NDK", async () => {
-    // Production flag: the modal's getService() would return NDK — the resume must NOT.
-    process.env.NEXT_PUBLIC_USE_NDK_NIP46 = "true"
-    // A live Amber connection lives on the legacy service; NDK knows nothing.
-    legacy().isConnected.mockReturnValue(true)
-    legacy().hasStoredSession.mockReturnValue(true)
-
-    const signIn = jest.fn(async () => ({ success: true }))
-    renderModal(signIn)
-
-    // Get a connection into flight (legacy waitForConnection resolves with a pubkey).
-    legacy().waitForConnection.mockResolvedValueOnce({
-      success: true,
-      publicKey: "a".repeat(64),
-    })
-    await act(async () => {
-      fireClick(openInAmberButton())
-      await flush()
-    })
-
-    // The resume decision must read the legacy service, not NDK.
-    await foreground()
-    await act(async () => flush())
-
-    expect(legacy().isConnected).toHaveBeenCalled()
-    // NDK's resume/session surface must never be consulted for the deeplink flow.
-    expect(ndk().restoreSession).not.toHaveBeenCalled()
-  })
-
-  /**
    * Blocker 2: while a NIP-98 sign-in is in flight, a foreground return must NOT launch a
    * second sign request.
    */
@@ -151,10 +121,7 @@ describe("NostrConnectModal — same-device NIP-46 resume (review blockers)", ()
       () => new Promise<{ success: boolean }>((r) => (resolveSign = r)),
     )
 
-    legacy().waitForConnection.mockResolvedValue({
-      success: true,
-      publicKey: "a".repeat(64),
-    })
+    legacy().waitForConnection.mockResolvedValue({ success: true, publicKey: PUBKEY })
     legacy().isConnected.mockReturnValue(true)
     legacy().hasStoredSession.mockReturnValue(true)
 
@@ -178,6 +145,143 @@ describe("NostrConnectModal — same-device NIP-46 resume (review blockers)", ()
       resolveSign({ success: true })
       await flush()
     })
+  })
+
+  /**
+   * Round-2 blocker: a foreground return while the fresh connect attempt is still PENDING
+   * must leave it alone — no UI reset, no session restore — and the attempt must complete
+   * the flow exactly once when it eventually settles.
+   */
+  it("leaves a pending waitForConnection attempt alone on foreground, and it completes once", async () => {
+    // The connect attempt never settles until the test says so — this is the exact state a
+    // backgrounded tab is in while the user approves in the signer app.
+    let resolveConnect: (v: { success: boolean; publicKey: string }) => void = () => {}
+    legacy().waitForConnection.mockReturnValue(
+      new Promise<{ success: boolean; publicKey: string }>((r) => (resolveConnect = r)),
+    )
+    const signIn = jest.fn(async () => ({ success: true }))
+    renderModal(signIn)
+
+    await act(async () => {
+      fireClick(openInAmberButton())
+      await flush()
+    })
+
+    // Foreground return mid-attempt: the pending attempt owns the flow.
+    await foreground()
+    await act(async () => flush())
+
+    expect(legacy().restoreSession).not.toHaveBeenCalled()
+    expect(signIn).not.toHaveBeenCalled()
+
+    // The signer answers: the SAME attempt drives sign-in exactly once.
+    await act(async () => {
+      resolveConnect({ success: true, publicKey: PUBKEY })
+      await flushThroughConnectDelay()
+    })
+
+    expect(signIn).toHaveBeenCalledTimes(1)
+    expect(signIn).toHaveBeenCalledWith(PUBKEY, expect.anything())
+  })
+
+  /**
+   * Restore path coverage: an ESTABLISHED connection (pubkey known, sign hung on a dead
+   * socket) restores from the stored session on foreground — exactly once — and the
+   * auth-in-flight guard prevents a duplicate sign while the original is still running.
+   */
+  it("restores the dropped session once on foreground (established connection, dead socket)", async () => {
+    let resolveSign: (v: { success: boolean }) => void = () => {}
+    const signIn = jest.fn(
+      () => new Promise<{ success: boolean }>((r) => (resolveSign = r)),
+    )
+    legacy().waitForConnection.mockResolvedValue({ success: true, publicKey: PUBKEY })
+    legacy().hasStoredSession.mockReturnValue(true)
+    legacy().restoreSession.mockResolvedValue({ success: true, publicKey: PUBKEY })
+
+    renderModal(signIn)
+    await act(async () => {
+      fireClick(openInAmberButton())
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(1)
+
+    // The socket dies while the sign hangs.
+    legacy().isConnected.mockReturnValue(false)
+
+    await foreground()
+    await act(async () => flush())
+
+    expect(legacy().restoreSession).toHaveBeenCalledTimes(1)
+    // The original sign is still in flight — the restore's handleConnectionSuccess must not
+    // start a second one (authInFlightRef guard).
+    expect(signIn).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      resolveSign({ success: true })
+      await flush()
+    })
+  })
+
+  /** Restore failure: the modal resets to idle so the user can reopen the signer. */
+  it("resets to idle when the stored session fails to restore", async () => {
+    let resolveSign: (v: { success: boolean }) => void = () => {}
+    const signIn = jest.fn(
+      () => new Promise<{ success: boolean }>((r) => (resolveSign = r)),
+    )
+    legacy().waitForConnection.mockResolvedValue({ success: true, publicKey: PUBKEY })
+    legacy().hasStoredSession.mockReturnValue(true)
+    legacy().restoreSession.mockResolvedValue({ success: false, error: "dead" })
+
+    renderModal(signIn)
+    await act(async () => {
+      fireClick(openInAmberButton())
+      await flushThroughConnectDelay()
+    })
+
+    legacy().isConnected.mockReturnValue(false)
+
+    await foreground()
+    await act(async () => flush())
+
+    expect(legacy().restoreSession).toHaveBeenCalledTimes(1)
+    expect(signIn).toHaveBeenCalledTimes(1)
+    // Back at the idle options view — the entry points are offered again.
+    expect(openInAmberButton()).toBeTruthy()
+
+    await act(async () => {
+      resolveSign({ success: true })
+      await flush()
+    })
+  })
+
+  /**
+   * Legitimate retry: after a sign-in FAILS (guard released in finally), the error Retry
+   * button must start a fresh sign — the auth-in-flight guard is not a permanent block.
+   */
+  it("allows a legitimate retry after the in-flight guard is released", async () => {
+    const signIn = jest
+      .fn<Promise<{ success: boolean }>, []>()
+      .mockRejectedValueOnce(new Error("relay timeout"))
+      .mockResolvedValue({ success: true })
+    legacy().waitForConnection.mockResolvedValue({ success: true, publicKey: PUBKEY })
+    legacy().isConnected.mockReturnValue(true)
+
+    renderModal(signIn)
+    await act(async () => {
+      fireClick(openInAmberButton())
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(1)
+    // The failure surfaced the error state with the Retry button.
+    const retry = await screen.findByRole("button", { name: /Try Again/i })
+
+    await act(async () => {
+      fireClick(retry)
+      await flushThroughConnectDelay()
+    })
+
+    // The retry ran a second, legitimate sign-in.
+    expect(signIn).toHaveBeenCalledTimes(2)
   })
 
   it("resets to idle (no session, not connected) so the user can reopen the signer", async () => {

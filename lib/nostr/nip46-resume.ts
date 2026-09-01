@@ -23,6 +23,12 @@ export type ResumeAction =
 export interface ResumeInput {
   /** Modal connection stage at the moment the tab regained foreground. */
   stage: string
+  /**
+   * Whether a fresh waitForConnection() attempt is currently pending (its BunkerSigner
+   * fromURI promise has not settled). A pending attempt OWNS the flow — it will resolve and
+   * drive the connection itself — so the resume must not touch the service or reset the UI.
+   */
+  connectInFlight: boolean
   /** Whether the NIP-46 service still reports a live signer connection. */
   connected: boolean
   /** Whether a user pubkey was already obtained from the signer. */
@@ -32,18 +38,26 @@ export interface ResumeInput {
 }
 
 const IN_FLIGHT_STAGES: readonly string[] = ["waiting", "connected", "signing"]
+/** Stages where a connection was ESTABLISHED (the signer acked); only these may restore a
+ *  dropped session. "waiting" means a fresh attempt is pending — restoring there would
+ *  resurrect a PREVIOUS signer's session mid-attempt (the round-2 review race). */
+const ESTABLISHED_STAGES: readonly string[] = ["connected", "signing"]
 
 /**
  * Decide how to resume an in-flight NIP-46 flow on foreground return.
  *
- * - A flow not in flight (idle/complete/error) is left alone → `null`.
- * - Live connection + known pubkey → re-drive only the NIP-98 sign step.
- * - No live connection but a stored session → restore the signer, then continue.
- * - Neither → restart from idle.
+ * - A fresh connect attempt still pending (connectInFlight) → leave it alone: `null`.
+ * - A flow not in flight (idle/complete/error) → `null`.
+ * - Established session, still live + pubkey known → re-drive only the NIP-98 sign step.
+ * - Established session dropped, stored session exists → restore the signer, then continue.
+ * - Everything else (including a stalled "waiting" attempt that died without settling) →
+ *   restart from idle.
  */
 export function decideNip46Resume(input: ResumeInput): ResumeAction | null {
   if (!IN_FLIGHT_STAGES.includes(input.stage)) return null
+  if (input.connectInFlight) return null
   if (input.connected && input.hasPubkey) return "resume-signing"
-  if (input.hasSession) return "restore-session"
+  if (ESTABLISHED_STAGES.includes(input.stage) && input.hasSession)
+    return "restore-session"
   return "restart"
 }

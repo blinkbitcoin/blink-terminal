@@ -130,6 +130,14 @@ export default function NostrConnectModal({
   // duplicate signer prompts and racing login state. Wrapping handleConnectionSuccess
   // covers every caller (connect success, retry, resume, bunker, poll) uniformly.
   const authInFlightRef = useRef<boolean>(false)
+  // Whether a fresh waitForConnection() attempt is pending (BunkerSigner.fromURI has not
+  // settled). A pending attempt OWNS the flow — the foreground resume must leave it alone.
+  const connectInFlightRef = useRef<boolean>(false)
+  // Monotonic flow generation: every intentional reset/restart bumps it, and every long
+  // async continuation (connect settle, session restore) captures it up front and bails
+  // WITHOUT mutating state if it has moved — a superseded waiter must never resurrect the
+  // flow after the user (or the resume logic) has moved on.
+  const flowGenRef = useRef<number>(0)
 
   // Clear any pending timers on unmount to avoid leaked intervals and
   // setState-after-unmount from the approval poll
@@ -149,8 +157,28 @@ export default function NostrConnectModal({
   const startWaitingForConnection = useCallback(async () => {
     logAuth("NostrConnectModal", "Waiting for NIP-46 connection...")
 
+    // A new attempt supersedes any prior one: bump the generation so a still-pending
+    // earlier attempt's continuation cannot mutate state when it eventually settles, and
+    // mark the attempt in-flight so the foreground resume leaves it alone.
+    flowGenRef.current += 1
+    const gen = flowGenRef.current
+    connectInFlightRef.current = true
+
     try {
       const result = await NostrConnectService.waitForConnection(uri)
+
+      // The connect attempt has SETTLED (acked or failed): clear the in-flight flag BEFORE
+      // entering the sign-in phase — handleConnectionSuccess is a separate phase guarded by
+      // authInFlightRef, and holding the connect flag across it would freeze the foreground
+      // resume (a pending sign is not a pending connect). Only the current generation clears
+      // it, so a superseded attempt settling late must not clear a newer attempt's flag.
+      if (gen === flowGenRef.current) connectInFlightRef.current = false
+
+      // Superseded attempt: the flow was reset/restarted while this fromURI was pending.
+      if (gen !== flowGenRef.current) {
+        logAuth("NostrConnectModal", "Connect attempt superseded — dropping its result")
+        return
+      }
 
       if (result.success && result.publicKey) {
         logAuth(
@@ -167,6 +195,8 @@ export default function NostrConnectModal({
         setErrorStage("connected")
       }
     } catch (error: unknown) {
+      if (gen === flowGenRef.current) connectInFlightRef.current = false
+      if (gen !== flowGenRef.current) return
       logAuthError("NostrConnectModal", "Exception during connection:", error)
       setStage("error")
       setErrorMessage((error as Error).message || "Connection failed")
@@ -313,6 +343,9 @@ export default function NostrConnectModal({
     const service = NostrConnectService
     const action = decideNip46Resume({
       stage,
+      // Round-2 blocker: a pending fresh connect attempt owns the flow — the resume must
+      // leave it alone (it resolves or times out by itself, generation-guarded).
+      connectInFlight: connectInFlightRef.current,
       connected: service.isConnected(),
       hasPubkey: Boolean(connectedPubkey),
       hasSession: service.hasStoredSession(),
@@ -333,8 +366,15 @@ export default function NostrConnectModal({
       }
       if (action === "restore-session") {
         // The socket died while suspended: rebuild from the stored session and re-drive.
+        // Capture the flow generation now so a superseding reset during the async restore
+        // makes its continuation a no-op instead of resurrecting a stale session.
+        const gen = flowGenRef.current
         logAuth("NostrConnectModal", "Connection lost — restoring session")
         const restored = await service.restoreSession()
+        if (gen !== flowGenRef.current) {
+          logAuth("NostrConnectModal", "Restore superseded — dropping its result")
+          return
+        }
         if (restored.success && restored.publicKey) {
           setConnectedPubkey(restored.publicKey)
           await handleConnectionSuccess(restored.publicKey)
@@ -347,10 +387,14 @@ export default function NostrConnectModal({
         )
       }
       // action === "restart" (or a failed restore): reset so the user can reopen the signer.
+      // Bumping the generation first makes any still-pending attempt/restore continuation
+      // a no-op, so the reset is authoritative.
+      flowGenRef.current += 1
       setStage("idle")
       setConnectedPubkey(null)
     } catch (error: unknown) {
       logAuthError("NostrConnectModal", "Foreground resume failed:", error)
+      flowGenRef.current += 1
       setStage("idle")
       setConnectedPubkey(null)
     } finally {
@@ -646,6 +690,9 @@ export default function NostrConnectModal({
 
   const handleCancel = () => {
     logAuth("NostrConnectModal", "User cancelled")
+    // Bump the flow generation: any still-pending connect/restore continuation must become
+    // a no-op rather than resurrecting a flow the user just cancelled.
+    flowGenRef.current += 1
     // Clean disconnect
     if (slowTimerRef.current) {
       clearTimeout(slowTimerRef.current)
@@ -659,6 +706,8 @@ export default function NostrConnectModal({
   }
 
   const handleBackToOptions = () => {
+    // Same guard as cancel: leaving the flow supersedes any in-flight attempt.
+    flowGenRef.current += 1
     setStage("idle")
     setShowSlowWarning(false)
     setErrorMessage("")
