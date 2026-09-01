@@ -123,6 +123,13 @@ export default function NostrConnectModal({
   // Single-flight guard for the foreground-resume path so a burst of
   // visibilitychange/focus events doesn't fire the NIP-98 sign request twice.
   const resumeInFlightRef = useRef<boolean>(false)
+  // Concurrency guard for the AUTHENTICATION itself (not just the resume fn): the
+  // sign_in step (handleConnectionSuccess → signInWithNostrConnect → nip98Login) can
+  // still be in flight from the ORIGINAL mobile flow when the tab returns to the
+  // foreground. Without this, a foreground resume would start a SECOND NIP-98 request —
+  // duplicate signer prompts and racing login state. Wrapping handleConnectionSuccess
+  // covers every caller (connect success, retry, resume, bunker, poll) uniformly.
+  const authInFlightRef = useRef<boolean>(false)
 
   // Clear any pending timers on unmount to avoid leaked intervals and
   // setState-after-unmount from the approval poll
@@ -211,6 +218,14 @@ export default function NostrConnectModal({
   }
 
   const handleConnectionSuccess = async (pubkey: string) => {
+    // Concurrency guard: if a sign-in is ALREADY running (the original mobile flow, a
+    // retry, or a foreground resume), a second entry must not start another NIP-98 request
+    // — that produces duplicate signer prompts and racing login state.
+    if (authInFlightRef.current) {
+      logAuth("NostrConnectModal", "Sign-in already in flight — ignoring re-entry")
+      return
+    }
+    authInFlightRef.current = true
     logAuth("NostrConnectModal", "Handling connection success...")
     setStage("connected")
     setConnectedPubkey(pubkey)
@@ -223,12 +238,12 @@ export default function NostrConnectModal({
       setShowSlowWarning(true)
     }, 15000)
 
-    // Small delay to show the "connected" state
-    await new Promise<void>((resolve) => setTimeout(resolve, 300))
-
-    setStage("signing")
-
     try {
+      // Small delay to show the "connected" state
+      await new Promise<void>((resolve) => setTimeout(resolve, 300))
+
+      setStage("signing")
+
       // Call the sign-in function with progress callback
       const result = await signInWithNostrConnect(pubkey, {
         onProgress: (progressStage: string, message?: string) => {
@@ -265,6 +280,10 @@ export default function NostrConnectModal({
       setStage("error")
       setErrorStage("signing")
       setErrorMessage((error as Error).message || "An unexpected error occurred")
+    } finally {
+      // Always release the guard — success, error, or timeout — so a later legitimate
+      // sign-in (retry / a fresh connection) is not permanently blocked.
+      authInFlightRef.current = false
     }
   }
 
@@ -284,7 +303,14 @@ export default function NostrConnectModal({
    * doesn't double-fire the sign request.
    */
   const resumeOnForeground = useCallback(async () => {
-    const service = getService()
+    // IMPORTANT (review blocker 1): the direct nostrconnect:// / Amber deeplink flow is
+    // LEGACY-service-only — the connection is established by NostrConnectService
+    // (startWaitingForConnection hardcodes it; there is no NDK waitForConnection). We must
+    // therefore inspect THAT service here, NOT getService(): under USE_NDK=true (production)
+    // getService() returns NostrConnectServiceNDK, whose isConnected()/hasStoredSession()/
+    // restoreSession() know nothing about the live Amber connection — deciding "restart"
+    // would reset a perfectly valid connection to idle.
+    const service = NostrConnectService
     const action = decideNip46Resume({
       stage,
       connected: service.isConnected(),
@@ -297,8 +323,9 @@ export default function NostrConnectModal({
     logAuth("NostrConnectModal", `Foreground resume (stage=${stage}, action=${action})`)
     try {
       if (action === "resume-signing" && connectedPubkey) {
-        // The BunkerSigner survived backgrounding — re-drive only the NIP-98 step
-        // (mirrors handleRetry's "still connected" branch).
+        // The BunkerSigner survived backgrounding — re-drive only the NIP-98 step. The
+        // authInFlightRef guard inside handleConnectionSuccess makes this a no-op if the
+        // ORIGINAL mobile sign-in is still running (review blocker 2).
         logAuth("NostrConnectModal", "Still connected — resuming at signing stage")
         setStage("signing")
         await handleConnectionSuccess(connectedPubkey)
