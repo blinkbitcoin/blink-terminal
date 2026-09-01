@@ -26,16 +26,11 @@ test.describe("NIP-46 Modal", () => {
       await authPage.connectRemoteSignerButton.click()
       await page.waitForTimeout(1500)
 
-      // Should show QR code or waiting state (the QR/Bunker tabs were removed with the
-      // bunker flow — the QR view is now the only one)
-      const waitingText = page.locator("text=Waiting for connection")
-      const qrCanvas = page.locator("canvas")
-
-      const hasWaiting = await waitingText.isVisible().catch(() => false)
-      const hasQR = await qrCanvas.isVisible().catch(() => false)
-
-      // Either QR code or waiting message should be visible
-      expect(hasWaiting || hasQR).toBeTruthy()
+      // The QR is a QRCodeSVG — an <svg>, not a <canvas>. Assert the rendered QR directly
+      // (the previous canvas selector never matched, and this test passed vacuously via the
+      // always-visible waiting-text fallback).
+      const qr = page.getByTestId("nostr-connect-qr").locator("svg")
+      await expect(qr).toBeVisible({ timeout: TIMEOUTS.short })
     })
 
     test("should have option to open in desktop signer", async ({ page }) => {

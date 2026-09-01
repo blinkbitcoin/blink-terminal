@@ -31,6 +31,10 @@ const isAndroid = typeof navigator !== "undefined" && /Android/.test(navigator.u
 // Helper to get the progress stages
 const getStages = () => [
   {
+    id: "waiting",
+    label: "Waiting for connection",
+  },
+  {
     id: "connected",
     label: "Connected to signer",
   },
@@ -511,14 +515,17 @@ export default function NostrConnectModal({
             <div className="py-2">
               {/* QR Code - Primary for desktop */}
               <div className="flex flex-col items-center mb-4">
-                <div className="p-4 bg-white rounded-xl shadow-sm border border-gray-200">
+                <div
+                  data-testid="nostr-connect-qr"
+                  className="p-4 bg-white rounded-xl shadow-sm border border-gray-200"
+                >
                   <QRCodeSVG value={uri} size={200} level="M" includeMargin={false} />
                 </div>
                 <p className="mt-3 text-sm text-gray-600 dark:text-gray-400 text-center">
                   Scan with your mobile signer app
                 </p>
                 <p className="text-xs text-gray-500 dark:text-gray-500 text-center">
-                  (Amber, nsec.app, or any NIP-46 signer)
+                  (Amber or any NIP-46 signer)
                 </p>
               </div>
 
@@ -692,14 +699,17 @@ export default function NostrConnectModal({
                 <div className="space-y-4">
                   {/* QR Code - Primary for desktop */}
                   <div className="flex flex-col items-center">
-                    <div className="p-4 bg-white rounded-xl shadow-sm border border-gray-200">
+                    <div
+                      data-testid="nostr-connect-qr"
+                      className="p-4 bg-white rounded-xl shadow-sm border border-gray-200"
+                    >
                       <QRCodeSVG value={uri} size={200} level="M" includeMargin={false} />
                     </div>
                     <p className="mt-3 text-sm text-gray-600 dark:text-gray-400 text-center">
                       Scan with your mobile signer app
                     </p>
                     <p className="text-xs text-gray-500 dark:text-gray-500 text-center">
-                      (Amber, nsec.app, or any NIP-46 signer)
+                      (Amber or any NIP-46 signer)
                     </p>
                   </div>
 
@@ -746,17 +756,6 @@ export default function NostrConnectModal({
               {/* v55: Mobile experience - iOS */}
               {isIOS && (
                 <div className="space-y-3">
-                  {/* nsec.app recommendation banner */}
-                  <div className="p-3 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-xl">
-                    <p className="text-sm text-green-700 dark:text-green-400 font-medium">
-                      ✅ <strong>Recommended for iOS:</strong> Use nsec.app (web-based
-                      signer)
-                    </p>
-                    <p className="text-xs text-green-600 dark:text-green-500 mt-1">
-                      Works reliably in Safari. Native iOS signers have known issues.
-                    </p>
-                  </div>
-
                   {/* Copy Link Button - Primary action for client-initiated flow */}
                   <button
                     onClick={() => {
@@ -775,7 +774,7 @@ export default function NostrConnectModal({
                     {copied ? (
                       <>
                         <span>✓</span>
-                        <span>Copied! Paste in nsec.app</span>
+                        <span>Copied! Paste in your signer</span>
                       </>
                     ) : (
                       <>
@@ -813,7 +812,7 @@ export default function NostrConnectModal({
                     </div>
                   )}
 
-                  {/* Instructions - updated for client-initiated flow */}
+                  {/* Instructions - client-initiated flow */}
                   <div className="bg-gray-50 dark:bg-gray-800/50 rounded-lg p-4">
                     <p className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
                       How to connect:
@@ -822,22 +821,7 @@ export default function NostrConnectModal({
                       <li>
                         Tap <strong>&quot;Copy Connection Link&quot;</strong> above
                       </li>
-                      <li>
-                        Open{" "}
-                        <a
-                          href="https://nsec.app"
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-purple-600 dark:text-purple-400 underline"
-                        >
-                          nsec.app
-                        </a>{" "}
-                        and sign in
-                      </li>
-                      <li>
-                        Tap <strong>&quot;Connect App&quot;</strong> →{" "}
-                        <strong>&quot;Paste from clipboard&quot;</strong>
-                      </li>
+                      <li>Open your Nostr signer and paste the connection link</li>
                       <li>Approve the connection request</li>
                     </ol>
                   </div>
@@ -861,7 +845,10 @@ export default function NostrConnectModal({
 
                     {showMobileQR && (
                       <div className="mt-4 flex flex-col items-center">
-                        <div className="p-4 bg-white rounded-xl shadow-sm border border-gray-200">
+                        <div
+                          data-testid="nostr-connect-qr"
+                          className="p-4 bg-white rounded-xl shadow-sm border border-gray-200"
+                        >
                           <QRCodeSVG
                             value={uri}
                             size={200}
@@ -946,7 +933,10 @@ export default function NostrConnectModal({
 
                     {showMobileQR && (
                       <div className="mt-4 flex flex-col items-center">
-                        <div className="p-4 bg-white rounded-xl shadow-sm border border-gray-200">
+                        <div
+                          data-testid="nostr-connect-qr"
+                          className="p-4 bg-white rounded-xl shadow-sm border border-gray-200"
+                        >
                           <QRCodeSVG
                             value={uri}
                             size={200}

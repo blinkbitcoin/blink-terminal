@@ -119,13 +119,13 @@ interface SimplePoolInstance {
 // =====================================================================
 
 // Default relays for NIP-46 connections
-// These relays are known to support NIP-46 well
+// Kept at parity with the Blink nostr-login plugin's defaults
+// (btcpay-nostr-login NostrLoginService.DefaultRelays); relay.nsec.app was dropped
+// with the discontinued signer it fronted.
 const DEFAULT_NIP46_RELAYS: string[] = [
-  "wss://relay.nsec.app", // Popular NIP-46 relay
+  "wss://nos.lol", // Good uptime
   "wss://relay.damus.io", // Very reliable general relay
-  "wss://nos.lol", // Good uptime backup
-  "wss://relay.getportal.cc", // Portal relay
-  "wss://offchain.pub", // Offchain relay
+  "wss://relay.primal.net", // Primal relay
 ]
 
 // Storage keys
