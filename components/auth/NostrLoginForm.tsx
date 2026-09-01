@@ -25,9 +25,6 @@ import { AUTH_VERSION_FULL, logAuth, logAuthError } from "../../lib/version"
 
 import NostrConnectModal from "./NostrConnectModal"
 
-// Feature flag to use NDK implementation for bunker:// URLs
-const _USE_NDK = process.env.NEXT_PUBLIC_USE_NDK_NIP46 === "true"
-
 /** Auth mode for the form's view state */
 type AuthMode = "main" | "create" | "password"
 
