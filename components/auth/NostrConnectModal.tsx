@@ -17,6 +17,7 @@
 import { QRCodeSVG } from "qrcode.react"
 import { useState, useEffect, useCallback, useRef } from "react"
 
+import { decideNip46Resume } from "../../lib/nostr/nip46-resume"
 import NostrConnectService from "../../lib/nostr/NostrConnectService"
 import NostrConnectServiceNDK from "../../lib/nostr/NostrConnectServiceNDK"
 import { logAuth, logAuthError, logAuthWarn } from "../../lib/version"
@@ -119,6 +120,30 @@ export default function NostrConnectModal({
   // cleared from any code path, including unmount)
   const slowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const approvalPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  // Single-flight guard for the foreground-resume path so a burst of
+  // visibilitychange/focus events doesn't fire the NIP-98 sign request twice.
+  const resumeInFlightRef = useRef<boolean>(false)
+  // Attempt-scoped authentication ownership. Round-3 replaced the Boolean guard with a
+  // token; round-4 review found the token had an ABA hole: resetting it to 0 on idle let a
+  // later attempt reuse token 1, reviving a superseded token-1 continuation. The counter is
+  // now STRICTLY MONOTONIC (never reset), and the active owner is a separate nullable slot —
+  // null means idle. No token is ever reused, so a stale continuation can never become
+  // current again.
+  const authAttemptSeqRef = useRef<number>(0)
+  const authActiveTokenRef = useRef<number | null>(null)
+  // Whether a fresh waitForConnection() attempt is pending (BunkerSigner.fromURI has not
+  // settled). A pending attempt OWNS the flow — the foreground resume must leave it alone.
+  const connectInFlightRef = useRef<boolean>(false)
+  // Which connection flow is active (round-5 review): the foreground-resume recovery is
+  // designed for the direct nostrconnect:// DEEPLINK flow only. The bunker flow (legacy or
+  // NDK) shares the same stage values but recovers via its own approval polling — a focus
+  // return must not reset its UI or restore a different signer under its continuation.
+  const flowKindRef = useRef<"deeplink" | "bunker" | null>(null)
+  // Monotonic flow generation: every intentional reset/restart bumps it, and every long
+  // async continuation (connect settle, session restore) captures it up front and bails
+  // WITHOUT mutating state if it has moved — a superseded waiter must never resurrect the
+  // flow after the user (or the resume logic) has moved on.
+  const flowGenRef = useRef<number>(0)
 
   // Clear any pending timers on unmount to avoid leaked intervals and
   // setState-after-unmount from the approval poll
@@ -138,8 +163,32 @@ export default function NostrConnectModal({
   const startWaitingForConnection = useCallback(async () => {
     logAuth("NostrConnectModal", "Waiting for NIP-46 connection...")
 
+    // This is the direct nostrconnect:// deeplink flow — the only one the foreground
+    // resume may act on.
+    flowKindRef.current = "deeplink"
+
+    // A new attempt supersedes any prior one: bump the generation so a still-pending
+    // earlier attempt's continuation cannot mutate state when it eventually settles, and
+    // mark the attempt in-flight so the foreground resume leaves it alone.
+    flowGenRef.current += 1
+    const gen = flowGenRef.current
+    connectInFlightRef.current = true
+
     try {
       const result = await NostrConnectService.waitForConnection(uri)
+
+      // The connect attempt has SETTLED (acked or failed): clear the in-flight flag BEFORE
+      // entering the sign-in phase — handleConnectionSuccess is a separate phase owned by
+      // authAttemptRef, and holding the connect flag across it would freeze the foreground
+      // resume (a pending sign is not a pending connect). Only the current generation clears
+      // it, so a superseded attempt settling late must not clear a newer attempt's flag.
+      if (gen === flowGenRef.current) connectInFlightRef.current = false
+
+      // Superseded attempt: the flow was reset/restarted while this fromURI was pending.
+      if (gen !== flowGenRef.current) {
+        logAuth("NostrConnectModal", "Connect attempt superseded — dropping its result")
+        return
+      }
 
       if (result.success && result.publicKey) {
         logAuth(
@@ -156,6 +205,8 @@ export default function NostrConnectModal({
         setErrorStage("connected")
       }
     } catch (error: unknown) {
+      if (gen === flowGenRef.current) connectInFlightRef.current = false
+      if (gen !== flowGenRef.current) return
       logAuthError("NostrConnectModal", "Exception during connection:", error)
       setStage("error")
       setErrorMessage((error as Error).message || "Connection failed")
@@ -206,7 +257,26 @@ export default function NostrConnectModal({
     }
   }
 
-  const handleConnectionSuccess = async (pubkey: string) => {
+  const handleConnectionSuccess = async (
+    pubkey: string,
+    opts?: { supersede?: boolean },
+  ) => {
+    // Duplicate live invocation (visibility burst, retry while running): no-op. A session
+    // restore instead passes supersede — the obsolete attempt's auth is REPLACED, not blocked.
+    if (authActiveTokenRef.current !== null && opts?.supersede !== true) {
+      logAuth("NostrConnectModal", "Sign-in already in flight — ignoring duplicate entry")
+      return
+    }
+    // Every attempt gets a fresh, never-reused token; a superseding call's token increment is
+    // what retires the hung predecessor (its continuation goes inert the next time it checks
+    // currency). The counter is never reset, so no stale token can collide with a future one.
+    const attempt = ++authAttemptSeqRef.current
+    authActiveTokenRef.current = attempt
+    const isCurrent = () => attempt === authActiveTokenRef.current
+    // Set in the success branch so the finally does not zero the token before the deferred
+    // completion timeout runs — that timeout owns the release on success.
+    let completedSuccessfully = false
+
     logAuth("NostrConnectModal", "Handling connection success...")
     setStage("connected")
     setConnectedPubkey(pubkey)
@@ -216,18 +286,23 @@ export default function NostrConnectModal({
 
     // Start slow warning timer (15 seconds)
     slowTimerRef.current = setTimeout(() => {
-      setShowSlowWarning(true)
+      if (isCurrent()) setShowSlowWarning(true)
     }, 15000)
 
-    // Small delay to show the "connected" state
-    await new Promise<void>((resolve) => setTimeout(resolve, 300))
-
-    setStage("signing")
-
     try {
+      // Small delay to show the "connected" state
+      await new Promise<void>((resolve) => setTimeout(resolve, 300))
+
+      // A superseded attempt must not resume mutating UI after its await.
+      if (!isCurrent()) return
+
+      setStage("signing")
+
       // Call the sign-in function with progress callback
       const result = await signInWithNostrConnect(pubkey, {
         onProgress: (progressStage: string, message?: string) => {
+          // Stale attempts must not move the stepper mid-flight.
+          if (!isCurrent()) return
           logAuth("NostrConnectModal", "Progress:", progressStage, message)
           if (progressStage === "signing") setStage("signing")
           else if (progressStage === "syncing") setStage("syncing")
@@ -236,6 +311,10 @@ export default function NostrConnectModal({
         timeout: 30000,
       })
 
+      // The request settled after this attempt was superseded — apply nothing. (The hung
+      // original settling late must neither complete the login nor flip the UI to error.)
+      if (!isCurrent()) return
+
       // Clear the slow warning timer
       if (slowTimerRef.current) {
         clearTimeout(slowTimerRef.current)
@@ -243,9 +322,13 @@ export default function NostrConnectModal({
       }
 
       if (result.success) {
+        completedSuccessfully = true
         setStage("complete")
-        // Small delay to show completion before closing
+        // Small delay to show completion before closing; this timeout owns the currency check
+        // AND the guard release on success (finally skips it for completed attempts).
         setTimeout(() => {
+          if (!isCurrent()) return
+          authActiveTokenRef.current = null
           onSuccess?.(pubkey)
         }, 600)
       } else {
@@ -254,6 +337,7 @@ export default function NostrConnectModal({
         setErrorMessage(result.error || "Authentication failed")
       }
     } catch (error: unknown) {
+      if (!isCurrent()) return
       if (slowTimerRef.current) {
         clearTimeout(slowTimerRef.current)
         slowTimerRef.current = null
@@ -261,8 +345,136 @@ export default function NostrConnectModal({
       setStage("error")
       setErrorStage("signing")
       setErrorMessage((error as Error).message || "An unexpected error occurred")
+    } finally {
+      // Only the CURRENT attempt may release the guard — a superseded attempt settling must
+      // not free the slot its replacement still owns. On success the release is deferred to
+      // the completion timeout below (which owns the final isCurrent check + onSuccess).
+      if (isCurrent() && !completedSuccessfully) authActiveTokenRef.current = null
     }
   }
+
+  /**
+   * Same-device mobile fix: "Open in signer" navigates the browser AWAY to the
+   * nostrconnect:// deep link (`handleOpenInSigner`), which launches the signer app and
+   * SUSPENDS this tab. The NIP-46 client loop (`BunkerSigner`: connect-ack → get_public_key
+   * → sign_event) runs in JS in that suspended tab, so its WebSocket/timer chain stalls and
+   * the sign-in challenge is never driven. The flow is designed for the user to return to
+   * the browser afterwards (see the Android instructions), but nothing used to resume the
+   * relay client on that return — this effect closes that gap.
+   *
+   * On foreground while a connection flow is in flight, re-drive it from wherever it stopped:
+   * still connected → re-run just the NIP-98 sign step; dropped → rebuild the signer from the
+   * stored session (fresh-pool restore + ping liveness) and continue; no resumable session →
+   * reset to idle so the user can reopen the signer. Single-flight so a focus/visibility burst
+   * doesn't double-fire the sign request.
+   */
+  const resumeOnForeground = useCallback(async () => {
+    // Round-5 review: this recovery applies ONLY to the direct nostrconnect:// deeplink
+    // flow. The bunker flow (legacy or NDK) shares the same stage values but has its own
+    // approval-polling recovery — a focus return must not reset its UI or restore a
+    // different signer while its continuation is active.
+    if (flowKindRef.current !== "deeplink") return
+    // IMPORTANT (review blocker 1): the direct nostrconnect:// / Amber deeplink flow is
+    // LEGACY-service-only — the connection is established by NostrConnectService
+    // (startWaitingForConnection hardcodes it; there is no NDK waitForConnection). We must
+    // therefore inspect THAT service here, NOT getService(): under USE_NDK=true (production)
+    // getService() returns NostrConnectServiceNDK, whose isConnected()/hasStoredSession()/
+    // restoreSession() know nothing about the live Amber connection — deciding "restart"
+    // would reset a perfectly valid connection to idle.
+    const service = NostrConnectService
+    const action = decideNip46Resume({
+      stage,
+      // Round-2 blocker: a pending fresh connect attempt owns the flow — the resume must
+      // leave it alone (it resolves or times out by itself, generation-guarded).
+      connectInFlight: connectInFlightRef.current,
+      connected: service.isConnected(),
+      hasPubkey: Boolean(connectedPubkey),
+      hasSession: service.hasStoredSession(),
+    })
+    if (action === null) return
+    if (resumeInFlightRef.current) return
+    resumeInFlightRef.current = true
+    logAuth("NostrConnectModal", `Foreground resume (stage=${stage}, action=${action})`)
+    try {
+      if (action === "resume-signing" && connectedPubkey) {
+        // The BunkerSigner survived backgrounding — re-drive only the NIP-98 step. The
+        // authAttemptRef ownership guard inside handleConnectionSuccess makes this a no-op
+        // if the ORIGINAL mobile sign-in is still running (review blocker 2).
+        logAuth("NostrConnectModal", "Still connected — resuming at signing stage")
+        setStage("signing")
+        await handleConnectionSuccess(connectedPubkey)
+        return
+      }
+      if (action === "restore-session") {
+        // The socket died while suspended: rebuild from the stored session and re-drive.
+        // Capture the flow generation now so a superseding reset during the async restore
+        // makes its continuation a no-op instead of resurrecting a stale session.
+        const gen = flowGenRef.current
+        logAuth("NostrConnectModal", "Connection lost — restoring session")
+        const restored = await service.restoreSession()
+        if (gen !== flowGenRef.current) {
+          logAuth("NostrConnectModal", "Restore superseded — dropping its result")
+          return
+        }
+        if (restored.success && restored.publicKey) {
+          setConnectedPubkey(restored.publicKey)
+          // supersede: the original sign request hung on the dead socket and still owns the
+          // auth slot. The restore must REPLACE that obsolete authentication with exactly one
+          // request through the restored signer — the hung attempt's late settle (its eventual
+          // 30s timeout) then goes inert instead of erroring the UI (round-3 blocker).
+          await handleConnectionSuccess(restored.publicKey, { supersede: true })
+          return
+        }
+        logAuthWarn(
+          "NostrConnectModal",
+          "Session restore failed — resetting to idle:",
+          restored.error,
+        )
+      }
+      // action === "restart" (or a failed restore): reset so the user can reopen the signer.
+      // Bumping the flow generation first makes any still-pending attempt/restore continuation
+      // a no-op, and releasing the auth slot supersedes any hung sign request — its eventual
+      // timeout must not flip this fresh idle UI to an error. disconnect() invalidates the
+      // SERVICE-side pending attempt too (round-4 review), not just the modal refs.
+      flowGenRef.current += 1
+      authActiveTokenRef.current = null
+      flowKindRef.current = null
+      setStage("idle")
+      setConnectedPubkey(null)
+      service.disconnect().catch(() => undefined)
+    } catch (error: unknown) {
+      logAuthError("NostrConnectModal", "Foreground resume failed:", error)
+      flowGenRef.current += 1
+      authActiveTokenRef.current = null
+      flowKindRef.current = null
+      setStage("idle")
+      setConnectedPubkey(null)
+      service.disconnect().catch(() => undefined)
+    } finally {
+      resumeInFlightRef.current = false
+    }
+    // stage/connectedPubkey are read at fire time; handleConnectionSuccess is stable per
+    // render. Deliberately NOT reactive — this runs on visibility/focus events, not on state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stage, connectedPubkey])
+
+  useEffect(() => {
+    // Only the same-device mobile flow backgrounds the driving tab (desktop QR keeps the
+    // browser foregrounded), so only register the resume listener there.
+    if (!isIOS && !isAndroid) return
+
+    const onVisible = () => {
+      if (document.visibilityState === "visible") resumeOnForeground()
+    }
+    const onFocus = () => resumeOnForeground()
+
+    document.addEventListener("visibilitychange", onVisible)
+    window.addEventListener("focus", onFocus)
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible)
+      window.removeEventListener("focus", onFocus)
+    }
+  }, [resumeOnForeground])
 
   const handleBunkerSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()
@@ -272,6 +484,9 @@ export default function NostrConnectModal({
       "NostrConnectModal",
       `Connecting with bunker URL (using ${USE_NDK ? "NDK" : "nostr-tools"})...`,
     )
+    // Bunker flow: the foreground resume must leave it alone (round-5 review) — it
+    // recovers via its own approval polling.
+    flowKindRef.current = "bunker"
     setStage("connected") // Go straight to 'connected' stage (showing progress stepper)
     setErrorMessage("")
     setAwaitingApproval(false)
@@ -458,6 +673,8 @@ export default function NostrConnectModal({
       "NostrConnectModal",
       `Manual retry after approval (using ${USE_NDK ? "NDK" : "nostr-tools"})...`,
     )
+    // Only ever reached from a bunker flow; keep the marker accurate across the retry.
+    flowKindRef.current = "bunker"
 
     try {
       let result: {
@@ -531,19 +748,33 @@ export default function NostrConnectModal({
 
   const handleCancel = () => {
     logAuth("NostrConnectModal", "User cancelled")
+    // Bump the flow generation: any still-pending connect/restore continuation must become
+    // a no-op rather than resurrecting a flow the user just cancelled. Releasing the auth
+    // slot likewise retires any hung sign request so its late timeout can't error the UI.
+    flowGenRef.current += 1
+    authActiveTokenRef.current = null
+    flowKindRef.current = null
     // Clean disconnect
     if (slowTimerRef.current) {
       clearTimeout(slowTimerRef.current)
     }
     // Stop approval polling
     stopApprovalPolling()
-    // Disconnect using appropriate service
+    // Disconnect the flow-active service AND the legacy deeplink service: the nostrconnect://
+    // flow lives on NostrConnectService regardless of USE_NDK (there is no NDK
+    // waitForConnection), so under production NDK mode getService() alone would leave the
+    // legacy attempt alive. disconnect() also invalidates any pending attempt (round-4).
     const service = getService()
     service.disconnect()
+    if (service !== NostrConnectService) NostrConnectService.disconnect()
     onCancel?.()
   }
 
   const handleBackToOptions = () => {
+    // Same guard as cancel: leaving the flow supersedes any in-flight attempt or hung sign.
+    flowGenRef.current += 1
+    authActiveTokenRef.current = null
+    flowKindRef.current = null
     setStage("idle")
     setShowSlowWarning(false)
     setErrorMessage("")
