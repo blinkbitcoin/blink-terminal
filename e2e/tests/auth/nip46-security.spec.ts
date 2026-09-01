@@ -26,11 +26,8 @@ test.describe("NIP-46 Modal", () => {
       await authPage.connectRemoteSignerButton.click()
       await page.waitForTimeout(1500)
 
-      // Should be on QR code tab by default
-      const qrScanTab = page.locator('button:has-text("Scan QR Code")')
-      await expect(qrScanTab).toBeVisible({ timeout: TIMEOUTS.short })
-
-      // Should show QR code or waiting state
+      // Should show QR code or waiting state (the QR/Bunker tabs were removed with the
+      // bunker flow — the QR view is now the only one)
       const waitingText = page.locator("text=Waiting for connection")
       const qrCanvas = page.locator("canvas")
 
