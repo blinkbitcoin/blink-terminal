@@ -175,45 +175,11 @@ class NostrConnectService {
 
   static userPublicKey: string | null = null
 
-  /**
-   * Get or create the shared SimplePool instance.
-   * Per nostr-tools recommendations, we should reuse the same pool.
-   *
-   * v49: Now creates a FRESH pool for each connection attempt.
-   * This prevents old subscriptions from interfering with new ones.
-   * The old pool with limit:0 subscriptions was causing relay to send
-   * old cached "invalid secret" responses on new connection attempts.
-   *
-   * @param forceNew - Force creation of a new pool
-   */
-  static getPool(forceNew: boolean = false): SimplePoolInstance {
-    if (forceNew && this.pool) {
-      console.log(
-        "[NostrConnect] v49: Force closing existing pool before creating new one",
-      )
-      this.closePool()
-    }
-
-    if (!this.pool) {
-      console.log("[NostrConnect] v49: Creating new SimplePool instance")
-      this.pool = new SimplePool()
-    }
-    return this.pool!
-  }
-
-  /** Close and cleanup the shared pool. */
-  static closePool(): void {
-    if (this.pool) {
-      console.log("[NostrConnect] v49: Closing SimplePool")
-      try {
-        // Close all relay connections
-        this.pool.close([])
-      } catch (e: unknown) {
-        console.warn("[NostrConnect] Error closing pool:", e)
-      }
-      this.pool = null
-    }
-  }
+  // NOTE: the former getPool(forceNew)/closePool() helpers were removed (Copilot review).
+  // Both mutated the SHARED pool from whatever context called them — the opposite of the
+  // attempt-ownership contract. Every writer (waitForConnection, connectWithBunkerURL,
+  // restoreSession) now builds its pool LOCALLY and publishes it detach-then-replace at its
+  // single success point; disconnect() closes its detached pool inline.
 
   /**
    * Generate a nostrconnect:// URI for the user to scan in Amber.
@@ -952,9 +918,30 @@ class NostrConnectService {
     const thisAttempt: number = connectionAttemptCounter
     const isCurrentAttempt = (): boolean => thisAttempt === connectionAttemptCounter
 
-    // Hoisted so the catch/mismatch paths can close it — a failed restore must not leak the
-    // candidate's sockets (round-5 review).
+    // Hoisted so the catch/mismatch paths can close them — a failed restore must not leak the
+    // candidate's sockets (round-5 review). The pool is LOCAL too (Copilot review): the shared
+    // `this.pool` is never touched before this restore has confirmed ownership, so a restore
+    // that is superseded or fails can never clobber a newer connection's live pool.
     let candidate: BunkerSignerInstance | null = null
+    let candidatePool: SimplePoolInstance | null = null
+    const closeCandidate = async (): Promise<void> => {
+      if (candidate) {
+        try {
+          await candidate.close()
+        } catch {
+          // best-effort cleanup
+        }
+        candidate = null
+      }
+      if (candidatePool) {
+        try {
+          candidatePool.close([])
+        } catch {
+          // best-effort cleanup
+        }
+        candidatePool = null
+      }
+    }
 
     try {
       const clientSecretKey: Uint8Array = this.getOrCreateClientKey()
@@ -968,14 +955,15 @@ class NostrConnectService {
 
       this.connectionState = "connecting"
 
-      // v49: Use fresh pool for session restore to avoid stale subscription issues
-      const pool: SimplePoolInstance = this.getPool(true)
+      // v49: fresh pool for session restore to avoid stale subscription issues — built
+      // locally and published only at the success point below.
+      candidatePool = new SimplePool() as unknown as SimplePoolInstance
       console.log("[NostrConnect] v49: Using fresh SimplePool for session restore")
 
       const created: BunkerSignerInstance = BunkerSigner.fromBunker(
         clientSecretKey,
         bunkerPointer,
-        { pool },
+        { pool: candidatePool },
       )
       candidate = created
 
@@ -992,14 +980,9 @@ class NostrConnectService {
         console.warn(
           "[NostrConnect] Superseded restore attempt — closing stale candidate",
         )
-        try {
-          await created.close()
-        } catch {
-          // best-effort cleanup
-        }
+        await closeCandidate()
         return { success: false, error: "Restore attempt superseded" }
       }
-      this.signer = created
 
       if (publicKey !== session.publicKey) {
         console.warn("[NostrConnect] Public key mismatch, clearing session")
@@ -1007,16 +990,27 @@ class NostrConnectService {
         this.connectionState = "disconnected"
         this.signer = null
         // Close the mismatched candidate — its sockets must not leak (round-5 review).
-        try {
-          await created.close()
-        } catch {
-          // best-effort cleanup
-        }
+        await closeCandidate()
         return { success: false, error: "Session invalid" }
       }
 
+      // Single atomic publish point. The pool is detach-then-replace: the previous shared
+      // pool is captured, the fresh one installed, and only then is the old one closed —
+      // so closing it can never touch state this restore does not own.
+      const previousPool: SimplePoolInstance | null = this.pool
+      this.pool = candidatePool
+      candidatePool = null // ownership transferred to the singleton
+      this.signer = created
+      candidate = null // ownership transferred to the singleton
       this.connectionState = "connected"
       this.userPublicKey = publicKey
+      if (previousPool) {
+        try {
+          previousPool.close([])
+        } catch (e: unknown) {
+          console.warn("[NostrConnect] Error closing previous pool:", e)
+        }
+      }
 
       // Update session timestamp
       this.storeSession({
@@ -1036,15 +1030,10 @@ class NostrConnectService {
         this.connectionState = "disconnected"
         this.signer = null
       }
-      // The LOCAL candidate is ours either way — close it so its sockets never leak
-      // (round-5 review; e.g. a current-attempt ping/getPublicKey failure).
-      if (candidate) {
-        try {
-          await candidate.close()
-        } catch {
-          // best-effort cleanup
-        }
-      }
+      // The LOCAL candidate + pool are ours either way — close them so their sockets never
+      // leak (round-5 review; e.g. a current-attempt ping/getPublicKey failure). Both are
+      // nulled at the publish point, so a post-publish throw cannot close the live resources.
+      await closeCandidate()
       return { success: false, error: "Session expired or invalid" }
     }
   }

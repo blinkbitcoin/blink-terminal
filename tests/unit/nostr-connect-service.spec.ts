@@ -70,10 +70,15 @@ jest.mock("nostr-tools/nip46", () => ({
   parseBunkerInput: jest.fn(),
 }))
 
-jest.mock("nostr-tools/pool", () => ({
-  __esModule: true,
-  SimplePool: jest.fn(() => ({ close: jest.fn() })),
-}))
+// Each `new SimplePool()` yields a distinct, identifiable instance so tests can assert WHICH
+// pool the singleton holds and whether a given pool was closed.
+jest.mock("nostr-tools/pool", () => {
+  let seq = 0
+  return {
+    __esModule: true,
+    SimplePool: jest.fn(() => ({ id: ++seq, close: jest.fn() })),
+  }
+})
 
 // The service's ESM imports (nostr-tools/pure, @noble/hashes) cannot be parsed by jest —
 // mock them at the boundary; the overlap tests never exercise real crypto.
@@ -356,6 +361,128 @@ describe("NostrConnectService — overlapping attempt ownership (round-4)", () =
     expect(signerA.close).toHaveBeenCalled()
     expect(NostrConnectService.signer).toBe(signerB)
     expect(NostrConnectService.connectionState).toBe("connected")
+  })
+
+  /**
+   * Copilot review (round 2): restoreSession used getPool(true), which CLOSED and replaced
+   * the shared pool before the restore had confirmed ownership — a restore starting while
+   * connection B was live tore down B's relay sockets. The pool is now local and published
+   * atomically; a pending/failed/superseded restore never touches the shared pool.
+   */
+  it("a restore must not clobber a live connection's pool before it owns the singleton", async () => {
+    const nip46 = jest.requireMock("nostr-tools/nip46") as {
+      parseBunkerInput: jest.Mock
+    }
+    // Connection B via the bunker path (the only writer that publishes a pool it created).
+    nip46.parseBunkerInput.mockResolvedValue({
+      pubkey: "signerB",
+      relays: ["wss://r.example"],
+      secret: "s3cret",
+    })
+    const signerB = makeFakeSigner("signerB")
+    signerQueue.push(() => signerB)
+    await NostrConnectService.connectWithBunkerURL("bunker://x")
+    const livePool = NostrConnectService.pool as unknown as {
+      id: number
+      close: jest.Mock
+    }
+    expect(livePool).not.toBeNull()
+    expect(NostrConnectService.signer).toBe(signerB)
+
+    // A restore starts (stale stored session) and hangs on its ping.
+    localStorage.setItem(
+      "blinkpos_nip46_session",
+      JSON.stringify({
+        publicKey: "user-signerOld",
+        signerPubkey: "signerOld",
+        relays: ["wss://r.example"],
+      }),
+    )
+    let failPing: (e: Error) => void = () => {}
+    const signerOld = makeFakeSigner("signerOld")
+    signerOld.ping = jest.fn(() => new Promise<void>((_r, rej) => (failPing = rej)))
+    signerQueue.push(() => signerOld)
+
+    const restore = NostrConnectService.restoreSession()
+    await flush()
+
+    // While the restore is pending, B's live pool must be untouched — NOT closed, NOT
+    // replaced (the old getPool(true) did both here).
+    expect(NostrConnectService.pool).toBe(livePool)
+    expect(livePool.close).not.toHaveBeenCalled()
+
+    // The restore fails: it closes ITS OWN local pool and still leaves B's alone.
+    failPing(new Error("dead"))
+    await restore
+    await flush()
+
+    expect(NostrConnectService.pool).toBe(livePool)
+    expect(livePool.close).not.toHaveBeenCalled()
+  })
+
+  it("a failed restore closes its own local pool", async () => {
+    localStorage.setItem(
+      "blinkpos_nip46_session",
+      JSON.stringify({
+        publicKey: "user-signerOld",
+        signerPubkey: "signerOld",
+        relays: ["wss://r.example"],
+      }),
+    )
+    const signerOld = makeFakeSigner("signerOld")
+    signerOld.ping = jest.fn(async () => {
+      throw new Error("dead socket")
+    })
+    signerQueue.push(() => signerOld)
+    const poolMock = (jest.requireMock("nostr-tools/pool") as { SimplePool: jest.Mock })
+      .SimplePool
+    const before = poolMock.mock.results.length
+
+    await NostrConnectService.restoreSession()
+
+    // Exactly one pool was created for this restore, and it was closed.
+    const createdPools = poolMock.mock.results.slice(before)
+    expect(createdPools).toHaveLength(1)
+    const localPool = createdPools[0].value as { close: jest.Mock }
+    expect(localPool.close).toHaveBeenCalled()
+    // Nothing was published.
+    expect(NostrConnectService.pool).toBeNull()
+  })
+
+  it("a successful restore publishes its pool and closes the previous one (detach-then-replace)", async () => {
+    // A prior live pool.
+    const nip46 = jest.requireMock("nostr-tools/nip46") as {
+      parseBunkerInput: jest.Mock
+    }
+    nip46.parseBunkerInput.mockResolvedValue({
+      pubkey: "signerB",
+      relays: ["wss://r.example"],
+      secret: "s3cret",
+    })
+    signerQueue.push(() => makeFakeSigner("signerB"))
+    await NostrConnectService.connectWithBunkerURL("bunker://x")
+    const previousPool = NostrConnectService.pool as unknown as { close: jest.Mock }
+
+    // A restore that succeeds (stored session matches the candidate's pubkey).
+    localStorage.setItem(
+      "blinkpos_nip46_session",
+      JSON.stringify({
+        publicKey: "user-signerR",
+        signerPubkey: "signerR",
+        relays: ["wss://r.example"],
+      }),
+    )
+    const signerR = makeFakeSigner("signerR")
+    signerQueue.push(() => signerR)
+
+    const result = await NostrConnectService.restoreSession()
+
+    expect(result.success).toBe(true)
+    expect(NostrConnectService.signer).toBe(signerR)
+    // The restore's own pool is now the singleton's, and the previous one was closed
+    // only AFTER the replacement — never a window with a closed live pool.
+    expect(NostrConnectService.pool).not.toBe(previousPool)
+    expect(previousPool.close).toHaveBeenCalled()
   })
 
   /** Round-5 verified follow-up: failure paths must close the candidate (no socket leaks). */
