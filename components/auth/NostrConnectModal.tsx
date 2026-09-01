@@ -17,6 +17,7 @@
 import { QRCodeSVG } from "qrcode.react"
 import { useState, useEffect, useCallback, useRef } from "react"
 
+import { decideNip46Resume } from "../../lib/nostr/nip46-resume"
 import NostrConnectService from "../../lib/nostr/NostrConnectService"
 import NostrConnectServiceNDK from "../../lib/nostr/NostrConnectServiceNDK"
 import { logAuth, logAuthError, logAuthWarn } from "../../lib/version"
@@ -119,6 +120,9 @@ export default function NostrConnectModal({
   // cleared from any code path, including unmount)
   const slowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const approvalPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  // Single-flight guard for the foreground-resume path so a burst of
+  // visibilitychange/focus events doesn't fire the NIP-98 sign request twice.
+  const resumeInFlightRef = useRef<boolean>(false)
 
   // Clear any pending timers on unmount to avoid leaked intervals and
   // setState-after-unmount from the approval poll
@@ -263,6 +267,90 @@ export default function NostrConnectModal({
       setErrorMessage((error as Error).message || "An unexpected error occurred")
     }
   }
+
+  /**
+   * Same-device mobile fix: "Open in signer" navigates the browser AWAY to the
+   * nostrconnect:// deep link (`handleOpenInSigner`), which launches the signer app and
+   * SUSPENDS this tab. The NIP-46 client loop (`BunkerSigner`: connect-ack → get_public_key
+   * → sign_event) runs in JS in that suspended tab, so its WebSocket/timer chain stalls and
+   * the sign-in challenge is never driven. The flow is designed for the user to return to
+   * the browser afterwards (see the Android instructions), but nothing used to resume the
+   * relay client on that return — this effect closes that gap.
+   *
+   * On foreground while a connection flow is in flight, re-drive it from wherever it stopped:
+   * still connected → re-run just the NIP-98 sign step; dropped → rebuild the signer from the
+   * stored session (fresh-pool restore + ping liveness) and continue; no resumable session →
+   * reset to idle so the user can reopen the signer. Single-flight so a focus/visibility burst
+   * doesn't double-fire the sign request.
+   */
+  const resumeOnForeground = useCallback(async () => {
+    const service = getService()
+    const action = decideNip46Resume({
+      stage,
+      connected: service.isConnected(),
+      hasPubkey: Boolean(connectedPubkey),
+      hasSession: service.hasStoredSession(),
+    })
+    if (action === null) return
+    if (resumeInFlightRef.current) return
+    resumeInFlightRef.current = true
+    logAuth("NostrConnectModal", `Foreground resume (stage=${stage}, action=${action})`)
+    try {
+      if (action === "resume-signing" && connectedPubkey) {
+        // The BunkerSigner survived backgrounding — re-drive only the NIP-98 step
+        // (mirrors handleRetry's "still connected" branch).
+        logAuth("NostrConnectModal", "Still connected — resuming at signing stage")
+        setStage("signing")
+        await handleConnectionSuccess(connectedPubkey)
+        return
+      }
+      if (action === "restore-session") {
+        // The socket died while suspended: rebuild from the stored session and re-drive.
+        logAuth("NostrConnectModal", "Connection lost — restoring session")
+        const restored = await service.restoreSession()
+        if (restored.success && restored.publicKey) {
+          setConnectedPubkey(restored.publicKey)
+          await handleConnectionSuccess(restored.publicKey)
+          return
+        }
+        logAuthWarn(
+          "NostrConnectModal",
+          "Session restore failed — resetting to idle:",
+          restored.error,
+        )
+      }
+      // action === "restart" (or a failed restore): reset so the user can reopen the signer.
+      setStage("idle")
+      setConnectedPubkey(null)
+    } catch (error: unknown) {
+      logAuthError("NostrConnectModal", "Foreground resume failed:", error)
+      setStage("idle")
+      setConnectedPubkey(null)
+    } finally {
+      resumeInFlightRef.current = false
+    }
+    // stage/connectedPubkey are read at fire time; handleConnectionSuccess is stable per
+    // render. Deliberately NOT reactive — this runs on visibility/focus events, not on state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stage, connectedPubkey])
+
+  useEffect(() => {
+    // Only the same-device mobile flow backgrounds the driving tab (desktop QR keeps the
+    // browser foregrounded), so only register the resume listener there.
+    if (!isIOS && !isAndroid) return
+
+    const onVisible = () => {
+      if (document.visibilityState === "visible") resumeOnForeground()
+    }
+    const onFocus = () => resumeOnForeground()
+
+    document.addEventListener("visibilitychange", onVisible)
+    window.addEventListener("focus", onFocus)
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible)
+      window.removeEventListener("focus", onFocus)
+    }
+  }, [resumeOnForeground])
 
   const handleBunkerSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()

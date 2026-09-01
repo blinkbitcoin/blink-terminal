@@ -245,7 +245,7 @@ class NostrConnectService {
       name: "Blink POS",
       url: baseUrl,
       image: `${baseUrl}/icons/icon-96x96.png`, // App icon for signer apps (NIP-46)
-      perms: ["sign_event:22242", "get_public_key"], // NIP-98 auth events + pubkey
+      perms: ["sign_event:27235", "get_public_key"], // NIP-98 auth events + pubkey
     })
 
     // Store connection params for reference
