@@ -146,6 +146,28 @@ let connectionAttemptCounter = 0
 // =====================================================================
 // Service class
 // =====================================================================
+//
+// ATTEMPT-OWNERSHIP CONTRACT (v65/v66) — read before adding any method that
+// mutates the shared statics (signer/pool/connectionState/userPublicKey/session).
+// Every writer MUST follow the protocol the three existing writers implement
+// (waitForConnection, restoreSession, disconnect):
+//
+//   1. Take a ticket: `connectionAttemptCounter++; const thisAttempt = counter`.
+//      (disconnect only increments — invalidating every pending attempt.)
+//   2. Work on LOCAL candidates only (signer/pool). Never touch the shared
+//      statics before ownership is confirmed.
+//   3. Re-check currency (`thisAttempt === connectionAttemptCounter`) after
+//      EVERY await, at minimum immediately before publishing.
+//   4. If superseded: close the local candidates, return without touching
+//      shared state.
+//   5. Publish atomically at a single success point (signer + pool + state +
+//      pubkey + session together, no awaits in between).
+//   6. On teardown: detach synchronously (null the statics before any await),
+//      then close the detached resources.
+//
+// The race-scenario tests in tests/unit/nostr-connect-service.spec.ts pin this
+// behavior; a writer that skips the protocol will resurrect the interleaving
+// bugs that took PR #61 seven review rounds to kill.
 
 class NostrConnectService {
   /** Active BunkerSigner instance (runtime type from nostr-tools/nip46) */
