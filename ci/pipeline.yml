@@ -7,7 +7,6 @@
 #@   "release",
 #@   "open_charts_pr",
 #@   "repo_resource",
-#@   "nodejs_deps_resource",
 #@   "install_nodejs_deps",
 #@   "deps_version_resource",
 #@   "bundled_deps_resource",
@@ -24,6 +23,18 @@
 #@   "slack_resource",
 #@   "gcr_resource_type",
 #@   "slack_resource_type")
+
+#! The shared pnpm resource only watches pnpm-lock.yaml. Keep the dependency
+#! bundle in sync with every file that affects pnpm's install result.
+#@ def pnpm_deps_resource():
+name: deps
+type: git
+source:
+  paths: [package.json, pnpm-lock.yaml, pnpm-workspace.yaml, patches/*]
+  uri: #@ data.values.git_uri
+  branch: #@ data.values.git_branch
+  private_key: #@ data.values.github_private_key
+#@ end
 
 groups:
 - name: terminal
@@ -47,7 +58,7 @@ resources:
 - #@ repo_resource(webhook=True)
 - #@ pipeline_tasks_resource()
 - #@ edge_image_resource()
-- #@ nodejs_deps_resource(pckgMgr="pnpm")
+- #@ pnpm_deps_resource()
 - #@ deps_version_resource()
 - #@ bundled_deps_resource()
 - #@ slack_resource()
