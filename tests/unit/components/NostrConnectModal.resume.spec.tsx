@@ -20,6 +20,9 @@ import { act, render, screen } from "@testing-library/react"
 import React from "react"
 
 // Force the Android branch BEFORE importing the component (isAndroid is module-level).
+// The original UA is captured and restored in afterAll so this file does not leak its
+// global override into whatever runs after it in the same jest worker.
+const ORIGINAL_UA = window.navigator.userAgent
 Object.defineProperty(window.navigator, "userAgent", {
   value: "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36",
   configurable: true,
@@ -110,6 +113,14 @@ describe("NostrConnectModal — same-device NIP-46 resume (review blockers)", ()
     ndk().hasStoredSession.mockReturnValue(false)
   })
 
+  afterAll(() => {
+    // Undo the module-scope UA override so no global state leaks beyond this file.
+    Object.defineProperty(window.navigator, "userAgent", {
+      value: ORIGINAL_UA,
+      configurable: true,
+    })
+  })
+
   /**
    * Blocker 2: while a NIP-98 sign-in is in flight, a foreground return must NOT launch a
    * second sign request.
@@ -185,48 +196,80 @@ describe("NostrConnectModal — same-device NIP-46 resume (review blockers)", ()
   })
 
   /**
-   * Restore path coverage: an ESTABLISHED connection (pubkey known, sign hung on a dead
-   * socket) restores from the stored session on foreground — exactly once — and the
-   * auth-in-flight guard prevents a duplicate sign while the original is still running.
+   * Restore path (round-3 blocker): an ESTABLISHED connection whose socket died mid-sign gets
+   * restored on foreground, and the restore SUPERSEDES the hung original authentication — a
+   * replacement sign runs through the restored signer and completes the login. The hung
+   * original settling late (success OR rejection) must change no state and fire no callbacks.
    */
-  it("restores the dropped session once on foreground (established connection, dead socket)", async () => {
-    let resolveSign: (v: { success: boolean }) => void = () => {}
+  it("restores the dropped session and re-drives auth through it; the hung original's late settle is inert", async () => {
+    // Call 1 (original, dead socket) hangs until the test settles it late. Call 2 (the
+    // replacement through the restored signer) resolves successfully.
+    const deferreds: Array<{
+      resolve: (v: { success: boolean }) => void
+      reject: (e: Error) => void
+    }> = []
     const signIn = jest.fn(
-      () => new Promise<{ success: boolean }>((r) => (resolveSign = r)),
+      () =>
+        new Promise<{ success: boolean }>((resolve, reject) => {
+          deferreds.push({ resolve, reject })
+        }),
     )
+    const onSuccess = jest.fn()
     legacy().waitForConnection.mockResolvedValue({ success: true, publicKey: PUBKEY })
     legacy().hasStoredSession.mockReturnValue(true)
     legacy().restoreSession.mockResolvedValue({ success: true, publicKey: PUBKEY })
 
-    renderModal(signIn)
+    render(
+      <NostrConnectModal
+        uri="nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example&secret=s&name=Blink%20POS"
+        signInWithNostrConnect={signIn}
+        onSuccess={onSuccess}
+      />,
+    )
+
+    // Connect, sign begins and hangs (dead socket).
     await act(async () => {
       fireClick(openInAmberButton())
       await flushThroughConnectDelay()
     })
     expect(signIn).toHaveBeenCalledTimes(1)
 
-    // The socket dies while the sign hangs.
+    // Socket dies; foreground → restore → replacement auth runs.
     legacy().isConnected.mockReturnValue(false)
-
-    await foreground()
-    await act(async () => flush())
+    await act(async () => {
+      await foreground()
+      await flushThroughConnectDelay()
+    })
 
     expect(legacy().restoreSession).toHaveBeenCalledTimes(1)
-    // The original sign is still in flight — the restore's handleConnectionSuccess must not
-    // start a second one (authInFlightRef guard).
-    expect(signIn).toHaveBeenCalledTimes(1)
+    // The replacement auth started through the restored signer.
+    expect(signIn).toHaveBeenCalledTimes(2)
 
+    // The replacement completes → login completes exactly once.
     await act(async () => {
-      resolveSign({ success: true })
+      deferreds[1].resolve({ success: true })
+      // Past the 600ms completion timeout that owns onSuccess.
+      await new Promise((r) => setTimeout(r, 650))
+    })
+    expect(onSuccess).toHaveBeenCalledTimes(1)
+    expect(onSuccess).toHaveBeenCalledWith(PUBKEY)
+
+    // The hung ORIGINAL now settles late with an error (its 30s timeout). Its continuation
+    // must be inert: no second onSuccess, and the completed UI must not flip to error.
+    await act(async () => {
+      deferreds[0].reject(new Error("TIMEOUT"))
       await flush()
     })
+    expect(onSuccess).toHaveBeenCalledTimes(1)
+    expect(screen.queryByRole("button", { name: /Try Again/i })).toBeNull()
   })
 
-  /** Restore failure: the modal resets to idle so the user can reopen the signer. */
-  it("resets to idle when the stored session fails to restore", async () => {
-    let resolveSign: (v: { success: boolean }) => void = () => {}
+  /** Restore failure: the modal resets to idle so the user can reopen the signer — and the
+   *  hung original sign request's late timeout must not flip that fresh idle UI to error. */
+  it("resets to idle when the stored session fails to restore, and the hung original's late timeout stays inert", async () => {
+    let rejectSign: (e: Error) => void = () => {}
     const signIn = jest.fn(
-      () => new Promise<{ success: boolean }>((r) => (resolveSign = r)),
+      () => new Promise<{ success: boolean }>((_r, reject) => (rejectSign = reject)),
     )
     legacy().waitForConnection.mockResolvedValue({ success: true, publicKey: PUBKEY })
     legacy().hasStoredSession.mockReturnValue(true)
@@ -237,6 +280,7 @@ describe("NostrConnectModal — same-device NIP-46 resume (review blockers)", ()
       fireClick(openInAmberButton())
       await flushThroughConnectDelay()
     })
+    expect(signIn).toHaveBeenCalledTimes(1)
 
     legacy().isConnected.mockReturnValue(false)
 
@@ -244,14 +288,17 @@ describe("NostrConnectModal — same-device NIP-46 resume (review blockers)", ()
     await act(async () => flush())
 
     expect(legacy().restoreSession).toHaveBeenCalledTimes(1)
-    expect(signIn).toHaveBeenCalledTimes(1)
     // Back at the idle options view — the entry points are offered again.
     expect(openInAmberButton()).toBeTruthy()
 
+    // The hung original now times out late. The reset superseded its auth token, so the
+    // rejection must not surface an error over the idle view.
     await act(async () => {
-      resolveSign({ success: true })
+      rejectSign(new Error("TIMEOUT"))
       await flush()
     })
+    expect(screen.queryByRole("button", { name: /Try Again/i })).toBeNull()
+    expect(openInAmberButton()).toBeTruthy()
   })
 
   /**

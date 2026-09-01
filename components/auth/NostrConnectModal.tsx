@@ -123,13 +123,12 @@ export default function NostrConnectModal({
   // Single-flight guard for the foreground-resume path so a burst of
   // visibilitychange/focus events doesn't fire the NIP-98 sign request twice.
   const resumeInFlightRef = useRef<boolean>(false)
-  // Concurrency guard for the AUTHENTICATION itself (not just the resume fn): the
-  // sign_in step (handleConnectionSuccess → signInWithNostrConnect → nip98Login) can
-  // still be in flight from the ORIGINAL mobile flow when the tab returns to the
-  // foreground. Without this, a foreground resume would start a SECOND NIP-98 request —
-  // duplicate signer prompts and racing login state. Wrapping handleConnectionSuccess
-  // covers every caller (connect success, retry, resume, bunker, poll) uniformly.
-  const authInFlightRef = useRef<boolean>(false)
+  // Attempt-scoped authentication ownership. A Boolean in-flight flag conflates two
+  // different re-entries (round-3 review): a DUPLICATE live invocation (visibility burst,
+  // retry while running — must no-op) and an OBSOLETE invocation superseded by a session
+  // restore (the old request hung on a dead socket — its auth must be replaced, not blocked).
+  // 0 means idle; any positive value is the token of the currently-owned attempt.
+  const authAttemptRef = useRef<number>(0)
   // Whether a fresh waitForConnection() attempt is pending (BunkerSigner.fromURI has not
   // settled). A pending attempt OWNS the flow — the foreground resume must leave it alone.
   const connectInFlightRef = useRef<boolean>(false)
@@ -168,8 +167,8 @@ export default function NostrConnectModal({
       const result = await NostrConnectService.waitForConnection(uri)
 
       // The connect attempt has SETTLED (acked or failed): clear the in-flight flag BEFORE
-      // entering the sign-in phase — handleConnectionSuccess is a separate phase guarded by
-      // authInFlightRef, and holding the connect flag across it would freeze the foreground
+      // entering the sign-in phase — handleConnectionSuccess is a separate phase owned by
+      // authAttemptRef, and holding the connect flag across it would freeze the foreground
       // resume (a pending sign is not a pending connect). Only the current generation clears
       // it, so a superseded attempt settling late must not clear a newer attempt's flag.
       if (gen === flowGenRef.current) connectInFlightRef.current = false
@@ -247,15 +246,24 @@ export default function NostrConnectModal({
     }
   }
 
-  const handleConnectionSuccess = async (pubkey: string) => {
-    // Concurrency guard: if a sign-in is ALREADY running (the original mobile flow, a
-    // retry, or a foreground resume), a second entry must not start another NIP-98 request
-    // — that produces duplicate signer prompts and racing login state.
-    if (authInFlightRef.current) {
-      logAuth("NostrConnectModal", "Sign-in already in flight — ignoring re-entry")
+  const handleConnectionSuccess = async (
+    pubkey: string,
+    opts?: { supersede?: boolean },
+  ) => {
+    // Duplicate live invocation (visibility burst, retry while running): no-op. A session
+    // restore instead passes supersede — the obsolete attempt's auth is REPLACED, not blocked.
+    if (authAttemptRef.current !== 0 && opts?.supersede !== true) {
+      logAuth("NostrConnectModal", "Sign-in already in flight — ignoring duplicate entry")
       return
     }
-    authInFlightRef.current = true
+    // Every attempt gets a fresh token; a superseding call's token increment is what retires
+    // the hung predecessor (its continuation goes inert the next time it checks currency).
+    const attempt = ++authAttemptRef.current
+    const isCurrent = () => attempt === authAttemptRef.current
+    // Set in the success branch so the finally does not zero the token before the deferred
+    // completion timeout runs — that timeout owns the release on success.
+    let completedSuccessfully = false
+
     logAuth("NostrConnectModal", "Handling connection success...")
     setStage("connected")
     setConnectedPubkey(pubkey)
@@ -265,18 +273,23 @@ export default function NostrConnectModal({
 
     // Start slow warning timer (15 seconds)
     slowTimerRef.current = setTimeout(() => {
-      setShowSlowWarning(true)
+      if (isCurrent()) setShowSlowWarning(true)
     }, 15000)
 
     try {
       // Small delay to show the "connected" state
       await new Promise<void>((resolve) => setTimeout(resolve, 300))
 
+      // A superseded attempt must not resume mutating UI after its await.
+      if (!isCurrent()) return
+
       setStage("signing")
 
       // Call the sign-in function with progress callback
       const result = await signInWithNostrConnect(pubkey, {
         onProgress: (progressStage: string, message?: string) => {
+          // Stale attempts must not move the stepper mid-flight.
+          if (!isCurrent()) return
           logAuth("NostrConnectModal", "Progress:", progressStage, message)
           if (progressStage === "signing") setStage("signing")
           else if (progressStage === "syncing") setStage("syncing")
@@ -285,6 +298,10 @@ export default function NostrConnectModal({
         timeout: 30000,
       })
 
+      // The request settled after this attempt was superseded — apply nothing. (The hung
+      // original settling late must neither complete the login nor flip the UI to error.)
+      if (!isCurrent()) return
+
       // Clear the slow warning timer
       if (slowTimerRef.current) {
         clearTimeout(slowTimerRef.current)
@@ -292,9 +309,13 @@ export default function NostrConnectModal({
       }
 
       if (result.success) {
+        completedSuccessfully = true
         setStage("complete")
-        // Small delay to show completion before closing
+        // Small delay to show completion before closing; this timeout owns the currency check
+        // AND the guard release on success (finally skips it for completed attempts).
         setTimeout(() => {
+          if (!isCurrent()) return
+          authAttemptRef.current = 0
           onSuccess?.(pubkey)
         }, 600)
       } else {
@@ -303,6 +324,7 @@ export default function NostrConnectModal({
         setErrorMessage(result.error || "Authentication failed")
       }
     } catch (error: unknown) {
+      if (!isCurrent()) return
       if (slowTimerRef.current) {
         clearTimeout(slowTimerRef.current)
         slowTimerRef.current = null
@@ -311,9 +333,10 @@ export default function NostrConnectModal({
       setErrorStage("signing")
       setErrorMessage((error as Error).message || "An unexpected error occurred")
     } finally {
-      // Always release the guard — success, error, or timeout — so a later legitimate
-      // sign-in (retry / a fresh connection) is not permanently blocked.
-      authInFlightRef.current = false
+      // Only the CURRENT attempt may release the guard — a superseded attempt settling must
+      // not free the slot its replacement still owns. On success the release is deferred to
+      // the completion timeout below (which owns the final isCurrent check + onSuccess).
+      if (isCurrent() && !completedSuccessfully) authAttemptRef.current = 0
     }
   }
 
@@ -357,8 +380,8 @@ export default function NostrConnectModal({
     try {
       if (action === "resume-signing" && connectedPubkey) {
         // The BunkerSigner survived backgrounding — re-drive only the NIP-98 step. The
-        // authInFlightRef guard inside handleConnectionSuccess makes this a no-op if the
-        // ORIGINAL mobile sign-in is still running (review blocker 2).
+        // authAttemptRef ownership guard inside handleConnectionSuccess makes this a no-op
+        // if the ORIGINAL mobile sign-in is still running (review blocker 2).
         logAuth("NostrConnectModal", "Still connected — resuming at signing stage")
         setStage("signing")
         await handleConnectionSuccess(connectedPubkey)
@@ -377,7 +400,11 @@ export default function NostrConnectModal({
         }
         if (restored.success && restored.publicKey) {
           setConnectedPubkey(restored.publicKey)
-          await handleConnectionSuccess(restored.publicKey)
+          // supersede: the original sign request hung on the dead socket and still owns the
+          // auth slot. The restore must REPLACE that obsolete authentication with exactly one
+          // request through the restored signer — the hung attempt's late settle (its eventual
+          // 30s timeout) then goes inert instead of erroring the UI (round-3 blocker).
+          await handleConnectionSuccess(restored.publicKey, { supersede: true })
           return
         }
         logAuthWarn(
@@ -387,14 +414,17 @@ export default function NostrConnectModal({
         )
       }
       // action === "restart" (or a failed restore): reset so the user can reopen the signer.
-      // Bumping the generation first makes any still-pending attempt/restore continuation
-      // a no-op, so the reset is authoritative.
+      // Bumping the flow generation first makes any still-pending attempt/restore continuation
+      // a no-op, and zeroing the auth token supersedes any hung sign request — its eventual
+      // timeout must not flip this fresh idle UI to an error.
       flowGenRef.current += 1
+      authAttemptRef.current = 0
       setStage("idle")
       setConnectedPubkey(null)
     } catch (error: unknown) {
       logAuthError("NostrConnectModal", "Foreground resume failed:", error)
       flowGenRef.current += 1
+      authAttemptRef.current = 0
       setStage("idle")
       setConnectedPubkey(null)
     } finally {
@@ -691,8 +721,10 @@ export default function NostrConnectModal({
   const handleCancel = () => {
     logAuth("NostrConnectModal", "User cancelled")
     // Bump the flow generation: any still-pending connect/restore continuation must become
-    // a no-op rather than resurrecting a flow the user just cancelled.
+    // a no-op rather than resurrecting a flow the user just cancelled. Zeroing the auth
+    // token likewise retires any hung sign request so its late timeout can't error the UI.
     flowGenRef.current += 1
+    authAttemptRef.current = 0
     // Clean disconnect
     if (slowTimerRef.current) {
       clearTimeout(slowTimerRef.current)
@@ -706,8 +738,9 @@ export default function NostrConnectModal({
   }
 
   const handleBackToOptions = () => {
-    // Same guard as cancel: leaving the flow supersedes any in-flight attempt.
+    // Same guard as cancel: leaving the flow supersedes any in-flight attempt or hung sign.
     flowGenRef.current += 1
+    authAttemptRef.current = 0
     setStage("idle")
     setShowSlowWarning(false)
     setErrorMessage("")

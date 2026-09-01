@@ -18,9 +18,12 @@ import { act, render, screen } from "@testing-library/react"
 import React from "react"
 
 // Production posture: NDK active. MUST run before the component module is loaded.
+// The prior value is restored in afterAll so this file does not leak its env override.
+const ORIGINAL_NDK_FLAG = process.env.NEXT_PUBLIC_USE_NDK_NIP46
 process.env.NEXT_PUBLIC_USE_NDK_NIP46 = "true"
 
 // Force the Android branch BEFORE importing the component (isAndroid is module-level).
+const ORIGINAL_UA = window.navigator.userAgent
 Object.defineProperty(window.navigator, "userAgent", {
   value: "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36",
   configurable: true,
@@ -100,6 +103,19 @@ describe("NostrConnectModal — foreground resume under production NDK mode", ()
     ndk().isConnected.mockReturnValue(false)
     ndk().hasStoredSession.mockReturnValue(false)
     ndk().restoreSession.mockResolvedValue({ success: false })
+  })
+
+  afterAll(() => {
+    // Undo the module-scope overrides so no global state leaks beyond this file.
+    Object.defineProperty(window.navigator, "userAgent", {
+      value: ORIGINAL_UA,
+      configurable: true,
+    })
+    if (ORIGINAL_NDK_FLAG === undefined) {
+      delete process.env.NEXT_PUBLIC_USE_NDK_NIP46
+    } else {
+      process.env.NEXT_PUBLIC_USE_NDK_NIP46 = ORIGINAL_NDK_FLAG
+    }
   })
 
   it("consults the LEGACY service for the resume decision — NDK is never asked to restore", async () => {
