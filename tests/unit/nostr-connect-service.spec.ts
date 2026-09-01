@@ -67,7 +67,6 @@ jest.mock("nostr-tools/nip46", () => ({
       params.relays.map((r) => `&relay=${encodeURIComponent(r)}`).join("") +
       (params.perms ? `&perms=${encodeURIComponent(params.perms.join(","))}` : ""),
   ),
-  parseBunkerInput: jest.fn(),
 }))
 
 // Each `new SimplePool()` yields a distinct, identifiable instance so tests can assert WHICH
@@ -279,49 +278,6 @@ describe("NostrConnectService — overlapping attempt ownership (round-4)", () =
   })
 
   /**
-   * Round-5 verified follow-up: a stale connectWithBunkerURL continuation settling after a
-   * newer waitForConnection winner must neither overwrite nor clear it.
-   */
-  it("a stale bunker continuation cannot overwrite or clear a newer winner", async () => {
-    const nip46 = jest.requireMock("nostr-tools/nip46") as {
-      parseBunkerInput: jest.Mock
-    }
-    nip46.parseBunkerInput.mockResolvedValue({
-      pubkey: "bunkerSigner",
-      relays: ["wss://r.example"],
-      secret: "s3cret",
-    })
-
-    // Bunker attempt A: its connect() hangs until released.
-    let releaseConnect: () => void = () => {}
-    const bunkerSigner = makeFakeSigner("bunkerSigner")
-    bunkerSigner.connect = jest.fn(() => new Promise<void>((r) => (releaseConnect = r)))
-    signerQueue.push(() => bunkerSigner)
-
-    const bunkerAttempt = NostrConnectService.connectWithBunkerURL("bunker://x")
-    await flush()
-
-    // Newer waitForConnection B wins while the bunker connect is pending.
-    const signerB = makeFakeSigner("signerB")
-    signerQueue.push(() => signerB)
-    await NostrConnectService.waitForConnection(URI)
-    expect(NostrConnectService.signer).toBe(signerB)
-
-    // The bunker attempt now completes its network phase — but it is superseded: it must
-    // close its candidate and leave B untouched.
-    releaseConnect()
-    const bunkerResult = await bunkerAttempt
-    await flush()
-
-    expect(bunkerResult.success).toBe(false)
-    expect(bunkerResult.error).toMatch(/superseded/i)
-    expect(bunkerSigner.close).toHaveBeenCalled()
-    expect(NostrConnectService.signer).toBe(signerB)
-    expect(NostrConnectService.connectionState).toBe("connected")
-    expect(NostrConnectService.userPublicKey).toBe("user-signerB")
-  })
-
-  /**
    * Copilot review: waitForConnection must not publish the signer EARLY (before getPublicKey /
    * stabilization). Otherwise a supersede after that point closes the candidate but leaves
    * `signer` pointing at the closed instance. The singleton is published atomically at the
@@ -370,18 +326,18 @@ describe("NostrConnectService — overlapping attempt ownership (round-4)", () =
    * atomically; a pending/failed/superseded restore never touches the shared pool.
    */
   it("a restore must not clobber a live connection's pool before it owns the singleton", async () => {
-    const nip46 = jest.requireMock("nostr-tools/nip46") as {
-      parseBunkerInput: jest.Mock
-    }
-    // Connection B via the bunker path (the only writer that publishes a pool it created).
-    nip46.parseBunkerInput.mockResolvedValue({
-      pubkey: "signerB",
-      relays: ["wss://r.example"],
-      secret: "s3cret",
-    })
+    // Establish a live connection via a first successful restore (publishes its own pool).
+    localStorage.setItem(
+      "blinkpos_nip46_session",
+      JSON.stringify({
+        publicKey: "user-signerB",
+        signerPubkey: "signerB",
+        relays: ["wss://r.example"],
+      }),
+    )
     const signerB = makeFakeSigner("signerB")
     signerQueue.push(() => signerB)
-    await NostrConnectService.connectWithBunkerURL("bunker://x")
+    await NostrConnectService.restoreSession()
     const livePool = NostrConnectService.pool as unknown as {
       id: number
       close: jest.Mock
@@ -389,7 +345,7 @@ describe("NostrConnectService — overlapping attempt ownership (round-4)", () =
     expect(livePool).not.toBeNull()
     expect(NostrConnectService.signer).toBe(signerB)
 
-    // A restore starts (stale stored session) and hangs on its ping.
+    // A second restore starts (newer stored session) and hangs on its ping.
     localStorage.setItem(
       "blinkpos_nip46_session",
       JSON.stringify({
@@ -406,12 +362,12 @@ describe("NostrConnectService — overlapping attempt ownership (round-4)", () =
     const restore = NostrConnectService.restoreSession()
     await flush()
 
-    // While the restore is pending, B's live pool must be untouched — NOT closed, NOT
+    // While the restore is pending, the live pool must be untouched — NOT closed, NOT
     // replaced (the old getPool(true) did both here).
     expect(NostrConnectService.pool).toBe(livePool)
     expect(livePool.close).not.toHaveBeenCalled()
 
-    // The restore fails: it closes ITS OWN local pool and still leaves B's alone.
+    // The restore fails: it closes ITS OWN local pool and still leaves the live one alone.
     failPing(new Error("dead"))
     await restore
     await flush()
@@ -450,20 +406,20 @@ describe("NostrConnectService — overlapping attempt ownership (round-4)", () =
   })
 
   it("a successful restore publishes its pool and closes the previous one (detach-then-replace)", async () => {
-    // A prior live pool.
-    const nip46 = jest.requireMock("nostr-tools/nip46") as {
-      parseBunkerInput: jest.Mock
-    }
-    nip46.parseBunkerInput.mockResolvedValue({
-      pubkey: "signerB",
-      relays: ["wss://r.example"],
-      secret: "s3cret",
-    })
+    // A prior live pool from a first successful restore.
+    localStorage.setItem(
+      "blinkpos_nip46_session",
+      JSON.stringify({
+        publicKey: "user-signerB",
+        signerPubkey: "signerB",
+        relays: ["wss://r.example"],
+      }),
+    )
     signerQueue.push(() => makeFakeSigner("signerB"))
-    await NostrConnectService.connectWithBunkerURL("bunker://x")
+    await NostrConnectService.restoreSession()
     const previousPool = NostrConnectService.pool as unknown as { close: jest.Mock }
 
-    // A restore that succeeds (stored session matches the candidate's pubkey).
+    // A second restore that succeeds (stored session matches the candidate's pubkey).
     localStorage.setItem(
       "blinkpos_nip46_session",
       JSON.stringify({

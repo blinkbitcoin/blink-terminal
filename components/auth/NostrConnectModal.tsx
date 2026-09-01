@@ -1,17 +1,17 @@
 /**
  * NostrConnectModal - NIP-46 Remote Signer Connection Modal
  *
- * Supports multiple connection methods:
- * - QR Code scanning (nostrconnect://) - for Amber, other mobile signers
- * - Bunker URL paste (bunker://) - for nsec.app, Portal
+ * Connection methods (client-initiated nostrconnect:// only):
+ * - QR Code scanning (nostrconnect://) - desktop signers + mobile signers on another device
  * - Direct app open - for Amber (Android)
+ *
+ * The signer-initiated bunker:// paste flow (nsec.app) was removed: nsec.app is
+ * discontinued and the flow had no users. Its NDK variant went with it.
  *
  * Features:
  * - Desktop: Shows QR code as primary method, auto-starts waiting for connection
  * - Mobile: Toggle between QR display and direct app buttons
  * - Progress stepper UI showing connection → signing → syncing → complete
- * - Auto-polling for approval when signer requires confirmation
- * - NDK implementation available via NEXT_PUBLIC_USE_NDK_NIP46=true flag
  */
 
 import { QRCodeSVG } from "qrcode.react"
@@ -19,27 +19,24 @@ import { useState, useEffect, useCallback, useRef } from "react"
 
 import { decideNip46Resume } from "../../lib/nostr/nip46-resume"
 import NostrConnectService from "../../lib/nostr/NostrConnectService"
-import NostrConnectServiceNDK from "../../lib/nostr/NostrConnectServiceNDK"
 import { logAuth, logAuthError, logAuthWarn } from "../../lib/version"
 
 import ProgressStepper from "./ProgressStepper"
-
-// Feature flag to use NDK implementation for bunker:// URLs
-const USE_NDK = process.env.NEXT_PUBLIC_USE_NDK_NIP46 === "true"
-
-// Get the appropriate service based on feature flag
-const getService = () => (USE_NDK ? NostrConnectServiceNDK : NostrConnectService)
 
 // Detect iOS
 const isIOS =
   typeof navigator !== "undefined" && /iPad|iPhone|iPod/.test(navigator.userAgent)
 const isAndroid = typeof navigator !== "undefined" && /Android/.test(navigator.userAgent)
 
-// Helper to get stages with dynamic label for waiting state
-const getStages = (waitingForApproval: boolean) => [
+// Helper to get the progress stages
+const getStages = () => [
+  {
+    id: "waiting",
+    label: "Waiting for connection",
+  },
   {
     id: "connected",
-    label: waitingForApproval ? "Waiting for approval" : "Connected to signer",
+    label: "Connected to signer",
   },
   { id: "signing", label: "Signing authentication" },
   { id: "syncing", label: "Loading your data" },
@@ -54,12 +51,6 @@ type ConnectionStage =
   | "syncing"
   | "complete"
   | "error"
-
-/** Security rejection info */
-interface SecurityRejectionInfo {
-  noSecret?: boolean
-  unsupportedType?: string
-}
 
 /** Sign-in progress callback */
 interface SignInProgressOptions {
@@ -95,10 +86,8 @@ export default function NostrConnectModal({
   signInWithNostrConnect,
 }: NostrConnectModalProps) {
   // UI state
-  const [showBunkerInput, setShowBunkerInput] = useState<boolean>(false)
   const [_showQRCode, _setShowQRCode] = useState<boolean>(false)
   const [showMobileQR, setShowMobileQR] = useState<boolean>(false) // v55: QR toggle for mobile
-  const [bunkerUrl, setBunkerUrl] = useState<string>("")
   const [copied, setCopied] = useState<boolean>(false)
 
   // Connection state machine
@@ -108,18 +97,9 @@ export default function NostrConnectModal({
   const [_errorStage, setErrorStage] = useState<string | null>(null)
   const [showSlowWarning, setShowSlowWarning] = useState<boolean>(false)
 
-  const [awaitingApproval, setAwaitingApproval] = useState<boolean>(false)
-  const [authUrl, setAuthUrl] = useState<string | null>(null)
-  const [approvalPollCount, setApprovalPollCount] = useState<number>(0)
-
-  // Security rejection state - shows special UI for blocked connections
-  const [securityRejection, setSecurityRejection] =
-    useState<SecurityRejectionInfo | null>(null)
-
   // Timer refs (real refs so timers survive re-renders and can be
   // cleared from any code path, including unmount)
   const slowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const approvalPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   // Single-flight guard for the foreground-resume path so a burst of
   // visibilitychange/focus events doesn't fire the NIP-98 sign request twice.
   const resumeInFlightRef = useRef<boolean>(false)
@@ -134,38 +114,24 @@ export default function NostrConnectModal({
   // Whether a fresh waitForConnection() attempt is pending (BunkerSigner.fromURI has not
   // settled). A pending attempt OWNS the flow — the foreground resume must leave it alone.
   const connectInFlightRef = useRef<boolean>(false)
-  // Which connection flow is active (round-5 review): the foreground-resume recovery is
-  // designed for the direct nostrconnect:// DEEPLINK flow only. The bunker flow (legacy or
-  // NDK) shares the same stage values but recovers via its own approval polling — a focus
-  // return must not reset its UI or restore a different signer under its continuation.
-  const flowKindRef = useRef<"deeplink" | "bunker" | null>(null)
   // Monotonic flow generation: every intentional reset/restart bumps it, and every long
   // async continuation (connect settle, session restore) captures it up front and bails
   // WITHOUT mutating state if it has moved — a superseded waiter must never resurrect the
   // flow after the user (or the resume logic) has moved on.
   const flowGenRef = useRef<number>(0)
 
-  // Clear any pending timers on unmount to avoid leaked intervals and
-  // setState-after-unmount from the approval poll
+  // Clear any pending timers on unmount to avoid leaked intervals
   useEffect(() => {
     return () => {
       if (slowTimerRef.current) {
         clearTimeout(slowTimerRef.current)
         slowTimerRef.current = null
       }
-      if (approvalPollRef.current) {
-        clearInterval(approvalPollRef.current)
-        approvalPollRef.current = null
-      }
     }
   }, [])
 
   const startWaitingForConnection = useCallback(async () => {
     logAuth("NostrConnectModal", "Waiting for NIP-46 connection...")
-
-    // This is the direct nostrconnect:// deeplink flow — the only one the foreground
-    // resume may act on.
-    flowKindRef.current = "deeplink"
 
     // A new attempt supersedes any prior one: bump the generation so a still-pending
     // earlier attempt's continuation cannot mutate state when it eventually settles, and
@@ -369,18 +335,8 @@ export default function NostrConnectModal({
    * doesn't double-fire the sign request.
    */
   const resumeOnForeground = useCallback(async () => {
-    // Round-5 review: this recovery applies ONLY to the direct nostrconnect:// deeplink
-    // flow. The bunker flow (legacy or NDK) shares the same stage values but has its own
-    // approval-polling recovery — a focus return must not reset its UI or restore a
-    // different signer while its continuation is active.
-    if (flowKindRef.current !== "deeplink") return
-    // IMPORTANT (review blocker 1): the direct nostrconnect:// / Amber deeplink flow is
-    // LEGACY-service-only — the connection is established by NostrConnectService
-    // (startWaitingForConnection hardcodes it; there is no NDK waitForConnection). We must
-    // therefore inspect THAT service here, NOT getService(): under USE_NDK=true (production)
-    // getService() returns NostrConnectServiceNDK, whose isConnected()/hasStoredSession()/
-    // restoreSession() know nothing about the live Amber connection — deciding "restart"
-    // would reset a perfectly valid connection to idle.
+    // The only connection path left is the direct nostrconnect:// deeplink flow, served by
+    // NostrConnectService (the bunker flow and its NDK variant were removed).
     const service = NostrConnectService
     const action = decideNip46Resume({
       stage,
@@ -438,7 +394,6 @@ export default function NostrConnectModal({
       // SERVICE-side pending attempt too (round-4 review), not just the modal refs.
       flowGenRef.current += 1
       authActiveTokenRef.current = null
-      flowKindRef.current = null
       setStage("idle")
       setConnectedPubkey(null)
       service.disconnect().catch(() => undefined)
@@ -446,7 +401,6 @@ export default function NostrConnectModal({
       logAuthError("NostrConnectModal", "Foreground resume failed:", error)
       flowGenRef.current += 1
       authActiveTokenRef.current = null
-      flowKindRef.current = null
       setStage("idle")
       setConnectedPubkey(null)
       service.disconnect().catch(() => undefined)
@@ -476,264 +430,14 @@ export default function NostrConnectModal({
     }
   }, [resumeOnForeground])
 
-  const handleBunkerSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
-    e.preventDefault()
-    if (!bunkerUrl.trim()) return
-
-    logAuth(
-      "NostrConnectModal",
-      `Connecting with bunker URL (using ${USE_NDK ? "NDK" : "nostr-tools"})...`,
-    )
-    // Bunker flow: the foreground resume must leave it alone (round-5 review) — it
-    // recovers via its own approval polling.
-    flowKindRef.current = "bunker"
-    setStage("connected") // Go straight to 'connected' stage (showing progress stepper)
-    setErrorMessage("")
-    setAwaitingApproval(false)
-    setAuthUrl(null)
-    setApprovalPollCount(0)
-    setSecurityRejection(null) // Clear any previous security rejection
-
-    // Clear any existing poll timer
-    if (approvalPollRef.current) {
-      clearInterval(approvalPollRef.current)
-      approvalPollRef.current = null
-    }
-
-    // Auth URL callback for nsec.app approval flow (some signers use this)
-    const handleAuthUrl = (url: string) => {
-      logAuth("NostrConnectModal", "Received auth URL:", url)
-      setAuthUrl(url)
-      // Don't change stage, just set awaitingApproval flag to show different UI
-      setAwaitingApproval(true)
-
-      // Open the auth URL in a popup
-      const popup = window.open(
-        url,
-        "nsec_auth",
-        "width=500,height=700,popup=yes,scrollbars=yes",
-      )
-      if (!popup) {
-        logAuthWarn("NostrConnectModal", "Popup blocked, user needs to click link")
-      }
-    }
-
-    try {
-      let result: {
-        success: boolean
-        publicKey?: string
-        error?: string
-        needsApproval?: boolean
-        securityRejection?: boolean
-        noSecret?: boolean
-        unsupportedType?: string
-      }
-
-      if (USE_NDK) {
-        // Use NDK implementation
-        result = await NostrConnectServiceNDK.connect(bunkerUrl.trim(), {
-          onAuthUrl: handleAuthUrl,
-          onStatusChange: (status: string) => {
-            logAuth("NostrConnectModal", "NDK status:", status)
-            if (status === "awaiting_approval") {
-              // Stay on 'connected' stage but show approval UI
-              setAwaitingApproval(true)
-            }
-          },
-        })
-      } else {
-        // Legacy: Use nostr-tools implementation
-        result = await NostrConnectService.connectWithBunkerURL(
-          bunkerUrl.trim(),
-          1,
-          false,
-          handleAuthUrl,
-        )
-      }
-
-      // Handle result - both implementations return similar structure
-      if (result.needsApproval) {
-        logAuth("NostrConnectModal", "Signer requires approval, starting auto-poll...")
-        setAwaitingApproval(true)
-        // Start auto-polling for approval
-        startApprovalPolling()
-        return
-      }
-
-      if (result.success && result.publicKey) {
-        logAuth("NostrConnectModal", "Connection successful")
-        stopApprovalPolling()
-        setAwaitingApproval(false)
-        setAuthUrl(null)
-        await handleConnectionSuccess(result.publicKey)
-      } else {
-        // Check for security rejection
-        if (result.securityRejection) {
-          logAuthWarn(
-            "NostrConnectModal",
-            "SECURITY: Connection blocked -",
-            result.noSecret ? "no secret" : result.unsupportedType,
-          )
-          setStage("error")
-          setSecurityRejection({
-            noSecret: result.noSecret,
-            unsupportedType: result.unsupportedType,
-          })
-          setErrorMessage(result.error || "Connection blocked for security reasons")
-          setErrorStage("connected")
-        } else {
-          setStage("error")
-          setErrorMessage(result.error || "Connection failed")
-          setErrorStage("connected")
-        }
-      }
-    } catch (error: unknown) {
-      setStage("error")
-      setErrorMessage((error as Error).message || "Connection failed")
-      setErrorStage("connected")
-    }
-  }
-
-  // Start auto-polling for approval
-  const startApprovalPolling = () => {
-    logAuth("NostrConnectModal", "Starting approval polling...")
-    setApprovalPollCount(0)
-
-    // Clear any existing timer
-    if (approvalPollRef.current) {
-      clearInterval(approvalPollRef.current)
-    }
-
-    // Poll every 4 seconds for up to 2 minutes (30 attempts)
-    approvalPollRef.current = setInterval(async () => {
-      setApprovalPollCount((prev) => {
-        const newCount = prev + 1
-        logAuth("NostrConnectModal", `Approval poll attempt ${newCount}/30`)
-
-        if (newCount >= 30) {
-          // Stop after 2 minutes
-          logAuth("NostrConnectModal", "Polling timeout, stopping")
-          stopApprovalPolling()
-          return newCount
-        }
-
-        return newCount
-      })
-
-      // Try to reconnect
-      try {
-        let result: {
-          success: boolean
-          publicKey?: string
-          needsApproval?: boolean
-          error?: string
-        }
-        if (USE_NDK) {
-          result = await NostrConnectServiceNDK.connect(bunkerUrl.trim(), {
-            onStatusChange: (status: string) => {
-              logAuth("NostrConnectModal", "Poll status:", status)
-            },
-          })
-        } else {
-          result = await NostrConnectService.connectWithBunkerURL(
-            bunkerUrl.trim(),
-            1,
-            false,
-          )
-        }
-
-        if (result.success && result.publicKey) {
-          logAuth("NostrConnectModal", "Poll successful - approval detected!")
-          stopApprovalPolling()
-          setAwaitingApproval(false)
-          setAuthUrl(null)
-          await handleConnectionSuccess(result.publicKey)
-        }
-        // If still needs approval, continue polling (no action needed)
-      } catch (error: unknown) {
-        logAuth("NostrConnectModal", "Poll attempt failed:", (error as Error).message)
-        // Continue polling on error
-      }
-    }, 4000)
-  }
-
-  // Stop approval polling
-  const stopApprovalPolling = () => {
-    if (approvalPollRef.current) {
-      logAuth("NostrConnectModal", "Stopping approval polling")
-      clearInterval(approvalPollRef.current)
-      approvalPollRef.current = null
-    }
-  }
-
-  // Handle retry after nsec.app approval (manual trigger)
-  // This is now just a manual trigger of what polling does automatically
-  const handleRetryAfterApproval = async () => {
-    logAuth(
-      "NostrConnectModal",
-      `Manual retry after approval (using ${USE_NDK ? "NDK" : "nostr-tools"})...`,
-    )
-    // Only ever reached from a bunker flow; keep the marker accurate across the retry.
-    flowKindRef.current = "bunker"
-
-    try {
-      let result: {
-        success: boolean
-        publicKey?: string
-        needsApproval?: boolean
-        error?: string
-      }
-
-      if (USE_NDK) {
-        result = await NostrConnectServiceNDK.connect(bunkerUrl.trim(), {
-          onStatusChange: (status: string) => {
-            logAuth("NostrConnectModal", "NDK retry status:", status)
-          },
-        })
-      } else {
-        result = await NostrConnectService.connectWithBunkerURL(
-          bunkerUrl.trim(),
-          1,
-          false,
-        )
-      }
-
-      if (result.success && result.publicKey) {
-        logAuth("NostrConnectModal", "Connection successful after manual retry")
-        stopApprovalPolling()
-        setAwaitingApproval(false)
-        setAuthUrl(null)
-        await handleConnectionSuccess(result.publicKey)
-      } else if (result.needsApproval) {
-        // Still needs approval
-        logAuth("NostrConnectModal", "Still needs approval")
-        setErrorMessage(
-          "Still waiting for approval. Please approve the connection in your signer app.",
-        )
-      } else {
-        setStage("error")
-        setErrorMessage(
-          result.error || "Connection failed. Please try with a new bunker URL.",
-        )
-        setErrorStage("connected")
-      }
-    } catch (error: unknown) {
-      setStage("error")
-      setErrorMessage((error as Error).message || "Connection failed")
-      setErrorStage("connected")
-    }
-  }
-
   const handleRetry = async () => {
     logAuth("NostrConnectModal", "Retrying...")
     setErrorMessage("")
     setShowSlowWarning(false)
     setErrorStage(null)
-    setSecurityRejection(null) // Clear security rejection on retry
 
-    // Check if we still have a relay connection (use appropriate service)
-    const service = getService()
-    if (service.isConnected() && connectedPubkey) {
+    // Check if we still have a relay connection
+    if (NostrConnectService.isConnected() && connectedPubkey) {
       // Retry just the NIP-98 part
       logAuth("NostrConnectModal", "Still connected, retrying from signing stage")
       setStage("signing")
@@ -753,20 +457,12 @@ export default function NostrConnectModal({
     // slot likewise retires any hung sign request so its late timeout can't error the UI.
     flowGenRef.current += 1
     authActiveTokenRef.current = null
-    flowKindRef.current = null
     // Clean disconnect
     if (slowTimerRef.current) {
       clearTimeout(slowTimerRef.current)
     }
-    // Stop approval polling
-    stopApprovalPolling()
-    // Disconnect the flow-active service AND the legacy deeplink service: the nostrconnect://
-    // flow lives on NostrConnectService regardless of USE_NDK (there is no NDK
-    // waitForConnection), so under production NDK mode getService() alone would leave the
-    // legacy attempt alive. disconnect() also invalidates any pending attempt (round-4).
-    const service = getService()
-    service.disconnect()
-    if (service !== NostrConnectService) NostrConnectService.disconnect()
+    // Disconnect also invalidates any pending attempt at the service level (round-4 review).
+    NostrConnectService.disconnect()
     onCancel?.()
   }
 
@@ -774,16 +470,10 @@ export default function NostrConnectModal({
     // Same guard as cancel: leaving the flow supersedes any in-flight attempt or hung sign.
     flowGenRef.current += 1
     authActiveTokenRef.current = null
-    flowKindRef.current = null
     setStage("idle")
     setShowSlowWarning(false)
     setErrorMessage("")
     setErrorStage(null)
-    setAwaitingApproval(false)
-    setAuthUrl(null)
-    setSecurityRejection(null) // Clear security rejection
-    // Stop approval polling
-    stopApprovalPolling()
   }
 
   // Determine what to render based on stage
@@ -807,11 +497,9 @@ export default function NostrConnectModal({
               ? "✓ Connected!"
               : isInErrorState
                 ? "⚠️ Connection Failed"
-                : awaitingApproval
-                  ? "⏳ Waiting for Approval"
-                  : isInConnectionFlow
-                    ? "🔗 Connecting..."
-                    : "🔗 Connect with Nostr Signer"}
+                : isInConnectionFlow
+                  ? "🔗 Connecting..."
+                  : "🔗 Connect with Nostr Signer"}
           </h3>
           {!isInConnectionFlow && !isInErrorState && (
             <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
@@ -822,168 +510,82 @@ export default function NostrConnectModal({
 
         {/* Content - scrollable */}
         <div className="px-6 py-5 overflow-y-auto flex-1 min-h-0">
-          {/* v58: Desktop waiting view - show tabs with QR code or Bunker URL */}
+          {/* v58: Desktop waiting view - QR code */}
           {stage === "waiting" && !isIOS && !isAndroid && (
             <div className="py-2">
-              {/* Option selector tabs */}
-              <div className="flex rounded-xl bg-gray-100 dark:bg-gray-800 p-1 mb-4">
-                <button
-                  onClick={() => setShowBunkerInput(false)}
-                  className={`flex-1 py-2 px-3 text-sm font-medium rounded-lg transition-all ${
-                    !showBunkerInput
-                      ? "bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm"
-                      : "text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300"
-                  }`}
+              {/* QR Code - Primary for desktop */}
+              <div className="flex flex-col items-center mb-4">
+                <div
+                  data-testid="nostr-connect-qr"
+                  className="p-4 bg-white rounded-xl shadow-sm border border-gray-200"
                 >
-                  📱 Scan QR Code
-                </button>
-                <button
-                  onClick={() => setShowBunkerInput(true)}
-                  className={`flex-1 py-2 px-3 text-sm font-medium rounded-lg transition-all ${
-                    showBunkerInput
-                      ? "bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm"
-                      : "text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300"
-                  }`}
-                >
-                  🔗 Bunker URL
-                </button>
+                  <QRCodeSVG value={uri} size={200} level="M" includeMargin={false} />
+                </div>
+                <p className="mt-3 text-sm text-gray-600 dark:text-gray-400 text-center">
+                  Scan with your mobile signer app
+                </p>
+                <p className="text-xs text-gray-500 dark:text-gray-500 text-center">
+                  (Amber or any NIP-46 signer)
+                </p>
               </div>
 
-              {/* QR Code view */}
-              {!showBunkerInput && (
-                <>
-                  {/* QR Code - Primary for desktop */}
-                  <div className="flex flex-col items-center mb-4">
-                    <div className="p-4 bg-white rounded-xl shadow-sm border border-gray-200">
-                      <QRCodeSVG value={uri} size={200} level="M" includeMargin={false} />
-                    </div>
-                    <p className="mt-3 text-sm text-gray-600 dark:text-gray-400 text-center">
-                      Scan with your mobile signer app
-                    </p>
-                    <p className="text-xs text-gray-500 dark:text-gray-500 text-center">
-                      (Amber, nsec.app, or any NIP-46 signer)
-                    </p>
-                  </div>
+              {/* Waiting indicator */}
+              <div className="flex items-center justify-center gap-2 text-purple-600 dark:text-purple-400 mb-4">
+                <svg className="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
+                  <circle
+                    className="opacity-25"
+                    cx="12"
+                    cy="12"
+                    r="10"
+                    stroke="currentColor"
+                    strokeWidth="4"
+                  />
+                  <path
+                    className="opacity-75"
+                    fill="currentColor"
+                    d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                  />
+                </svg>
+                <span className="text-sm font-medium">Waiting for connection...</span>
+              </div>
 
-                  {/* Waiting indicator */}
-                  <div className="flex items-center justify-center gap-2 text-purple-600 dark:text-purple-400 mb-4">
-                    <svg className="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
-                      <circle
-                        className="opacity-25"
-                        cx="12"
-                        cy="12"
-                        r="10"
-                        stroke="currentColor"
-                        strokeWidth="4"
-                      />
-                      <path
-                        className="opacity-75"
-                        fill="currentColor"
-                        d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
-                      />
-                    </svg>
-                    <span className="text-sm font-medium">Waiting for connection...</span>
-                  </div>
+              {/* Divider */}
+              <div className="flex items-center gap-3 mb-4">
+                <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700"></div>
+                <span className="text-xs text-gray-400 dark:text-gray-500">or</span>
+                <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700"></div>
+              </div>
 
-                  {/* Divider */}
-                  <div className="flex items-center gap-3 mb-4">
-                    <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700"></div>
-                    <span className="text-xs text-gray-400 dark:text-gray-500">or</span>
-                    <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700"></div>
-                  </div>
+              {/* Desktop signer button (for Peridot, etc.) */}
+              <button
+                onClick={handleOpenInSigner}
+                className="w-full py-3 px-4 text-base font-medium text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-xl transition-all flex items-center justify-center gap-2 mb-3"
+              >
+                <span>🔗</span>
+                <span>Open in Desktop Signer</span>
+              </button>
 
-                  {/* Desktop signer button (for Peridot, etc.) */}
-                  <button
-                    onClick={handleOpenInSigner}
-                    className="w-full py-3 px-4 text-base font-medium text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-xl transition-all flex items-center justify-center gap-2 mb-3"
-                  >
-                    <span>🔗</span>
-                    <span>Open in Desktop Signer</span>
-                  </button>
-
-                  {/* Copy Link Button */}
-                  <button
-                    onClick={handleCopyLink}
-                    className={`w-full py-3 px-4 text-base font-medium rounded-xl transition-all flex items-center justify-center gap-2 ${
-                      copied
-                        ? "bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 border-2 border-green-500"
-                        : "bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700 border-2 border-transparent"
-                    }`}
-                  >
-                    {copied ? (
-                      <>
-                        <span>✓</span>
-                        <span>Copied! Paste in signer app</span>
-                      </>
-                    ) : (
-                      <>
-                        <span>📋</span>
-                        <span>Copy Link</span>
-                      </>
-                    )}
-                  </button>
-                </>
-              )}
-
-              {/* Bunker URL view */}
-              {showBunkerInput && (
-                <div className="space-y-4">
-                  {/* Explanation */}
-                  <div className="p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-xl">
-                    <p className="text-sm text-blue-700 dark:text-blue-400">
-                      <strong>Signer-initiated flow:</strong> Get a bunker URL from your
-                      signer app and paste it here.
-                    </p>
-                  </div>
-
-                  <form onSubmit={handleBunkerSubmit} className="space-y-3">
-                    <div>
-                      <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                        Paste your bunker:// URL
-                      </label>
-                      <input
-                        type="text"
-                        value={bunkerUrl}
-                        onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                          setBunkerUrl(e.target.value)
-                        }
-                        placeholder="bunker://..."
-                        className="w-full px-4 py-3 text-base border border-gray-300 dark:border-gray-600 rounded-xl bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent"
-                        autoFocus
-                      />
-                    </div>
-
-                    <button
-                      type="submit"
-                      disabled={!bunkerUrl.trim()}
-                      className="w-full py-3 px-4 text-base font-semibold text-white bg-purple-600 hover:bg-purple-700 disabled:bg-gray-300 dark:disabled:bg-gray-600 rounded-xl transition-colors disabled:cursor-not-allowed"
-                    >
-                      Connect
-                    </button>
-                  </form>
-
-                  {/* Instructions */}
-                  <div className="bg-gray-50 dark:bg-gray-800/50 rounded-xl p-4">
-                    <p className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                      How to get a bunker URL:
-                    </p>
-                    <div className="text-sm text-gray-600 dark:text-gray-400 space-y-2">
-                      <div className="flex items-start gap-2">
-                        <span className="font-semibold text-green-600 dark:text-green-400">
-                          nsec.app:
-                        </span>
-                        <span>Connect App → Advanced options → Copy Bunker URL</span>
-                      </div>
-                      <div className="flex items-start gap-2">
-                        <span className="font-semibold text-amber-600 dark:text-amber-400">
-                          Amber:
-                        </span>
-                        <span>Applications → + → Copy bunker URL</span>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              )}
+              {/* Copy Link Button */}
+              <button
+                onClick={handleCopyLink}
+                className={`w-full py-3 px-4 text-base font-medium rounded-xl transition-all flex items-center justify-center gap-2 ${
+                  copied
+                    ? "bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 border-2 border-green-500"
+                    : "bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700 border-2 border-transparent"
+                }`}
+              >
+                {copied ? (
+                  <>
+                    <span>✓</span>
+                    <span>Copied! Paste in signer app</span>
+                  </>
+                ) : (
+                  <>
+                    <span>📋</span>
+                    <span>Copy Link</span>
+                  </>
+                )}
+              </button>
 
               {/* Cancel button */}
               <button
@@ -999,84 +601,10 @@ export default function NostrConnectModal({
           {isInConnectionFlow && (stage !== "waiting" || isIOS || isAndroid) && (
             <div className="py-2">
               <ProgressStepper
-                stages={getStages(awaitingApproval)}
+                stages={getStages()}
                 currentStage={stage}
                 errorStage={null}
-                waitingForApproval={awaitingApproval}
               />
-
-              {/* Waiting for approval message */}
-              {awaitingApproval && stage === "connected" && (
-                <div className="mt-4 p-4 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-xl">
-                  <div className="flex items-start gap-3">
-                    <div className="flex-shrink-0 mt-0.5">
-                      <svg
-                        className="w-5 h-5 text-amber-500 animate-pulse"
-                        fill="none"
-                        viewBox="0 0 24 24"
-                        stroke="currentColor"
-                      >
-                        <path
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          strokeWidth="2"
-                          d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"
-                        />
-                      </svg>
-                    </div>
-                    <div className="flex-1">
-                      <p className="text-sm font-medium text-amber-800 dark:text-amber-300 mb-1">
-                        Action required in signer app
-                      </p>
-                      <p className="text-sm text-amber-700 dark:text-amber-400 mb-2">
-                        Please open <strong>nsec.app</strong> and approve the connection
-                        request.
-                        {approvalPollCount > 0 && (
-                          <span className="text-xs opacity-75 ml-1">
-                            (checking... {approvalPollCount}/30)
-                          </span>
-                        )}
-                      </p>
-                      <ol className="text-xs text-amber-600 dark:text-amber-500 space-y-1 list-decimal list-inside mb-3">
-                        <li>Open nsec.app in another tab</li>
-                        <li>Look for a pending connection request</li>
-                        <li>
-                          Tap <strong>&quot;Approve&quot;</strong> to allow the connection
-                        </li>
-                      </ol>
-
-                      {/* Auth URL link if provided */}
-                      {authUrl && (
-                        <div className="mb-3">
-                          <a
-                            href={authUrl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="inline-flex items-center gap-1 text-sm text-blue-600 dark:text-blue-400 hover:underline"
-                          >
-                            Open approval page →
-                          </a>
-                        </div>
-                      )}
-
-                      {/* Manual retry button */}
-                      <button
-                        onClick={handleRetryAfterApproval}
-                        className="w-full py-2 px-3 text-sm font-medium text-amber-700 dark:text-amber-300 bg-amber-100 dark:bg-amber-800/30 hover:bg-amber-200 dark:hover:bg-amber-800/50 rounded-lg transition-colors"
-                      >
-                        I&apos;ve approved - check now
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Show any error message */}
-                  {errorMessage && (
-                    <p className="mt-3 text-sm text-amber-600 dark:text-amber-400 border-t border-amber-200 dark:border-amber-700 pt-2">
-                      {errorMessage}
-                    </p>
-                  )}
-                </div>
-              )}
 
               {/* Slow warning */}
               {showSlowWarning && stage === "signing" && (
@@ -1134,101 +662,17 @@ export default function NostrConnectModal({
                   stroke="currentColor"
                   viewBox="0 0 24 24"
                 >
-                  {securityRejection ? (
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth="2"
-                      d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
-                    />
-                  ) : (
-                    <path
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth="2"
-                      d="M6 18L18 6M6 6l12 12"
-                    />
-                  )}
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth="2"
+                    d="M6 18L18 6M6 6l12 12"
+                  />
                 </svg>
               </div>
 
-              {/* Security Rejection - Special UI */}
-              {securityRejection && (
-                <div className="text-left mb-4">
-                  <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-4 mb-4">
-                    <h4 className="font-semibold text-red-800 dark:text-red-200 mb-2 flex items-center gap-2">
-                      <svg
-                        className="w-5 h-5"
-                        fill="none"
-                        stroke="currentColor"
-                        viewBox="0 0 24 24"
-                      >
-                        <path
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          strokeWidth="2"
-                          d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"
-                        />
-                      </svg>
-                      Security Protection
-                    </h4>
-                    <p className="text-sm text-red-700 dark:text-red-300">
-                      {errorMessage}
-                    </p>
-                  </div>
-
-                  {securityRejection.noSecret && (
-                    <div className="bg-gray-50 dark:bg-gray-800 rounded-lg p-4 text-sm">
-                      <p className="font-medium text-gray-700 dark:text-gray-300 mb-3">
-                        How to get a secure bunker URL:
-                      </p>
-                      <ul className="space-y-2 text-gray-600 dark:text-gray-400">
-                        <li className="flex items-start gap-2">
-                          <span className="font-semibold text-purple-600 dark:text-purple-400">
-                            nsec.app:
-                          </span>
-                          <span>Keys → Copy bunker URL (includes secret)</span>
-                        </li>
-                        <li className="flex items-start gap-2">
-                          <span className="font-semibold text-purple-600 dark:text-purple-400">
-                            Amber:
-                          </span>
-                          <span>Use QR code scan instead (auto-generates secret)</span>
-                        </li>
-                        <li className="flex items-start gap-2">
-                          <span className="font-semibold text-purple-600 dark:text-purple-400">
-                            Portal:
-                          </span>
-                          <span>Create connection → Copy bunker URL</span>
-                        </li>
-                      </ul>
-                    </div>
-                  )}
-
-                  {securityRejection.unsupportedType && (
-                    <div className="bg-gray-50 dark:bg-gray-800 rounded-lg p-4 text-sm">
-                      <p className="font-medium text-gray-700 dark:text-gray-300 mb-2">
-                        Secure connection options:
-                      </p>
-                      <ul className="space-y-1 text-gray-600 dark:text-gray-400 list-disc list-inside">
-                        <li>Scan the QR code with your signer app</li>
-                        <li>
-                          Paste a{" "}
-                          <code className="bg-gray-200 dark:bg-gray-700 px-1 rounded">
-                            bunker://
-                          </code>{" "}
-                          URL with a secret
-                        </li>
-                      </ul>
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* Regular error message (non-security) */}
-              {!securityRejection && (
-                <p className="text-gray-700 dark:text-gray-300 mb-2">{errorMessage}</p>
-              )}
+              {/* Regular error message */}
+              <p className="text-gray-700 dark:text-gray-300 mb-2">{errorMessage}</p>
 
               <div className="flex gap-3 mt-6">
                 <button
@@ -1253,169 +697,65 @@ export default function NostrConnectModal({
               {/* v58: Desktop experience with two clear options */}
               {!isIOS && !isAndroid && (
                 <div className="space-y-4">
-                  {/* Option selector tabs */}
-                  <div className="flex rounded-xl bg-gray-100 dark:bg-gray-800 p-1">
-                    <button
-                      onClick={() => setShowBunkerInput(false)}
-                      className={`flex-1 py-2 px-3 text-sm font-medium rounded-lg transition-all ${
-                        !showBunkerInput
-                          ? "bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm"
-                          : "text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300"
-                      }`}
+                  {/* QR Code - Primary for desktop */}
+                  <div className="flex flex-col items-center">
+                    <div
+                      data-testid="nostr-connect-qr"
+                      className="p-4 bg-white rounded-xl shadow-sm border border-gray-200"
                     >
-                      📱 Scan QR Code
-                    </button>
-                    <button
-                      onClick={() => setShowBunkerInput(true)}
-                      className={`flex-1 py-2 px-3 text-sm font-medium rounded-lg transition-all ${
-                        showBunkerInput
-                          ? "bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm"
-                          : "text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300"
-                      }`}
-                    >
-                      🔗 Bunker URL
-                    </button>
+                      <QRCodeSVG value={uri} size={200} level="M" includeMargin={false} />
+                    </div>
+                    <p className="mt-3 text-sm text-gray-600 dark:text-gray-400 text-center">
+                      Scan with your mobile signer app
+                    </p>
+                    <p className="text-xs text-gray-500 dark:text-gray-500 text-center">
+                      (Amber or any NIP-46 signer)
+                    </p>
                   </div>
 
-                  {/* QR Code view */}
-                  {!showBunkerInput && (
-                    <>
-                      {/* QR Code - Primary for desktop */}
-                      <div className="flex flex-col items-center">
-                        <div className="p-4 bg-white rounded-xl shadow-sm border border-gray-200">
-                          <QRCodeSVG
-                            value={uri}
-                            size={200}
-                            level="M"
-                            includeMargin={false}
-                          />
-                        </div>
-                        <p className="mt-3 text-sm text-gray-600 dark:text-gray-400 text-center">
-                          Scan with your mobile signer app
-                        </p>
-                        <p className="text-xs text-gray-500 dark:text-gray-500 text-center">
-                          (Amber, nsec.app, or any NIP-46 signer)
-                        </p>
-                      </div>
+                  {/* Divider */}
+                  <div className="flex items-center gap-3">
+                    <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700"></div>
+                    <span className="text-xs text-gray-400 dark:text-gray-500">or</span>
+                    <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700"></div>
+                  </div>
 
-                      {/* Divider */}
-                      <div className="flex items-center gap-3">
-                        <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700"></div>
-                        <span className="text-xs text-gray-400 dark:text-gray-500">
-                          or
-                        </span>
-                        <div className="flex-1 h-px bg-gray-200 dark:bg-gray-700"></div>
-                      </div>
+                  {/* Desktop signer button (for Peridot, etc.) */}
+                  <button
+                    onClick={handleOpenInSigner}
+                    className="w-full py-3 px-4 text-base font-medium text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-xl transition-all flex items-center justify-center gap-2"
+                  >
+                    <span>🔗</span>
+                    <span>Open in Desktop Signer</span>
+                  </button>
 
-                      {/* Desktop signer button (for Peridot, etc.) */}
-                      <button
-                        onClick={handleOpenInSigner}
-                        className="w-full py-3 px-4 text-base font-medium text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-xl transition-all flex items-center justify-center gap-2"
-                      >
-                        <span>🔗</span>
-                        <span>Open in Desktop Signer</span>
-                      </button>
-
-                      {/* Copy Link Button */}
-                      <button
-                        onClick={handleCopyLink}
-                        className={`w-full py-3 px-4 text-base font-medium rounded-xl transition-all flex items-center justify-center gap-2 ${
-                          copied
-                            ? "bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 border-2 border-green-500"
-                            : "bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700 border-2 border-transparent"
-                        }`}
-                      >
-                        {copied ? (
-                          <>
-                            <span>✓</span>
-                            <span>Copied! Paste in signer app</span>
-                          </>
-                        ) : (
-                          <>
-                            <span>📋</span>
-                            <span>Copy Link</span>
-                          </>
-                        )}
-                      </button>
-                    </>
-                  )}
-
-                  {/* Bunker URL view - v58: Now a primary option */}
-                  {showBunkerInput && (
-                    <div className="space-y-4">
-                      {/* Explanation */}
-                      <div className="p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-xl">
-                        <p className="text-sm text-blue-700 dark:text-blue-400">
-                          <strong>Signer-initiated flow:</strong> Get a bunker URL from
-                          your signer app and paste it here.
-                        </p>
-                      </div>
-
-                      <form onSubmit={handleBunkerSubmit} className="space-y-3">
-                        <div>
-                          <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                            Paste your bunker:// URL
-                          </label>
-                          <input
-                            type="text"
-                            value={bunkerUrl}
-                            onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                              setBunkerUrl(e.target.value)
-                            }
-                            placeholder="bunker://..."
-                            className="w-full px-4 py-3 text-base border border-gray-300 dark:border-gray-600 rounded-xl bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent"
-                            autoFocus
-                          />
-                        </div>
-
-                        <button
-                          type="submit"
-                          disabled={!bunkerUrl.trim()}
-                          className="w-full py-3 px-4 text-base font-semibold text-white bg-purple-600 hover:bg-purple-700 disabled:bg-gray-300 dark:disabled:bg-gray-600 rounded-xl transition-colors disabled:cursor-not-allowed"
-                        >
-                          Connect
-                        </button>
-                      </form>
-
-                      {/* Instructions */}
-                      <div className="bg-gray-50 dark:bg-gray-800/50 rounded-xl p-4">
-                        <p className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-                          How to get a bunker URL:
-                        </p>
-                        <div className="text-sm text-gray-600 dark:text-gray-400 space-y-2">
-                          <div className="flex items-start gap-2">
-                            <span className="font-semibold text-green-600 dark:text-green-400">
-                              nsec.app:
-                            </span>
-                            <span>Connect App → Advanced options → Copy Bunker URL</span>
-                          </div>
-                          <div className="flex items-start gap-2">
-                            <span className="font-semibold text-amber-600 dark:text-amber-400">
-                              Amber:
-                            </span>
-                            <span>Applications → + → Copy bunker URL</span>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  )}
+                  {/* Copy Link Button */}
+                  <button
+                    onClick={handleCopyLink}
+                    className={`w-full py-3 px-4 text-base font-medium rounded-xl transition-all flex items-center justify-center gap-2 ${
+                      copied
+                        ? "bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 border-2 border-green-500"
+                        : "bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700 border-2 border-transparent"
+                    }`}
+                  >
+                    {copied ? (
+                      <>
+                        <span>✓</span>
+                        <span>Copied! Paste in signer app</span>
+                      </>
+                    ) : (
+                      <>
+                        <span>📋</span>
+                        <span>Copy Link</span>
+                      </>
+                    )}
+                  </button>
                 </div>
               )}
 
               {/* v55: Mobile experience - iOS */}
               {isIOS && (
                 <div className="space-y-3">
-                  {/* nsec.app recommendation banner */}
-                  <div className="p-3 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-xl">
-                    <p className="text-sm text-green-700 dark:text-green-400 font-medium">
-                      ✅ <strong>Recommended for iOS:</strong> Use nsec.app (web-based
-                      signer)
-                    </p>
-                    <p className="text-xs text-green-600 dark:text-green-500 mt-1">
-                      Works reliably in Safari. Native iOS signers have known issues.
-                    </p>
-                  </div>
-
                   {/* Copy Link Button - Primary action for client-initiated flow */}
                   <button
                     onClick={() => {
@@ -1434,7 +774,7 @@ export default function NostrConnectModal({
                     {copied ? (
                       <>
                         <span>✓</span>
-                        <span>Copied! Paste in nsec.app</span>
+                        <span>Copied! Paste in your signer</span>
                       </>
                     ) : (
                       <>
@@ -1472,7 +812,7 @@ export default function NostrConnectModal({
                     </div>
                   )}
 
-                  {/* Instructions - updated for client-initiated flow */}
+                  {/* Instructions - client-initiated flow */}
                   <div className="bg-gray-50 dark:bg-gray-800/50 rounded-lg p-4">
                     <p className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
                       How to connect:
@@ -1481,22 +821,7 @@ export default function NostrConnectModal({
                       <li>
                         Tap <strong>&quot;Copy Connection Link&quot;</strong> above
                       </li>
-                      <li>
-                        Open{" "}
-                        <a
-                          href="https://nsec.app"
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-purple-600 dark:text-purple-400 underline"
-                        >
-                          nsec.app
-                        </a>{" "}
-                        and sign in
-                      </li>
-                      <li>
-                        Tap <strong>&quot;Connect App&quot;</strong> →{" "}
-                        <strong>&quot;Paste from clipboard&quot;</strong>
-                      </li>
+                      <li>Open your Nostr signer and paste the connection link</li>
                       <li>Approve the connection request</li>
                     </ol>
                   </div>
@@ -1520,7 +845,10 @@ export default function NostrConnectModal({
 
                     {showMobileQR && (
                       <div className="mt-4 flex flex-col items-center">
-                        <div className="p-4 bg-white rounded-xl shadow-sm border border-gray-200">
+                        <div
+                          data-testid="nostr-connect-qr"
+                          className="p-4 bg-white rounded-xl shadow-sm border border-gray-200"
+                        >
                           <QRCodeSVG
                             value={uri}
                             size={200}
@@ -1532,57 +860,6 @@ export default function NostrConnectModal({
                           Scan this QR from another device
                         </p>
                       </div>
-                    )}
-                  </div>
-
-                  {/* Alternative: Bunker URL Input */}
-                  <div className="border-t border-gray-100 dark:border-gray-800 pt-4">
-                    {!showBunkerInput ? (
-                      <button
-                        onClick={() => setShowBunkerInput(true)}
-                        className="w-full text-center text-sm text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 transition-colors"
-                      >
-                        Or paste bunker URL instead (advanced)
-                      </button>
-                    ) : (
-                      <form onSubmit={handleBunkerSubmit} className="space-y-3">
-                        <div>
-                          <label className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">
-                            Paste bunker:// URL from nsec.app
-                          </label>
-                          <input
-                            type="text"
-                            value={bunkerUrl}
-                            onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                              setBunkerUrl(e.target.value)
-                            }
-                            placeholder="bunker://..."
-                            className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent"
-                            autoFocus
-                          />
-                          <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">
-                            <strong>nsec.app:</strong> Connect App → Advanced options →
-                            Copy Bunker URL
-                          </p>
-                        </div>
-                        <button
-                          type="submit"
-                          disabled={!bunkerUrl.trim()}
-                          className="w-full py-2.5 px-4 text-sm font-medium text-white bg-purple-600 hover:bg-purple-700 disabled:bg-gray-300 dark:disabled:bg-gray-600 rounded-lg transition-colors disabled:cursor-not-allowed"
-                        >
-                          Connect with Bunker URL
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setShowBunkerInput(false)
-                            setBunkerUrl("")
-                          }}
-                          className="w-full text-center text-sm text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300"
-                        >
-                          ← Back
-                        </button>
-                      </form>
                     )}
                   </div>
                 </div>
@@ -1656,7 +933,10 @@ export default function NostrConnectModal({
 
                     {showMobileQR && (
                       <div className="mt-4 flex flex-col items-center">
-                        <div className="p-4 bg-white rounded-xl shadow-sm border border-gray-200">
+                        <div
+                          data-testid="nostr-connect-qr"
+                          className="p-4 bg-white rounded-xl shadow-sm border border-gray-200"
+                        >
                           <QRCodeSVG
                             value={uri}
                             size={200}
@@ -1693,59 +973,6 @@ export default function NostrConnectModal({
                           </span>
                         </div>
                       </div>
-                    )}
-                  </div>
-
-                  {/* Alternative: Bunker URL Input */}
-                  <div className="border-t border-gray-100 dark:border-gray-800 pt-4">
-                    {!showBunkerInput ? (
-                      <button
-                        onClick={() => setShowBunkerInput(true)}
-                        className="w-full text-center text-sm text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 transition-colors"
-                      >
-                        Or paste bunker URL instead
-                      </button>
-                    ) : (
-                      <form onSubmit={handleBunkerSubmit} className="space-y-3">
-                        <div>
-                          <label className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">
-                            Paste bunker:// URL from your signer
-                          </label>
-                          <input
-                            type="text"
-                            value={bunkerUrl}
-                            onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                              setBunkerUrl(e.target.value)
-                            }
-                            placeholder="bunker://..."
-                            className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent"
-                            autoFocus
-                          />
-                          <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">
-                            <strong>Amber:</strong> Applications → + → Copy bunker URL
-                            <br />
-                            <strong>nsec.app:</strong> Connect App → Advanced options →
-                            Copy Bunker URL
-                          </p>
-                        </div>
-                        <button
-                          type="submit"
-                          disabled={!bunkerUrl.trim()}
-                          className="w-full py-2.5 px-4 text-sm font-medium text-white bg-purple-600 hover:bg-purple-700 disabled:bg-gray-300 dark:disabled:bg-gray-600 rounded-lg transition-colors disabled:cursor-not-allowed"
-                        >
-                          Connect with Bunker URL
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setShowBunkerInput(false)
-                            setBunkerUrl("")
-                          }}
-                          className="w-full text-center text-sm text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300"
-                        >
-                          ← Back
-                        </button>
-                      </form>
                     )}
                   </div>
                 </div>

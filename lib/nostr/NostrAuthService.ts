@@ -1094,61 +1094,25 @@ class NostrAuthService {
   /**
    * Sign event using Nostr Connect (NIP-46)
    *
-   * Note: We check which service is actually connected, not just the feature flag
-   * - QR code flow (nostrconnect://) uses legacy NostrConnectService
-   * - Bunker URL flow uses NostrConnectServiceNDK when USE_NDK=true
-   * - We need to check both services and use whichever one is connected
-   *
    * @param event
    * @returns {Promise<SignedEvent>}
    */
   static async signEventWithNostrConnect(event: UnsignedEvent): Promise<SignedEvent> {
-    const USE_NDK = process.env.NEXT_PUBLIC_USE_NDK_NIP46 === "true"
-
-    // Import both services
-    const NostrConnectServiceNDK: NostrConnectServiceLike = (
-      await import("./NostrConnectServiceNDK")
-    ).default
     const NostrConnectService: NostrConnectServiceLike = (
       await import("./NostrConnectService")
     ).default
 
-    // Check which service is actually connected
-    const ndkConnected = NostrConnectServiceNDK.isConnected()
-    const legacyConnected = NostrConnectService.isConnected()
-
-    logAuth(
-      "NostrAuthService",
-      "Checking connected services - NDK:",
-      ndkConnected,
-      "Legacy:",
-      legacyConnected,
-    )
-
-    // Use whichever service is actually connected
-    // Priority: If both connected, prefer NDK when USE_NDK is true
-    if (ndkConnected && (USE_NDK || !legacyConnected)) {
-      logAuth("NostrAuthService", "Using NDK service for signing")
-      const result = await NostrConnectServiceNDK.signEvent(event)
-
-      if (!result.success) {
-        throw new Error(result.error || "Failed to sign event via Nostr Connect (NDK)")
-      }
-
-      return result.event!
-    } else if (legacyConnected) {
-      logAuth("NostrAuthService", "Using legacy nostr-tools service for signing")
-      const result = await NostrConnectService.signEvent(event)
-
-      if (!result.success) {
-        throw new Error(result.error || "Failed to sign event via Nostr Connect")
-      }
-
-      return result.event!
-    } else {
-      // Neither service is connected
+    if (!NostrConnectService.isConnected()) {
       throw new Error("Nostr Connect session not active. Please reconnect.")
     }
+
+    const result = await NostrConnectService.signEvent(event)
+
+    if (!result.success) {
+      throw new Error(result.error || "Failed to sign event via Nostr Connect")
+    }
+
+    return result.event!
   }
 
   /**

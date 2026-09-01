@@ -27,7 +27,6 @@ ENV NEXT_TELEMETRY_DISABLED 1
 
 # v52: NEXT_PUBLIC_* variables must be set at build time for Next.js
 # They get inlined into the JavaScript bundle during build
-ENV NEXT_PUBLIC_USE_NDK_NIP46=true
 
 # Git commit hash for build versioning
 ARG GIT_COMMIT=unknown

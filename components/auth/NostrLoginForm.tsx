@@ -25,9 +25,6 @@ import { AUTH_VERSION_FULL, logAuth, logAuthError } from "../../lib/version"
 
 import NostrConnectModal from "./NostrConnectModal"
 
-// Feature flag to use NDK implementation for bunker:// URLs
-const _USE_NDK = process.env.NEXT_PUBLIC_USE_NDK_NIP46 === "true"
-
 /** Auth mode for the form's view state */
 type AuthMode = "main" | "create" | "password"
 
@@ -85,9 +82,7 @@ export default function NostrLoginForm() {
   const [confirmPassword, setConfirmPassword] = useState<string>("")
   const [hasStoredAccount, setHasStoredAccount] = useState<boolean>(false)
 
-  // Detect iOS vs Android for showing appropriate mobile options
-  const isIOS =
-    typeof navigator !== "undefined" && /iPad|iPhone|iPod/.test(navigator.userAgent)
+  // Detect Android for showing appropriate mobile options
   const isAndroid =
     typeof navigator !== "undefined" && /Android/.test(navigator.userAgent)
 
@@ -1339,33 +1334,6 @@ export default function NostrLoginForm() {
                 </svg>
                 Create New Account
               </button>
-            )}
-
-            {/* iOS hint - show when no extension detected */}
-            {isIOS && !hasExtension && (
-              <div className="text-center p-4 bg-blue-50 dark:bg-blue-900/20 rounded-xl border border-blue-200 dark:border-blue-800">
-                <p className="text-sm text-blue-700 dark:text-blue-300">
-                  &#128241; Nostr Connect works best with{" "}
-                  <a
-                    href="https://nsec.app"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="font-medium underline hover:text-blue-800 dark:hover:text-blue-200"
-                  >
-                    nsec.app
-                  </a>{" "}
-                  (web-based signer). For browser extension, install{" "}
-                  <a
-                    href="https://apps.apple.com/cy/app/nostash/id6744309333"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="font-medium underline hover:text-blue-800 dark:hover:text-blue-200"
-                  >
-                    Nostash
-                  </a>{" "}
-                  for Safari.
-                </p>
-              </div>
             )}
 
             {/* Android hint */}

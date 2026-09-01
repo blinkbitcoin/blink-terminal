@@ -5,17 +5,18 @@
  * This is the recommended method for web apps to communicate with external
  * signers like Amber, as it doesn't rely on unreliable URL schemes.
  *
- * Note: NDK alternative available (see NostrConnectServiceNDK.ts)
- * Set NEXT_PUBLIC_USE_NDK_NIP46=true to use NDK implementation instead.
- * NDK handles NIP-46 more robustly, especially with nsec.app on iOS Safari.
- * This file remains as legacy/fallback implementation.
+ * Only the client-initiated nostrconnect:// flow is supported (QR on desktop,
+ * "Open in Amber" deeplink on mobile). The signer-initiated bunker:// paste flow
+ * and the NDK alternative were removed (nsec.app is discontinued; the bunker
+ * flow had no users and was the source of the dual-service ambiguity that drove
+ * repeated review rounds).
  *
  * @see https://github.com/nostr-protocol/nips/blob/master/46.md
  */
 
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils"
 // @ts-expect-error -- nostr-tools subpath exports require moduleResolution:"bundler", works at runtime via webpack
-import { BunkerSigner, createNostrConnectURI, parseBunkerInput } from "nostr-tools/nip46"
+import { BunkerSigner, createNostrConnectURI } from "nostr-tools/nip46"
 // @ts-expect-error -- nostr-tools subpath exports require moduleResolution:"bundler", works at runtime via webpack
 import { SimplePool } from "nostr-tools/pool"
 // @ts-expect-error -- nostr-tools subpath exports require moduleResolution:"bundler", works at runtime via webpack
@@ -41,18 +42,6 @@ interface ConnectionResult {
   success: boolean
   publicKey?: string
   error?: string
-  /** Set when the bunker URL is missing a secret (security rejection) */
-  securityRejection?: boolean
-  /** Set when there is no secret in the bunker URL */
-  noSecret?: boolean
-  /** Set when the remote signer needs user approval (nsec.app) */
-  needsApproval?: boolean
-  /** Whether an auth URL was opened during the attempt */
-  authUrlOpened?: boolean
-  /** Whether the same bunker URL can be re-used for a retry */
-  canRetryWithSameUrl?: boolean
-  /** True when this is the first "invalid secret" attempt */
-  isFirstAttempt?: boolean
 }
 
 /** Unsigned Nostr event template passed to signEvent */
@@ -130,13 +119,13 @@ interface SimplePoolInstance {
 // =====================================================================
 
 // Default relays for NIP-46 connections
-// These relays are known to support NIP-46 well
+// Kept at parity with the Blink nostr-login plugin's defaults
+// (btcpay-nostr-login NostrLoginService.DefaultRelays); relay.nsec.app was dropped
+// with the discontinued signer it fronted.
 const DEFAULT_NIP46_RELAYS: string[] = [
-  "wss://relay.nsec.app", // Popular NIP-46 relay
+  "wss://nos.lol", // Good uptime
   "wss://relay.damus.io", // Very reliable general relay
-  "wss://nos.lol", // Good uptime backup
-  "wss://relay.getportal.cc", // Portal relay
-  "wss://offchain.pub", // Offchain relay
+  "wss://relay.primal.net", // Primal relay
 ]
 
 // Storage keys
@@ -147,18 +136,12 @@ const NIP46_PENDING_KEY = "blinkpos_nip46_pending"
 // Connection timeout (2 minutes)
 const CONNECTION_TIMEOUT = 120000
 
-// Bunker connect timeout (30 seconds - shorter than overall timeout)
-const BUNKER_CONNECT_TIMEOUT = 30000
-
 // Post-connect stabilization delay (helps prevent first signing attempt failures)
 // Some signers need a moment after connect() before they're ready for sign requests
 const POST_CONNECT_DELAY = 500
 
 // v49: Track connection attempt number to detect stale responses
 let connectionAttemptCounter = 0
-
-// Auth URL callback - set by UI components to handle nsec.app approval flow
-let authUrlCallback: ((url: string) => void) | null = null
 
 // =====================================================================
 // Service class
@@ -177,9 +160,9 @@ class NostrConnectService {
 
   // NOTE: the former getPool(forceNew)/closePool() helpers were removed (Copilot review).
   // Both mutated the SHARED pool from whatever context called them — the opposite of the
-  // attempt-ownership contract. Every writer (waitForConnection, connectWithBunkerURL,
-  // restoreSession) now builds its pool LOCALLY and publishes it detach-then-replace at its
-  // single success point; disconnect() closes its detached pool inline.
+  // attempt-ownership contract. Every writer (waitForConnection, restoreSession) now builds
+  // its pool LOCALLY and publishes it detach-then-replace at its single success point;
+  // disconnect() closes its detached pool inline.
 
   /**
    * Generate a nostrconnect:// URI for the user to scan in Amber.
@@ -372,456 +355,6 @@ class NostrConnectService {
 
       return { success: false, error: errorMessage }
     }
-  }
-
-  /**
-   * Connect using a bunker:// URL provided by the user.
-   * Alternative flow if QR scanning isn't working.
-   *
-   * v49: CRITICAL FIX for iOS Safari "invalid secret"
-   * - ROOT CAUSE: nostr-tools subscriptions use limit:0 with no 'since' filter
-   * - This causes relay to replay ALL historical events including old error responses
-   * - Old "invalid secret" responses from PREVIOUS attempts get replayed
-   * - FIX: Create a FRESH pool for each connection to avoid old subscription interference
-   * - FIX: On first "invalid secret", assume nsec.app needs approval (show approval UI)
-   * - FIX: Only after retry also fails do we mark URL as truly expired
-   *
-   * @param bunkerUrl - bunker:// URL from Amber/nsec.app
-   * @param maxRetries - Maximum retry attempts (default 1 since secrets are single-use)
-   * @param forceNewClientKey - Force generation of a new client key
-   * @param onAuthUrl - Callback when signer requests auth URL approval (nsec.app)
-   */
-  static async connectWithBunkerURL(
-    bunkerUrl: string,
-    maxRetries: number = 1,
-    forceNewClientKey: boolean = false,
-    onAuthUrl: ((url: string) => void) | null = null,
-  ): Promise<ConnectionResult> {
-    // v49: Increment connection attempt counter
-    // v66 (round-5 review): the ticket is now OWNERSHIP, not just logging — this attempt may
-    // publish or clear shared singleton state only while it is still the latest one, exactly
-    // like waitForConnection/restoreSession. The candidate signer + pool stay LOCAL until
-    // publish; a superseded or failed attempt closes them instead of leaking sockets.
-    connectionAttemptCounter++
-    const thisAttempt: number = connectionAttemptCounter
-    const isCurrentAttempt = (): boolean => thisAttempt === connectionAttemptCounter
-    console.log(`[NostrConnect] v49: Connection attempt #${thisAttempt}`)
-
-    let candidate: BunkerSignerInstance | null = null
-    let candidatePool: SimplePoolInstance | null = null
-    const closeCandidate = async (): Promise<void> => {
-      if (candidate) {
-        try {
-          await candidate.close()
-        } catch {
-          // best-effort cleanup
-        }
-        candidate = null
-      }
-      if (candidatePool) {
-        try {
-          candidatePool.close([])
-        } catch {
-          // best-effort cleanup
-        }
-        candidatePool = null
-      }
-    }
-
-    try {
-      console.log("[NostrConnect] v49: Parsing bunker URL...")
-      console.log("[NostrConnect] URL length:", bunkerUrl?.length)
-      console.log("[NostrConnect] forceNewClientKey:", forceNewClientKey)
-      console.log("[NostrConnect] onAuthUrl callback provided:", !!onAuthUrl)
-      console.log("[NostrConnect] maxRetries:", maxRetries)
-
-      const bunkerPointer: {
-        pubkey: string
-        relays: string[]
-        secret?: string | null
-      } | null = await parseBunkerInput(bunkerUrl)
-
-      if (!bunkerPointer) {
-        return { success: false, error: "Invalid bunker URL format" }
-      }
-
-      if (bunkerPointer.relays.length === 0) {
-        return { success: false, error: "Bunker URL must include at least one relay" }
-      }
-
-      // SECURITY: Require secret in bunker URLs to prevent connection hijacking
-      // See: Mike Dilger security disclosure on NIP-46 relay monitoring attacks
-      // https://github.com/nostrband/nostrconnect.org - nostrconnect.org recommendations
-      if (!bunkerPointer.secret) {
-        console.error(
-          "[NostrConnect] SECURITY: Bunker URL has no secret - rejecting to prevent hijacking",
-        )
-        return {
-          success: false,
-          error:
-            "This bunker URL does not contain a verification secret. For your security, please generate a NEW bunker URL from your signer app that includes a secret.",
-          securityRejection: true,
-          noSecret: true,
-        }
-      }
-
-      // Enhanced debugging for iOS issue
-      console.log("[NostrConnect] Bunker pointer parsed:")
-      console.log(
-        "[NostrConnect]   - pubkey:",
-        bunkerPointer.pubkey?.slice(0, 16) + "...",
-      )
-      console.log("[NostrConnect]   - secret exists:", !!bunkerPointer.secret)
-      console.log("[NostrConnect]   - secret length:", bunkerPointer.secret?.length || 0)
-      console.log(
-        "[NostrConnect]   - secret preview:",
-        bunkerPointer.secret ? bunkerPointer.secret.slice(0, 8) + "..." : "none",
-      )
-      console.log("[NostrConnect]   - relays count:", bunkerPointer.relays?.length)
-
-      // Force new client key if requested (helps with some edge cases)
-      if (forceNewClientKey) {
-        console.log("[NostrConnect] Forcing new client key generation...")
-        this.clearClientKey()
-      }
-
-      const clientSecretKey: Uint8Array = this.getOrCreateClientKey()
-      const clientPubkey: string = getPublicKey(clientSecretKey)
-
-      // parseBunkerInput awaited above — a newer attempt may have started since; touch
-      // nothing shared if so.
-      if (!isCurrentAttempt()) {
-        return { success: false, error: "Connection attempt superseded" }
-      }
-
-      this.connectionState = "connecting"
-      console.log("[NostrConnect] Connecting to bunker...")
-      console.log("[NostrConnect] Client pubkey:", clientPubkey.slice(0, 16) + "...")
-      console.log(
-        "[NostrConnect] Signer pubkey:",
-        bunkerPointer.pubkey.slice(0, 16) + "...",
-      )
-      console.log("[NostrConnect] Relays:", bunkerPointer.relays)
-
-      // Store the auth callback for use in onauth handler
-      authUrlCallback = onAuthUrl
-
-      // Track if auth URL was opened (nsec.app approval flow)
-      let authUrlOpened = false
-
-      // v49: CRITICAL - Close ANY existing signer AND pool before creating new ones
-      // This prevents old subscriptions from interfering.
-      // v66: DETACH synchronously (we are the newest attempt right now), then close the
-      // detached resources — the awaits below can no longer touch a newer attempt's state.
-      const oldSigner: BunkerSignerInstance | null = this.signer
-      this.signer = null
-      const oldPool: SimplePoolInstance | null = this.pool
-      this.pool = null
-      if (oldSigner) {
-        try {
-          console.log("[NostrConnect] v49: Closing previous signer...")
-          await oldSigner.close()
-        } catch (e: unknown) {
-          console.warn("[NostrConnect] v49: Error closing previous signer:", e)
-        }
-      }
-      if (oldPool) {
-        try {
-          oldPool.close([])
-        } catch (e: unknown) {
-          console.warn("[NostrConnect] v49: Error closing previous pool:", e)
-        }
-      }
-
-      // v49: Force a NEW pool to avoid old subscription interference
-      // The old pool may have subscriptions with limit:0 that receive old cached events
-      // v66: the fresh pool stays LOCAL until this attempt publishes on success.
-      console.log(
-        "[NostrConnect] v49: Creating FRESH pool to avoid old subscription interference",
-      )
-      candidatePool = new SimplePool() as unknown as SimplePoolInstance
-      const pool: SimplePoolInstance = candidatePool
-
-      // Create signer with onauth callback for nsec.app approval flow
-      const signerParams: {
-        pool: SimplePoolInstance
-        onauth: (authUrl: string) => void
-      } = {
-        pool,
-        onauth: (authUrl: string) => {
-          console.log("[NostrConnect] v49: *** ONAUTH CALLBACK TRIGGERED ***")
-          console.log(
-            "[NostrConnect] v49: Received auth_url from remote signer:",
-            authUrl,
-          )
-          authUrlOpened = true
-
-          if (onAuthUrl) {
-            // Let the UI component handle the auth URL
-            console.log("[NostrConnect] v49: Calling UI onAuthUrl callback...")
-            onAuthUrl(authUrl)
-          } else if (authUrlCallback) {
-            // Fallback to stored callback
-            console.log("[NostrConnect] v49: Calling stored authUrlCallback...")
-            authUrlCallback(authUrl)
-          } else {
-            // Default: open in new window/tab
-            console.log("[NostrConnect] v49: Opening auth URL in new window...")
-            if (typeof window !== "undefined") {
-              const authWindow: Window | null = window.open(
-                authUrl,
-                "_blank",
-                "width=500,height=600,popup=yes",
-              )
-              if (!authWindow) {
-                console.warn("[NostrConnect] Popup blocked, trying location redirect")
-                window.open(authUrl, "_blank")
-              }
-            }
-          }
-        },
-      }
-
-      // v49: Log the exact bunker pointer being used
-      console.log("[NostrConnect] v49: Creating BunkerSigner with:")
-      console.log("[NostrConnect] v49:   bunkerPointer.pubkey:", bunkerPointer.pubkey)
-      console.log("[NostrConnect] v49:   bunkerPointer.secret:", bunkerPointer.secret)
-      console.log(
-        "[NostrConnect] v49:   bunkerPointer.relays:",
-        JSON.stringify(bunkerPointer.relays),
-      )
-      console.log(
-        "[NostrConnect] v49:   clientSecretKey length:",
-        clientSecretKey?.length,
-      )
-      console.log("[NostrConnect] v49:   clientPubkey:", clientPubkey)
-      console.log("[NostrConnect] v49:   connectionAttempt:", thisAttempt)
-
-      const created: BunkerSignerInstance = BunkerSigner.fromBunker(
-        clientSecretKey,
-        bunkerPointer,
-        signerParams,
-      )
-      candidate = created
-
-      console.log(
-        "[NostrConnect] v49: BunkerSigner created, signer.bp:",
-        JSON.stringify({
-          pubkey: created.bp?.pubkey?.slice(0, 16) + "...",
-          secret: created.bp?.secret ? "exists" : "none",
-          relays: created.bp?.relays,
-        }),
-      )
-
-      try {
-        // Establish connection with the remote signer WITH TIMEOUT
-        // nostr-tools signer.connect() has no built-in timeout, so we add one
-        console.log("[NostrConnect] v49: Calling signer.connect() with timeout...")
-        await this.connectWithTimeout(created, BUNKER_CONNECT_TIMEOUT)
-        console.log("[NostrConnect] v49: connect() completed successfully")
-
-        // Small delay to let WebSocket connections stabilize
-        console.log("[NostrConnect] Adding post-connect stabilization delay...")
-        await new Promise<void>((resolve) => setTimeout(resolve, POST_CONNECT_DELAY))
-
-        // Get user's public key with retry
-        console.log("[NostrConnect] Getting public key...")
-        const publicKey: string = await this.getPublicKeyWithRetry(created, 3)
-
-        // The network round-trips above are suspension points — publish only if this
-        // attempt still owns the singleton (v66).
-        if (!isCurrentAttempt()) {
-          console.warn(
-            "[NostrConnect] Superseded bunker attempt — closing stale candidate",
-          )
-          await closeCandidate()
-          return { success: false, error: "Connection attempt superseded" }
-        }
-
-        this.signer = created
-        this.pool = candidatePool
-        this.connectionState = "connected"
-        this.userPublicKey = publicKey
-
-        // Store session for persistence
-        this.storeSession({
-          publicKey,
-          signerPubkey: bunkerPointer.pubkey,
-          relays: bunkerPointer.relays,
-        })
-
-        console.log("[NostrConnect] v49: Successfully connected via bunker URL!")
-        console.log("[NostrConnect] User pubkey:", publicKey.slice(0, 16) + "...")
-
-        // Clear the callback
-        authUrlCallback = null
-
-        return { success: true, publicKey }
-      } catch (innerErr: unknown) {
-        // Handle both Error objects and plain string throws
-        const errorMessage: string =
-          typeof innerErr === "string"
-            ? innerErr
-            : innerErr instanceof Error
-              ? innerErr.message
-              : "no message"
-
-        console.warn(`[NostrConnect] v49: Connection failed:`, errorMessage)
-        console.warn(`[NostrConnect] v49: Error type:`, typeof innerErr)
-        console.warn(`[NostrConnect] v49: Raw error value:`, innerErr)
-        console.warn(`[NostrConnect] v49: authUrlOpened at error time:`, authUrlOpened)
-
-        // v49: Handle "invalid secret" error
-        // On first attempt, this likely means nsec.app needs approval
-        // nsec.app doesn't send auth_url callback - it shows approval in its own UI
-        if (errorMessage.includes("invalid secret")) {
-          console.log('[NostrConnect] v49: Got "invalid secret" error')
-
-          // Brief wait in case auth_url is coming (some signers send it)
-          await new Promise<void>((resolve) => setTimeout(resolve, 500))
-
-          console.log("[NostrConnect] v49: authUrlOpened:", authUrlOpened)
-
-          // Clean up for retry — shared state only while this attempt still owns it (v66),
-          // and always close the failed candidate (the retry creates a fresh one).
-          if (isCurrentAttempt()) {
-            authUrlCallback = null
-            this.connectionState = "disconnected"
-          }
-          await closeCandidate()
-
-          // v49: ALWAYS show approval UI on first "invalid secret"
-          // This could be:
-          // 1. nsec.app waiting for user approval (most likely)
-          // 2. Old cached response from relay (fixed with fresh pool, but still possible)
-          // 3. Actually expired token (we'll find out on retry)
-          console.log(
-            "[NostrConnect] v49: Showing approval UI - user should check nsec.app",
-          )
-
-          return {
-            success: false,
-            error:
-              'Please open nsec.app and approve the connection request for this app, then tap "Retry" to complete sign-in.',
-            needsApproval: true,
-            authUrlOpened: authUrlOpened,
-            canRetryWithSameUrl: true,
-            isFirstAttempt: true,
-          }
-        }
-
-        if (innerErr instanceof Error) {
-          console.warn(
-            `[NostrConnect] Error details:`,
-            JSON.stringify({
-              name: innerErr.name,
-              message: innerErr.message,
-              stack: innerErr.stack?.split("\n").slice(0, 3).join(" | "),
-            }),
-          )
-        }
-
-        // For other errors, provide generic message. Shared state only while current (v66);
-        // the candidate is closed regardless so its sockets never leak.
-        if (isCurrentAttempt()) {
-          authUrlCallback = null
-          this.connectionState = "disconnected"
-        }
-        await closeCandidate()
-
-        let userFriendlyError: string = errorMessage
-        if (errorMessage.includes("timed out")) {
-          userFriendlyError =
-            "Connection timed out. Please ensure nsec.app is open and try with a new bunker URL."
-        } else if (errorMessage.includes("closed")) {
-          userFriendlyError = "Connection was closed. Please try with a new bunker URL."
-        }
-
-        return { success: false, error: userFriendlyError }
-      }
-    } catch (outerErr: unknown) {
-      if (isCurrentAttempt()) {
-        this.connectionState = "disconnected"
-        authUrlCallback = null
-      }
-      await closeCandidate()
-
-      const error = outerErr instanceof Error ? outerErr : new Error(String(outerErr))
-      console.error("[NostrConnect] Bunker connection failed:", error)
-      return { success: false, error: error.message }
-    }
-  }
-
-  /**
-   * Get public key with retry logic.
-   * @param signer - The candidate signer to query (kept local until published, v66)
-   * @param maxRetries - Maximum number of attempts
-   */
-  private static async getPublicKeyWithRetry(
-    signer: BunkerSignerInstance,
-    maxRetries: number = 3,
-  ): Promise<string> {
-    let lastError: unknown = null
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        const publicKey: string = await signer.getPublicKey()
-        return publicKey
-      } catch (err: unknown) {
-        lastError = err
-        const msg = err instanceof Error ? err.message : String(err)
-        console.warn(`[NostrConnect] getPublicKey attempt ${attempt} failed:`, msg)
-        if (attempt < maxRetries) {
-          await new Promise<void>((resolve) => setTimeout(resolve, 500 * attempt))
-        }
-      }
-    }
-    throw lastError || new Error("Failed to get public key")
-  }
-
-  /**
-   * Connect to bunker with timeout.
-   * nostr-tools BunkerSigner.connect() has no built-in timeout, so we wrap it.
-   *
-   * @param signer - The BunkerSigner instance (typed as any — can't resolve from subpath export)
-   * @param timeout - Timeout in milliseconds
-   */
-  private static async connectWithTimeout(
-    signer: BunkerSignerInstance,
-    timeout: number = BUNKER_CONNECT_TIMEOUT,
-  ): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      let resolved = false
-
-      // Set up timeout
-      const timeoutId: ReturnType<typeof setTimeout> = setTimeout(() => {
-        if (!resolved) {
-          resolved = true
-          console.error(`[NostrConnect] connect() timed out after ${timeout}ms`)
-          reject(
-            new Error(
-              `Connection timed out after ${timeout / 1000} seconds. The remote signer may not be responding. Please check that the signer app is open and connected to the relay.`,
-            ),
-          )
-        }
-      }, timeout)
-
-      // Call the actual connect
-      ;(signer.connect() as Promise<void>)
-        .then(() => {
-          if (!resolved) {
-            resolved = true
-            clearTimeout(timeoutId)
-            resolve()
-          }
-        })
-        .catch((error: unknown) => {
-          if (!resolved) {
-            resolved = true
-            clearTimeout(timeoutId)
-            reject(error)
-          }
-        })
-    })
   }
 
   /**
@@ -1228,15 +761,6 @@ class NostrConnectService {
     }
     this.clearPendingConnection()
     console.log("[NostrConnect] Session cleared")
-  }
-
-  /**
-   * Clear client key (use with caution — will invalidate all sessions).
-   */
-  static clearClientKey(): void {
-    if (typeof localStorage !== "undefined") {
-      localStorage.removeItem(NIP46_CLIENT_KEY)
-    }
   }
 
   /**
