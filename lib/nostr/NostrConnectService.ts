@@ -165,10 +165,12 @@ let connectionAttemptCounter = 0
 //      shared state.
 //   5. Publish the in-memory statics together at a single success point
 //      (signer + pool + state + pubkey, no awaits in between). Session
-//      persistence via storeSession() follows the publish; it is synchronous
-//      but NOT atomic with it — a storage failure after publish leaves a live
-//      connection with no stored session (fails toward re-auth, never toward
-//      a stale session).
+//      persistence via storeSession() follows the publish and is NOT atomic
+//      with it: storeSession() overwrites the stored session with no rollback,
+//      so if the write throws (e.g. localStorage quota) whatever was stored
+//      BEFORE is left in place — including a previous session — and a reload
+//      could restore it. Adding rollback (clear-before-write + a failed-write
+//      test) is the tracked #61 follow-up; it is out of scope here.
 //   6. On teardown: detach synchronously (null the statics before any await),
 //      then close the detached resources.
 //

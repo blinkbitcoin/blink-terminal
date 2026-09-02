@@ -1,46 +1,81 @@
 /**
  * Guard: the dependency-override policy has exactly ONE authoritative source —
- * `pnpm-workspace.yaml#overrides`.
+ * `pnpm-workspace.yaml#overrides` — and the lockfile faithfully reflects it.
  *
  * pnpm does NOT merge `package.json#pnpm.overrides` with the workspace map: if
  * both exist, the package.json map silently REPLACES the workspace one. That
  * exact failure happened on PR #63: adding a single browserslist override to
  * package.json disabled the workspace map, downgraded protobufjs, and
- * resurfaced the already-patched sharp/postcss advisories.
+ * resurfaced the already-patched sharp/postcss advisories — a change the
+ * lockfile's `overrides:` block recorded but no test caught.
  *
- * If you need a new override, add it to pnpm-workspace.yaml.
+ * This guard pins the *values*, not just the dependency names: the workspace
+ * map must equal EXPECTED_OVERRIDES exactly, and the lockfile's regenerated
+ * override map must equal the workspace map. Weakening a floor, pointing a
+ * selector at a vulnerable replacement, or letting the two sources diverge all
+ * fail here.
+ *
+ * If you need a new/changed override: edit pnpm-workspace.yaml, run
+ * `pnpm install`, then update EXPECTED_OVERRIDES to match.
  */
 import fs from "fs"
 import path from "path"
 
-describe("dependency override policy", () => {
-  const root = path.resolve(__dirname, "..", "..")
+// Selector -> replacement, exactly as it must appear in pnpm-workspace.yaml.
+const EXPECTED_OVERRIDES: Record<string, string> = {
+  "protobufjs": ">=8.4.1",
+  "lodash@<4.18.0": ">=4.18.0",
+  "ws@>=8.0.0 <8.21.0": ">=8.21.0",
+  "@grpc/grpc-js@>=1.14.0 <1.14.4": ">=1.14.4",
+  "sharp@<0.35.0": ">=0.35.3",
+  "postcss@<8.5.18": ">=8.5.18",
+  "nanoid@<3.3.18": "^3.3.18",
+  "browserslist@<4.28.7": "^4.28.8",
+}
 
-  it("package.json does not define pnpm overrides (workspace map is the single source)", () => {
+const root = path.resolve(__dirname, "..", "..")
+
+/**
+ * Parse a flat `overrides:` block from either pnpm-workspace.yaml (top-level)
+ * or pnpm-lock.yaml (top-level) into a selector -> replacement map. Both files
+ * write one `  "<selector>": "<replacement>"` entry per line with no nesting,
+ * so a line parser avoids adding a YAML dependency for a guard.
+ */
+function parseOverridesBlock(fileContents: string): Record<string, string> {
+  const lines = fileContents.split("\n")
+  const start = lines.findIndex((l) => l === "overrides:")
+  if (start === -1) return {}
+
+  const result: Record<string, string> = {}
+  for (let i = start + 1; i < lines.length; i++) {
+    const line = lines[i]
+    if (line.trim() === "") break // blank line ends the block
+    if (!/^\s/.test(line)) break // dedent to column 0 ends the block
+    const m = line.match(/^\s+'?"?(.+?)"?'?:\s*'?"?(.+?)"?'?\s*$/)
+    if (m) result[m[1]] = m[2]
+  }
+  return result
+}
+
+describe("dependency override policy", () => {
+  const workspace = parseOverridesBlock(
+    fs.readFileSync(path.join(root, "pnpm-workspace.yaml"), "utf8"),
+  )
+  const lockfile = parseOverridesBlock(
+    fs.readFileSync(path.join(root, "pnpm-lock.yaml"), "utf8"),
+  )
+
+  it("package.json does not define overrides (workspace map is the single source)", () => {
     const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"))
     expect(pkg.pnpm?.overrides).toBeUndefined()
     expect(pkg.overrides).toBeUndefined() // npm-style map is equally dead config
   })
 
-  it("pnpm-workspace.yaml keeps the established security floors", () => {
-    // The file is flat YAML: `overrides:` followed by `  "<selector>": "<range>"`
-    // lines. A line-based parse avoids adding a YAML dependency for a guard.
-    const workspaceYaml = fs.readFileSync(path.join(root, "pnpm-workspace.yaml"), "utf8")
-    const selectors = [...workspaceYaml.matchAll(/^\s+"?([^"\n:]+?)"?:\s/gm)].map(
-      (m) => m[1],
-    )
-    const floors = [
-      "protobufjs",
-      "lodash",
-      "ws",
-      "@grpc/grpc-js",
-      "sharp",
-      "postcss",
-      "nanoid",
-      "browserslist",
-    ]
-    for (const dep of floors) {
-      expect(selectors.some((s) => s === dep || s.startsWith(`${dep}@`))).toBe(true)
-    }
+  it("pnpm-workspace.yaml matches the expected selector->replacement policy exactly", () => {
+    expect(workspace).toEqual(EXPECTED_OVERRIDES)
+  })
+
+  it("the lockfile's override map equals the workspace map", () => {
+    expect(lockfile).toEqual(workspace)
   })
 })
