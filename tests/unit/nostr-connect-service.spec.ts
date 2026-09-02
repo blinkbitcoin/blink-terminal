@@ -582,3 +582,88 @@ describe("NostrConnectService — storeSession failure is fail-safe", () => {
     expect(stored.signerPubkey).toBe("signerNew")
   })
 })
+
+/**
+ * Same-device deeplink recovery (verified on-device 2026-09-02): the connect handshake reaches
+ * the signer's ack (fromURI resolves), a PENDING session is persisted, then Android suspends
+ * the tab's socket before getPublicKey resolves. The connection is recoverable via
+ * restoreSession (fromBunker with the known signer pubkey), and a pending session skips the
+ * user-pubkey match since none was ever confirmed.
+ */
+describe("NostrConnectService — pending-session handshake recovery", () => {
+  const SESSION_KEY = "blinkpos_nip46_session"
+
+  beforeEach(() => {
+    signerQueue.length = 0
+    localStorage.clear()
+    NostrConnectService.signer = null
+    NostrConnectService.pool = null
+    NostrConnectService.connectionState = "disconnected"
+    NostrConnectService.userPublicKey = null
+  })
+
+  it("persists a pending session as soon as the connection is established, before getPublicKey", async () => {
+    // getPublicKey never resolves (socket died) — the connect hangs, but the pending session
+    // must already be on disk from the moment fromURI resolved.
+    const signer = makeFakeSigner("signerX")
+    signer.getPublicKey = jest.fn(() => new Promise<string>(() => {})) // never resolves
+    signerQueue.push(() => signer)
+
+    NostrConnectService.waitForConnection(URI) // do not await — it hangs at getPublicKey
+    await flush()
+
+    const stored = JSON.parse(localStorage.getItem(SESSION_KEY) ?? "null")
+    expect(stored).not.toBeNull()
+    expect(stored.pending).toBe(true)
+    expect(stored.signerPubkey).toBe("signerX")
+    expect(stored.publicKey).toBe("") // user pubkey not known yet
+  })
+
+  it("restores a pending session without enforcing a user-pubkey match, then finalizes it", async () => {
+    // A pending session left by an interrupted handshake.
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        publicKey: "",
+        signerPubkey: "signerX",
+        relays: ["wss://r.example"],
+        connectedAt: Date.now(),
+        pending: true,
+      }),
+    )
+    const restored = makeFakeSigner("signerX") // fromBunker candidate
+    signerQueue.push(() => restored)
+
+    const result = await NostrConnectService.restoreSession()
+
+    expect(result.success).toBe(true)
+    expect(result.publicKey).toBe("user-signerX")
+    expect(NostrConnectService.isConnected()).toBe(true)
+    // Session finalized: real pubkey stamped, pending cleared.
+    const stored = JSON.parse(localStorage.getItem(SESSION_KEY) ?? "null")
+    expect(stored.publicKey).toBe("user-signerX")
+    expect(stored.pending).toBe(false)
+    expect(restored.close).not.toHaveBeenCalled()
+  })
+
+  it("still enforces the pubkey match for a CONFIRMED (non-pending) session", async () => {
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        publicKey: "user-EXPECTED",
+        signerPubkey: "signerX",
+        relays: ["wss://r.example"],
+        connectedAt: Date.now(),
+        // no pending flag → confirmed
+      }),
+    )
+    const mismatch = makeFakeSigner("signerX") // getPublicKey → "user-signerX" ≠ expected
+    signerQueue.push(() => mismatch)
+
+    const result = await NostrConnectService.restoreSession()
+
+    expect(result.success).toBe(false)
+    expect(result.error).toMatch(/invalid/i)
+    expect(mismatch.close).toHaveBeenCalled()
+  })
+})

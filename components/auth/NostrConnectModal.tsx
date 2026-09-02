@@ -112,8 +112,19 @@ export default function NostrConnectModal({
   const authAttemptSeqRef = useRef<number>(0)
   const authActiveTokenRef = useRef<number | null>(null)
   // Whether a fresh waitForConnection() attempt is pending (BunkerSigner.fromURI has not
-  // settled). A pending attempt OWNS the flow — the foreground resume must leave it alone.
+  // settled). A pending attempt OWNS the flow — the foreground resume must leave it alone
+  // UNLESS it was stalled by a backgrounding (see connectStalledRef).
   const connectInFlightRef = useRef<boolean>(false)
+  // Set when the tab goes hidden while a connect is in flight (the deeplink launched the
+  // signer). It means the pending fromURI subscription was suspended and its ephemeral
+  // connect-ack was lost, so on return the resume path must abort and restart the connect
+  // rather than wait out the 2-minute maxWait. Cleared whenever a connect (re)starts.
+  const connectStalledRef = useRef<boolean>(false)
+  // Set on pagehide(persisted=true): the page is entering the browser's back-forward cache,
+  // which will DISCARD all WebSockets. The visibilitychange:visible that fires during the
+  // subsequent bfcache restoration must NOT run the resume then (its fresh sockets get killed
+  // mid-restore); the later pageshow(persisted=true) is the correct, settled trigger.
+  const cameFromBfcacheRef = useRef<boolean>(false)
   // Monotonic flow generation: every intentional reset/restart bumps it, and every long
   // async continuation (connect settle, session restore) captures it up front and bails
   // WITHOUT mutating state if it has moved — a superseded waiter must never resurrect the
@@ -139,6 +150,8 @@ export default function NostrConnectModal({
     flowGenRef.current += 1
     const gen = flowGenRef.current
     connectInFlightRef.current = true
+    // A fresh attempt starts clean: any stall from a previous attempt is irrelevant now.
+    connectStalledRef.current = false
 
     try {
       const result = await NostrConnectService.waitForConnection(uri)
@@ -341,8 +354,10 @@ export default function NostrConnectModal({
     const action = decideNip46Resume({
       stage,
       // Round-2 blocker: a pending fresh connect attempt owns the flow — the resume must
-      // leave it alone (it resolves or times out by itself, generation-guarded).
+      // leave it alone WHILE it is still legitimately waiting. But if it stalled across a
+      // backgrounding (connectStalled), its subscription is dead and we must reconnect.
       connectInFlight: connectInFlightRef.current,
+      connectStalled: connectStalledRef.current,
       connected: service.isConnected(),
       hasPubkey: Boolean(connectedPubkey),
       hasSession: service.hasStoredSession(),
@@ -352,6 +367,21 @@ export default function NostrConnectModal({
     resumeInFlightRef.current = true
     logAuth("NostrConnectModal", `Foreground resume (stage=${stage}, action=${action})`)
     try {
+      if (action === "reconnect") {
+        // The connect stalled across the deeplink backgrounding: its fromURI subscription was
+        // suspended and the signer's connect-ack was lost. Supersede the stuck attempt (bump
+        // the generation so its eventual maxWait settle is inert, disconnect the service-side
+        // pending attempt) and start a fresh connect whose live subscription can catch the
+        // ack the signer re-publishes. Stay at the "waiting" stage — the UI never left it.
+        logAuth("NostrConnectModal", "Connect stalled by backgrounding — reconnecting")
+        connectStalledRef.current = false
+        connectInFlightRef.current = false
+        flowGenRef.current += 1
+        await NostrConnectService.disconnect().catch(() => undefined)
+        setStage("waiting")
+        startWaitingForConnection()
+        return
+      }
       if (action === "resume-signing" && connectedPubkey) {
         // The BunkerSigner survived backgrounding — re-drive only the NIP-98 step. The
         // authAttemptRef ownership guard inside handleConnectionSuccess makes this a no-op
@@ -363,8 +393,19 @@ export default function NostrConnectModal({
       }
       if (action === "restore-session") {
         // The socket died while suspended: rebuild from the stored session and re-drive.
+        // If we got here from a STALLED pending connect (its handshake reached the ack and
+        // persisted a pending session, but the socket died before/at getPublicKey), the stuck
+        // waitForConnection is still in flight — supersede it first so its eventual maxWait
+        // settle is inert and cannot race this restore. Bumping the generation below covers
+        // the continuation guard; clear the connect refs so the flow is owned by the restore.
+        if (connectInFlightRef.current) {
+          logAuth("NostrConnectModal", "Stalled connect — restoring the pending session")
+          connectStalledRef.current = false
+          connectInFlightRef.current = false
+        }
         // Capture the flow generation now so a superseding reset during the async restore
         // makes its continuation a no-op instead of resurrecting a stale session.
+        flowGenRef.current += 1
         const gen = flowGenRef.current
         logAuth("NostrConnectModal", "Connection lost — restoring session")
         const restored = await service.restoreSession()
@@ -418,15 +459,62 @@ export default function NostrConnectModal({
     if (!isIOS && !isAndroid) return
 
     const onVisible = () => {
-      if (document.visibilityState === "visible") resumeOnForeground()
+      if (document.visibilityState === "visible") {
+        // If we are coming back via bfcache, defer to pageshow — running now would race the
+        // bfcache restoration and kill the restore's fresh sockets. pageshow clears the flag.
+        if (cameFromBfcacheRef.current) {
+          logAuth(
+            "NostrConnectModal",
+            "Visible during bfcache restore — waiting for pageshow",
+          )
+          return
+        }
+        resumeOnForeground()
+      } else if (connectInFlightRef.current) {
+        // Tab hidden while a connect is pending: the deeplink launched the signer and this
+        // tab (with its relay subscription) is about to be suspended. Mark the connect as
+        // stalled so the resume on return aborts-and-restarts it instead of hanging.
+        connectStalledRef.current = true
+        logAuth("NostrConnectModal", "Tab hidden during connect — marking stalled")
+      }
     }
-    const onFocus = () => resumeOnForeground()
+    const onFocus = () => {
+      // Same bfcache guard as visibility — pageshow owns the post-bfcache resume.
+      if (cameFromBfcacheRef.current) return
+      resumeOnForeground()
+    }
+    const onPageHide = (e: PageTransitionEvent) => {
+      // persisted=true → the page is being frozen into bfcache (sockets will be discarded).
+      if (e.persisted) cameFromBfcacheRef.current = true
+    }
+
+    // pageshow with persisted=true means the page was restored from the browser's
+    // back-forward cache (bfcache). On mobile, the nostrconnect:// deeplink is a same-document
+    // navigation that Chrome serves via bfcache, which SUSPENDS and then DISCARDS all
+    // WebSockets. If the resume runs during that restoration, the fresh restore pool's sockets
+    // are killed mid-flight (observed on-device: "Page entered Back-Forward Cache" socket
+    // errors + a hung ping). pageshow fires AFTER restoration settles, so it is the correct
+    // trigger; a short defer lets the socket layer fully re-enable before restore opens its
+    // fresh pool.
+    const onPageShow = (e: PageTransitionEvent) => {
+      if (!e.persisted && !cameFromBfcacheRef.current) return
+      // Restored from bfcache: sockets were discarded and restoration has now settled. Clear
+      // the guard and run the resume after a short defer so the socket layer is fully
+      // re-enabled before restoreSession opens its fresh pool.
+      cameFromBfcacheRef.current = false
+      logAuth("NostrConnectModal", "Restored from bfcache — resuming after settle")
+      setTimeout(() => resumeOnForeground(), 150)
+    }
 
     document.addEventListener("visibilitychange", onVisible)
     window.addEventListener("focus", onFocus)
+    window.addEventListener("pageshow", onPageShow)
+    window.addEventListener("pagehide", onPageHide)
     return () => {
       document.removeEventListener("visibilitychange", onVisible)
       window.removeEventListener("focus", onFocus)
+      window.removeEventListener("pageshow", onPageShow)
+      window.removeEventListener("pagehide", onPageHide)
     }
   }, [resumeOnForeground])
 

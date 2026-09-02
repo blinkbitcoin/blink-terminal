@@ -11,6 +11,7 @@ describe("decideNip46Resume (same-device mobile sign-in resume)", () => {
   const base: ResumeInput = {
     stage: "signing",
     connectInFlight: false,
+    connectStalled: false,
     connected: false,
     hasPubkey: false,
     hasSession: false,
@@ -22,15 +23,52 @@ describe("decideNip46Resume (same-device mobile sign-in resume)", () => {
     expect(decideNip46Resume({ ...base, stage: "error" })).toBeNull()
   })
 
-  it("leaves a pending fresh connect attempt alone, whatever the service state", () => {
+  it("leaves a pending fresh connect attempt alone while it is still legitimately waiting", () => {
     // The attempt's fromURI promise owns the flow: it will resolve and drive the
     // connection itself. Even with a stale session present, touching the service singleton
-    // here would race the pending attempt.
+    // here would race the pending attempt. connectStalled=false → not interrupted.
     for (const stage of ["waiting", "connected", "signing"] as const) {
       expect(
-        decideNip46Resume({ ...base, stage, connectInFlight: true, hasSession: true }),
+        decideNip46Resume({
+          ...base,
+          stage,
+          connectInFlight: true,
+          connectStalled: false,
+          hasSession: true,
+        }),
       ).toBeNull()
     }
+  })
+
+  it("reconnects when a stalled connect established NOTHING (no session persisted)", () => {
+    // The tab went hidden before the signer's connect-ack arrived, so no (pending) session
+    // was stored and the pending promise would hang until maxWait. With nothing established,
+    // the only way forward is a fresh connect for a new ack.
+    expect(
+      decideNip46Resume({
+        ...base,
+        stage: "waiting",
+        connectInFlight: true,
+        connectStalled: true,
+        hasSession: false,
+      }),
+    ).toBe("reconnect")
+  })
+
+  it("restores (not reconnects) when a stalled connect had ESTABLISHED (pending session present)", () => {
+    // The handshake reached the ack (signer pubkey known → pending session persisted) but the
+    // socket died before/at getPublicKey. The signer now considers itself connected and will
+    // NOT re-ack, so a fresh connect would hang — restore rebuilds via fromBunker and finishes
+    // getPublicKey on a live socket. This is the core same-device deeplink fix.
+    expect(
+      decideNip46Resume({
+        ...base,
+        stage: "waiting",
+        connectInFlight: true,
+        connectStalled: true,
+        hasSession: true,
+      }),
+    ).toBe("restore-session")
   })
 
   it("re-drives only the NIP-98 sign step when the connection survived and we have the pubkey", () => {

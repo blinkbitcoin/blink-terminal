@@ -35,6 +35,14 @@ interface NIP46Session {
   signerPubkey: string
   relays: string[]
   connectedAt: number
+  /**
+   * True while the connection has been ESTABLISHED (the signer sent its connect-ack, so we
+   * know signerPubkey + relays) but the user pubkey has not been confirmed yet — persisted
+   * early in waitForConnection so a same-device deeplink backgrounding that kills the socket
+   * mid-handshake (before getPublicKey resolves) is recoverable: restoreSession rebuilds via
+   * fromBunker and completes getPublicKey on a fresh socket, with no pubkey-match to enforce.
+   */
+  pending?: boolean
 }
 
 /** Result returned by every connection attempt */
@@ -86,6 +94,8 @@ interface StoreSessionData {
   signerPubkey: string
   relays: string[]
   connectedAt?: number
+  /** See NIP46Session.pending. */
+  pending?: boolean
 }
 
 /**
@@ -122,10 +132,19 @@ interface SimplePoolInstance {
 // Kept at parity with the Blink nostr-login plugin's defaults
 // (btcpay-nostr-login NostrLoginService.DefaultRelays); relay.nsec.app was dropped
 // with the discontinued signer it fronted.
+// Both the client and the signer use the relays advertised in the nostrconnect:// URI, so
+// this list is the shared rendezvous for the whole NIP-46 exchange (connect-ack AND
+// sign_event responses). On-device testing (2026-09-02) showed same-device sign-in timing out
+// when 2 of 3 relays were transiently down on the phone's network (damus 503, primal DNS
+// failure) — the sign request reached only one relay and the signer's response never routed
+// back. Extra reliable relays add rendezvous redundancy so a couple of flaky ones no longer
+// break the exchange. Keep this modest — every relay is a fan-out socket the mobile browser
+// must open on a backgrounding-prone tab.
 const DEFAULT_NIP46_RELAYS: string[] = [
   "wss://nos.lol", // Good uptime
   "wss://relay.damus.io", // Very reliable general relay
   "wss://relay.primal.net", // Primal relay
+  "wss://relay.nostr.band", // High-uptime aggregator (rendezvous redundancy)
 ]
 
 // Storage keys
@@ -321,6 +340,21 @@ class NostrConnectService {
       // pointing at a closed instance if a later supersede check fired (Copilot review);
       // everything below works on the local `created` and the singleton is published
       // atomically at the single success point with state/pubkey/session.
+
+      // Persist a PENDING session the instant the connection is established (the signer's
+      // connect-ack gave us its pubkey + relays), BEFORE the fragile getPublicKey round-trip.
+      // On same-device mobile, the deeplink backgrounds this tab right about now and Android
+      // suspends the relay socket — often after the ack but before getPublicKey resolves.
+      // Without this, that progress is lost and the signer won't re-ack a connection it
+      // considers established, so the flow hangs. With it, the foreground-resume path rebuilds
+      // via fromBunker and finishes getPublicKey on a fresh socket. The user pubkey is unknown
+      // here, so it is left empty and filled in at restore/success.
+      this.storeSession({
+        publicKey: "",
+        signerPubkey: created.bp.pubkey!,
+        relays: created.bp.relays!,
+        pending: true,
+      })
 
       console.log("[NostrConnect] Connection established, getting public key...")
 
@@ -565,7 +599,11 @@ class NostrConnectService {
         return { success: false, error: "Restore attempt superseded" }
       }
 
-      if (publicKey !== session.publicKey) {
+      // A PENDING session never confirmed a user pubkey (the original handshake was cut off
+      // before getPublicKey resolved), so there is nothing to match against — whatever this
+      // fresh restore's getPublicKey returns IS the user pubkey. For a confirmed session,
+      // enforce the match so a swapped signer can't hijack the session.
+      if (!session.pending && publicKey !== session.publicKey) {
         console.warn("[NostrConnect] Public key mismatch, clearing session")
         this.clearSession()
         this.connectionState = "disconnected"
@@ -593,10 +631,14 @@ class NostrConnectService {
         }
       }
 
-      // Update session timestamp
+      // Finalize the session: stamp the now-confirmed user pubkey and drop the pending flag
+      // (a pending session that just completed getPublicKey is fully established), refreshing
+      // the timestamp.
       this.storeSession({
         ...session,
+        publicKey,
         connectedAt: Date.now(),
+        pending: false,
       })
 
       console.log("[NostrConnect] Session restored successfully!")
@@ -774,6 +816,7 @@ class NostrConnectService {
       signerPubkey: sessionData.signerPubkey,
       relays: sessionData.relays,
       connectedAt: sessionData.connectedAt || Date.now(),
+      pending: sessionData.pending,
     }
     try {
       // Clear FIRST so a failed write can never leave a PREVIOUS session behind for a
