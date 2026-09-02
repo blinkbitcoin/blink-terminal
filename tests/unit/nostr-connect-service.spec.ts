@@ -499,3 +499,86 @@ describe("NostrConnectService — overlapping attempt ownership (round-4)", () =
     expect(NostrConnectService.signer).toBeNull()
   })
 })
+
+/**
+ * storeSession() failure semantics (PR #61 approval follow-up; stale-session hazard flagged
+ * in the PR #63 review). A storage write failure after the in-memory publish must:
+ *  - never leave a PREVIOUS session behind for a reload to restore (clear-before-write)
+ *  - never propagate into the connect path's catch and tear down the live connection
+ */
+describe("NostrConnectService — storeSession failure is fail-safe", () => {
+  const SESSION_KEY = "blinkpos_nip46_session"
+
+  beforeEach(() => {
+    signerQueue.length = 0
+    localStorage.clear()
+    NostrConnectService.signer = null
+    NostrConnectService.pool = null
+    NostrConnectService.connectionState = "disconnected"
+    NostrConnectService.userPublicKey = null
+  })
+
+  // The test-env localStorage carries its own setItem (not Storage.prototype's), so the
+  // override must target the instance for the service's `localStorage.setItem(...)` to
+  // hit it. Captured ONCE, before any override, so the passthrough never recurses.
+  const realSetItem = localStorage.setItem
+
+  afterEach(() => {
+    localStorage.setItem = realSetItem
+    jest.restoreAllMocks()
+  })
+
+  const failNextSessionWrite = (): void => {
+    localStorage.setItem = (key: string, value: string): void => {
+      if (key === SESSION_KEY) throw new Error("QuotaExceededError")
+      realSetItem.call(localStorage, key, value)
+    }
+  }
+
+  it("a failed session write leaves NO previous session behind and keeps the new connection live", async () => {
+    jest.spyOn(console, "warn").mockImplementation(() => {})
+    // A previous session from an older signer is already persisted.
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        publicKey: "user-OLD",
+        signerPubkey: "signerOld",
+        relays: ["wss://r.example"],
+      }),
+    )
+    const signerNew = makeFakeSigner("signerNew")
+    signerQueue.push(() => signerNew)
+    failNextSessionWrite()
+
+    const result = await NostrConnectService.waitForConnection(URI)
+
+    // Connection published and NOT torn down by the storage failure.
+    expect(result.success).toBe(true)
+    expect(result.publicKey).toBe("user-signerNew")
+    expect(NostrConnectService.signer).toBe(signerNew)
+    expect(NostrConnectService.connectionState).toBe("connected")
+    expect(signerNew.close).not.toHaveBeenCalled()
+    // The OLD session is gone — a reload cannot restore it.
+    expect(localStorage.getItem(SESSION_KEY)).toBeNull()
+    expect(NostrConnectService.hasStoredSession()).toBe(false)
+    expect(console.warn).toHaveBeenCalledWith(
+      expect.stringContaining("Session not persisted"),
+      expect.any(Error),
+    )
+  })
+
+  it("a successful session write replaces the previous session", async () => {
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({ publicKey: "user-OLD", signerPubkey: "signerOld", relays: [] }),
+    )
+    const signerNew = makeFakeSigner("signerNew")
+    signerQueue.push(() => signerNew)
+
+    await NostrConnectService.waitForConnection(URI)
+
+    const stored = JSON.parse(localStorage.getItem(SESSION_KEY) ?? "null")
+    expect(stored.publicKey).toBe("user-signerNew")
+    expect(stored.signerPubkey).toBe("signerNew")
+  })
+})
