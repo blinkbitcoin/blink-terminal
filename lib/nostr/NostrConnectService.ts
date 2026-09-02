@@ -146,6 +146,53 @@ let connectionAttemptCounter = 0
 // =====================================================================
 // Service class
 // =====================================================================
+//
+// ATTEMPT-OWNERSHIP CONTRACT (v65/v66) — read before adding any method that
+// mutates the shared statics (signer/pool/connectionState/userPublicKey/session).
+// Every writer MUST follow the protocol the three existing writers implement
+// (waitForConnection, restoreSession, disconnect):
+//
+// "Ownership" here is specifically over the SUCCESS-PUBLICATION FIELDS — the
+// signer, the connected connectionState, the userPublicKey, and (restoreSession
+// only) the shared pool. These are what a caller reads to treat the connection
+// as live, so only the latest attempt may write them.
+//
+//   1. Take a ticket: `connectionAttemptCounter++` and capture it in
+//      `const thisAttempt = connectionAttemptCounter`.
+//      (disconnect only increments — invalidating every pending attempt.)
+//   2. Work on LOCAL candidates only (signer, and the fresh pool in
+//      restoreSession). Do not assign the success-publication fields before
+//      ownership is confirmed.
+//      EXCEPTION — the provisional status write: both connect writers set
+//      `connectionState = "connecting"` before their awaited work, unguarded.
+//      That is deliberate and safe: it is cosmetic UI status, not a live
+//      connection (no signer is published), and it is overwritten by whichever
+//      attempt actually reaches the success point. It is NOT a
+//      success-publication field.
+//   3. Re-check currency (`thisAttempt === connectionAttemptCounter`)
+//      IMMEDIATELY BEFORE publishing the success-publication fields — that is
+//      the invariant the tests pin. Extra checks after long awaits are an
+//      optimization (fail fast, close candidates sooner), not the guarantee.
+//   4. If superseded: close the local candidates, return without publishing.
+//   5. Publish the success-publication fields together at a single point, no
+//      awaits in between, so no caller observes a signer without a matching
+//      connected state:
+//        - waitForConnection: signer + connectionState="connected" + pubkey
+//          (it never touches this.pool; fromURI manages relays internally).
+//        - restoreSession: the same three PLUS swapping in its fresh pool
+//          (this.pool = candidatePool), closing the previous pool after.
+//      Session persistence via storeSession() follows the publish and is NOT
+//      atomic with it: storeSession() overwrites the stored session with no
+//      rollback, so if the write throws (e.g. localStorage quota) whatever was
+//      stored BEFORE is left in place — including a previous session — and a
+//      reload could restore it. Adding rollback (clear-before-write + a
+//      failed-write test) is the tracked #61 follow-up; it is out of scope here.
+//   6. On teardown: detach synchronously (null the statics before any await),
+//      then close the detached resources.
+//
+// The race-scenario tests in tests/unit/nostr-connect-service.spec.ts pin this
+// behavior; a writer that skips the protocol will resurrect the interleaving
+// bugs that took PR #61 seven review rounds to kill.
 
 class NostrConnectService {
   /** Active BunkerSigner instance (runtime type from nostr-tools/nip46) */
