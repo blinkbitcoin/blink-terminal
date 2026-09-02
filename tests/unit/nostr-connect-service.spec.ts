@@ -960,5 +960,71 @@ describe("NostrConnectService — pending-session handshake recovery", () => {
     // A published nothing: no signer on the singleton, no pending record stamped with A's data.
     expect(NostrConnectService.signer).toBeNull()
     expect(localStorage.getItem(SESSION_KEY)).toBeNull()
+
+    // ...and now B stalls before its OWN ack. B must not be able to own or restore anything
+    // left by A: no attempt-owned pending record exists, and a restore driven by B's secret is
+    // refused (the reviewer's exact generate A → wait → generate B → A ack → B stall sequence).
+    const uriB = "nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example&secret=secretB"
+    signerQueue.push(() => new Promise<FakeSigner>(() => {})) // B's fromURI never resolves
+    NostrConnectService.waitForConnection(uriB) // hangs pre-ack
+    await flush()
+
+    expect(NostrConnectService.hasPendingSessionForCurrentAttempt(uriB)).toBe(false)
+    // No signer queued for a restore: if it wrongly proceeded, fromBunker would reject and the
+    // assertions below would not hold.
+    const bRestore = await NostrConnectService.restoreSession({
+      expectedSecret: "secretB",
+    })
+    expect(bRestore.success).toBe(false)
+    expect(NostrConnectService.signer).toBeNull()
+    expect(NostrConnectService.isConnected()).toBe(false)
+  })
+
+  /**
+   * LOW (PR #66 review, Codex GPT-5): the cleanup helpers must be non-throwing even when the
+   * Window storage GETTER itself throws (SecurityError in some privacy modes) — not only when
+   * removeItem throws. Previously the `typeof sessionStorage` check sat OUTSIDE the try, so a
+   * denied getter escaped clearPendingConnection() through clearSession() and skipped the
+   * caller's candidate teardown.
+   */
+  it("survives THROWING storage getters: cleanup stays non-throwing and the candidate is still torn down (PR #66)", async () => {
+    jest.spyOn(console, "warn").mockImplementation(() => {})
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        publicKey: "user-EXPECTED",
+        signerPubkey: "signerX",
+        relays: ["wss://r.example"],
+        connectedAt: Date.now(),
+      }),
+    )
+    const mismatch = makeFakeSigner("signerX") // getPublicKey → "user-signerX" ≠ expected
+    signerQueue.push(() => mismatch)
+
+    // Deny the sessionStorage getter outright — evaluating the identifier throws.
+    const realSession = Object.getOwnPropertyDescriptor(window, "sessionStorage")
+    Object.defineProperty(window, "sessionStorage", {
+      get() {
+        throw new Error("SecurityError")
+      },
+      configurable: true,
+    })
+    try {
+      // The standalone helper must not propagate the getter throw.
+      expect(() => NostrConnectService.clearPendingConnection()).not.toThrow()
+
+      // And the restore mismatch path (which calls clearSession → clearPendingConnection)
+      // must still RETURN a failure, close the candidate, and clear the singleton state.
+      const result = await NostrConnectService.restoreSession()
+
+      expect(result.success).toBe(false)
+      expect(result.error).toMatch(/invalid/i)
+      expect(mismatch.close).toHaveBeenCalled() // teardown NOT skipped by the getter throw
+      expect(NostrConnectService.signer).toBeNull()
+      expect(NostrConnectService.connectionState).toBe("disconnected")
+      expect(NostrConnectService.userPublicKey).toBeNull()
+    } finally {
+      if (realSession) Object.defineProperty(window, "sessionStorage", realSession)
+    }
   })
 })

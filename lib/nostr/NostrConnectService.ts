@@ -176,6 +176,27 @@ export const secretFromUri = (uri: string): string | undefined => {
   }
 }
 
+/**
+ * Acquire a Web Storage object, or null if it is unavailable OR inaccessible.
+ *
+ * A `typeof sessionStorage === "undefined"` check is NOT sufficient: evaluating the identifier
+ * invokes the Window storage GETTER, which itself can throw SecurityError when storage is
+ * denied (some privacy modes / partitioned third-party contexts). Because that evaluation used
+ * to sit outside the callers' try blocks, a denied getter escaped the "non-throwing" cleanup
+ * helpers and skipped the caller's socket teardown (PR #66 review). Acquiring the object here —
+ * with both the existence check and the getter access inside one try — makes every storage
+ * helper total: they get a usable Storage or null, and never see a throw.
+ */
+const safeStorage = (kind: "session" | "local"): Storage | null => {
+  try {
+    const storage = kind === "session" ? sessionStorage : localStorage
+    return storage ?? null
+  } catch (err: unknown) {
+    console.warn(`[NostrConnect] ${kind}Storage is inaccessible:`, err)
+    return null
+  }
+}
+
 // Connection timeout (2 minutes)
 const CONNECTION_TIMEOUT = 120000
 
@@ -787,15 +808,30 @@ class NostrConnectService {
    * Get or create the ephemeral client keypair.
    * This key is used to communicate with the remote signer.
    */
+  /** Read the stored client key, tolerating a throwing getItem (denied storage). */
+  private static readClientKey(storage: Storage): string | null {
+    try {
+      return storage.getItem(NIP46_CLIENT_KEY)
+    } catch (err: unknown) {
+      console.warn("[NostrConnect] getOrCreateClientKey: Failed to read stored key:", err)
+      return null
+    }
+  }
+
   private static getOrCreateClientKey(): Uint8Array {
-    if (typeof localStorage === "undefined") {
-      // Server-side, generate temporary key
-      console.log("[NostrConnect] getOrCreateClientKey: Server-side, generating temp key")
+    // Server-side, or storage denied (the getter itself can throw): fall back to a temporary
+    // key. The connect flow must not fail just because the key cannot be persisted — it simply
+    // will not be reused across reloads (PR #66 review).
+    const storage = safeStorage("local")
+    if (!storage) {
+      console.log(
+        "[NostrConnect] getOrCreateClientKey: No usable storage, generating temp key",
+      )
       return generateSecretKey()
     }
 
     // Try to retrieve existing key
-    const stored: string | null = localStorage.getItem(NIP46_CLIENT_KEY)
+    const stored: string | null = this.readClientKey(storage)
     console.log("[NostrConnect] getOrCreateClientKey: Stored key exists:", !!stored)
     console.log(
       "[NostrConnect] getOrCreateClientKey: Stored key length:",
@@ -825,10 +861,17 @@ class NostrConnectService {
     console.log("[NostrConnect] getOrCreateClientKey: Generating new key")
     const newKey: Uint8Array = generateSecretKey()
     const newKeyHex: string = bytesToHex(newKey)
-    localStorage.setItem(NIP46_CLIENT_KEY, newKeyHex)
+    // Persisting is best-effort: a failed write only costs key reuse across reloads.
+    let persisted = true
+    try {
+      storage.setItem(NIP46_CLIENT_KEY, newKeyHex)
+    } catch (err: unknown) {
+      persisted = false
+      console.warn("[NostrConnect] getOrCreateClientKey: Failed to persist key:", err)
+    }
 
     // Verify it was stored correctly
-    const verifyStored: string | null = localStorage.getItem(NIP46_CLIENT_KEY)
+    const verifyStored: string | null = persisted ? this.readClientKey(storage) : null
     console.log(
       "[NostrConnect] getOrCreateClientKey: Storage verification:",
       verifyStored === newKeyHex ? "OK" : "MISMATCH",
@@ -849,14 +892,20 @@ class NostrConnectService {
   private static storeConnectionParams(
     params: Omit<PendingConnectionParams, "timestamp">,
   ): void {
-    if (typeof sessionStorage !== "undefined") {
-      sessionStorage.setItem(
+    const storage = safeStorage("session")
+    if (!storage) return
+    try {
+      storage.setItem(
         NIP46_PENDING_KEY,
         JSON.stringify({
           ...params,
           timestamp: Date.now(),
         }),
       )
+    } catch (err: unknown) {
+      // Best-effort, like every storage path here: the connect flow must proceed even if the
+      // params cannot be cached (the uri carries the attempt identity regardless).
+      console.warn("[NostrConnect] Failed to store pending connection params:", err)
     }
   }
 
@@ -864,9 +913,10 @@ class NostrConnectService {
    * Get pending connection parameters.
    */
   static getPendingConnection(): PendingConnectionParams | null {
-    if (typeof sessionStorage === "undefined") return null
+    const storage = safeStorage("session")
+    if (!storage) return null
     try {
-      const stored: string | null = sessionStorage.getItem(NIP46_PENDING_KEY)
+      const stored: string | null = storage.getItem(NIP46_PENDING_KEY)
       return stored ? (JSON.parse(stored) as PendingConnectionParams) : null
     } catch {
       return null
@@ -877,12 +927,14 @@ class NostrConnectService {
    * Clear pending connection.
    */
   static clearPendingConnection(): void {
-    if (typeof sessionStorage === "undefined") return
-    // Best-effort: sessionStorage.removeItem can throw (SecurityError in some privacy modes).
-    // A failure to clear must never propagate — callers invoke this on cleanup/failure paths
-    // where a throw would skip subsequent socket teardown (PR #66 review).
+    // Best-effort and NON-THROWING: both the storage GETTER and removeItem can throw
+    // (SecurityError in some privacy modes). A failure to clear must never propagate — callers
+    // invoke this on cleanup/failure paths where a throw would skip subsequent socket teardown
+    // (PR #66 review).
+    const storage = safeStorage("session")
+    if (!storage) return
     try {
-      sessionStorage.removeItem(NIP46_PENDING_KEY)
+      storage.removeItem(NIP46_PENDING_KEY)
     } catch (err: unknown) {
       console.warn("[NostrConnect] Failed to clear pending connection:", err)
     }
@@ -892,7 +944,8 @@ class NostrConnectService {
    * Store session data for persistence.
    */
   private static storeSession(sessionData: StoreSessionData): void {
-    if (typeof localStorage === "undefined") return
+    const storage = safeStorage("local")
+    if (!storage) return
     const session: NIP46Session = {
       publicKey: sessionData.publicKey,
       signerPubkey: sessionData.signerPubkey,
@@ -917,12 +970,12 @@ class NostrConnectService {
     //  3. If removeItem ALSO fails, a stale session may genuinely remain — say so honestly.
     // The connection stays live in every branch.
     try {
-      localStorage.setItem(NIP46_SESSION_KEY, JSON.stringify(session))
+      storage.setItem(NIP46_SESSION_KEY, JSON.stringify(session))
       console.log("[NostrConnect] Session stored")
       return
     } catch (writeErr: unknown) {
       try {
-        localStorage.removeItem(NIP46_SESSION_KEY)
+        storage.removeItem(NIP46_SESSION_KEY)
         console.warn(
           "[NostrConnect] Session not persisted (write failed); cleared any previous session, " +
             "connection stays live, reload will require re-auth:",
@@ -943,9 +996,10 @@ class NostrConnectService {
    * Get stored session data.
    */
   private static getStoredSession(): NIP46Session | null {
-    if (typeof localStorage === "undefined") return null
+    const storage = safeStorage("local")
+    if (!storage) return null
     try {
-      const stored: string | null = localStorage.getItem(NIP46_SESSION_KEY)
+      const stored: string | null = storage.getItem(NIP46_SESSION_KEY)
       return stored ? (JSON.parse(stored) as NIP46Session) : null
     } catch {
       return null
@@ -986,16 +1040,20 @@ class NostrConnectService {
   private static clearSession(): void {
     // Best-effort and NON-THROWING: clearSession runs on failure/cleanup paths (the
     // restoreSession pubkey-mismatch branch and its catch) where a storage throw would escape
-    // the function and skip the candidate socket teardown that follows (PR #66 review). Web
-    // Storage removeItem can throw (SecurityError in some privacy modes), so it is guarded.
+    // the function and skip the candidate socket teardown that follows (PR #66 review). Both
+    // the storage GETTER and removeItem can throw (SecurityError in some privacy modes), so
+    // acquisition goes through safeStorage and the removal is guarded.
     let cleared = true
-    if (typeof localStorage !== "undefined") {
+    const storage = safeStorage("local")
+    if (storage) {
       try {
-        localStorage.removeItem(NIP46_SESSION_KEY)
+        storage.removeItem(NIP46_SESSION_KEY)
       } catch (err: unknown) {
         cleared = false
         console.warn("[NostrConnect] Failed to clear stored session:", err)
       }
+    } else {
+      cleared = false
     }
     this.clearPendingConnection()
     // Only claim success when the removal actually happened — logging "cleared" after a caught
