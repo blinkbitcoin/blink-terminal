@@ -49,8 +49,17 @@ export interface ResumeInput {
   connected: boolean
   /** Whether a user pubkey was already obtained from the signer. */
   hasPubkey: boolean
-  /** Whether the service has a stored session to restore from. */
+  /** Whether the service has ANY stored session to restore from (pending or confirmed). */
   hasSession: boolean
+  /**
+   * Whether the stored session is a PENDING one belonging to the CURRENT handshake — written
+   * only by waitForConnection right after its own fromURI ack. This is what a stalled fresh
+   * connect must check: a plain `hasSession` is also true for a PREVIOUS signer's confirmed
+   * session, and restoring on that would authenticate the wrong signer (PR #66 review — old
+   * signer A confirmed, user starts signer B, backgrounds before B's ack: no pending record
+   * for B, so B must reconnect, not restore A).
+   */
+  hasPendingSession: boolean
 }
 
 const IN_FLIGHT_STAGES: readonly string[] = ["waiting", "connected", "signing"]
@@ -62,7 +71,8 @@ const ESTABLISHED_STAGES: readonly string[] = ["connected", "signing"]
 /**
  * Decide how to resume an in-flight NIP-46 flow on foreground return.
  *
- * - A fresh connect pending AND stalled by the backgrounding → reconnect (abort + restart).
+ * - A fresh connect pending + stalled + THIS attempt's pending session exists → restore it.
+ * - A fresh connect pending + stalled + no pending record (never established) → reconnect.
  * - A fresh connect pending but NOT stalled (still waiting in the foreground) → leave it
  *   alone: `null`.
  * - A flow not in flight (idle/complete/error) → `null`.
@@ -76,12 +86,14 @@ export function decideNip46Resume(input: ResumeInput): ResumeAction | null {
   if (input.connectInFlight) {
     // A pending connect that was NOT interrupted is still legitimately waiting — leave it.
     if (!input.connectStalled) return null
-    // It stalled across the backgrounding. If the handshake got far enough to establish the
-    // connection, a (pending) session was persisted: restore rebuilds via fromBunker and
-    // finishes getPublicKey on a fresh socket — the signer will not re-ack a connection it
-    // considers established, so restoring is the ONLY way forward. Only when nothing was
-    // established (no session) do we reconnect from scratch for a fresh ack.
-    return input.hasSession ? "restore-session" : "reconnect"
+    // It stalled across the backgrounding. Restore ONLY if THIS handshake persisted a pending
+    // record (it reached its own connect-ack): restore rebuilds via fromBunker and finishes
+    // getPublicKey on a fresh socket — the signer will not re-ack a connection it considers
+    // established, so restoring is the only way forward. A plain hasSession is NOT enough — a
+    // previous signer's CONFIRMED session also satisfies it, and restoring that would
+    // authenticate the wrong signer (PR #66 review). Absent a pending record, this attempt
+    // never established, so reconnect from scratch for a fresh ack.
+    return input.hasPendingSession ? "restore-session" : "reconnect"
   }
   if (input.connected && input.hasPubkey) return "resume-signing"
   if (ESTABLISHED_STAGES.includes(input.stage) && input.hasSession)

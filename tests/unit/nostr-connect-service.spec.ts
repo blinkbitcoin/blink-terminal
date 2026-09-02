@@ -616,6 +616,67 @@ describe("NostrConnectService — storeSession failure is fail-safe", () => {
     expect(stored.publicKey).toBe("user-signerNew")
     expect(stored.signerPubkey).toBe("signerNew")
   })
+
+  it("clearPendingConnection swallows a throwing sessionStorage.removeItem (PR #66)", () => {
+    jest.spyOn(console, "warn").mockImplementation(() => {})
+    const spy = jest.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+      throw new Error("SecurityError")
+    })
+    try {
+      // Must not throw — cleanup/failure paths call this and a throw would skip teardown.
+      expect(() => NostrConnectService.clearPendingConnection()).not.toThrow()
+      expect(console.warn).toHaveBeenCalledWith(
+        expect.stringContaining("Failed to clear pending connection"),
+        expect.any(Error),
+      )
+    } finally {
+      spy.mockRestore()
+    }
+  })
+})
+
+/**
+ * hasPendingSession() — the resume decision uses it to avoid restoring a PREVIOUS signer's
+ * confirmed session when a fresh connect stalls before its own ack (PR #66 review).
+ */
+describe("NostrConnectService — hasPendingSession", () => {
+  const SESSION_KEY = "blinkpos_nip46_session"
+
+  beforeEach(() => {
+    localStorage.clear()
+  })
+
+  it("is false when there is no stored session", () => {
+    expect(NostrConnectService.hasPendingSession()).toBe(false)
+  })
+
+  it("is false for a CONFIRMED session (no pending flag)", () => {
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        publicKey: "user-A",
+        signerPubkey: "signerA",
+        relays: [],
+        connectedAt: 0, // a legitimate 0 timestamp must round-trip untouched
+      }),
+    )
+    expect(NostrConnectService.hasPendingSession()).toBe(false)
+    expect(NostrConnectService.hasStoredSession()).toBe(true)
+  })
+
+  it("is true only for a PENDING session", () => {
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        publicKey: "",
+        signerPubkey: "signerB",
+        relays: [],
+        connectedAt: Date.now(),
+        pending: true,
+      }),
+    )
+    expect(NostrConnectService.hasPendingSession()).toBe(true)
+  })
 })
 
 /**

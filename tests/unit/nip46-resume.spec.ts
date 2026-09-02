@@ -15,6 +15,7 @@ describe("decideNip46Resume (same-device mobile sign-in resume)", () => {
     connected: false,
     hasPubkey: false,
     hasSession: false,
+    hasPendingSession: false,
   }
 
   it("leaves a non-in-flight flow alone (idle/complete/error)", () => {
@@ -67,8 +68,26 @@ describe("decideNip46Resume (same-device mobile sign-in resume)", () => {
         connectInFlight: true,
         connectStalled: true,
         hasSession: true,
+        hasPendingSession: true,
       }),
     ).toBe("restore-session")
+  })
+
+  it("RECONNECTS (never restores signer A) when a stalled fresh connect has only a PREVIOUS confirmed session", () => {
+    // PR #66 review — wrong-signer restore. Signer A has a CONFIRMED stored session
+    // (hasSession=true, hasPendingSession=false). The user starts signer B; the tab backgrounds
+    // before B's fromURI resolves, so B never wrote a pending record. hasSession alone would
+    // wrongly pick restore-session and authenticate A. The pending-record gate must reconnect.
+    expect(
+      decideNip46Resume({
+        ...base,
+        stage: "waiting",
+        connectInFlight: true,
+        connectStalled: true,
+        hasSession: true, // A's confirmed record on disk
+        hasPendingSession: false, // but B never acked → no pending record for THIS attempt
+      }),
+    ).toBe("reconnect")
   })
 
   it("re-drives only the NIP-98 sign step when the connection survived and we have the pubkey", () => {

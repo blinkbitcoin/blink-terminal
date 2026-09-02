@@ -887,6 +887,19 @@ class NostrConnectService {
   }
 
   /**
+   * Check whether the stored session is a PENDING one — i.e. a handshake that reached the
+   * signer's connect-ack (so signerPubkey + relays are known) but was cut off before
+   * getPublicKey confirmed the user pubkey. `pending: true` is written ONLY by
+   * waitForConnection right after its own fromURI ack, so a pending record is proof that the
+   * CURRENT attempt established. The resume decision uses this to avoid adopting a previous
+   * (confirmed, other-signer) session when a fresh attempt stalls before its own ack (PR #66
+   * review — wrong-signer restore).
+   */
+  static hasPendingSession(): boolean {
+    return this.getStoredSession()?.pending === true
+  }
+
+  /**
    * Clear stored session data.
    */
   private static clearSession(): void {
@@ -894,15 +907,19 @@ class NostrConnectService {
     // restoreSession pubkey-mismatch branch and its catch) where a storage throw would escape
     // the function and skip the candidate socket teardown that follows (PR #66 review). Web
     // Storage removeItem can throw (SecurityError in some privacy modes), so it is guarded.
+    let cleared = true
     if (typeof localStorage !== "undefined") {
       try {
         localStorage.removeItem(NIP46_SESSION_KEY)
       } catch (err: unknown) {
+        cleared = false
         console.warn("[NostrConnect] Failed to clear stored session:", err)
       }
     }
     this.clearPendingConnection()
-    console.log("[NostrConnect] Session cleared")
+    // Only claim success when the removal actually happened — logging "cleared" after a caught
+    // failure would mislead operational diagnosis (PR #66 review).
+    if (cleared) console.log("[NostrConnect] Session cleared")
   }
 
   /**
