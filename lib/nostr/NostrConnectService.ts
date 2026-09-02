@@ -606,9 +606,12 @@ class NostrConnectService {
       // enforce the match so a swapped signer can't hijack the session.
       if (!session.pending && publicKey !== session.publicKey) {
         console.warn("[NostrConnect] Public key mismatch, clearing session")
+        // clearSession is now non-throwing, so the state cleanup and candidate teardown below
+        // always run — a storage failure can no longer escape here and leak the candidate.
         this.clearSession()
         this.connectionState = "disconnected"
         this.signer = null
+        this.userPublicKey = null // consistent invalid-state (PR #66 review)
         // Close the mismatched candidate — its sockets must not leak (round-5 review).
         await closeCandidate()
         return { success: false, error: "Session invalid" }
@@ -802,8 +805,14 @@ class NostrConnectService {
    * Clear pending connection.
    */
   static clearPendingConnection(): void {
-    if (typeof sessionStorage !== "undefined") {
+    if (typeof sessionStorage === "undefined") return
+    // Best-effort: sessionStorage.removeItem can throw (SecurityError in some privacy modes).
+    // A failure to clear must never propagate — callers invoke this on cleanup/failure paths
+    // where a throw would skip subsequent socket teardown (PR #66 review).
+    try {
       sessionStorage.removeItem(NIP46_PENDING_KEY)
+    } catch (err: unknown) {
+      console.warn("[NostrConnect] Failed to clear pending connection:", err)
     }
   }
 
@@ -881,8 +890,16 @@ class NostrConnectService {
    * Clear stored session data.
    */
   private static clearSession(): void {
+    // Best-effort and NON-THROWING: clearSession runs on failure/cleanup paths (the
+    // restoreSession pubkey-mismatch branch and its catch) where a storage throw would escape
+    // the function and skip the candidate socket teardown that follows (PR #66 review). Web
+    // Storage removeItem can throw (SecurityError in some privacy modes), so it is guarded.
     if (typeof localStorage !== "undefined") {
-      localStorage.removeItem(NIP46_SESSION_KEY)
+      try {
+        localStorage.removeItem(NIP46_SESSION_KEY)
+      } catch (err: unknown) {
+        console.warn("[NostrConnect] Failed to clear stored session:", err)
+      }
     }
     this.clearPendingConnection()
     console.log("[NostrConnect] Session cleared")

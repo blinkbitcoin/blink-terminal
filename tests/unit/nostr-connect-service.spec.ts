@@ -701,4 +701,41 @@ describe("NostrConnectService — pending-session handshake recovery", () => {
     expect(result.error).toMatch(/invalid/i)
     expect(mismatch.close).toHaveBeenCalled()
   })
+
+  it("survives a throwing clearSession on the mismatch path: still returns, closes the candidate, clears state", async () => {
+    // Confirmed session + a mismatching signer + localStorage.removeItem throwing (e.g.
+    // SecurityError). clearSession() is now non-throwing, so restoreSession must still RETURN
+    // a failure result (not reject), close the mismatched candidate (no socket leak), and
+    // clear the singleton state. (PR #66 review.)
+    jest.spyOn(console, "warn").mockImplementation(() => {})
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        publicKey: "user-EXPECTED",
+        signerPubkey: "signerX",
+        relays: ["wss://r.example"],
+        connectedAt: Date.now(),
+      }),
+    )
+    const mismatch = makeFakeSigner("signerX") // getPublicKey → "user-signerX" ≠ expected
+    signerQueue.push(() => mismatch)
+
+    const realRemove = localStorage.removeItem
+    localStorage.removeItem = (key: string): void => {
+      if (key === SESSION_KEY) throw new Error("SecurityError")
+      realRemove.call(localStorage, key)
+    }
+    try {
+      const result = await NostrConnectService.restoreSession()
+
+      expect(result.success).toBe(false)
+      expect(result.error).toMatch(/invalid/i)
+      expect(mismatch.close).toHaveBeenCalled() // candidate torn down despite the storage throw
+      expect(NostrConnectService.signer).toBeNull()
+      expect(NostrConnectService.connectionState).toBe("disconnected")
+      expect(NostrConnectService.userPublicKey).toBeNull()
+    } finally {
+      localStorage.removeItem = realRemove
+    }
+  })
 })
