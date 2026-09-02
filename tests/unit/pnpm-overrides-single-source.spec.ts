@@ -48,8 +48,11 @@ const root = path.resolve(__dirname, "..", "..")
  * quietly under-report the map.
  */
 export function parseOverridesBlock(fileContents: string): Record<string, string> {
-  const lines = fileContents.split("\n")
-  const start = lines.findIndex((l) => l === "overrides:")
+  // Split on LF or CRLF: the repo does not enforce LF via .gitattributes, so a
+  // Windows / core.autocrlf checkout would otherwise leave "\r" on every line
+  // and the header lookup would miss, failing an unchanged policy file.
+  const lines = fileContents.split(/\r?\n/)
+  const start = lines.findIndex((l) => l.trimEnd() === "overrides:")
   if (start === -1) return {}
 
   const result: Record<string, string> = {}
@@ -92,6 +95,18 @@ describe("overrides parser", () => {
   it("throws on an unsupported indented line instead of silently skipping it", () => {
     const yaml = "overrides:\n  nested:\n    deep: value\n"
     expect(() => parseOverridesBlock(yaml)).toThrow(/Unparsable line/)
+  })
+
+  it("parses a CRLF checkout identically to LF", () => {
+    const lf = 'overrides:\n  "a@<1": ">=1"\n  b: ">=2"\n\nother: x\n'
+    const crlf = lf.replace(/\n/g, "\r\n")
+    expect(parseOverridesBlock(crlf)).toEqual(parseOverridesBlock(lf))
+    expect(parseOverridesBlock(crlf)).toEqual({ "a@<1": ">=1", "b": ">=2" })
+  })
+
+  it("tolerates trailing whitespace on the header line", () => {
+    const yaml = 'overrides:   \n  "a@<1": ">=1"\n'
+    expect(parseOverridesBlock(yaml)).toEqual({ "a@<1": ">=1" })
   })
 })
 
