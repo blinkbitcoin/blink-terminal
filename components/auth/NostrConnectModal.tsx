@@ -100,6 +100,10 @@ export default function NostrConnectModal({
   // Timer refs (real refs so timers survive re-renders and can be
   // cleared from any code path, including unmount)
   const slowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // The bfcache pageshow resume is deferred with a short setTimeout; hold its id so it is
+  // cleared on unmount / effect re-registration and can never fire resumeOnForeground()
+  // against a stale or unmounted component.
+  const bfcacheResumeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Single-flight guard for the foreground-resume path so a burst of
   // visibilitychange/focus events doesn't fire the NIP-98 sign request twice.
   const resumeInFlightRef = useRef<boolean>(false)
@@ -137,6 +141,10 @@ export default function NostrConnectModal({
       if (slowTimerRef.current) {
         clearTimeout(slowTimerRef.current)
         slowTimerRef.current = null
+      }
+      if (bfcacheResumeTimerRef.current) {
+        clearTimeout(bfcacheResumeTimerRef.current)
+        bfcacheResumeTimerRef.current = null
       }
     }
   }, [])
@@ -503,7 +511,11 @@ export default function NostrConnectModal({
       // re-enabled before restoreSession opens its fresh pool.
       cameFromBfcacheRef.current = false
       logAuth("NostrConnectModal", "Restored from bfcache — resuming after settle")
-      setTimeout(() => resumeOnForeground(), 150)
+      if (bfcacheResumeTimerRef.current) clearTimeout(bfcacheResumeTimerRef.current)
+      bfcacheResumeTimerRef.current = setTimeout(() => {
+        bfcacheResumeTimerRef.current = null
+        resumeOnForeground()
+      }, 150)
     }
 
     document.addEventListener("visibilitychange", onVisible)
@@ -515,6 +527,12 @@ export default function NostrConnectModal({
       window.removeEventListener("focus", onFocus)
       window.removeEventListener("pageshow", onPageShow)
       window.removeEventListener("pagehide", onPageHide)
+      // Cancel a pending bfcache-resume defer so it cannot fire after this effect is torn
+      // down (unmount, or re-registration when resumeOnForeground changes).
+      if (bfcacheResumeTimerRef.current) {
+        clearTimeout(bfcacheResumeTimerRef.current)
+        bfcacheResumeTimerRef.current = null
+      }
     }
   }, [resumeOnForeground])
 
