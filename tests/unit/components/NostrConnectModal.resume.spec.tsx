@@ -36,7 +36,7 @@ jest.mock("../../../lib/nostr/NostrConnectService", () => ({
   default: {
     isConnected: jest.fn(() => false),
     hasStoredSession: jest.fn(() => false),
-    hasPendingSession: jest.fn(() => false),
+    hasPendingSessionForCurrentAttempt: jest.fn(() => false),
     restoreSession: jest.fn(async () => ({ success: false })),
     waitForConnection: jest.fn(async () => ({ success: false })),
     disconnect: jest.fn(async () => undefined),
@@ -92,7 +92,7 @@ describe("NostrConnectModal — same-device NIP-46 resume (review blockers)", ()
     jest.clearAllMocks()
     legacy().isConnected.mockReturnValue(false)
     legacy().hasStoredSession.mockReturnValue(false)
-    legacy().hasPendingSession.mockReturnValue(false)
+    legacy().hasPendingSessionForCurrentAttempt.mockReturnValue(false)
     legacy().restoreSession.mockResolvedValue({ success: false })
     legacy().waitForConnection.mockResolvedValue({ success: false })
   })

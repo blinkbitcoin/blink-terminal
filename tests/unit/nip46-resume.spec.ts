@@ -15,7 +15,7 @@ describe("decideNip46Resume (same-device mobile sign-in resume)", () => {
     connected: false,
     hasPubkey: false,
     hasSession: false,
-    hasPendingSession: false,
+    hasOwnPendingSession: false,
   }
 
   it("leaves a non-in-flight flow alone (idle/complete/error)", () => {
@@ -68,14 +68,14 @@ describe("decideNip46Resume (same-device mobile sign-in resume)", () => {
         connectInFlight: true,
         connectStalled: true,
         hasSession: true,
-        hasPendingSession: true,
+        hasOwnPendingSession: true,
       }),
     ).toBe("restore-session")
   })
 
   it("RECONNECTS (never restores signer A) when a stalled fresh connect has only a PREVIOUS confirmed session", () => {
     // PR #66 review — wrong-signer restore. Signer A has a CONFIRMED stored session
-    // (hasSession=true, hasPendingSession=false). The user starts signer B; the tab backgrounds
+    // (hasSession=true, hasOwnPendingSession=false). The user starts signer B; the tab backgrounds
     // before B's fromURI resolves, so B never wrote a pending record. hasSession alone would
     // wrongly pick restore-session and authenticate A. The pending-record gate must reconnect.
     expect(
@@ -85,7 +85,25 @@ describe("decideNip46Resume (same-device mobile sign-in resume)", () => {
         connectInFlight: true,
         connectStalled: true,
         hasSession: true, // A's confirmed record on disk
-        hasPendingSession: false, // but B never acked → no pending record for THIS attempt
+        hasOwnPendingSession: false, // but B never acked → no pending record for THIS attempt
+      }),
+    ).toBe("reconnect")
+  })
+
+  it("RECONNECTS (never restores signer A) when a stalled fresh connect finds only a STALE PENDING record from a previous attempt", () => {
+    // PR #66 review round 2 — stale-pending wrong-signer restore. Signer A reached its ack and
+    // wrote a PENDING record, then died. The user starts signer B; B backgrounds before its own
+    // ack. A bare pending check would be true (A's leftover record) and wrongly restore A. The
+    // secret-bound hasOwnPendingSession is false (A's record carries A's secret, not B's), so
+    // the decision must reconnect B.
+    expect(
+      decideNip46Resume({
+        ...base,
+        stage: "waiting",
+        connectInFlight: true,
+        connectStalled: true,
+        hasSession: true, // A's pending record is on disk
+        hasOwnPendingSession: false, // but it is bound to A's secret, not this attempt's
       }),
     ).toBe("reconnect")
   })

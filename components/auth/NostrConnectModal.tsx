@@ -369,9 +369,10 @@ export default function NostrConnectModal({
       connected: service.isConnected(),
       hasPubkey: Boolean(connectedPubkey),
       hasSession: service.hasStoredSession(),
-      // Distinguishes THIS handshake's pending record from a previous signer's confirmed one,
-      // so a stalled pre-ack connect reconnects instead of restoring the wrong signer.
-      hasPendingSession: service.hasPendingSession(),
+      // Attempt-owned pending record (secret-bound): distinguishes THIS handshake's pending
+      // record from a previous signer's confirmed OR leftover-pending one, so a stalled
+      // pre-ack connect reconnects instead of restoring the wrong signer.
+      hasOwnPendingSession: service.hasPendingSessionForCurrentAttempt(),
     })
     if (action === null) return
     if (resumeInFlightRef.current) return

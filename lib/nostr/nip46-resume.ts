@@ -52,14 +52,14 @@ export interface ResumeInput {
   /** Whether the service has ANY stored session to restore from (pending or confirmed). */
   hasSession: boolean
   /**
-   * Whether the stored session is a PENDING one belonging to the CURRENT handshake — written
-   * only by waitForConnection right after its own fromURI ack. This is what a stalled fresh
-   * connect must check: a plain `hasSession` is also true for a PREVIOUS signer's confirmed
-   * session, and restoring on that would authenticate the wrong signer (PR #66 review — old
-   * signer A confirmed, user starts signer B, backgrounds before B's ack: no pending record
-   * for B, so B must reconnect, not restore A).
+   * Whether a PENDING session record exists AND is bound to the CURRENT attempt (its stored
+   * secret matches the secret of the connect now in progress). A stalled fresh connect uses
+   * this — NOT a plain `hasSession`, which is also true for a previous signer's confirmed
+   * session, and NOT a bare pending check, which is also true for a previous signer's leftover
+   * PENDING record. Both would authenticate the wrong signer (PR #66 review). Only an
+   * attempt-owned pending record proves THIS handshake established.
    */
-  hasPendingSession: boolean
+  hasOwnPendingSession: boolean
 }
 
 const IN_FLIGHT_STAGES: readonly string[] = ["waiting", "connected", "signing"]
@@ -86,14 +86,14 @@ export function decideNip46Resume(input: ResumeInput): ResumeAction | null {
   if (input.connectInFlight) {
     // A pending connect that was NOT interrupted is still legitimately waiting — leave it.
     if (!input.connectStalled) return null
-    // It stalled across the backgrounding. Restore ONLY if THIS handshake persisted a pending
-    // record (it reached its own connect-ack): restore rebuilds via fromBunker and finishes
-    // getPublicKey on a fresh socket — the signer will not re-ack a connection it considers
-    // established, so restoring is the only way forward. A plain hasSession is NOT enough — a
-    // previous signer's CONFIRMED session also satisfies it, and restoring that would
-    // authenticate the wrong signer (PR #66 review). Absent a pending record, this attempt
-    // never established, so reconnect from scratch for a fresh ack.
-    return input.hasPendingSession ? "restore-session" : "reconnect"
+    // It stalled across the backgrounding. Restore ONLY if THIS attempt persisted a pending
+    // record bound to its own secret (it reached its own connect-ack): restore rebuilds via
+    // fromBunker and finishes getPublicKey on a fresh socket — the signer will not re-ack a
+    // connection it considers established, so restoring is the only way forward. A plain
+    // session (confirmed) or a previous signer's leftover pending record must NOT be adopted
+    // here — that would authenticate the wrong signer (PR #66 review). Without an attempt-owned
+    // pending record, this attempt never established, so reconnect from scratch for a fresh ack.
+    return input.hasOwnPendingSession ? "restore-session" : "reconnect"
   }
   if (input.connected && input.hasPubkey) return "resume-signing"
   if (ESTABLISHED_STAGES.includes(input.stage) && input.hasSession)
