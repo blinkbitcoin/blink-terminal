@@ -60,7 +60,7 @@ export function parseOverridesBlock(fileContents: string): Record<string, string
     const m = line.match(/^\s+'?"?(.+?)"?'?:\s*'?"?(.+?)"?'?\s*$/)
     if (!m) {
       throw new Error(
-        `Unparseable line in overrides block (line ${i + 1}): ${JSON.stringify(line)}. ` +
+        `Unparsable line in overrides block (line ${i + 1}): ${JSON.stringify(line)}. ` +
           `The guard's parser only supports flat "selector: replacement" entries.`,
       )
     }
@@ -91,7 +91,7 @@ describe("overrides parser", () => {
 
   it("throws on an unsupported indented line instead of silently skipping it", () => {
     const yaml = "overrides:\n  nested:\n    deep: value\n"
-    expect(() => parseOverridesBlock(yaml)).toThrow(/Unparseable line/)
+    expect(() => parseOverridesBlock(yaml)).toThrow(/Unparsable line/)
   })
 })
 
