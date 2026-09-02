@@ -40,8 +40,14 @@ const root = path.resolve(__dirname, "..", "..")
  * or pnpm-lock.yaml (top-level) into a selector -> replacement map. Both files
  * write one `  "<selector>": "<replacement>"` entry per line with no nesting,
  * so a line parser avoids adding a YAML dependency for a guard.
+ *
+ * An indented line inside the block that does not parse as a single
+ * `selector: replacement` entry is REJECTED (throws), not silently skipped:
+ * unsupported syntax (nested maps, list items, comments-as-entries) means the
+ * guard can no longer vouch for the policy, so it must fail loudly rather than
+ * quietly under-report the map.
  */
-function parseOverridesBlock(fileContents: string): Record<string, string> {
+export function parseOverridesBlock(fileContents: string): Record<string, string> {
   const lines = fileContents.split("\n")
   const start = lines.findIndex((l) => l === "overrides:")
   if (start === -1) return {}
@@ -52,10 +58,42 @@ function parseOverridesBlock(fileContents: string): Record<string, string> {
     if (line.trim() === "") break // blank line ends the block
     if (!/^\s/.test(line)) break // dedent to column 0 ends the block
     const m = line.match(/^\s+'?"?(.+?)"?'?:\s*'?"?(.+?)"?'?\s*$/)
-    if (m) result[m[1]] = m[2]
+    if (!m) {
+      throw new Error(
+        `Unparseable line in overrides block (line ${i + 1}): ${JSON.stringify(line)}. ` +
+          `The guard's parser only supports flat "selector: replacement" entries.`,
+      )
+    }
+    result[m[1]] = m[2]
   }
   return result
 }
+
+describe("overrides parser", () => {
+  it("returns an empty map when there is no overrides block", () => {
+    expect(parseOverridesBlock("packages:\n  - app\n")).toEqual({})
+  })
+
+  it("ends the block at a blank line", () => {
+    const yaml = 'overrides:\n  "a@<1": ">=1"\n\nother:\n  "b@<2": ">=2"\n'
+    expect(parseOverridesBlock(yaml)).toEqual({ "a@<1": ">=1" })
+  })
+
+  it("ends the block at a dedent to column 0", () => {
+    const yaml = 'overrides:\n  "a@<1": ">=1"\nother: value\n'
+    expect(parseOverridesBlock(yaml)).toEqual({ "a@<1": ">=1" })
+  })
+
+  it("strips both single and double quotes from selector and replacement", () => {
+    const yaml = "overrides:\n  'a@<1': '>=1'\n  b: \">=2\"\n"
+    expect(parseOverridesBlock(yaml)).toEqual({ "a@<1": ">=1", "b": ">=2" })
+  })
+
+  it("throws on an unsupported indented line instead of silently skipping it", () => {
+    const yaml = "overrides:\n  nested:\n    deep: value\n"
+    expect(() => parseOverridesBlock(yaml)).toThrow(/Unparseable line/)
+  })
+})
 
 describe("dependency override policy", () => {
   const workspace = parseOverridesBlock(
