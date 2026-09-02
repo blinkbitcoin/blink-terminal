@@ -182,11 +182,13 @@ let connectionAttemptCounter = 0
 //        - restoreSession: the same three PLUS swapping in its fresh pool
 //          (this.pool = candidatePool), closing the previous pool after.
 //      Session persistence via storeSession() follows the publish and is NOT
-//      atomic with it: storeSession() overwrites the stored session with no
-//      rollback, so if the write throws (e.g. localStorage quota) whatever was
-//      stored BEFORE is left in place — including a previous session — and a
-//      reload could restore it. Adding rollback (clear-before-write + a
-//      failed-write test) is the tracked #61 follow-up; it is out of scope here.
+//      atomic with it, but it is best-effort and fail-safe: it swallows storage
+//      failures (logging them) so a throw can never propagate into the caller's
+//      catch and tear down the live connection just published. On a write
+//      failure it removes any previously stored session so a reload cannot
+//      restore it; a stale session can remain ONLY if BOTH the write and that
+//      fallback removal throw, and that worst case is warned explicitly. The
+//      failure direction is otherwise "connected now, re-auth on reload".
 //   6. On teardown: detach synchronously (null the statics before any await),
 //      then close the detached resources.
 //
@@ -767,15 +769,48 @@ class NostrConnectService {
    * Store session data for persistence.
    */
   private static storeSession(sessionData: StoreSessionData): void {
-    if (typeof localStorage !== "undefined") {
-      const session: NIP46Session = {
-        publicKey: sessionData.publicKey,
-        signerPubkey: sessionData.signerPubkey,
-        relays: sessionData.relays,
-        connectedAt: sessionData.connectedAt || Date.now(),
-      }
+    if (typeof localStorage === "undefined") return
+    const session: NIP46Session = {
+      publicKey: sessionData.publicKey,
+      signerPubkey: sessionData.signerPubkey,
+      relays: sessionData.relays,
+      // ?? not || so a legitimate 0 timestamp is not replaced by Date.now().
+      connectedAt: sessionData.connectedAt ?? Date.now(),
+    }
+
+    // Persistence is best-effort: a storage failure must never throw (the caller's catch would
+    // tear down the live connection just published) and must never leave a PREVIOUS session on
+    // disk for a reload to restore.
+    //
+    // Web Storage can throw on setItem AND on removeItem (quota, but also access/security
+    // failures in some privacy modes). We handle the two independently rather than under one
+    // try (a throwing removeItem must not skip the write, per the PR #65 review):
+    //
+    //  1. Try setItem(new). Success OVERWRITES the same key — the old session is gone, done.
+    //  2. If setItem fails, the old session is still on disk, so try removeItem to invalidate
+    //     it (fail toward re-auth on reload, never toward a stale session).
+    //  3. If removeItem ALSO fails, a stale session may genuinely remain — say so honestly.
+    // The connection stays live in every branch.
+    try {
       localStorage.setItem(NIP46_SESSION_KEY, JSON.stringify(session))
       console.log("[NostrConnect] Session stored")
+      return
+    } catch (writeErr: unknown) {
+      try {
+        localStorage.removeItem(NIP46_SESSION_KEY)
+        console.warn(
+          "[NostrConnect] Session not persisted (write failed); cleared any previous session, " +
+            "connection stays live, reload will require re-auth:",
+          writeErr,
+        )
+      } catch (clearErr: unknown) {
+        console.warn(
+          "[NostrConnect] Session not persisted AND could not clear a previous session; " +
+            "connection stays live, but a reload MAY restore a stale session:",
+          writeErr,
+          clearErr,
+        )
+      }
     }
   }
 
