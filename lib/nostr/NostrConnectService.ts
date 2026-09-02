@@ -201,12 +201,13 @@ let connectionAttemptCounter = 0
 //        - restoreSession: the same three PLUS swapping in its fresh pool
 //          (this.pool = candidatePool), closing the previous pool after.
 //      Session persistence via storeSession() follows the publish and is NOT
-//      atomic with it, but it is best-effort and fail-safe: it clears the
-//      stored session BEFORE writing and swallows a write failure (logging it),
-//      so a throw (e.g. localStorage quota) can neither leave a previous
-//      session behind for a reload to restore nor propagate into the caller's
-//      catch and tear down the live connection just published. The failure
-//      direction is always "connected now, re-auth on reload".
+//      atomic with it, but it is best-effort and fail-safe: it swallows storage
+//      failures (logging them) so a throw can never propagate into the caller's
+//      catch and tear down the live connection just published. On a write
+//      failure it removes any previously stored session so a reload cannot
+//      restore it; a stale session can remain ONLY if BOTH the write and that
+//      fallback removal throw, and that worst case is warned explicitly. The
+//      failure direction is otherwise "connected now, re-auth on reload".
 //   6. On teardown: detach synchronously (null the statics before any await),
 //      then close the detached resources.
 //
@@ -815,24 +816,44 @@ class NostrConnectService {
       publicKey: sessionData.publicKey,
       signerPubkey: sessionData.signerPubkey,
       relays: sessionData.relays,
-      connectedAt: sessionData.connectedAt || Date.now(),
+      // ?? not || so a legitimate 0 timestamp is not replaced by Date.now().
+      connectedAt: sessionData.connectedAt ?? Date.now(),
       pending: sessionData.pending,
     }
+
+    // Persistence is best-effort: a storage failure must never throw (the caller's catch would
+    // tear down the live connection just published) and must never leave a PREVIOUS session on
+    // disk for a reload to restore.
+    //
+    // Web Storage can throw on setItem AND on removeItem (quota, but also access/security
+    // failures in some privacy modes). We handle the two independently rather than under one
+    // try (a throwing removeItem must not skip the write, per the PR #65 review):
+    //
+    //  1. Try setItem(new). Success OVERWRITES the same key — the old session is gone, done.
+    //  2. If setItem fails, the old session is still on disk, so try removeItem to invalidate
+    //     it (fail toward re-auth on reload, never toward a stale session).
+    //  3. If removeItem ALSO fails, a stale session may genuinely remain — say so honestly.
+    // The connection stays live in every branch.
     try {
-      // Clear FIRST so a failed write can never leave a PREVIOUS session behind for a
-      // reload to restore (stale-session hazard from the PR #63 review).
-      localStorage.removeItem(NIP46_SESSION_KEY)
       localStorage.setItem(NIP46_SESSION_KEY, JSON.stringify(session))
       console.log("[NostrConnect] Session stored")
-    } catch (err: unknown) {
-      // Persistence is best-effort. The in-memory connection published just before this
-      // call is live and usable; throwing here would let the caller's catch tear it down
-      // over a storage quota error. Fail toward re-auth on reload, never toward a stale
-      // session and never toward killing a working connection.
-      console.warn(
-        "[NostrConnect] Session not persisted (storage write failed); connection stays live, reload will require re-auth:",
-        err,
-      )
+      return
+    } catch (writeErr: unknown) {
+      try {
+        localStorage.removeItem(NIP46_SESSION_KEY)
+        console.warn(
+          "[NostrConnect] Session not persisted (write failed); cleared any previous session, " +
+            "connection stays live, reload will require re-auth:",
+          writeErr,
+        )
+      } catch (clearErr: unknown) {
+        console.warn(
+          "[NostrConnect] Session not persisted AND could not clear a previous session; " +
+            "connection stays live, but a reload MAY restore a stale session:",
+          writeErr,
+          clearErr,
+        )
+      }
     }
   }
 
