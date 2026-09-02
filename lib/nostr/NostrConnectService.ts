@@ -162,6 +162,20 @@ const NIP46_SESSION_KEY = "blinkpos_nip46_session"
 const NIP46_CLIENT_KEY = "blinkpos_nip46_clientkey"
 const NIP46_PENDING_KEY = "blinkpos_nip46_pending"
 
+/**
+ * Extract the per-attempt connection secret from a nostrconnect:// URI. The URI is the single
+ * IMMUTABLE source of attempt identity — unlike the mutable `blinkpos_nip46_pending`
+ * sessionStorage record, which a reconnect's disconnect() wipes and an overlapping attempt
+ * overwrites (PR #66 review). Returns undefined if the URI has no secret.
+ */
+export const secretFromUri = (uri: string): string | undefined => {
+  try {
+    return new URL(uri).searchParams.get("secret") ?? undefined
+  } catch {
+    return undefined
+  }
+}
+
 // Connection timeout (2 minutes)
 const CONNECTION_TIMEOUT = 120000
 
@@ -249,11 +263,17 @@ class NostrConnectService {
    * @returns nostrconnect:// URI string
    */
   static generateConnectionURI(options: GenerateURIOptions = {}): string {
-    // A fresh attempt begins: proactively drop any leftover PENDING record from an earlier,
-    // never-finished attempt so it cannot linger. This is best-effort tidiness only —
-    // correctness rests on the secret binding (hasPendingSessionForCurrentAttempt +
-    // restoreSession's mismatch guard), which refuses a foreign pending record even if this
-    // clear fails or never runs. A CONFIRMED session is left intact (startup restore needs it).
+    // A fresh attempt begins: supersede any still-pending earlier attempt (Kimi K3 review). A
+    // prior waitForConnection awaiting its ack does NOT hold the flow open across URI
+    // generation, so bumping the counter makes its late fromURI settle fail isCurrentAttempt()
+    // and close itself — it can neither publish nor stamp a pending record with this URI's
+    // secret and be mistaken for the new attempt.
+    connectionAttemptCounter++
+    // Also proactively drop any leftover PENDING record from an earlier, never-finished
+    // attempt so it cannot linger. Best-effort tidiness only — correctness rests on the secret
+    // binding (hasPendingSessionForCurrentAttempt + restoreSession's mismatch guard), which
+    // refuses a foreign pending record even if this clear fails or never runs. A CONFIRMED
+    // session is left intact (startup restore needs it).
     if (this.getStoredSession()?.pending === true) {
       this.clearSession()
     }
@@ -305,6 +325,10 @@ class NostrConnectService {
     timeout: number = CONNECTION_TIMEOUT,
   ): Promise<ConnectionResult> {
     const clientSecretKey: Uint8Array = this.getOrCreateClientKey()
+    // Capture the attempt secret from the IMMUTABLE uri up front — not from mutable ambient
+    // storage after the await, which a reconnect wipes or an overlapping attempt overwrites
+    // (PR #66 review). This binds the pending record to THIS uri regardless of storage churn.
+    const attemptSecret: string | undefined = secretFromUri(uri)
 
     // v65: attempt ownership. This attempt takes the next ticket; only the LATEST attempt may
     // publish signer/session/state into the singleton or clear it on failure. A superseded
@@ -369,15 +393,17 @@ class NostrConnectService {
       // considers established, so the flow hangs. With it, the foreground-resume path rebuilds
       // via fromBunker and finishes getPublicKey on a fresh socket. The user pubkey is unknown
       // here, so it is left empty and filled in at restore/success.
-      // Bind the pending record to THIS attempt's secret (the one generateConnectionURI just
-      // stored) so a later stalled attempt cannot mistake a leftover pending record from a
-      // previous signer for its own (PR #66 review — stale-pending wrong-signer restore).
+      // Bind the pending record to THIS attempt's secret (parsed from the uri at entry) so a
+      // later stalled attempt cannot mistake a leftover pending record from a previous signer
+      // for its own (PR #66 review — stale-pending wrong-signer restore). Sourced from the uri,
+      // not ambient storage, so reconnect (which wipes storage) and overlapping attempts (which
+      // overwrite it) cannot corrupt the stamp.
       this.storeSession({
         publicKey: "",
         signerPubkey: created.bp.pubkey!,
         relays: created.bp.relays!,
         pending: true,
-        secret: this.getPendingConnection()?.secret,
+        secret: attemptSecret,
       })
 
       console.log("[NostrConnect] Connection established, getting public key...")
@@ -538,9 +564,13 @@ class NostrConnectService {
 
   /**
    * Attempt to restore a previous NIP-46 session.
-   * Called on app startup to reconnect if session exists.
+   * Called on app startup (no opts → confirmed session) and by the foreground-resume path,
+   * which passes `expectedSecret` (the secret of the uri it is driving) so a PENDING record is
+   * only adopted by the attempt that created it.
    */
-  static async restoreSession(): Promise<ConnectionResult> {
+  static async restoreSession(opts?: {
+    expectedSecret?: string
+  }): Promise<ConnectionResult> {
     const session: NIP46Session | null = this.getStoredSession()
     if (!session) {
       console.log("[NostrConnect] No stored session to restore")
@@ -549,13 +579,14 @@ class NostrConnectService {
 
     // Defense-in-depth (PR #66 review): a PENDING record skips the user-pubkey match, so it
     // must only be restored by the attempt that created it. If its bound secret does not match
-    // the current attempt's secret, it belongs to a PREVIOUS signer — refuse and clear it, so
-    // a decision-path bypass cannot authenticate the wrong signer. Restoration is gated on the
-    // MATCH (not on a successful removal), so a failed clear still cannot authorize adoption.
-    // A confirmed session (no `pending`) is unaffected — startup restore has no current attempt.
+    // the caller's expected secret (the current uri's secret), it belongs to a PREVIOUS signer
+    // — refuse and clear it, so a decision-path bypass cannot authenticate the wrong signer.
+    // Restoration is gated on the MATCH (not on a successful removal), so a failed clear still
+    // cannot authorize adoption. A confirmed session (no `pending`) is unaffected — startup
+    // restore has no current attempt and passes no expectedSecret.
     if (session.pending) {
-      const currentSecret = this.getPendingConnection()?.secret
-      if (!currentSecret || session.secret !== currentSecret) {
+      const expectedSecret = opts?.expectedSecret
+      if (!expectedSecret || session.secret !== expectedSecret) {
         console.warn(
           "[NostrConnect] Pending session belongs to a different attempt — refusing restore",
         )
@@ -931,18 +962,21 @@ class NostrConnectService {
   /**
    * Whether the stored session is a PENDING record belonging to the CURRENT attempt — i.e. a
    * handshake that reached the signer's connect-ack (signerPubkey + relays known) but was cut
-   * off before getPublicKey, AND whose bound secret matches the secret of the attempt now in
-   * progress (getPendingConnection().secret, set by generateConnectionURI).
+   * off before getPublicKey, AND whose bound secret matches the secret of `currentUri` (the
+   * URI of the attempt now in progress).
    *
-   * The secret binding is what makes this attempt-owned rather than merely "some pending
-   * record exists": a leftover pending record from a PREVIOUS signer A carries A's secret, so
-   * when signer B's fresh attempt stalls before its own ack this returns false and the resume
-   * decision reconnects B instead of restoring (and authenticating) A (PR #66 review).
+   * The current secret comes from the IMMUTABLE uri, not mutable sessionStorage: a reconnect
+   * wipes that storage and overlapping attempts overwrite it, but the uri the modal is driving
+   * is stable (PR #66 review). The secret binding is what makes this attempt-owned rather than
+   * merely "some pending record exists": a leftover pending record from a PREVIOUS signer A
+   * carries A's secret, so when signer B's fresh attempt stalls before its own ack this
+   * returns false and the resume decision reconnects B instead of restoring (and
+   * authenticating) A.
    */
-  static hasPendingSessionForCurrentAttempt(): boolean {
+  static hasPendingSessionForCurrentAttempt(currentUri: string): boolean {
     const session = this.getStoredSession()
     if (session?.pending !== true) return false
-    const currentSecret = this.getPendingConnection()?.secret
+    const currentSecret = secretFromUri(currentUri)
     return Boolean(currentSecret) && session.secret === currentSecret
   }
 

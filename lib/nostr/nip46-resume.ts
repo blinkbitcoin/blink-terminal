@@ -60,6 +60,16 @@ export interface ResumeInput {
    * attempt-owned pending record proves THIS handshake established.
    */
   hasOwnPendingSession: boolean
+  /**
+   * Whether the transport (relay WebSockets) was DISCARDED by the browser while backgrounded —
+   * true when the page returns from the back-forward cache (pageshow persisted). `connected`
+   * reflects only published singleton state and a non-null signer; it stays true across
+   * bfcache even though the sockets are dead. So for an ESTABLISHED flow that returned via
+   * bfcache, `resume-signing` (which re-drives on the existing, now-dead signer and no-ops
+   * under the auth token, leaving the request hung) must be avoided in favour of a fresh,
+   * liveness-checked restore (PR #66 review).
+   */
+  transportDiscarded: boolean
 }
 
 const IN_FLIGHT_STAGES: readonly string[] = ["waiting", "connected", "signing"]
@@ -76,6 +86,8 @@ const ESTABLISHED_STAGES: readonly string[] = ["connected", "signing"]
  * - A fresh connect pending but NOT stalled (still waiting in the foreground) → leave it
  *   alone: `null`.
  * - A flow not in flight (idle/complete/error) → `null`.
+ * - Established flow whose transport was DISCARDED (bfcache): never trust the "live" signer —
+ *   restore (fresh, ping-checked) if a session exists, else restart.
  * - Established session, still live + pubkey known → re-drive only the NIP-98 sign step.
  * - Established session dropped, stored session exists → restore the signer, then continue.
  * - Everything else (including a stalled "waiting" attempt that died without settling) →
@@ -94,6 +106,13 @@ export function decideNip46Resume(input: ResumeInput): ResumeAction | null {
     // here — that would authenticate the wrong signer (PR #66 review). Without an attempt-owned
     // pending record, this attempt never established, so reconnect from scratch for a fresh ack.
     return input.hasOwnPendingSession ? "restore-session" : "reconnect"
+  }
+  // Established flow returning from bfcache: the sockets were discarded, so the "live" signer
+  // is dead even though `connected` still reads true. Do NOT resume-signing on it (that no-ops
+  // under the auth token and leaves the request hung); force a fresh restore, or restart if
+  // there is nothing to restore from.
+  if (ESTABLISHED_STAGES.includes(input.stage) && input.transportDiscarded) {
+    return input.hasSession ? "restore-session" : "restart"
   }
   if (input.connected && input.hasPubkey) return "resume-signing"
   if (ESTABLISHED_STAGES.includes(input.stage) && input.hasSession)

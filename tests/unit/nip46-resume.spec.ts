@@ -16,6 +16,7 @@ describe("decideNip46Resume (same-device mobile sign-in resume)", () => {
     hasPubkey: false,
     hasSession: false,
     hasOwnPendingSession: false,
+    transportDiscarded: false,
   }
 
   it("leaves a non-in-flight flow alone (idle/complete/error)", () => {
@@ -114,6 +115,38 @@ describe("decideNip46Resume (same-device mobile sign-in resume)", () => {
         decideNip46Resume({ ...base, stage, connected: true, hasPubkey: true }),
       ).toBe("resume-signing")
     }
+  })
+
+  it("never resume-signs an established flow whose transport was DISCARDED by bfcache — restores instead (PR #66)", () => {
+    // Returning from the back-forward cache, `connected` still reads true (published singleton
+    // state + non-null signer) even though the WebSockets were discarded. resume-signing on
+    // that dead signer no-ops under the live auth token and leaves the request hung — so for an
+    // established stage with transportDiscarded, force a fresh liveness-checked restore.
+    for (const stage of ["connected", "signing"] as const) {
+      expect(
+        decideNip46Resume({
+          ...base,
+          stage,
+          connected: true, // stale "live" reading across bfcache
+          hasPubkey: true, // would otherwise pick resume-signing
+          hasSession: true,
+          transportDiscarded: true,
+        }),
+      ).toBe("restore-session")
+    }
+  })
+
+  it("restarts an established bfcache-discarded flow with NO stored session to restore (PR #66)", () => {
+    expect(
+      decideNip46Resume({
+        ...base,
+        stage: "signing",
+        connected: true,
+        hasPubkey: true,
+        hasSession: false,
+        transportDiscarded: true,
+      }),
+    ).toBe("restart")
   })
 
   it("restores the session when an ESTABLISHED connection (connected/signing) dropped", () => {

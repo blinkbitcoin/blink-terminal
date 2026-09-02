@@ -33,6 +33,15 @@ Object.defineProperty(window.navigator, "userAgent", {
 // via jest.requireMock — the one reliable way to reach them.
 jest.mock("../../../lib/nostr/NostrConnectService", () => ({
   __esModule: true,
+  // The modal imports the real secretFromUri helper — provide a faithful parse so the resume
+  // path passes the correct expectedSecret / uri through to the mocked service methods.
+  secretFromUri: (uri: string): string | undefined => {
+    try {
+      return new URL(uri).searchParams.get("secret") ?? undefined
+    } catch {
+      return undefined
+    }
+  },
   default: {
     isConnected: jest.fn(() => false),
     hasStoredSession: jest.fn(() => false),
@@ -74,6 +83,23 @@ const foreground = async () => {
     document.dispatchEvent(new Event("visibilitychange"))
     window.dispatchEvent(new Event("focus"))
     await flush()
+  })
+}
+
+// Drive a bfcache round-trip exactly as a returning mobile browser does after a same-document
+// deeplink nav: pagehide(persisted) freezes the page (sockets discarded), pageshow(persisted)
+// restores it. jsdom cannot construct PageTransitionEvent, so dispatch an Event with persisted
+// assigned. The modal's pageshow resume is deferred ~150ms, so flush past it.
+const bfcacheRoundTrip = async () => {
+  await act(async () => {
+    const hide = new Event("pagehide")
+    Object.defineProperty(hide, "persisted", { value: true })
+    window.dispatchEvent(hide)
+    const show = new Event("pageshow")
+    Object.defineProperty(show, "persisted", { value: true })
+    window.dispatchEvent(show)
+    // Past the 150ms settle defer + the 300ms show-connected delay before the sign step.
+    await new Promise<void>((r) => setTimeout(r, 500))
   })
 }
 
@@ -240,6 +266,71 @@ describe("NostrConnectModal — same-device NIP-46 resume (review blockers)", ()
 
     // The hung ORIGINAL now settles late with an error (its 30s timeout). Its continuation
     // must be inert: no second onSuccess, and the completed UI must not flip to error.
+    await act(async () => {
+      deferreds[0].reject(new Error("TIMEOUT"))
+      await flush()
+    })
+    expect(onSuccess).toHaveBeenCalledTimes(1)
+    expect(screen.queryByRole("button", { name: /Try Again/i })).toBeNull()
+  })
+
+  /**
+   * Finding 1 (PR #66 review): a bfcache round-trip discards the relay sockets, but
+   * isConnected() still reads TRUE (published state + non-null signer). If the resume trusted
+   * that stale reading it would pick resume-signing, which no-ops under the live auth token and
+   * leaves the hung request stuck forever. The pageshow(persisted) path must instead force a
+   * fresh, liveness-checked restore that SUPERSEDES the hung original — exactly one replacement
+   * sign runs through the restored signer.
+   */
+  it("does not trust a stale isConnected() after bfcache — restores and re-drives auth exactly once (PR #66)", async () => {
+    const deferreds: Array<{
+      resolve: (v: { success: boolean }) => void
+      reject: (e: Error) => void
+    }> = []
+    const signIn = jest.fn(
+      () =>
+        new Promise<{ success: boolean }>((resolve, reject) => {
+          deferreds.push({ resolve, reject })
+        }),
+    )
+    const onSuccess = jest.fn()
+    legacy().waitForConnection.mockResolvedValue({ success: true, publicKey: PUBKEY })
+    legacy().hasStoredSession.mockReturnValue(true)
+    legacy().restoreSession.mockResolvedValue({ success: true, publicKey: PUBKEY })
+    // The signer LOOKS live across the bfcache round-trip — the discarded transport is not
+    // reflected in this published flag. The fix must not rely on it.
+    legacy().isConnected.mockReturnValue(true)
+
+    render(
+      <NostrConnectModal
+        uri="nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example&secret=s&name=Blink%20POS"
+        signInWithNostrConnect={signIn}
+        onSuccess={onSuccess}
+      />,
+    )
+
+    // Connect, sign begins and hangs (the dead socket, though isConnected still says true).
+    await act(async () => {
+      fireClick(openInAmberButton())
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(1)
+
+    // bfcache round-trip: transport discarded. Despite isConnected()===true, the resume must
+    // restore (not resume-sign no-op) and issue exactly one replacement auth.
+    await bfcacheRoundTrip()
+
+    expect(legacy().restoreSession).toHaveBeenCalledTimes(1)
+    expect(signIn).toHaveBeenCalledTimes(2)
+
+    // Replacement completes → login completes exactly once.
+    await act(async () => {
+      deferreds[1].resolve({ success: true })
+      await new Promise((r) => setTimeout(r, 650))
+    })
+    expect(onSuccess).toHaveBeenCalledTimes(1)
+
+    // The hung original settles late → inert.
     await act(async () => {
       deferreds[0].reject(new Error("TIMEOUT"))
       await flush()

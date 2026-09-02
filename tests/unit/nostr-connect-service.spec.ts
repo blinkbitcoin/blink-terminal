@@ -636,21 +636,17 @@ describe("NostrConnectService — storeSession failure is fail-safe", () => {
 })
 
 /**
- * hasPendingSessionForCurrentAttempt() — the resume decision uses it to restore ONLY an
+ * hasPendingSessionForCurrentAttempt(uri) — the resume decision uses it to restore ONLY an
  * attempt-owned pending record, never a previous signer's confirmed OR leftover-pending record
- * (PR #66 review). The record's stored `secret` must match the current attempt's secret
- * (getPendingConnection, in sessionStorage).
+ * (PR #66 review). The record's stored `secret` must match the secret parsed from the CURRENT
+ * uri (the immutable source of attempt identity — not mutable sessionStorage).
  */
 describe("NostrConnectService — hasPendingSessionForCurrentAttempt", () => {
   const SESSION_KEY = "blinkpos_nip46_session"
-  const PENDING_KEY = "blinkpos_nip46_pending"
 
-  const setCurrentAttemptSecret = (secret: string): void => {
-    sessionStorage.setItem(
-      PENDING_KEY,
-      JSON.stringify({ secret, relays: [], uri: "u", timestamp: Date.now() }),
-    )
-  }
+  // Build a nostrconnect:// uri carrying the given attempt secret.
+  const uriFor = (secret: string): string =>
+    `nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example&secret=${secret}`
 
   beforeEach(() => {
     localStorage.clear()
@@ -658,8 +654,9 @@ describe("NostrConnectService — hasPendingSessionForCurrentAttempt", () => {
   })
 
   it("is false when there is no stored session", () => {
-    setCurrentAttemptSecret("secretB")
-    expect(NostrConnectService.hasPendingSessionForCurrentAttempt()).toBe(false)
+    expect(
+      NostrConnectService.hasPendingSessionForCurrentAttempt(uriFor("secretB")),
+    ).toBe(false)
   })
 
   it("is false for a CONFIRMED session (no pending flag)", () => {
@@ -672,12 +669,13 @@ describe("NostrConnectService — hasPendingSessionForCurrentAttempt", () => {
         connectedAt: 0, // a legitimate 0 timestamp must round-trip untouched
       }),
     )
-    setCurrentAttemptSecret("secretB")
-    expect(NostrConnectService.hasPendingSessionForCurrentAttempt()).toBe(false)
+    expect(
+      NostrConnectService.hasPendingSessionForCurrentAttempt(uriFor("secretB")),
+    ).toBe(false)
     expect(NostrConnectService.hasStoredSession()).toBe(true)
   })
 
-  it("is TRUE for a pending record whose secret matches the current attempt", () => {
+  it("is TRUE for a pending record whose secret matches the current uri", () => {
     localStorage.setItem(
       SESSION_KEY,
       JSON.stringify({
@@ -689,12 +687,13 @@ describe("NostrConnectService — hasPendingSessionForCurrentAttempt", () => {
         secret: "secretB",
       }),
     )
-    setCurrentAttemptSecret("secretB")
-    expect(NostrConnectService.hasPendingSessionForCurrentAttempt()).toBe(true)
+    expect(
+      NostrConnectService.hasPendingSessionForCurrentAttempt(uriFor("secretB")),
+    ).toBe(true)
   })
 
   it("is FALSE for a stale pending record from a PREVIOUS attempt (secret mismatch)", () => {
-    // Signer A's leftover pending record (secret A) while the current attempt is B (secret B).
+    // Signer A's leftover pending record (secret A) while the current uri carries secret B.
     localStorage.setItem(
       SESSION_KEY,
       JSON.stringify({
@@ -706,11 +705,12 @@ describe("NostrConnectService — hasPendingSessionForCurrentAttempt", () => {
         secret: "secretA",
       }),
     )
-    setCurrentAttemptSecret("secretB")
-    expect(NostrConnectService.hasPendingSessionForCurrentAttempt()).toBe(false)
+    expect(
+      NostrConnectService.hasPendingSessionForCurrentAttempt(uriFor("secretB")),
+    ).toBe(false)
   })
 
-  it("is FALSE for a pending record when there is no current attempt secret", () => {
+  it("is FALSE for a pending record when the uri carries no secret", () => {
     localStorage.setItem(
       SESSION_KEY,
       JSON.stringify({
@@ -722,8 +722,12 @@ describe("NostrConnectService — hasPendingSessionForCurrentAttempt", () => {
         secret: "secretA",
       }),
     )
-    // No getPendingConnection() → no current attempt to own the record.
-    expect(NostrConnectService.hasPendingSessionForCurrentAttempt()).toBe(false)
+    // A uri with no secret param → no attempt identity to own the record.
+    expect(
+      NostrConnectService.hasPendingSessionForCurrentAttempt(
+        "nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example",
+      ),
+    ).toBe(false)
   })
 })
 
@@ -736,14 +740,6 @@ describe("NostrConnectService — hasPendingSessionForCurrentAttempt", () => {
  */
 describe("NostrConnectService — pending-session handshake recovery", () => {
   const SESSION_KEY = "blinkpos_nip46_session"
-  const PENDING_KEY = "blinkpos_nip46_pending"
-
-  const setCurrentAttemptSecret = (secret: string): void => {
-    sessionStorage.setItem(
-      PENDING_KEY,
-      JSON.stringify({ secret, relays: [], uri: "u", timestamp: Date.now() }),
-    )
-  }
 
   beforeEach(() => {
     signerQueue.length = 0
@@ -770,6 +766,10 @@ describe("NostrConnectService — pending-session handshake recovery", () => {
     expect(stored.pending).toBe(true)
     expect(stored.signerPubkey).toBe("signerX")
     expect(stored.publicKey).toBe("") // user pubkey not known yet
+    // The pending record is stamped with the secret parsed from the URI (secret=s), not from
+    // ambient sessionStorage — this is what makes it attempt-owned and survives a reconnect
+    // that wipes sessionStorage (PR #66 review).
+    expect(stored.secret).toBe("s")
   })
 
   it("restores a pending session (matching secret) without enforcing a user-pubkey match, then finalizes it", async () => {
@@ -785,11 +785,12 @@ describe("NostrConnectService — pending-session handshake recovery", () => {
         secret: "secretX",
       }),
     )
-    setCurrentAttemptSecret("secretX") // current attempt owns this pending record
     const restored = makeFakeSigner("signerX") // fromBunker candidate
     signerQueue.push(() => restored)
 
-    const result = await NostrConnectService.restoreSession()
+    // The caller passes the current uri's secret — it matches the pending record's, so restore
+    // proceeds and finalizes.
+    const result = await NostrConnectService.restoreSession({ expectedSecret: "secretX" })
 
     expect(result.success).toBe(true)
     expect(result.publicKey).toBe("user-signerX")
@@ -818,11 +819,11 @@ describe("NostrConnectService — pending-session handshake recovery", () => {
         secret: "secretA",
       }),
     )
-    setCurrentAttemptSecret("secretB") // current attempt is B, not A
     // No signer queued: if restore wrongly proceeded it would try to build one and we'd catch
     // it via the assertions below.
 
-    const result = await NostrConnectService.restoreSession()
+    // The caller passes the current uri's secret (B), which does NOT match the record's (A).
+    const result = await NostrConnectService.restoreSession({ expectedSecret: "secretB" })
 
     expect(result.success).toBe(false)
     expect(result.error).toMatch(/invalid/i)
@@ -887,5 +888,77 @@ describe("NostrConnectService — pending-session handshake recovery", () => {
     } finally {
       localStorage.removeItem = realRemove
     }
+  })
+
+  /**
+   * Finding 2 (PR #66 review — self-inflicted regression). The reconnect path calls
+   * disconnect() → clearSession() → clearPendingConnection(), wiping the
+   * `blinkpos_nip46_pending` sessionStorage record, then retries the SAME uri. If the pending
+   * record's secret were sourced from that wiped sessionStorage, the retry would stamp
+   * `secret: undefined` and a second recovery could no longer prove ownership. Sourcing the
+   * secret from the immutable uri makes the retry's pending record carry the right secret
+   * across the wipe, so restoreSession(expectedSecret) still matches.
+   */
+  it("re-stamps the attempt secret from the URI after a reconnect wipes sessionStorage, so a second recovery still matches (PR #66)", async () => {
+    const uriA = "nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example&secret=secretA"
+
+    // First attempt: stalls at getPublicKey after establishing (pending record persisted).
+    const first = makeFakeSigner("signerA")
+    first.getPublicKey = jest.fn(() => new Promise<string>(() => {})) // never resolves
+    signerQueue.push(() => first)
+    NostrConnectService.waitForConnection(uriA) // hangs
+    await flush()
+    expect(JSON.parse(localStorage.getItem(SESSION_KEY) ?? "null").secret).toBe("secretA")
+
+    // reconnect ≈ disconnect() (wipes sessionStorage + the pending record) then retry the uri.
+    await NostrConnectService.disconnect()
+    expect(sessionStorage.getItem("blinkpos_nip46_pending")).toBeNull()
+
+    // Retry the SAME uri; it also stalls after establishing.
+    const second = makeFakeSigner("signerA")
+    second.getPublicKey = jest.fn(() => new Promise<string>(() => {})) // never resolves
+    signerQueue.push(() => second)
+    NostrConnectService.waitForConnection(uriA) // hangs again
+    await flush()
+
+    // The retry's pending record is stamped with the URI's secret — NOT undefined — so a
+    // second recovery driven by the same uri can still prove ownership.
+    const stored = JSON.parse(localStorage.getItem(SESSION_KEY) ?? "null")
+    expect(stored.pending).toBe(true)
+    expect(stored.secret).toBe("secretA")
+    expect(NostrConnectService.hasPendingSessionForCurrentAttempt(uriA)).toBe(true)
+  })
+
+  /**
+   * Kimi K3 (PR #66 review — overlapping attempts). Attempt A is awaiting its ack when a fresh
+   * URI (attempt B) is generated. generateConnectionURI bumps the attempt counter, so A's late
+   * fromURI settle fails isCurrentAttempt(): it closes its candidate and neither publishes a
+   * signer nor stamps a pending record — so it cannot be mistaken for B or authenticate the
+   * wrong signer.
+   */
+  it("supersedes a still-pending attempt A when a new URI (attempt B) is generated — A's late ack publishes nothing (PR #66)", async () => {
+    jest.spyOn(console, "warn").mockImplementation(() => {})
+    const uriA = "nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example&secret=secretA"
+
+    // A's fromURI stays pending until we release it, so we can generate B in between.
+    let releaseA: (s: FakeSigner) => void = () => {}
+    const aSigner = makeFakeSigner("signerA")
+    signerQueue.push(() => new Promise<FakeSigner>((resolve) => (releaseA = resolve)))
+    const aResult = NostrConnectService.waitForConnection(uriA)
+    await flush()
+
+    // A fresh URI (attempt B) is generated while A is still awaiting its ack.
+    NostrConnectService.generateConnectionURI()
+
+    // Now A's ack finally arrives — but A has been superseded.
+    releaseA(aSigner)
+    const settled = await aResult
+
+    expect(settled.success).toBe(false)
+    expect(settled.error).toMatch(/superseded/i)
+    expect(aSigner.close).toHaveBeenCalled() // stale candidate torn down
+    // A published nothing: no signer on the singleton, no pending record stamped with A's data.
+    expect(NostrConnectService.signer).toBeNull()
+    expect(localStorage.getItem(SESSION_KEY)).toBeNull()
   })
 })
