@@ -207,6 +207,20 @@ const POST_CONNECT_DELAY = 500
 // v49: Track connection attempt number to detect stale responses
 let connectionAttemptCounter = 0
 
+/**
+ * Process-lifetime fallback client key, used ONLY when storage is unusable (denied getter,
+ * throwing getItem, failing setItem).
+ *
+ * The client key IS this client's identity: generateConnectionURI embeds its pubkey in the
+ * nostrconnect:// URI, and the signer addresses its response to that pubkey. If the storage
+ * fallback minted a fresh random key per call, the URI would advertise key A while
+ * waitForConnection's fromURI subscribed and decrypted with key B — the signer's reply would be
+ * undecryptable and the handshake could never complete (PR #66 review). Caching one key for the
+ * page lifetime keeps URI generation, the initial wait, reconnect, and restore on a single
+ * identity even with no storage.
+ */
+let ephemeralClientKey: Uint8Array | null = null
+
 // =====================================================================
 // Service class
 // =====================================================================
@@ -587,10 +601,12 @@ class NostrConnectService {
    * Attempt to restore a previous NIP-46 session.
    * Called on app startup (no opts → confirmed session) and by the foreground-resume path,
    * which passes `expectedSecret` (the secret of the uri it is driving) so a PENDING record is
-   * only adopted by the attempt that created it.
+   * only adopted by the attempt that created it, and `expectedPublicKey` (the user pubkey the
+   * live flow already established) so a STALE confirmed record cannot replace it.
    */
   static async restoreSession(opts?: {
     expectedSecret?: string
+    expectedPublicKey?: string
   }): Promise<ConnectionResult> {
     const session: NIP46Session | null = this.getStoredSession()
     if (!session) {
@@ -614,6 +630,19 @@ class NostrConnectService {
         this.clearSession()
         return { success: false, error: "Session invalid" }
       }
+    } else if (opts?.expectedPublicKey && session.publicKey !== opts.expectedPublicKey) {
+      // A CONFIRMED record for a DIFFERENT user than the flow that is asking to be restored.
+      // This is reachable when storeSession's write AND its fallback removal both failed, so a
+      // previous user A's record survived while user B went live: a bfcache-triggered restore
+      // would otherwise rebuild A, pass its own publicKey match, and authenticate the WRONG
+      // USER (PR #66 review). Refuse before building any signer, and clear the provably stale
+      // record so a later startup restore (which has no expectation to check against) cannot
+      // silently log in as A.
+      console.warn(
+        "[NostrConnect] Stored session belongs to a different user — refusing restore",
+      )
+      this.clearSession()
+      return { success: false, error: "Session invalid" }
     }
 
     console.log("[NostrConnect] Attempting to restore session...")
@@ -808,30 +837,37 @@ class NostrConnectService {
    * Get or create the ephemeral client keypair.
    * This key is used to communicate with the remote signer.
    */
-  /** Read the stored client key, tolerating a throwing getItem (denied storage). */
-  private static readClientKey(storage: Storage): string | null {
+  /**
+   * Read the stored client key, tolerating a throwing getItem (denied storage). `onThrow` lets
+   * the caller distinguish "no key stored" (null) from "storage is unusable" (threw), which
+   * must fall back to the stable ephemeral key rather than minting a fresh one.
+   */
+  private static readClientKey(storage: Storage, onThrow?: () => void): string | null {
     try {
       return storage.getItem(NIP46_CLIENT_KEY)
     } catch (err: unknown) {
       console.warn("[NostrConnect] getOrCreateClientKey: Failed to read stored key:", err)
+      onThrow?.()
       return null
     }
   }
 
   private static getOrCreateClientKey(): Uint8Array {
-    // Server-side, or storage denied (the getter itself can throw): fall back to a temporary
-    // key. The connect flow must not fail just because the key cannot be persisted — it simply
-    // will not be reused across reloads (PR #66 review).
+    // Server-side, or storage denied (the getter itself can throw): fall back to the
+    // process-lifetime key. The connect flow must not fail just because the key cannot be
+    // persisted — it simply will not be reused across reloads (PR #66 review).
     const storage = safeStorage("local")
-    if (!storage) {
-      console.log(
-        "[NostrConnect] getOrCreateClientKey: No usable storage, generating temp key",
-      )
-      return generateSecretKey()
-    }
+    if (!storage) return this.getEphemeralClientKey("no usable storage")
 
-    // Try to retrieve existing key
-    const stored: string | null = this.readClientKey(storage)
+    // Try to retrieve existing key. readClientKey returns null if getItem THREW (denied
+    // storage) as well as if no key is stored — a throw means we cannot trust this storage, so
+    // fall back to the stable in-memory key rather than minting a fresh one per call.
+    let readFailed = false
+    const stored: string | null = this.readClientKey(storage, () => {
+      readFailed = true
+    })
+    if (readFailed) return this.getEphemeralClientKey("stored key unreadable")
+
     console.log("[NostrConnect] getOrCreateClientKey: Stored key exists:", !!stored)
     console.log(
       "[NostrConnect] getOrCreateClientKey: Stored key length:",
@@ -857,21 +893,21 @@ class NostrConnectService {
       }
     }
 
-    // Generate new ephemeral key
+    // Generate new key and persist it. If the write fails we cannot rely on storage to hand
+    // the SAME key back on the next call (URI generation and the waiter each call this), so
+    // the key must come from the process-lifetime cache instead (PR #66 review).
     console.log("[NostrConnect] getOrCreateClientKey: Generating new key")
     const newKey: Uint8Array = generateSecretKey()
     const newKeyHex: string = bytesToHex(newKey)
-    // Persisting is best-effort: a failed write only costs key reuse across reloads.
-    let persisted = true
     try {
       storage.setItem(NIP46_CLIENT_KEY, newKeyHex)
     } catch (err: unknown) {
-      persisted = false
       console.warn("[NostrConnect] getOrCreateClientKey: Failed to persist key:", err)
+      return this.getEphemeralClientKey("key not persistable")
     }
 
     // Verify it was stored correctly
-    const verifyStored: string | null = persisted ? this.readClientKey(storage) : null
+    const verifyStored: string | null = this.readClientKey(storage)
     console.log(
       "[NostrConnect] getOrCreateClientKey: Storage verification:",
       verifyStored === newKeyHex ? "OK" : "MISMATCH",
@@ -884,6 +920,22 @@ class NostrConnectService {
     )
 
     return newKey
+  }
+
+  /**
+   * The process-lifetime fallback key, minted once. Every storage-failure path routes here so
+   * URI generation, the initial wait, reconnect, and restore all use ONE identity — otherwise
+   * the URI would advertise one pubkey while the waiter decrypted with another.
+   */
+  private static getEphemeralClientKey(reason: string): Uint8Array {
+    if (ephemeralClientKey) return ephemeralClientKey
+    const key: Uint8Array = generateSecretKey()
+    ephemeralClientKey = key
+    console.warn(
+      `[NostrConnect] getOrCreateClientKey: ${reason} — using a process-lifetime ` +
+        "ephemeral key (not persisted across reloads)",
+    )
+    return key
   }
 
   /**

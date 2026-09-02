@@ -340,6 +340,129 @@ describe("NostrConnectModal — same-device NIP-46 resume (review blockers)", ()
   })
 
   /**
+   * Divergent finding (PR #66 review, GPT-5.6): user B is live, but a stale CONFIRMED record
+   * for user A survived (session write AND fallback removal both failed). A bfcache restore
+   * must not authenticate as A. The modal passes expectedPublicKey, so the service refuses.
+   */
+  it("does not authenticate a stale other-user session after bfcache (PR #66)", async () => {
+    // The sign hangs on the dead socket, so the flow is still at the signing stage when the
+    // bfcache resume runs (a completed flow is not in flight and is left alone).
+    const signDeferreds: Array<(v: { success: boolean }) => void> = []
+    const signIn = jest.fn(
+      () => new Promise<{ success: boolean }>((r) => signDeferreds.push(r)),
+    )
+    const onSuccess = jest.fn()
+    legacy().waitForConnection.mockResolvedValue({ success: true, publicKey: PUBKEY })
+    legacy().hasStoredSession.mockReturnValue(true)
+    legacy().isConnected.mockReturnValue(true)
+    // The service refuses when the caller's expectedPublicKey does not match the stored record
+    // (here the stored record is a DIFFERENT user), exactly as the real implementation does.
+    const OTHER = "b".repeat(64)
+    legacy().restoreSession.mockImplementation(
+      async (opts?: { expectedPublicKey?: string }) =>
+        opts?.expectedPublicKey && opts.expectedPublicKey !== OTHER
+          ? { success: false, error: "Session invalid" }
+          : { success: true, publicKey: OTHER },
+    )
+
+    render(
+      <NostrConnectModal
+        uri="nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example&secret=s&name=Blink%20POS"
+        signInWithNostrConnect={signIn}
+        onSuccess={onSuccess}
+      />,
+    )
+
+    await act(async () => {
+      fireClick(openInAmberButton())
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(1)
+    expect(signIn).toHaveBeenCalledWith(PUBKEY, expect.anything())
+
+    await bfcacheRoundTrip()
+
+    // The restore was attempted with the live user's pubkey and refused — the OTHER user must
+    // never be signed in or reported as a success.
+    expect(legacy().restoreSession).toHaveBeenCalledWith(
+      expect.objectContaining({ expectedPublicKey: PUBKEY }),
+    )
+    expect(signIn).not.toHaveBeenCalledWith(OTHER, expect.anything())
+    expect(onSuccess).not.toHaveBeenCalledWith(OTHER)
+  })
+
+  /**
+   * Divergent finding (PR #66 review, Kimi K3): a SECOND bfcache discard while the first
+   * recovery is still in flight must not be dropped. The first recovery's fresh sockets were
+   * discarded too, so it is hanging; the second discard supersedes it and takes ownership.
+   */
+  it("supersedes an in-flight recovery when a second bfcache discard arrives (PR #66)", async () => {
+    // Call 1 (original) hangs on the dead socket so the flow stays at the signing stage; the
+    // replacement issued by the winning recovery resolves.
+    const signDeferreds: Array<(v: { success: boolean }) => void> = []
+    const signIn = jest.fn(
+      () => new Promise<{ success: boolean }>((r) => signDeferreds.push(r)),
+    )
+    const onSuccess = jest.fn()
+    legacy().waitForConnection.mockResolvedValue({ success: true, publicKey: PUBKEY })
+    legacy().hasStoredSession.mockReturnValue(true)
+    legacy().isConnected.mockReturnValue(true)
+
+    // Restore #1 hangs (its fresh sockets get discarded by the second bfcache); #2 succeeds.
+    const restoreResolvers: Array<(v: { success: boolean; publicKey: string }) => void> =
+      []
+    legacy().restoreSession.mockImplementation(
+      () =>
+        new Promise<{ success: boolean; publicKey: string }>((r) =>
+          restoreResolvers.push(r),
+        ),
+    )
+
+    render(
+      <NostrConnectModal
+        uri="nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example&secret=s&name=Blink%20POS"
+        signInWithNostrConnect={signIn}
+        onSuccess={onSuccess}
+      />,
+    )
+
+    await act(async () => {
+      fireClick(openInAmberButton())
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(1)
+
+    // First bfcache → recovery #1 starts and hangs on restoreSession.
+    await bfcacheRoundTrip()
+    expect(legacy().restoreSession).toHaveBeenCalledTimes(1)
+
+    // Second bfcache while #1 is still awaiting: it must NOT be dropped.
+    await bfcacheRoundTrip()
+    expect(legacy().restoreSession).toHaveBeenCalledTimes(2)
+
+    // #2 completes the recovery and issues exactly one replacement auth, which then succeeds.
+    await act(async () => {
+      restoreResolvers[1]({ success: true, publicKey: PUBKEY })
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      signDeferreds[1]({ success: true })
+      await new Promise((r) => setTimeout(r, 650))
+    })
+    expect(onSuccess).toHaveBeenCalledTimes(1)
+
+    // #1 settling late is inert: no third sign, no second success.
+    await act(async () => {
+      restoreResolvers[0]({ success: true, publicKey: PUBKEY })
+      await new Promise((r) => setTimeout(r, 650))
+    })
+    expect(signIn).toHaveBeenCalledTimes(2)
+    expect(onSuccess).toHaveBeenCalledTimes(1)
+  })
+
+  /**
    * ABA regression (round-4 review): auth tokens must NEVER be reused. Sequence: sign A hangs
    * → foreground restart resets the flow (old code zeroed the token) → fresh attempt starts
    * sign B (old code reused token 1 — A's late settle would then read CURRENT and mutate B's

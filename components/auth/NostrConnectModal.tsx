@@ -107,6 +107,10 @@ export default function NostrConnectModal({
   // Single-flight guard for the foreground-resume path so a burst of
   // visibilitychange/focus events doesn't fire the NIP-98 sign request twice.
   const resumeInFlightRef = useRef<boolean>(false)
+  // Ticket for the CURRENT resume owner. A second bfcache discard supersedes an in-flight
+  // recovery (whose fresh sockets were just discarded too); the superseded run's `finally` must
+  // not clear the new owner's in-flight flag (PR #66 review).
+  const resumeGenRef = useRef<number>(0)
   // Attempt-scoped authentication ownership. Round-3 replaced the Boolean guard with a
   // token; round-4 review found the token had an ABA hole: resetting it to 0 on idle let a
   // later attempt reuse token 1, reviving a superseded token-1 continuation. The counter is
@@ -384,8 +388,23 @@ export default function NostrConnectModal({
       transportDiscarded,
     })
     if (action === null) return
-    if (resumeInFlightRef.current) return
+    if (resumeInFlightRef.current) {
+      // A recovery is already running. Normally we leave it alone (a focus/visibility burst
+      // must not double-fire). But a NEW bfcache discard means the transport died AGAIN —
+      // including the fresh sockets the in-flight recovery just opened, so it is now hanging on
+      // a dead connection and will never complete. Supersede it and take ownership: bumping the
+      // flow generation makes its continuation a no-op (PR #66 review).
+      if (!transportDiscarded) return
+      logAuth(
+        "NostrConnectModal",
+        "Second bfcache discard — superseding the in-flight recovery",
+      )
+      flowGenRef.current += 1
+    }
     resumeInFlightRef.current = true
+    // Take the resume ticket AFTER claiming ownership, so a superseded run's finally sees a
+    // newer ticket and leaves the in-flight flag set for the new owner.
+    const myResumeGen = ++resumeGenRef.current
     logAuth("NostrConnectModal", `Foreground resume (stage=${stage}, action=${action})`)
     try {
       if (action === "reconnect") {
@@ -431,8 +450,12 @@ export default function NostrConnectModal({
         logAuth("NostrConnectModal", "Connection lost — restoring session")
         // Pass THIS uri's secret so a pending record is only adopted if it was created by this
         // attempt (the service refuses + clears a secret-mismatched pending record).
+        // expectedPublicKey: if this flow already established a user, a stored record for a
+        // DIFFERENT user is stale (possible when both the session write and its fallback
+        // removal failed) and must not replace the live one (PR #66 review).
         const restored = await service.restoreSession({
           expectedSecret: secretFromUri(uri),
+          expectedPublicKey: connectedPubkey ?? undefined,
         })
         if (gen !== flowGenRef.current) {
           logAuth("NostrConnectModal", "Restore superseded — dropping its result")
@@ -471,7 +494,9 @@ export default function NostrConnectModal({
       setConnectedPubkey(null)
       service.disconnect().catch(() => undefined)
     } finally {
-      resumeInFlightRef.current = false
+      // Only the CURRENT owner releases the flag: a superseded run finishing late must not
+      // clear it out from under the recovery that replaced it.
+      if (myResumeGen === resumeGenRef.current) resumeInFlightRef.current = false
     }
     // stage/connectedPubkey are read at fire time; handleConnectionSuccess is stable per
     // render. Deliberately NOT reactive — this runs on visibility/focus events, not on state.

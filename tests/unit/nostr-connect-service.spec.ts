@@ -981,6 +981,60 @@ describe("NostrConnectService — pending-session handshake recovery", () => {
   })
 
   /**
+   * Divergent finding (PR #66 review, GPT-5.6): a stale CONFIRMED record must not replace a
+   * live different user. Reachable when storeSession's write AND its fallback removal both
+   * failed, leaving user A's confirmed record on disk while user B went live. A bfcache-driven
+   * restore would rebuild A, pass A's own publicKey match, and authenticate the WRONG USER.
+   */
+  it("REFUSES to restore a CONFIRMED record for a different user than the live flow, and clears it (PR #66)", async () => {
+    jest.spyOn(console, "warn").mockImplementation(() => {})
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        publicKey: "user-A", // stale: a PREVIOUS user's confirmed record
+        signerPubkey: "signerA",
+        relays: ["wss://r.example"],
+        connectedAt: Date.now(),
+        // no pending flag → confirmed, so the secret guard does not apply
+      }),
+    )
+    // No signer queued: if the restore wrongly proceeded, fromBunker would be called and the
+    // assertions below would fail.
+
+    // The live flow established user B and asks to restore — the record is for A.
+    const result = await NostrConnectService.restoreSession({
+      expectedPublicKey: "user-B",
+    })
+
+    expect(result.success).toBe(false)
+    expect(result.error).toMatch(/invalid/i)
+    expect(NostrConnectService.isConnected()).toBe(false)
+    expect(NostrConnectService.signer).toBeNull()
+    // Cleared, so a later startup restore (no expectation to check) cannot log in as A.
+    expect(localStorage.getItem(SESSION_KEY)).toBeNull()
+  })
+
+  it("still restores a CONFIRMED record when it matches the live flow's user", async () => {
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        publicKey: "user-signerX",
+        signerPubkey: "signerX",
+        relays: ["wss://r.example"],
+        connectedAt: Date.now(),
+      }),
+    )
+    signerQueue.push(() => makeFakeSigner("signerX")) // getPublicKey → "user-signerX"
+
+    const result = await NostrConnectService.restoreSession({
+      expectedPublicKey: "user-signerX",
+    })
+
+    expect(result.success).toBe(true)
+    expect(result.publicKey).toBe("user-signerX")
+  })
+
+  /**
    * LOW (PR #66 review, Codex GPT-5): the cleanup helpers must be non-throwing even when the
    * Window storage GETTER itself throws (SecurityError in some privacy modes) — not only when
    * removeItem throws. Previously the `typeof sessionStorage` check sat OUTSIDE the try, so a
@@ -1025,6 +1079,176 @@ describe("NostrConnectService — pending-session handshake recovery", () => {
       expect(NostrConnectService.userPublicKey).toBeNull()
     } finally {
       if (realSession) Object.defineProperty(window, "sessionStorage", realSession)
+    }
+  })
+})
+
+/**
+ * Client-key consistency when storage is unusable (PR #66 review, GPT-5.6 + Kimi K3).
+ *
+ * The client key IS this client's identity: generateConnectionURI embeds its pubkey in the
+ * nostrconnect:// URI and the signer addresses its reply to that pubkey, while
+ * waitForConnection's fromURI subscribes and decrypts with whatever key it is handed. A storage
+ * fallback that mints a FRESH key per call therefore advertises key A and then listens with key
+ * B — the handshake can never complete, and reconnect rotates the key again.
+ *
+ * The file-level nostr-tools/pure + @noble/hashes mocks return constants, which conceals the
+ * mismatch, so this block makes them key-derived: every generateSecretKey() call yields a
+ * distinct key and getPublicKey/bytesToHex derive from the key bytes.
+ */
+describe("NostrConnectService — client-key consistency with unusable storage", () => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- reach the mocked modules
+  const pure = jest.requireMock("nostr-tools/pure") as {
+    generateSecretKey: jest.Mock
+    getPublicKey: jest.Mock
+  }
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- reach the mocked modules
+  const hashes = jest.requireMock("@noble/hashes/utils") as {
+    bytesToHex: jest.Mock
+    hexToBytes: jest.Mock
+  }
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- reach the mocked modules
+  const nip46 = jest.requireMock("nostr-tools/nip46") as {
+    BunkerSigner: { fromURI: jest.Mock }
+  }
+
+  const realImpls = {
+    generateSecretKey: pure.generateSecretKey.getMockImplementation(),
+    getPublicKey: pure.getPublicKey.getMockImplementation(),
+    bytesToHex: hashes.bytesToHex.getMockImplementation(),
+    hexToBytes: hashes.hexToBytes.getMockImplementation(),
+  }
+
+  let keySeq = 0
+
+  beforeEach(() => {
+    signerQueue.length = 0
+    localStorage.clear()
+    sessionStorage.clear()
+    NostrConnectService.signer = null
+    NostrConnectService.pool = null
+    NostrConnectService.connectionState = "disconnected"
+    NostrConnectService.userPublicKey = null
+    jest.spyOn(console, "warn").mockImplementation(() => {})
+
+    // Distinct key per call; pubkey/hex derived from the key's first byte so a swapped key is
+    // immediately visible.
+    keySeq = 0
+    pure.generateSecretKey.mockImplementation(() => new Uint8Array(32).fill(++keySeq))
+    pure.getPublicKey.mockImplementation((k: Uint8Array) => `pub-${k[0]}`)
+    hashes.bytesToHex.mockImplementation((b: Uint8Array) => `hex-${b[0]}`)
+    hashes.hexToBytes.mockImplementation((h: string) =>
+      new Uint8Array(32).fill(Number(String(h).replace("hex-", "")) || 0),
+    )
+  })
+
+  afterAll(() => {
+    // Restore the file-level constant mocks for any later suite.
+    pure.generateSecretKey.mockImplementation(realImpls.generateSecretKey!)
+    pure.getPublicKey.mockImplementation(realImpls.getPublicKey!)
+    hashes.bytesToHex.mockImplementation(realImpls.bytesToHex!)
+    hashes.hexToBytes.mockImplementation(realImpls.hexToBytes!)
+  })
+
+  /** The key handed to fromURI on the Nth call. */
+  const keyPassedToFromURI = (call: number): Uint8Array =>
+    nip46.BunkerSigner.fromURI.mock.calls[call][0] as Uint8Array
+
+  /** The client pubkey advertised in a nostrconnect:// uri (its host). */
+  const pubkeyInUri = (uri: string): string =>
+    new URL(uri).hostname || uri.split("//")[1]!.split("?")[0]!
+
+  const expectUriAndWaiterAgree = (uri: string, call: number): void => {
+    const advertised = pubkeyInUri(uri)
+    const used = pure.getPublicKey(keyPassedToFromURI(call))
+    expect(used).toBe(advertised)
+  }
+
+  const denyStorage = (impl: PropertyDescriptor): (() => void) => {
+    const real = Object.getOwnPropertyDescriptor(window, "localStorage")
+    Object.defineProperty(window, "localStorage", { ...impl, configurable: true })
+    return () => {
+      if (real) Object.defineProperty(window, "localStorage", real)
+    }
+  }
+
+  it("uses ONE key for the URI and the waiter when the localStorage GETTER throws", async () => {
+    const restore = denyStorage({
+      get() {
+        throw new Error("SecurityError")
+      },
+    })
+    try {
+      const uri: string = NostrConnectService.generateConnectionURI()
+      const signer = makeFakeSigner("signerX")
+      signer.getPublicKey = jest.fn(() => new Promise<string>(() => {}))
+      signerQueue.push(() => signer)
+      NostrConnectService.waitForConnection(uri)
+      await flush()
+
+      expectUriAndWaiterAgree(uri, 0)
+    } finally {
+      restore()
+    }
+  })
+
+  it("uses ONE key for the URI and the waiter when getItem throws", async () => {
+    const restore = denyStorage({
+      get: () => ({
+        getItem: () => {
+          throw new Error("SecurityError")
+        },
+        setItem: () => undefined,
+        removeItem: () => undefined,
+      }),
+    })
+    try {
+      const uri: string = NostrConnectService.generateConnectionURI()
+      const signer = makeFakeSigner("signerX")
+      signer.getPublicKey = jest.fn(() => new Promise<string>(() => {}))
+      signerQueue.push(() => signer)
+      NostrConnectService.waitForConnection(uri)
+      await flush()
+
+      expectUriAndWaiterAgree(uri, 0)
+    } finally {
+      restore()
+    }
+  })
+
+  it("uses ONE key for the URI and the waiter when setItem fails, and keeps it across a reconnect", async () => {
+    const restore = denyStorage({
+      get: () => ({
+        getItem: () => null, // nothing stored, and the write below will fail
+        setItem: () => {
+          throw new Error("QuotaExceededError")
+        },
+        removeItem: () => undefined,
+      }),
+    })
+    try {
+      const uri: string = NostrConnectService.generateConnectionURI()
+      const first = makeFakeSigner("signerX")
+      first.getPublicKey = jest.fn(() => new Promise<string>(() => {}))
+      signerQueue.push(() => first)
+      NostrConnectService.waitForConnection(uri)
+      await flush()
+
+      expectUriAndWaiterAgree(uri, 0)
+
+      // Reconnect: disconnect and retry the SAME uri — the key must not rotate, or the retry
+      // would listen with a key the signer is not addressing.
+      await NostrConnectService.disconnect()
+      const second = makeFakeSigner("signerX")
+      second.getPublicKey = jest.fn(() => new Promise<string>(() => {}))
+      signerQueue.push(() => second)
+      NostrConnectService.waitForConnection(uri)
+      await flush()
+
+      expectUriAndWaiterAgree(uri, 1)
+      expect(keyPassedToFromURI(1)).toEqual(keyPassedToFromURI(0))
+    } finally {
+      restore()
     }
   })
 })
