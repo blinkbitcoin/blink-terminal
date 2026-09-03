@@ -172,31 +172,23 @@ export function NostrAuthProvider({
   // Track if challenge flow is being handled to prevent duplicate processing
   const challengeFlowHandling = useRef<boolean>(false)
 
-  // Provider-wide ownership for Nostr Connect sign-ins. Auth data, the server session and the
-  // active profile are SHARED state, so a superseded attempt's cleanup must never run against a
-  // replacement's work: A could otherwise log out B's session, overwrite B's auth and reactivate
-  // the profile that predates A (PR #66 review). Each attempt takes a ticket; only the latest
-  // one may clean up.
-  const authAttemptSeqRef = useRef<number>(0)
-  // The in-flight cleanup, if any. A new attempt waits for it before taking its ticket, so a
-  // replacement can never start on top of a rollback that is about to undo shared state.
-  const pendingAuthCleanupRef = useRef<Promise<void> | null>(null)
   /**
-   * The true pre-attempt state, and the obligation to restore it.
+   * Provider-wide ownership for Nostr Connect sign-ins.
    *
-   * Captured by the FIRST attempt of a chain and INHERITED by every replacement, then cleared
-   * only when an attempt actually commits. Ownership alone is not enough: if A is superseded by
-   * B and then B fails, A skips cleanup because it is no longer the latest while B has nothing
-   * of its own to undo — leaving A's server session alive under B's local auth. Carrying the
-   * baseline forward means whichever attempt ends the chain unsuccessfully restores the state
-   * from before ANY of them ran (PR #66 review).
+   * The caller's own `isCurrent` predicate defaults to true and two overlapping calls can both
+   * believe they own the flow, so effective ownership is that predicate AND still holding the
+   * latest ticket (PR #66 review).
    */
-  const authBaselineRef = useRef<{
-    auth: { publicKey: string | null; method: string | null }
-    activeProfileId: string | null
-    /** The profile record for this pubkey as it was before the attempt, if one existed. */
-    profile: StoredProfile | null
-  } | null>(null)
+  const authAttemptSeqRef = useRef<number>(0)
+  /**
+   * The in-flight session establishment, if any.
+   *
+   * A new attempt waits for it before taking its ticket. Promise.race does not cancel a NIP-98
+   * login, so without this a retired attempt's late response could install a session behind a
+   * replacement that had already finished. Serializing means at most one attempt is ever
+   * establishing a session, which is what makes the single-resource cleanup below sufficient.
+   */
+  const pendingSessionRef = useRef<Promise<unknown> | null>(null)
 
   // Re-check extension availability after short delay (extensions may inject asynchronously)
   useEffect(() => {
@@ -311,6 +303,30 @@ export function NostrAuthProvider({
    * Sync Blink account from server (for cross-device consistency)
    * Called after NIP-98 session is established
    */
+  /**
+   * Give up a server session this attempt established but is not entitled to keep.
+   *
+   * This is the ONLY compensation the sign-in flow needs. Local auth, the profile and provider
+   * state are published after the ownership gate, so a superseded or failed attempt has nothing
+   * local to undo; the session is the single resource that must exist before the outcome is
+   * known, because signing is what proves the user (PR #66 review).
+   *
+   * Safe to call unconditionally: session establishment is serialized, so no replacement can
+   * have a session of its own at this point for this to destroy.
+   */
+  const discardSession = useCallback(
+    async (reason: string): Promise<AuthActionResult> => {
+      logAuthWarn("useNostrAuth", `Sign-in superseded ${reason} — discarding its session`)
+      try {
+        await fetch("/api/auth/logout", { method: "POST", credentials: "include" })
+      } catch (e: unknown) {
+        logAuthWarn("useNostrAuth", "Server logout while discarding session failed:", e)
+      }
+      return { success: false, error: "Superseded", errorType: "superseded" }
+    },
+    [],
+  )
+
   const syncBlinkAccountFromServer = useCallback(
     async (opts?: { isCurrent?: () => boolean }): Promise<SyncResult> => {
       // Optional ownership check for callers that can be superseded mid-flight. This function
@@ -1642,8 +1658,6 @@ export function NostrAuthProvider({
       options: NostrConnectSignInOptions = {},
     ): Promise<AuthActionResult> => {
       const { onProgress, timeout = 30000, isCurrent } = options
-      // Defaults to "still mine" so callers that do not track ownership are unaffected.
-      const stillOwned = (): boolean => isCurrent?.() ?? true
 
       logAuth(
         "useNostrAuth",
@@ -1652,149 +1666,61 @@ export function NostrAuthProvider({
       )
       // Note: Don't set loading state here - modal handles its own UI
 
-      // Never start on top of a rollback that is still undoing shared state.
-      if (pendingAuthCleanupRef.current) {
+      // Session establishment is serialized across attempts. Promise.race below does not cancel
+      // an in-flight NIP-98 login, so without this a retired attempt's response could land
+      // after a replacement had finished and quietly install a session behind it (PR #66
+      // review). Waiting means at most one attempt is ever establishing a session.
+      const previousSession: Promise<unknown> | null = pendingSessionRef.current
+      if (previousSession) {
         try {
-          await pendingAuthCleanupRef.current
+          await previousSession
         } catch {
-          // a failed cleanup must not block a fresh attempt
+          // a failed predecessor must not block this attempt
         }
       }
 
-      // Ownership ticket. Taken AFTER the wait above, so tickets are ordered consistently with
-      // the cleanups they follow.
+      // Ownership ticket, taken after that wait so tickets order consistently with the sessions
+      // they follow. Effective ownership is the caller's predicate AND still being the latest
+      // attempt: the caller's default is `true`, so on its own it cannot stop two overlapping
+      // calls from both believing they own the flow.
       const myTicket: number = ++authAttemptSeqRef.current
-      const isLatestAttempt = (): boolean => myTicket === authAttemptSeqRef.current
-
-      // Capture the baseline once per chain of overlapping attempts; a replacement inherits the
-      // state from before the FIRST of them, which is what must be restored if the chain ends
-      // without a commit.
-      if (!authBaselineRef.current) {
-        authBaselineRef.current = {
-          auth: NostrAuthService.getStoredAuthData(),
-          activeProfileId: ProfileStorage.getActiveProfileId(),
-          // Copied, not referenced: createProfile mutates the stored record in place for a
-          // known pubkey, and the baseline must keep the values from BEFORE that.
-          profile: ((): StoredProfile | null => {
-            const existing = ProfileStorage.getProfileByPublicKey(publicKey)
-            return existing ? { ...existing } : null
-          })(),
-        }
-      }
-      const baseline = authBaselineRef.current
-      // Set once this attempt creates/activates a profile, so rollback knows what to undo.
-      let createdProfileId: string | null = null
-      // Whether that profile already existed. createProfile RETURNS an existing profile for a
-      // known pubkey, so only a profile this attempt genuinely created may be deleted —
-      // removing a returning user's profile would destroy their accounts and settings.
-      let profileWasNew = false
-
-      /**
-       * Undo everything this attempt established, including the server session — nip98Login
-       * sets a session cookie, so simply not publishing would still leave the app logged in
-       * server-side after a reload.
-       *
-       * Gated on still being the latest attempt. Auth data, the session cookie and the active
-       * profile are shared, and a replacement that has already started owns all of them: an
-       * unconditional cleanup here would log out the replacement, overwrite its auth and
-       * reactivate the profile from before this attempt (PR #66 review). When a replacement
-       * exists there is also nothing to undo — it has overwritten this attempt's registration
-       * already.
-       */
-      const restoreBaseline = async (reason: string): Promise<void> => {
-        // Only the latest attempt restores. An older one has been replaced, and the replacement
-        // carries the same baseline obligation — so if IT also fails, IT will restore, and the
-        // chain still cannot end with leftover state.
-        if (!isLatestAttempt()) {
-          logAuthWarn(
-            "useNostrAuth",
-            `Sign-in ended ${reason} — a replacement owns the chain, leaving it alone`,
-          )
-          return
-        }
-        logAuthWarn("useNostrAuth", `Sign-in ended ${reason} — restoring the baseline`)
-
-        // Published synchronously (no await between the check above and this assignment) so a
-        // replacement starting now waits for the cleanup instead of racing it.
-        const cleanup: Promise<void> = (async (): Promise<void> => {
-          try {
-            await fetch("/api/auth/logout", { method: "POST", credentials: "include" })
-          } catch (e: unknown) {
-            logAuthWarn("useNostrAuth", "Server logout during rollback failed:", e)
-          }
-          if (baseline.auth.publicKey && baseline.auth.method) {
-            NostrAuthService.storeAuthData(baseline.auth.publicKey, baseline.auth.method)
-          } else {
-            NostrAuthService.clearAuthData()
-          }
-
-          // Profile restoration, in three independent steps — deleting a created profile and
-          // restoring the pointer are separate obligations, and doing only one of them (the
-          // previous `else if`) left durable traces behind (PR #66 review).
-          if (createdProfileId) {
-            if (profileWasNew) {
-              // This attempt genuinely created it, so it goes away regardless of what the
-              // pointer is restored to below.
-              ProfileStorage.deleteProfile(createdProfileId)
-            } else if (baseline.profile) {
-              // Pre-existing profile: createProfile mutated lastLogin/signInMethod on it, so
-              // put the recorded values back rather than leaving the attempt's stamp.
-              ProfileStorage.updateProfile(baseline.profile)
-            }
-          }
-          // Restore the pointer to exactly what it was, including "nothing was active".
-          if (baseline.activeProfileId) {
-            ProfileStorage.setActiveProfile(baseline.activeProfileId)
-          } else {
-            ProfileStorage.clearActiveProfile()
-          }
-        })()
-        pendingAuthCleanupRef.current = cleanup
-        try {
-          await cleanup
-        } finally {
-          if (pendingAuthCleanupRef.current === cleanup) {
-            pendingAuthCleanupRef.current = null
-          }
-          // Obligation discharged: the chain is back at its starting state.
-          authBaselineRef.current = null
-        }
-      }
-
-      /** Restore the baseline and report this attempt as superseded. */
-      const rollback = async (reason: string): Promise<AuthActionResult> => {
-        await restoreBaseline(reason)
-        return { success: false, error: "Superseded", errorType: "superseded" }
-      }
+      const stillOwned = (): boolean =>
+        myTicket === authAttemptSeqRef.current && (isCurrent?.() ?? true)
 
       try {
-        // Step 1: Register with NostrAuthService (local state only). This cannot be deferred:
-        // nip98Login refuses to sign unless the stored auth data is present, so the rollback
-        // above is what keeps it from outliving a superseded attempt.
-        const result: AuthResult = NostrAuthService.signInWithNostrConnect(publicKey)
-
-        if (!result.success) {
-          return { success: false, error: result.error }
-        }
-
-        // Step 2: NIP-98 login (this is the slow part - relay signing)
+        // Step 1: Establish the server session.
+        //
+        // Nothing local is mutated first. Signing is dispatched with an explicit method rather
+        // than by registering this user as the current one, so an attempt that is superseded,
+        // fails or times out has no local auth, no profile and no provider state to undo. That
+        // removes the compensating-rollback problem instead of managing it (PR #66 review).
         logAuth("useNostrAuth", "Starting NIP-98 login (blocking)...")
         onProgress?.("signing", "Signing authentication event...")
 
-        const sessionResult: Nip98LoginResult = await Promise.race([
-          NostrAuthService.nip98Login(),
-          new Promise<never>(
-            (_: (value: never) => void, reject: (reason: Error) => void) =>
-              setTimeout(() => reject(new Error("TIMEOUT")), timeout),
-          ),
-        ])
+        const sessionAttempt: Promise<Nip98LoginResult> = NostrAuthService.nip98Login({
+          signWithMethod: "nostrConnect",
+        })
+        pendingSessionRef.current = sessionAttempt
+
+        let sessionResult: Nip98LoginResult
+        try {
+          sessionResult = await Promise.race([
+            sessionAttempt,
+            new Promise<never>(
+              (_: (value: never) => void, reject: (reason: Error) => void) =>
+                setTimeout(() => reject(new Error("TIMEOUT")), timeout),
+            ),
+          ])
+        } finally {
+          // The next attempt waits on this settling, including on the timeout path where the
+          // request itself is still outstanding.
+          if (pendingSessionRef.current === sessionAttempt) {
+            pendingSessionRef.current = sessionAttempt.catch(() => undefined)
+          }
+        }
 
         if (!sessionResult.success) {
           logAuthWarn("useNostrAuth", "NIP-98 login failed:", sessionResult.error)
-          // Registration already happened, so a failure here must restore the baseline too —
-          // otherwise this attempt's local auth (and any session a PREVIOUS attempt in this
-          // chain established) survives an unsuccessful chain (PR #66 review).
-          await restoreBaseline("after a failed NIP-98 login")
           return {
             success: false,
             error: sessionResult.error || "Failed to establish session",
@@ -1804,47 +1730,28 @@ export function NostrAuthProvider({
 
         logAuth("useNostrAuth", "Server session established")
 
-        // This request may have been cancelled or superseded while the signing round-trip was
-        // in flight (e.g. a bfcache discard retired it). A server session now exists and local
-        // auth is registered, so returning is not enough — undo both (PR #66 review).
-        if (!stillOwned()) return await rollback("during signing")
+        // Step 2: Ownership gate. Everything below is durable, and this is the only point where
+        // an established session has to be surrendered — the single resource this flow can have
+        // created before knowing it owns the outcome.
+        if (!stillOwned()) return await discardSession("during signing")
 
-        // Step 3: Create profile (local storage). DEFERRED until ownership is confirmed —
-        // nip98Login does not need it, so a superseded attempt must not leave a profile
-        // created and activated for the retired user.
-        // Checked first so rollback can tell a profile this attempt created from one that
-        // already existed (createProfile returns the existing one for a known pubkey).
-        profileWasNew = ProfileStorage.getProfileByPublicKey(publicKey) === null
+        // Step 3: Register locally and publish. From here the attempt owns the flow, so these
+        // run together with no awaits in between that could hand ownership away.
+        const result: AuthResult = NostrAuthService.signInWithNostrConnect(publicKey)
+        if (!result.success) {
+          // Registration is local and synchronous; if it fails, only the session exists.
+          await discardSession("after a failed registration")
+          return { success: false, error: result.error }
+        }
+
         const profile: StoredProfile = ProfileStorage.createProfile(
           publicKey,
           "nostrConnect",
         )
-        createdProfileId = profile.id
         ProfileStorage.setActiveProfile(profile.id)
         const activeBlinkAccount: StoredBlinkAccount | null =
           profile.blinkAccounts.find((a) => a.isActive) || null
 
-        // Step 4: Sync data from server
-        logAuth("useNostrAuth", "Syncing data from server...")
-        onProgress?.("syncing", "Loading your data...")
-
-        try {
-          // Ownership is threaded INTO the sync: it awaits the network and then writes to
-          // profile storage, so checking only afterwards would let it commit for a retired
-          // attempt before we noticed (PR #66 review).
-          const syncResult = await syncBlinkAccountFromServer({ isCurrent: stillOwned })
-          logAuth("useNostrAuth", "Sync result:", syncResult)
-        } catch (syncError: unknown) {
-          // Soft failure - don't block sign-in for sync issues
-          logAuthWarn("useNostrAuth", "Sync failed (non-blocking):", syncError)
-        }
-
-        // Re-check after the sync await: ownership can be lost during it too, and the state
-        // published below is what actually authenticates the app.
-        if (!stillOwned()) return await rollback("during sync")
-
-        // Step 5: NOW set authenticated state (after session is established)
-        logAuth("useNostrAuth", "Setting authenticated state...")
         updateState({
           loading: false,
           isAuthenticated: true,
@@ -1860,8 +1767,18 @@ export function NostrAuthProvider({
         // Fetch Nostr profile metadata in background (non-blocking)
         fetchNostrProfile(publicKey)
 
-        // Committed: this state is now the truth, so there is nothing to restore any more.
-        authBaselineRef.current = null
+        // Step 4: Sync data from the server. This runs AFTER the commit, so a failure or a late
+        // supersession here can no longer strand a half-built sign-in; ownership is still
+        // threaded in so a retired attempt does not overwrite a replacement's profile state.
+        logAuth("useNostrAuth", "Syncing data from server...")
+        onProgress?.("syncing", "Loading your data...")
+        try {
+          const syncResult = await syncBlinkAccountFromServer({ isCurrent: stillOwned })
+          logAuth("useNostrAuth", "Sync result:", syncResult)
+        } catch (syncError: unknown) {
+          // Soft failure - don't block sign-in for sync issues
+          logAuthWarn("useNostrAuth", "Sync failed (non-blocking):", syncError)
+        }
 
         onProgress?.("complete", "Done!")
         logAuth("useNostrAuth", "Nostr Connect sign-in complete")
@@ -1869,10 +1786,6 @@ export function NostrAuthProvider({
       } catch (error: unknown) {
         const err = error as Error
         logAuthError("useNostrAuth", "Nostr Connect sign-in failed:", error)
-
-        // A throw (most commonly the signing timeout) is a post-registration failure like any
-        // other: restore the baseline so an unsuccessful chain leaves nothing behind.
-        await restoreBaseline("with an error")
 
         // Handle timeout specifically
         if (err.message === "TIMEOUT") {
@@ -1886,7 +1799,7 @@ export function NostrAuthProvider({
         return { success: false, error: err.message, errorType: "unknown" }
       }
     },
-    [updateState, fetchNostrProfile, syncBlinkAccountFromServer],
+    [updateState, fetchNostrProfile, syncBlinkAccountFromServer, discardSession],
   )
 
   /**

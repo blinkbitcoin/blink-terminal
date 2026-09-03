@@ -166,6 +166,8 @@ const renderProvider = async (): Promise<void> => {
 const authed = (): string | null => screen.getByTestId("authed").textContent
 
 describe("useNostrAuth — signInWithNostrConnect ownership (PR #66)", () => {
+  const PUBKEY_B = "c".repeat(64)
+
   beforeEach(() => {
     jest.clearAllMocks()
     authService.hasPendingChallengeFlow.mockReturnValue(false)
@@ -174,10 +176,9 @@ describe("useNostrAuth — signInWithNostrConnect ownership (PR #66)", () => {
     authService.isExtensionAvailable.mockReturnValue(false)
     authService.isMobileDevice.mockReturnValue(false)
     authService.getAvailableMethods.mockReturnValue([])
-    profileStorage.__reset()
     authService.signInWithNostrConnect.mockReturnValue({ success: true })
     authService.nip98Login.mockResolvedValue({ success: true })
-    // Any sync/account fetch the flow makes.
+    profileStorage.__reset()
     global.fetch = jest.fn(async () => ({
       ok: true,
       status: 200,
@@ -185,30 +186,26 @@ describe("useNostrAuth — signInWithNostrConnect ownership (PR #66)", () => {
     })) as unknown as typeof fetch
   })
 
-  it("rolls back local auth, active profile and the server session when superseded during signing", async () => {
-    // The signing round-trip hangs until the test releases it — the bfcache-discard window.
+  /**
+   * The flow establishes the session BEFORE it owns the outcome, because signing is what proves
+   * the user. Everything local — auth registration, the profile, provider state — is published
+   * only after the ownership gate, so a superseded attempt has nothing local to undo and the
+   * session is the single resource it must give up.
+   */
+  it("publishes nothing locally and discards its session when superseded during signing", async () => {
     let finishSigning: (v: { success: boolean }) => void = () => {}
     authService.nip98Login.mockImplementation(
       () => new Promise((r) => (finishSigning = r)),
     )
 
     await renderProvider()
-    expect(authed()).toBe("false")
-
-    // Seed the pre-existing state AFTER mount, so only the sign-in flow observes it: a
-    // different user was already signed in with an active profile, and being superseded must
-    // leave THEIR state intact rather than the retired attempt's.
+    // A different user is signed in with their own active profile.
     authService.getStoredAuthData.mockReturnValue({
       publicKey: "previous-user",
       method: "extension",
     })
+    profileStorage.__seedProfile("previous-user", "previous-profile")
     profileStorage.__setActiveId("previous-profile")
-    // Forget anything the provider's own mount did, so the assertions below describe only what
-    // the sign-in attempt caused.
-    profileStorage.createProfile.mockClear()
-    profileStorage.setActiveProfile.mockClear()
-    authService.storeAuthData.mockClear()
-    authService.clearAuthData.mockClear()
     ;(global.fetch as jest.Mock).mockClear()
 
     let owned = true
@@ -217,395 +214,172 @@ describe("useNostrAuth — signInWithNostrConnect ownership (PR #66)", () => {
       const pending = signIn(PUBKEY, { isCurrent: () => owned })
       await new Promise<void>((r) => setTimeout(r, 0))
       owned = false
-      finishSigning({ success: true }) // the session cookie now exists
+      finishSigning({ success: true }) // the session now exists
       result = await pending
     })
 
-    expect(result?.success).toBe(false)
     expect(result?.errorType).toBe("superseded")
-
-    // Provider state never published.
-    expect(authed()).toBe("false")
-
-    // The profile mutations are DEFERRED past the ownership check, so the retired user never
-    // got a profile created or activated for them — and the active pointer is therefore
-    // untouched rather than restored.
+    // Nothing local was ever touched, so there is nothing to have restored.
+    expect(authService.signInWithNostrConnect).not.toHaveBeenCalled()
     expect(profileStorage.createProfile).not.toHaveBeenCalled()
+    expect(profileStorage.setActiveProfile).not.toHaveBeenCalled()
+    expect(profileStorage.deleteProfile).not.toHaveBeenCalled()
+    expect(authed()).toBe("false")
+    // The previous user is untouched, not restored-after-damage.
     expect(profileStorage.getActiveProfileId()).toBe("previous-profile")
-
-    // The server session established by nip98Login was cleared.
+    expect(profileStorage.__getProfile("previous-user")?.id).toBe("previous-profile")
+    // The one resource it did create is given up.
     expect(global.fetch).toHaveBeenCalledWith(
       "/api/auth/logout",
       expect.objectContaining({ method: "POST" }),
     )
-    // Local auth was restored to the PREVIOUS user, not left as the retired one.
-    expect(authService.storeAuthData).toHaveBeenCalledWith("previous-user", "extension")
-    expect(authService.clearAuthData).not.toHaveBeenCalled()
-    // No account sync was attempted for the retired attempt.
+    // ...and no account sync ran for it.
     expect(global.fetch).not.toHaveBeenCalledWith(
       "/api/auth/nostr-blink-account",
       expect.anything(),
     )
   })
 
-  it("clears local auth on rollback when there was no previous user", async () => {
-    authService.getStoredAuthData.mockReturnValue({ publicKey: null, method: null })
-
-    let finishSigning: (v: { success: boolean }) => void = () => {}
-    authService.nip98Login.mockImplementation(
-      () => new Promise((r) => (finishSigning = r)),
-    )
-
-    await renderProvider()
-
-    let owned = true
-    await act(async () => {
-      const pending = signIn(PUBKEY, { isCurrent: () => owned })
-      await new Promise<void>((r) => setTimeout(r, 0))
-      owned = false
-      finishSigning({ success: true })
-      await pending
+  it("discards its session when local registration fails", async () => {
+    authService.signInWithNostrConnect.mockReturnValue({
+      success: false,
+      error: "Invalid public key",
     })
 
-    // Nothing to restore, so the retired attempt's auth data is cleared outright.
-    expect(authService.clearAuthData).toHaveBeenCalled()
-    expect(authService.storeAuthData).not.toHaveBeenCalled()
+    await renderProvider()
+    ;(global.fetch as jest.Mock).mockClear()
+
+    let result: { success: boolean; error?: string } | undefined
+    await act(async () => {
+      result = await signIn(PUBKEY)
+      await new Promise<void>((r) => setTimeout(r, 0))
+    })
+
+    expect(result?.success).toBe(false)
+    expect(global.fetch).toHaveBeenCalledWith(
+      "/api/auth/logout",
+      expect.objectContaining({ method: "POST" }),
+    )
+    expect(profileStorage.createProfile).not.toHaveBeenCalled()
     expect(authed()).toBe("false")
   })
 
-  it("commits nothing when ownership is lost during the account sync", async () => {
-    // Signing succeeds; the SYNC request is what hangs, so ownership is lost inside it.
+  it("leaves nothing behind when signing fails or times out", async () => {
+    authService.nip98Login.mockResolvedValue({ success: false, error: "relay down" })
+
+    await renderProvider()
+    let failed: { errorType?: string } | undefined
+    await act(async () => {
+      failed = await signIn(PUBKEY)
+      await new Promise<void>((r) => setTimeout(r, 0))
+    })
+    expect(failed?.errorType).toBe("session")
+
+    // A timeout is the same: the request never resolves within the budget.
+    authService.nip98Login.mockImplementation(() => new Promise(() => {}))
+    let timedOut: { errorType?: string } | undefined
+    await act(async () => {
+      const pending = signIn(PUBKEY, { timeout: 5 })
+      await new Promise<void>((r) => setTimeout(r, 20))
+      timedOut = await pending
+    })
+    expect(timedOut?.errorType).toBe("timeout")
+
+    // Neither path registered anything or published state.
+    expect(authService.signInWithNostrConnect).not.toHaveBeenCalled()
+    expect(profileStorage.createProfile).not.toHaveBeenCalled()
+    expect(authed()).toBe("false")
+  })
+
+  /**
+   * The caller's predicate defaults to true, so it cannot by itself stop two overlapping calls
+   * from both believing they own the flow. Effective ownership is that predicate AND the latest
+   * provider ticket — asserted here WITHOUT flipping any caller flag.
+   */
+  it("a stale attempt's late sync cannot overwrite a newer attempt, with no caller flag involved", async () => {
     let finishSync: (v: unknown) => void = () => {}
+    let syncCalls = 0
     global.fetch = jest.fn(async (url: string) => {
       if (String(url).includes("nostr-blink-account")) {
-        return new Promise((r) => (finishSync = r))
+        syncCalls += 1
+        if (syncCalls === 1) return new Promise((r) => (finishSync = r))
+        return { ok: true, status: 200, json: async () => ({ hasAccount: false }) }
       }
       return { ok: true, status: 200, json: async () => ({}) }
     }) as unknown as typeof fetch
 
     await renderProvider()
 
-    // Seeded after mount (see above).
-    authService.getStoredAuthData.mockReturnValue({
-      publicKey: "previous-user",
-      method: "extension",
-    })
-    profileStorage.__setActiveId("previous-profile")
-
-    let owned = true
-    let result: { success: boolean; errorType?: string } | undefined
     await act(async () => {
-      const pending = signIn(PUBKEY, { isCurrent: () => owned })
+      // A commits, then hangs in its post-commit sync. No isCurrent is passed at all.
+      const aPending = signIn(PUBKEY)
       await new Promise<void>((r) => setTimeout(r, 0))
-      owned = false
-      // The sync response arrives with an account to write — but ownership is already gone.
+
+      // B runs to completion for a DIFFERENT user, taking the latest ticket.
+      await signIn(PUBKEY_B)
+
+      // A's sync finally returns an account to write — it must be ignored.
       finishSync({
         ok: true,
         status: 200,
         json: async () => ({
           hasAccount: true,
-          blinkUsername: "someone",
+          blinkUsername: "stale",
           apiKey: "key",
         }),
       })
-      result = await pending
+      await aPending
     })
 
-    expect(result?.errorType).toBe("superseded")
-    // The sync must not have written the account into profile storage.
+    // B's profile is the active one and A's stale sync wrote nothing.
+    expect(profileStorage.getActiveProfileId()).toBe(
+      profileStorage.__getProfile(PUBKEY_B)?.id,
+    )
     expect(profileStorage.updateProfile).not.toHaveBeenCalled()
-    expect(authed()).toBe("false")
-    // And the attempt was rolled back: the profile it activated is no longer active, the
-    // previous one is.
-    expect(authService.storeAuthData).toHaveBeenCalledWith("previous-user", "extension")
-    expect(profileStorage.getActiveProfileId()).toBe("previous-profile")
   })
 
   /**
-   * HIGH (PR #66 review): rollback operates on SHARED state — auth data, the session cookie and
-   * the active profile. A superseded attempt A must never undo a replacement B's work. These
-   * cover the overlapping case with B completing first and A settling late.
+   * Promise.race does not cancel an in-flight NIP-98 login, so session establishment is
+   * serialized: a replacement cannot begin until the previous attempt's session request has
+   * settled, which is what stops a late response installing a session behind it.
    */
-  it("a superseded attempt does not log out or overwrite a replacement that already completed", async () => {
-    // A hangs at signing; B (started later) signs immediately.
-    const signingGates: Array<(v: { success: boolean }) => void> = []
-    authService.nip98Login.mockImplementation(
-      () =>
-        new Promise((r) => {
-          signingGates.push(r)
-        }),
-    )
-
-    await renderProvider()
-    profileStorage.__setActiveId("previous-profile")
-    authService.getStoredAuthData.mockReturnValue({
-      publicKey: "previous-user",
-      method: "extension",
-    })
-    ;(global.fetch as jest.Mock).mockClear()
-    authService.storeAuthData.mockClear()
-    authService.clearAuthData.mockClear()
-
-    let aOwned = true
-    let aResult: { errorType?: string } | undefined
-    await act(async () => {
-      // A starts and reaches its signing await.
-      const aPending = signIn(PUBKEY, { isCurrent: () => aOwned })
-      await new Promise<void>((r) => setTimeout(r, 0))
-
-      // A is retired, and B starts and COMPLETES fully while A is still hanging.
-      aOwned = false
-      const bPending = signIn(PUBKEY, { isCurrent: () => true })
-      await new Promise<void>((r) => setTimeout(r, 0))
-      signingGates[1]({ success: true }) // B's signing succeeds
-      await bPending
-
-      // Only now does A settle and try to clean up.
-      signingGates[0]({ success: true })
-      aResult = await aPending
-    })
-
-    expect(aResult?.errorType).toBe("superseded")
-
-    // B is still current everywhere: its session was not logged out...
-    expect(global.fetch).not.toHaveBeenCalledWith("/api/auth/logout", expect.anything())
-    // ...its local auth was not overwritten with A's snapshot...
-    expect(authService.storeAuthData).not.toHaveBeenCalledWith(
-      "previous-user",
-      "extension",
-    )
-    expect(authService.clearAuthData).not.toHaveBeenCalled()
-    // ...its profile is still the active one, not the pre-A profile...
-    expect(profileStorage.getActiveProfileId()).toBe(
-      profileStorage.__getProfile(PUBKEY)?.id,
-    )
-    expect(profileStorage.getActiveProfileId()).not.toBe("previous-profile")
-    expect(profileStorage.deleteProfile).not.toHaveBeenCalled()
-    // ...and the provider still reports B's authenticated state.
-    expect(authed()).toBe("true")
-  })
-
-  it("a replacement waits for a superseded attempt's rollback before registering", async () => {
-    // A's rollback hangs inside the logout request; B must not start on top of it.
-    let finishLogout: (v: unknown) => void = () => {}
+  it("serializes session establishment across attempts", async () => {
     const order: string[] = []
-    global.fetch = jest.fn(async (url: string) => {
-      if (String(url).includes("logout")) {
-        order.push("logout:start")
+    let finishA: (v: { success: boolean }) => void = () => {}
+    authService.nip98Login
+      .mockImplementationOnce(() => {
+        order.push("A:login:start")
         return new Promise((r) => {
-          finishLogout = (v) => {
-            order.push("logout:done")
+          finishA = (v) => {
+            order.push("A:login:done")
             r(v)
           }
         })
-      }
-      return { ok: true, status: 200, json: async () => ({}) }
-    }) as unknown as typeof fetch
-
-    let finishSigningA: (v: { success: boolean }) => void = () => {}
-    authService.nip98Login.mockImplementationOnce(
-      () => new Promise((r) => (finishSigningA = r)),
-    )
-
-    await renderProvider()
-    ;(global.fetch as jest.Mock).mockClear()
-
-    let aOwned = true
-    await act(async () => {
-      const aPending = signIn(PUBKEY, { isCurrent: () => aOwned })
-      await new Promise<void>((r) => setTimeout(r, 0))
-      aOwned = false
-      finishSigningA({ success: true }) // A settles → rollback begins, hangs on logout
-      await new Promise<void>((r) => setTimeout(r, 0))
-
-      // B starts while A's cleanup is still in flight.
-      authService.nip98Login.mockImplementation(async () => {
-        order.push("B:signing")
+      })
+      .mockImplementation(async () => {
+        order.push("B:login:start")
         return { success: true }
       })
-      const bPending = signIn(PUBKEY, { isCurrent: () => true })
+
+    await renderProvider()
+
+    await act(async () => {
+      const aPending = signIn(PUBKEY, { isCurrent: () => false }) // A is already retired
       await new Promise<void>((r) => setTimeout(r, 0))
 
-      finishLogout({ ok: true, status: 200, json: async () => ({}) })
+      const bPending = signIn(PUBKEY_B)
+      await new Promise<void>((r) => setTimeout(r, 0))
+
+      finishA({ success: true })
       await Promise.all([aPending, bPending])
     })
 
-    // B's work began only after A's cleanup finished — no interleaving.
-    expect(order).toEqual(["logout:start", "logout:done", "B:signing"])
+    // B's login only started after A's had settled — never interleaved.
+    expect(order).toEqual(["A:login:start", "A:login:done", "B:login:start"])
     expect(authed()).toBe("true")
   })
 
-  /**
-   * HIGH (PR #66 review): the ownership ticket alone left a hole. If A is superseded by B and
-   * then B FAILS, A skips cleanup (no longer latest) while B has nothing of its own to undo —
-   * so A's server session survives under B's local auth. The baseline is therefore captured
-   * once per chain and inherited, and whichever attempt ends the chain unsuccessfully restores
-   * the state from before ALL of them.
-   */
-  const PUBKEY_B = "c".repeat(64)
-
-  it("restores the pre-A baseline when A establishes a session and the replacement B then fails", async () => {
-    // A hangs at signing; B (distinct user) fails its NIP-98 login.
-    const gates: Array<(v: { success: boolean; error?: string }) => void> = []
-    authService.nip98Login.mockImplementation(() => new Promise((r) => gates.push(r)))
-
-    await renderProvider()
-    // The true pre-A baseline: a different user was signed in, with their own active profile.
-    authService.getStoredAuthData.mockReturnValue({
-      publicKey: "baseline-user",
-      method: "extension",
-    })
-    profileStorage.__seedProfile("baseline-user", "baseline-profile")
-    profileStorage.__setActiveId("baseline-profile")
-    ;(global.fetch as jest.Mock).mockClear()
-    authService.storeAuthData.mockClear()
-
-    let aOwned = true
-    await act(async () => {
-      const aPending = signIn(PUBKEY, { isCurrent: () => aOwned })
-      await new Promise<void>((r) => setTimeout(r, 0))
-
-      // A is retired and B starts; A's session is established as it settles.
-      aOwned = false
-      const bPending = signIn(PUBKEY_B, { isCurrent: () => true })
-      await new Promise<void>((r) => setTimeout(r, 0))
-
-      gates[0]({ success: true }) // A's cookie now exists; A defers cleanup to the chain
-      await aPending
-      gates[1]({ success: false, error: "nope" }) // B fails AFTER registering
-      await bPending
-    })
-
-    // The chain ended unsuccessfully, so the session A created is gone...
-    expect(global.fetch).toHaveBeenCalledWith(
-      "/api/auth/logout",
-      expect.objectContaining({ method: "POST" }),
-    )
-    // ...and the true pre-A baseline is restored, not B's or A's registration.
-    expect(authService.storeAuthData).toHaveBeenLastCalledWith(
-      "baseline-user",
-      "extension",
-    )
-    expect(profileStorage.getActiveProfileId()).toBe("baseline-profile")
-    expect(authed()).toBe("false")
-  })
-
-  it("restores the pre-A baseline when the replacement B times out", async () => {
-    const gates: Array<(v: { success: boolean }) => void> = []
-    authService.nip98Login.mockImplementation(() => new Promise((r) => gates.push(r)))
-
-    await renderProvider()
-    authService.getStoredAuthData.mockReturnValue({
-      publicKey: "baseline-user",
-      method: "extension",
-    })
-    profileStorage.__seedProfile("baseline-user", "baseline-profile")
-    profileStorage.__setActiveId("baseline-profile")
-    ;(global.fetch as jest.Mock).mockClear()
-    authService.storeAuthData.mockClear()
-
-    let aOwned = true
-    await act(async () => {
-      const aPending = signIn(PUBKEY, { isCurrent: () => aOwned })
-      await new Promise<void>((r) => setTimeout(r, 0))
-      aOwned = false
-      // B uses a tiny timeout and never resolves its signing, so it throws TIMEOUT.
-      const bPending = signIn(PUBKEY_B, { isCurrent: () => true, timeout: 5 })
-      await new Promise<void>((r) => setTimeout(r, 0))
-      gates[0]({ success: true })
-      await aPending
-      await new Promise<void>((r) => setTimeout(r, 20)) // let B's timeout fire
-      const bResult = await bPending
-      expect(bResult.errorType).toBe("timeout")
-    })
-
-    expect(global.fetch).toHaveBeenCalledWith(
-      "/api/auth/logout",
-      expect.objectContaining({ method: "POST" }),
-    )
-    expect(authService.storeAuthData).toHaveBeenLastCalledWith(
-      "baseline-user",
-      "extension",
-    )
-    expect(profileStorage.getActiveProfileId()).toBe("baseline-profile")
-  })
-
-  /**
-   * MEDIUM (PR #66 review): rollback must restore the COMPLETE prior profile state — deleting a
-   * profile this attempt created is a separate obligation from restoring the pointer, and a
-   * pre-existing profile must be left intact with its metadata unchanged.
-   */
-  it("deletes an attempt-created profile AND restores the previous pointer", async () => {
-    // Signing succeeds so the profile is created and activated; ownership is then lost during
-    // the SYNC, which is the window where a created profile actually exists.
-    let finishSync: (v: unknown) => void = () => {}
-    global.fetch = jest.fn(async (url: string) => {
-      if (String(url).includes("nostr-blink-account")) {
-        return new Promise((r) => (finishSync = r))
-      }
-      return { ok: true, status: 200, json: async () => ({}) }
-    }) as unknown as typeof fetch
-
-    await renderProvider()
-    // Another profile is active, and this pubkey has NO profile yet.
-    profileStorage.__seedProfile("other-user", "other-profile")
-    profileStorage.__setActiveId("other-profile")
-
-    let owned = true
-    await act(async () => {
-      const pending = signIn(PUBKEY, { isCurrent: () => owned })
-      await new Promise<void>((r) => setTimeout(r, 0))
-      owned = false
-      finishSync({ ok: true, status: 200, json: async () => ({}) })
-      await pending
-    })
-
-    // The created profile is gone (not merely deactivated) AND the pointer is back.
-    expect(profileStorage.__getProfile(PUBKEY)).toBeNull()
-    expect(profileStorage.deleteProfile).toHaveBeenCalled()
-    expect(profileStorage.getActiveProfileId()).toBe("other-profile")
-  })
-
-  it("keeps a pre-existing profile, restores its metadata, and clears a null pointer", async () => {
-    // Ownership is lost during the SYNC, so createProfile has already stamped the existing
-    // profile — which is exactly the mutation the restore has to undo. Superseding earlier
-    // would make this pass trivially.
-    let finishSync: (v: unknown) => void = () => {}
-    global.fetch = jest.fn(async (url: string) => {
-      if (String(url).includes("nostr-blink-account")) {
-        return new Promise((r) => (finishSync = r))
-      }
-      return { ok: true, status: 200, json: async () => ({}) }
-    }) as unknown as typeof fetch
-
-    await renderProvider()
-    // This pubkey already has a profile, and NOTHING is active.
-    profileStorage.__seedProfile(PUBKEY, "existing-profile", {
-      lastLogin: 111,
-      signInMethod: "extension",
-    })
-    profileStorage.__setActiveId(null)
-
-    let owned = true
-    await act(async () => {
-      const pending = signIn(PUBKEY, { isCurrent: () => owned })
-      await new Promise<void>((r) => setTimeout(r, 0))
-      owned = false
-      finishSync({ ok: true, status: 200, json: async () => ({}) })
-      await pending
-    })
-
-    // The user's own profile survives, with the metadata createProfile stamped put back...
-    const profile = profileStorage.__getProfile(PUBKEY)
-    expect(profile?.id).toBe("existing-profile")
-    expect(profile?.lastLogin).toBe(111)
-    expect(profile?.signInMethod).toBe("extension")
-    expect(profileStorage.deleteProfile).not.toHaveBeenCalled()
-    // ...and "nothing was active" is restored rather than leaving the retired attempt active.
-    expect(profileStorage.getActiveProfileId()).toBeNull()
-  })
-
-  it("still completes normally while the attempt is still owned", async () => {
+  it("completes normally and publishes state when it owns the flow", async () => {
     await renderProvider()
 
     let result: { success: boolean } | undefined
@@ -616,6 +390,27 @@ describe("useNostrAuth — signInWithNostrConnect ownership (PR #66)", () => {
 
     expect(result?.success).toBe(true)
     expect(authed()).toBe("true")
+    expect(authService.signInWithNostrConnect).toHaveBeenCalledWith(PUBKEY)
+    expect(profileStorage.getActiveProfileId()).toBe(
+      profileStorage.__getProfile(PUBKEY)?.id,
+    )
+  })
+
+  it("signs with an explicit method so nothing is registered before the session exists", async () => {
+    await renderProvider()
+    await act(async () => {
+      await signIn(PUBKEY)
+      await new Promise<void>((r) => setTimeout(r, 0))
+    })
+
+    // The signing dispatch is told the method explicitly rather than reading it back out of
+    // storage, which is what lets registration happen after the ownership gate.
+    expect(authService.nip98Login).toHaveBeenCalledWith({
+      signWithMethod: "nostrConnect",
+    })
+    const loginOrder = authService.nip98Login.mock.invocationCallOrder[0]
+    const registerOrder = authService.signInWithNostrConnect.mock.invocationCallOrder[0]
+    expect(loginOrder).toBeLessThan(registerOrder)
   })
 
   it("defaults to owned when the caller passes no ownership check", async () => {

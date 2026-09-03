@@ -1062,8 +1062,19 @@ class NostrAuthService {
    * @returns {Promise<SignedEvent>}
    * @throws {Error} If using external signer (will redirect) or if session key not available
    */
-  static async signEvent(event: UnsignedEvent): Promise<SignedEvent> {
-    const method = this.getCurrentMethod()
+  /**
+   * Sign an event with the caller's sign-in method.
+   *
+   * `methodOverride` lets a sign-in flow sign BEFORE it has registered itself as the current
+   * user. Without it, the stored auth data has to be written first purely so this dispatch can
+   * read it back, which forces a flow to mutate shared state before it knows it will succeed
+   * (PR #66 review). Omitting it preserves the previous behavior exactly.
+   */
+  static async signEvent(
+    event: UnsignedEvent,
+    methodOverride?: string,
+  ): Promise<SignedEvent> {
+    const method = methodOverride ?? this.getCurrentMethod()
 
     if (!method) {
       throw new Error("Not authenticated. Please sign in first.")
@@ -1258,6 +1269,7 @@ class NostrAuthService {
   static async createAuthEvent(
     url: string,
     method: string = "GET",
+    signWithMethod?: string,
   ): Promise<SignedEvent> {
     const event: UnsignedEvent = {
       kind: 27235, // NIP-98 HTTP Auth
@@ -1269,7 +1281,7 @@ class NostrAuthService {
       content: "",
     }
 
-    return this.signEvent(event)
+    return this.signEvent(event, signWithMethod)
   }
 
   /**
@@ -1478,10 +1490,13 @@ class NostrAuthService {
    *
    * @returns {Promise<Nip98LoginResult>}
    */
-  static async nip98Login(): Promise<Nip98LoginResult> {
+  static async nip98Login(opts?: { signWithMethod?: string }): Promise<Nip98LoginResult> {
     logAuth("NostrAuthService", "nip98Login called")
 
-    if (!this.isAuthenticated()) {
+    // With an explicit signing method the caller has not registered itself yet — deliberately,
+    // so it does not mutate shared auth state before it knows this succeeds (PR #66 review).
+    // Without one, the stored auth data is still the source of truth.
+    if (!opts?.signWithMethod && !this.isAuthenticated()) {
       logAuth("NostrAuthService", "Not authenticated - cannot do NIP-98 login")
       return { success: false, error: "Not signed in with Nostr" }
     }
@@ -1492,7 +1507,11 @@ class NostrAuthService {
       logAuth("NostrAuthService", "Creating auth event for URL:", loginUrl)
 
       // Create and sign NIP-98 event
-      const signedEvent = await this.createAuthEvent(loginUrl, "POST")
+      const signedEvent = await this.createAuthEvent(
+        loginUrl,
+        "POST",
+        opts?.signWithMethod,
+      )
       logAuth("NostrAuthService", "Signed event created:", signedEvent ? "yes" : "no")
 
       if (!signedEvent) {
