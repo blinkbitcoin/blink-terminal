@@ -108,21 +108,54 @@ function acquireSessionMutex(signal: AbortSignal): Promise<() => void> {
   })
 }
 
-/** Ceiling on the compensating logout, so a hung request cannot hold the mutex slot. */
-const LOGOUT_CEILING_MS = 5000
+/**
+ * Ceiling on the compensating logout, so a hung request cannot hold the mutex slot for long.
+ *
+ * Deliberately short: the successor is chained to this attempt's release, so this is time a
+ * replacement sign-in spends waiting. Giving up on the logout only means the abandoned session
+ * lives until the next successful login overwrites the cookie, which is strictly better than
+ * blocking the user's retry (PR #69 review).
+ */
+const LOGOUT_CEILING_MS = 1500
+
+/** How long a login may keep running after its abort before the transaction abandons it. */
+const GRACE_AFTER_ABORT_MS = 250
 
 /**
- * Give up a session this attempt created. Bounded: the logout races the transaction's signal
- * AND a fixed ceiling, so a never-settling request cannot hold the mutex slot open and wedge
- * the successor. The successor is chained to THIS attempt's release, so it cannot log in
- * before this logout has either completed or been cut off — the shared cookie is never
- * mutated by two attempts at once (PR #66 review).
+ * Give up a session this attempt created. Bounded by a fixed ceiling ONLY, so a never-settling
+ * request cannot hold the mutex slot open and wedge the successor.
+ *
+ * Deliberately NOT cancelled by the transaction's own signal: this compensation exists
+ * precisely because the attempt was cancelled, so wiring the cancellation into it would abort
+ * the cleanup at exactly the moment it is needed and leave the session alive (PR #69 review).
+ * The successor is chained to THIS attempt's release, so it cannot log in before this logout
+ * has completed or hit the ceiling — the shared cookie is never mutated by two attempts at
+ * once.
  */
-async function discardSession(signal: AbortSignal): Promise<void> {
+/**
+ * Rejects only if the login is still running GRACE_AFTER_ABORT_MS after cancellation.
+ *
+ * This is a liveness backstop for a login that ignores its signal, not a cancellation path: it
+ * cannot fire before the abort, and a login that settles promptly after being aborted always
+ * wins the race. That ordering is what keeps a session established at header receipt from being
+ * abandoned without compensation (PR #69 review).
+ */
+function abandonAfterGrace(signal: AbortSignal): Promise<never> {
+  return new Promise((_, reject) => {
+    const arm = (): void => {
+      setTimeout(
+        () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+        GRACE_AFTER_ABORT_MS,
+      )
+    }
+    if (signal.aborted) arm()
+    else signal.addEventListener("abort", arm, { once: true })
+  })
+}
+
+async function discardSession(): Promise<void> {
   const ceiling = new AbortController()
   const timer = setTimeout(() => ceiling.abort(), LOGOUT_CEILING_MS)
-  const onOuterAbort = (): void => ceiling.abort()
-  signal.addEventListener("abort", onOuterAbort)
   try {
     await fetch("/api/auth/logout", {
       method: "POST",
@@ -133,7 +166,6 @@ async function discardSession(signal: AbortSignal): Promise<void> {
     // best-effort: the session is abandoned regardless
   } finally {
     clearTimeout(timer)
-    signal.removeEventListener("abort", onOuterAbort)
   }
 }
 
@@ -188,35 +220,44 @@ export async function runNostrConnectSignIn(
     return aborted("superseded")
   }
 
-  // The transaction resolves on abort even if the underlying request never settles — an
-  // aborted-but-stuck login must not hold this attempt open forever (PR #66 review).
-  const onAbort = new Promise<never>((_, reject) => {
-    controller.signal.addEventListener("abort", () =>
-      reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
-    )
-  })
-
   try {
     onProgress?.("signing", "Signing authentication event...")
 
-    // Sign and establish the server session, both abortable via the transaction's signal.
+    // nip98Login is given the signal and is expected to settle on abort — it aborts its own
+    // fetch, and reports a post-header abort as ESTABLISHED so the session it created can be
+    // discarded below. It is NOT raced against a bare abort promise: racing meant an abort
+    // landing while the response body was being read won the race and returned cancelled,
+    // skipping compensation for a session the server had already committed with its headers
+    // (PR #69 review).
+    //
+    // A grace race is still needed for liveness, because a login that ignores its signal would
+    // otherwise hold this transaction — and the mutex slot — forever. The grace period starts
+    // only once the abort has fired, so a login that settles promptly (including one reporting
+    // an established session) always wins and its session is always compensated.
     const sessionResult: Awaited<ReturnType<typeof NostrAuthService.nip98Login>> =
       await Promise.race([
         NostrAuthService.nip98Login({
           signWithMethod: "nostrConnect",
           signal: controller.signal,
         }),
-        onAbort,
+        abandonAfterGrace(controller.signal),
       ])
 
-    if (controller.signal.aborted) {
-      return aborted(cause)
-    }
+    // NOTE: deliberately no `if (signal.aborted) return` here. "The caller gave up" and "no
+    // session exists" are different questions, and only the login can answer the second. An
+    // aborted attempt whose login still established a session must fall through to the
+    // ownership gate so that session is discarded (PR #69 review).
     if (!sessionResult.success) {
+      // A login that reports "superseded" was cancelled BEFORE it created a session, so there
+      // is nothing to compensate. The transaction reports its OWN cause, so a deadline still
+      // surfaces as "timeout" rather than being flattened into "superseded".
+      if (sessionResult.errorType === "superseded" || controller.signal.aborted) {
+        return aborted(cause)
+      }
       return {
         success: false,
         error: sessionResult.error || "Failed to establish session",
-        errorType: sessionResult.errorType === "superseded" ? "superseded" : "session",
+        errorType: "session",
       }
     }
 
@@ -224,9 +265,11 @@ export async function runNostrConnectSignIn(
     // the flow, give the session up; because establishment is serialised and the successor is
     // chained to THIS slot's release, no replacement has a session of its own for this to
     // destroy, and none can log in until this logout has completed or been cut off.
-    if (!stillOwned()) {
-      await discardSession(controller.signal)
-      return aborted("superseded")
+    if (!stillOwned() || controller.signal.aborted) {
+      await discardSession()
+      // A deadline does not flip the caller's isCurrent(), so the cause is what distinguishes a
+      // timeout from a supersession here.
+      return aborted(controller.signal.aborted ? cause : "superseded")
     }
 
     // Commit. Synchronous and inside the mutex. FAIL-CLOSED rather than snapshot-and-restore:
@@ -237,7 +280,7 @@ export async function runNostrConnectSignIn(
     // profile without auth data (PR #66 review).
     // Validate before touching storage, so an invalid key never creates a profile.
     if (!publicKey || publicKey.length !== 64 || !/^[0-9a-f]{64}$/i.test(publicKey)) {
-      await discardSession(controller.signal)
+      await discardSession()
       return { success: false, error: "Invalid public key" }
     }
 
@@ -260,7 +303,7 @@ export async function runNostrConnectSignIn(
       } catch {
         // storage is already failing; the session discard below is what matters
       }
-      await discardSession(controller.signal)
+      await discardSession()
       return {
         success: false,
         error:

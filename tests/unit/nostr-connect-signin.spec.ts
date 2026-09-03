@@ -168,19 +168,22 @@ describe("runNostrConnectSignIn (issue #67)", () => {
 
     let aOwned = true
     let bOwned = true
-    const a = runNostrConnectSignIn(PUBKEY, { timeout: 1000, isCurrent: () => aOwned })
-    const b = runNostrConnectSignIn(PUBKEY_B, { timeout: 1000, isCurrent: () => bOwned })
+    const a = runNostrConnectSignIn(PUBKEY, { timeout: 5000, isCurrent: () => aOwned })
+    const b = runNostrConnectSignIn(PUBKEY_B, { timeout: 5000, isCurrent: () => bOwned })
     await new Promise((r) => setTimeout(r, 0))
 
-    // B is superseded while still queued behind A.
+    // B is superseded while still queued behind A. A polled predicate cannot wake a queued
+    // waiter, so B discovers this when its turn comes — the point is that it then leaves
+    // WITHOUT logging in, so no second session is ever created.
     bOwned = false
-    const bResult = await b
-    expect(bResult.errorType).toBe("superseded")
-    expect(authService.nip98Login).toHaveBeenCalledTimes(1) // B never logged in
 
+    // Release A so B gets its turn.
     aOwned = false
     finishA({ success: true })
-    await a
+    const [, bResult] = await Promise.all([a, b])
+
+    expect(bResult.errorType).toBe("superseded")
+    expect(authService.nip98Login).toHaveBeenCalledTimes(1) // B never logged in
   })
 
   it("rejects an invalid key before touching storage, and discards the session", async () => {
@@ -321,7 +324,9 @@ describe("runNostrConnectSignIn (issue #67)", () => {
     finishLogin({ success: true })
     const [aResult, bResult] = await Promise.all([a, b])
 
-    expect(aResult.errorType).toBe("superseded")
+    // A's deadline is what ends it, so it reports timeout; the point of this test is the
+    // ORDER below — that the successor cannot log in while A's logout is still live.
+    expect(aResult.errorType).toBe("timeout")
     expect(bResult.success).toBe(true)
     // B's login happened only AFTER A's logout was cut off — never while it was live.
     expect(order).toEqual(["A:login", "A:logout:start", "A:logout:cut", "B:login"])
@@ -401,6 +406,96 @@ describe("runNostrConnectSignIn (issue #67)", () => {
     expect(authService.signInWithNostrConnect).not.toHaveBeenCalled()
   })
 
+  /**
+   * HIGH (PR #69 review): the previous regression mocked nip98Login as already-successful and
+   * only flipped isCurrent — it never drove the actual abort signal through the body window.
+   * The reviewer's probe did, and observed ZERO logout calls. This drives the real signal: the
+   * login resolves ESTABLISHED from the abort event (headers arrived, body read cancelled), and
+   * the transaction must still compensate.
+   */
+  it("compensates when the abort signal itself fires during body consumption", async () => {
+    const order: string[] = []
+    // Established at header receipt, reported only once the signal aborts — exactly what the
+    // service now does when the body read is cancelled after the cookie was committed.
+    authService.nip98Login.mockImplementationOnce(
+      (opts: { signal?: AbortSignal }) =>
+        new Promise((resolve) => {
+          opts.signal?.addEventListener("abort", () => {
+            order.push("A:login:established-after-abort")
+            resolve({ success: true })
+          })
+        }),
+    )
+    global.fetch = jest.fn(async (url: string) => {
+      if (String(url).includes("logout")) order.push("A:logout")
+      return { ok: true, status: 200, json: async () => ({}) }
+    }) as unknown as typeof fetch
+
+    const abort = new AbortController()
+    const pending = runNostrConnectSignIn(PUBKEY, { timeout: 5000, signal: abort.signal })
+    await new Promise((r) => setTimeout(r, 0))
+    abort.abort() // retired while the response body was being read
+    const result = await pending
+
+    expect(result.success).toBe(false)
+    expect(result.errorType).toBe("superseded")
+    // The session the server committed is discarded — the failure this PR exists to close.
+    expect(order).toEqual(["A:login:established-after-abort", "A:logout"])
+    expect(authService.signInWithNostrConnect).not.toHaveBeenCalled()
+  })
+
+  it("compensates the same way when the DEADLINE fires during body consumption", async () => {
+    const order: string[] = []
+    authService.nip98Login.mockImplementationOnce(
+      (opts: { signal?: AbortSignal }) =>
+        new Promise((resolve) => {
+          opts.signal?.addEventListener("abort", () => {
+            order.push("A:login:established-after-abort")
+            resolve({ success: true })
+          })
+        }),
+    )
+    global.fetch = jest.fn(async (url: string) => {
+      if (String(url).includes("logout")) order.push("A:logout")
+      return { ok: true, status: 200, json: async () => ({}) }
+    }) as unknown as typeof fetch
+
+    // No isCurrent change: a deadline does not flip caller ownership, so only the gate's
+    // abort check catches this. Reports "timeout", and still compensates.
+    const result = await runNostrConnectSignIn(PUBKEY, { timeout: 10 })
+
+    expect(result.errorType).toBe("timeout")
+    expect(order).toEqual(["A:login:established-after-abort", "A:logout"])
+    expect(authService.signInWithNostrConnect).not.toHaveBeenCalled()
+  })
+
+  it("does NOT log out when the abort happened before any session existed", async () => {
+    const order: string[] = []
+    // Cancelled BEFORE the headers: the service reports superseded, no session was created.
+    authService.nip98Login.mockImplementationOnce(
+      (opts: { signal?: AbortSignal }) =>
+        new Promise((resolve) => {
+          opts.signal?.addEventListener("abort", () =>
+            resolve({ success: false, error: "Aborted", errorType: "superseded" }),
+          )
+        }),
+    )
+    global.fetch = jest.fn(async (url: string) => {
+      if (String(url).includes("logout")) order.push("A:logout")
+      return { ok: true, status: 200, json: async () => ({}) }
+    }) as unknown as typeof fetch
+
+    const abort = new AbortController()
+    const pending = runNostrConnectSignIn(PUBKEY, { timeout: 5000, signal: abort.signal })
+    await new Promise((r) => setTimeout(r, 0))
+    abort.abort()
+    const result = await pending
+
+    expect(result.errorType).toBe("superseded")
+    // No session was created, so there is nothing to compensate — no spurious logout.
+    expect(order).toEqual([])
+  })
+
   it("a successor cannot log in until that compensation has settled", async () => {
     const order: string[] = []
     let finishLogout: (v: unknown) => void = () => {}
@@ -462,7 +557,9 @@ describe("runNostrConnectSignIn (issue #67)", () => {
 
     const a = runNostrConnectSignIn(PUBKEY, { timeout: 10 })
     const started = Date.now()
-    const bResult = await runNostrConnectSignIn(PUBKEY_B, { timeout: 200 })
+    // B's budget must exceed A's deadline plus the post-abort grace during which A's ignored
+    // login is still being waited on; otherwise B legitimately times out in the queue.
+    const bResult = await runNostrConnectSignIn(PUBKEY_B, { timeout: 2000 })
     const aResult = await a // A times out (10ms), releasing the slot for B
 
     expect(aResult.errorType).toBe("timeout")
