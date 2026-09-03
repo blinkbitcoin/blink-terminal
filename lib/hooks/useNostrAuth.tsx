@@ -28,13 +28,14 @@ import NostrAuthService, {
   type EncryptedNsecData,
 } from "../nostr/NostrAuthService"
 import { type ConnectionResult } from "../nostr/NostrConnectService"
+import { runNostrConnectSignIn } from "../nostr/NostrConnectSignIn"
 import NostrProfileService, { type NostrProfile } from "../nostr/NostrProfileService"
 import CryptoUtils, { type EncryptedData } from "../storage/CryptoUtils"
 import ProfileStorage, {
   type StoredProfile,
   type StoredBlinkAccount,
 } from "../storage/ProfileStorage"
-import { AUTH_VERSION_FULL, logAuth, logAuthError, logAuthWarn } from "../version"
+import { AUTH_VERSION_FULL, logAuth, logAuthWarn } from "../version"
 
 // ============= Helper Types =============
 
@@ -87,8 +88,20 @@ export interface NostrAuthState {
 }
 
 interface NostrConnectSignInOptions {
-  onProgress?: (stage: string, message: string) => void
+  onProgress?: (stage: string, message?: string) => void
   timeout?: number
+  /**
+   * Ownership check for the caller's attempt. Returns false once this sign-in has been
+   * cancelled or superseded (e.g. a bfcache discard retired it).
+   *
+   * The caller suppressing its OWN continuation is not enough: this operation publishes durable
+   * state of its own — profile activation, server-account sync, and the provider's
+   * authenticated state — after awaiting the network. Without this check a stale request could
+   * authenticate the app through a transport that is already gone (PR #66 review).
+   */
+  isCurrent?: () => boolean
+  /** External cancellation, forwarded to the sign-in transaction. */
+  signal?: AbortSignal
 }
 
 export interface NostrAuthContextValue extends NostrAuthState {
@@ -210,7 +223,10 @@ export function NostrAuthProvider({
    * Fetch Nostr profile metadata from relays
    */
   const fetchNostrProfile = useCallback(
-    async (publicKey: string): Promise<NostrProfile | null> => {
+    async (
+      publicKey: string,
+      isCurrent?: () => boolean,
+    ): Promise<NostrProfile | null> => {
       if (!publicKey) return null
 
       try {
@@ -222,6 +238,15 @@ export function NostrAuthProvider({
           await NostrProfileService.fetchProfile(publicKey)
 
         if (nostrProfile) {
+          // Recheck ownership AFTER the await: a caller that started this fetch while current
+          // may have been superseded by the time the relay responds, and publishing its metadata
+          // would overwrite a replacement's identity (PR #66 review).
+          if (isCurrent && !isCurrent()) {
+            console.warn(
+              "[useNostrAuth] Profile fetch superseded — not publishing metadata",
+            )
+            return nostrProfile
+          }
           console.log(
             "[useNostrAuth] ✓ Fetched Nostr profile:",
             nostrProfile.display_name || nostrProfile.name || "No name",
@@ -275,104 +300,123 @@ export function NostrAuthProvider({
    * Sync Blink account from server (for cross-device consistency)
    * Called after NIP-98 session is established
    */
-  const syncBlinkAccountFromServer = useCallback(async (): Promise<SyncResult> => {
-    try {
-      const response: Response = await fetch("/api/auth/nostr-blink-account", {
-        method: "GET",
-        credentials: "include",
-      })
-
-      if (!response.ok) {
-        console.log("No server Blink account to sync")
-        return { synced: false }
-      }
-
-      const data: BlinkAccountSyncResponse = await response.json()
-
-      if (data.hasAccount && data.blinkUsername && data.apiKey) {
-        console.log("[useNostrAuth] Found Blink account on server:", data.blinkUsername)
-
-        // Get current profile - reload from storage to avoid stale closure
-        const activeProfileId = ProfileStorage.getActiveProfileId()
-        const currentProfile: StoredProfile | null = activeProfileId
-          ? ProfileStorage.getProfileById(activeProfileId)
-          : state.profile
-
-        if (!currentProfile) {
-          console.warn("[useNostrAuth] No local profile found for sync")
-          return { synced: false, error: "No local profile" }
-        }
-
-        console.log(
-          "[useNostrAuth] Current profile has",
-          currentProfile.blinkAccounts?.length || 0,
-          "accounts",
-        )
-
-        // Check if we already have this account locally
-        const existingAccount = currentProfile.blinkAccounts.find(
-          (a) => a.username === data.blinkUsername,
-        )
-
-        if (existingAccount) {
-          console.log("[useNostrAuth] Blink account already exists locally")
-          return { synced: false, alreadyExists: true }
-        }
-
-        // Add the server account to local profile WITH the API key
-        // Encrypt the API key before storing locally
-        const encryptedApiKey: EncryptedData = await CryptoUtils.encryptWithDeviceKey(
-          data.apiKey,
-        )
-        const serverAccount: StoredBlinkAccount = {
-          id: `server-${Date.now()}`,
-          label: data.accountLabel || data.blinkUsername, // Use stored label if available
-          username: data.blinkUsername,
-          apiKey: encryptedApiKey, // Encrypted for local storage
-          defaultCurrency: data.preferredCurrency || "BTC",
-          isActive: currentProfile.blinkAccounts.length === 0, // Make active if no other accounts
-          createdAt: Date.now(),
-          lastUsed: null,
-        }
-
-        // Update local profile
-        console.log("[useNostrAuth] Adding synced account to local profile...")
-        const updatedAccounts: StoredBlinkAccount[] = [
-          ...currentProfile.blinkAccounts,
-          serverAccount,
-        ]
-        const updatedProfile: StoredProfile = {
-          ...currentProfile,
-          blinkAccounts: updatedAccounts,
-        }
-
-        ProfileStorage.updateProfile(updatedProfile)
-
-        // Update state
-        const activeBlinkAccount: StoredBlinkAccount | null = serverAccount.isActive
-          ? serverAccount
-          : updatedAccounts.find((a) => a.isActive) || null
-
-        console.log("[useNostrAuth] ✓ Synced Blink account from server (NIP-98)")
-
-        updateState({
-          profile: updatedProfile,
-          activeBlinkAccount,
+  const syncBlinkAccountFromServer = useCallback(
+    async (opts?: { isCurrent?: () => boolean }): Promise<SyncResult> => {
+      // Optional ownership check for callers that can be superseded mid-flight. This function
+      // awaits the network and then WRITES to profile storage and provider state, so a caller
+      // that only checks afterwards would already have committed (PR #66 review).
+      const stillOwned = (): boolean => opts?.isCurrent?.() ?? true
+      try {
+        const response: Response = await fetch("/api/auth/nostr-blink-account", {
+          method: "GET",
+          credentials: "include",
         })
 
-        console.log("[useNostrAuth] ✓ Synced Blink account from server")
-        return { synced: true, account: serverAccount }
-      } else if (data.hasAccount && !data.apiKey) {
-        console.warn("[useNostrAuth] Server has account but no API key returned")
-      }
+        if (!response.ok) {
+          console.log("No server Blink account to sync")
+          return { synced: false }
+        }
 
-      return { synced: false }
-    } catch (error: unknown) {
-      const err = error as Error
-      console.error("[useNostrAuth] Failed to sync Blink account from server:", error)
-      return { synced: false, error: err.message }
-    }
-  }, [state.profile, updateState])
+        const data: BlinkAccountSyncResponse = await response.json()
+
+        // Ownership can be lost across the two awaits above; everything below mutates.
+        if (!stillOwned()) {
+          console.warn("[useNostrAuth] Sync superseded — committing nothing")
+          return { synced: false, error: "Superseded" }
+        }
+
+        if (data.hasAccount && data.blinkUsername && data.apiKey) {
+          console.log("[useNostrAuth] Found Blink account on server:", data.blinkUsername)
+
+          // Get current profile - reload from storage to avoid stale closure
+          const activeProfileId = ProfileStorage.getActiveProfileId()
+          const currentProfile: StoredProfile | null = activeProfileId
+            ? ProfileStorage.getProfileById(activeProfileId)
+            : state.profile
+
+          if (!currentProfile) {
+            console.warn("[useNostrAuth] No local profile found for sync")
+            return { synced: false, error: "No local profile" }
+          }
+
+          console.log(
+            "[useNostrAuth] Current profile has",
+            currentProfile.blinkAccounts?.length || 0,
+            "accounts",
+          )
+
+          // Check if we already have this account locally
+          const existingAccount = currentProfile.blinkAccounts.find(
+            (a) => a.username === data.blinkUsername,
+          )
+
+          if (existingAccount) {
+            console.log("[useNostrAuth] Blink account already exists locally")
+            return { synced: false, alreadyExists: true }
+          }
+
+          // Add the server account to local profile WITH the API key
+          // Encrypt the API key before storing locally
+          const encryptedApiKey: EncryptedData = await CryptoUtils.encryptWithDeviceKey(
+            data.apiKey,
+          )
+          const serverAccount: StoredBlinkAccount = {
+            id: `server-${Date.now()}`,
+            label: data.accountLabel || data.blinkUsername, // Use stored label if available
+            username: data.blinkUsername,
+            apiKey: encryptedApiKey, // Encrypted for local storage
+            defaultCurrency: data.preferredCurrency || "BTC",
+            isActive: currentProfile.blinkAccounts.length === 0, // Make active if no other accounts
+            createdAt: Date.now(),
+            lastUsed: null,
+          }
+
+          // Final check immediately before the write: the key encryption above is another await.
+          if (!stillOwned()) {
+            console.warn("[useNostrAuth] Sync superseded before commit — writing nothing")
+            return { synced: false, error: "Superseded" }
+          }
+
+          // Update local profile
+          console.log("[useNostrAuth] Adding synced account to local profile...")
+          const updatedAccounts: StoredBlinkAccount[] = [
+            ...currentProfile.blinkAccounts,
+            serverAccount,
+          ]
+          const updatedProfile: StoredProfile = {
+            ...currentProfile,
+            blinkAccounts: updatedAccounts,
+          }
+
+          ProfileStorage.updateProfile(updatedProfile)
+
+          // Update state
+          const activeBlinkAccount: StoredBlinkAccount | null = serverAccount.isActive
+            ? serverAccount
+            : updatedAccounts.find((a) => a.isActive) || null
+
+          console.log("[useNostrAuth] ✓ Synced Blink account from server (NIP-98)")
+
+          updateState({
+            profile: updatedProfile,
+            activeBlinkAccount,
+          })
+
+          console.log("[useNostrAuth] ✓ Synced Blink account from server")
+          return { synced: true, account: serverAccount }
+        } else if (data.hasAccount && !data.apiKey) {
+          console.warn("[useNostrAuth] Server has account but no API key returned")
+        }
+
+        return { synced: false }
+      } catch (error: unknown) {
+        const err = error as Error
+        console.error("[useNostrAuth] Failed to sync Blink account from server:", error)
+        return { synced: false, error: err.message }
+      }
+    },
+    [state.profile, updateState],
+  )
 
   /**
    * Check authentication status on mount
@@ -684,10 +728,20 @@ export function NostrAuthProvider({
                 // Dynamic import to avoid circular dependency
                 const NostrConnectServiceModule = (
                   await import("../nostr/NostrConnectService")
-                ).default as { restoreSession: () => Promise<ConnectionResult> }
+                ).default as {
+                  restoreSession: (opts?: {
+                    expectedPublicKey?: string
+                  }) => Promise<ConnectionResult>
+                }
 
+                // Bind the restore to the user this session belongs to. Without it, a stale
+                // record for a DIFFERENT user (possible when a previous session write and its
+                // fallback removal both failed) would be restored here and authenticated as
+                // that other user (PR #66 review).
                 const restoreResult: ConnectionResult =
-                  await NostrConnectServiceModule.restoreSession()
+                  await NostrConnectServiceModule.restoreSession({
+                    expectedPublicKey: publicKey,
+                  })
 
                 if (!restoreResult.success) {
                   console.warn(
@@ -1576,7 +1630,7 @@ export function NostrAuthProvider({
       publicKey: string,
       options: NostrConnectSignInOptions = {},
     ): Promise<AuthActionResult> => {
-      const { onProgress, timeout = 30000 } = options
+      const { onProgress, timeout = 30000, isCurrent, signal } = options
 
       logAuth(
         "useNostrAuth",
@@ -1585,93 +1639,68 @@ export function NostrAuthProvider({
       )
       // Note: Don't set loading state here - modal handles its own UI
 
-      try {
-        // Step 1: Register with NostrAuthService (local state only)
-        const result: AuthResult = NostrAuthService.signInWithNostrConnect(publicKey)
+      // The whole lifecycle — serialization, signing, session establishment, ownership, and the
+      // durable commit — is owned by a single transaction unit (issue #67). This wrapper only
+      // translates the result into provider state, so the concurrency and cancellation
+      // invariants live in one tested place rather than being re-derived here (PR #66 review).
+      const result = await runNostrConnectSignIn(publicKey, {
+        timeout,
+        isCurrent,
+        signal,
+        onProgress,
+      })
 
-        if (!result.success) {
-          return { success: false, error: result.error }
-        }
-
-        // Step 2: Create profile (local storage)
-        const profile: StoredProfile = ProfileStorage.createProfile(
-          publicKey,
-          "nostrConnect",
-        )
-        ProfileStorage.setActiveProfile(profile.id)
-        const activeBlinkAccount: StoredBlinkAccount | null =
-          profile.blinkAccounts.find((a) => a.isActive) || null
-
-        // Step 3: NIP-98 login (this is the slow part - relay signing)
-        logAuth("useNostrAuth", "Starting NIP-98 login (blocking)...")
-        onProgress?.("signing", "Signing authentication event...")
-
-        const sessionResult: Nip98LoginResult = await Promise.race([
-          NostrAuthService.nip98Login(),
-          new Promise<never>(
-            (_: (value: never) => void, reject: (reason: Error) => void) =>
-              setTimeout(() => reject(new Error("TIMEOUT")), timeout),
-          ),
-        ])
-
-        if (!sessionResult.success) {
-          logAuthWarn("useNostrAuth", "NIP-98 login failed:", sessionResult.error)
-          return {
-            success: false,
-            error: sessionResult.error || "Failed to establish session",
-            errorType: "session",
-          }
-        }
-
-        logAuth("useNostrAuth", "Server session established")
-
-        // Step 4: Sync data from server
-        logAuth("useNostrAuth", "Syncing data from server...")
-        onProgress?.("syncing", "Loading your data...")
-
-        try {
-          const syncResult = await syncBlinkAccountFromServer()
-          logAuth("useNostrAuth", "Sync result:", syncResult)
-        } catch (syncError: unknown) {
-          // Soft failure - don't block sign-in for sync issues
-          logAuthWarn("useNostrAuth", "Sync failed (non-blocking):", syncError)
-        }
-
-        // Step 5: NOW set authenticated state (after session is established)
-        logAuth("useNostrAuth", "Setting authenticated state...")
-        updateState({
-          loading: false,
-          isAuthenticated: true,
-          publicKey: publicKey.toLowerCase(),
-          method: "nostrConnect",
-          profile,
-          activeBlinkAccount,
-          hasServerSession: true,
-          nostrProfile: null,
-          error: null,
-        })
-
-        // Fetch Nostr profile metadata in background (non-blocking)
-        fetchNostrProfile(publicKey)
-
-        onProgress?.("complete", "Done!")
-        logAuth("useNostrAuth", "Nostr Connect sign-in complete")
-        return { success: true, profile, publicKey }
-      } catch (error: unknown) {
-        const err = error as Error
-        logAuthError("useNostrAuth", "Nostr Connect sign-in failed:", error)
-
-        // Handle timeout specifically
-        if (err.message === "TIMEOUT") {
+      if (!result.success) {
+        if (result.errorType === "timeout") {
           return {
             success: false,
             error: "Signing timed out. Make sure Amber is open and approve the request.",
             errorType: "timeout",
           }
         }
-
-        return { success: false, error: err.message, errorType: "unknown" }
+        if (result.errorType === "superseded") {
+          return { success: false, error: "Superseded", errorType: "superseded" }
+        }
+        if (result.errorType === "session") {
+          return {
+            success: false,
+            error: result.error || "Failed to establish session",
+            errorType: "session",
+          }
+        }
+        return { success: false, error: result.error, errorType: "unknown" }
       }
+
+      // Committed by the transaction inside the mutex; publish to provider state.
+      updateState({
+        loading: false,
+        isAuthenticated: true,
+        publicKey: result.publicKey!.toLowerCase(),
+        method: "nostrConnect",
+        profile: result.profile!,
+        activeBlinkAccount: result.activeBlinkAccount ?? null,
+        hasServerSession: true,
+        nostrProfile: null,
+        error: null,
+      })
+
+      // Fetch Nostr profile metadata in background (non-blocking), still ownership-gated so a
+      // stale attempt's late relay response cannot publish into a replacement's state.
+      if (isCurrent?.() ?? true) fetchNostrProfile(result.publicKey!, isCurrent)
+
+      // Sync data from the server AFTER the commit. Ownership is threaded in so a retired
+      // attempt does not overwrite a replacement's profile state.
+      logAuth("useNostrAuth", "Syncing data from server...")
+      onProgress?.("syncing", "Loading your data...")
+      try {
+        const syncResult = await syncBlinkAccountFromServer({ isCurrent })
+        logAuth("useNostrAuth", "Sync result:", syncResult)
+      } catch (syncError: unknown) {
+        logAuthWarn("useNostrAuth", "Sync failed (non-blocking):", syncError)
+      }
+
+      logAuth("useNostrAuth", "Nostr Connect sign-in complete")
+      return { success: true, profile: result.profile, publicKey: result.publicKey }
     },
     [updateState, fetchNostrProfile, syncBlinkAccountFromServer],
   )

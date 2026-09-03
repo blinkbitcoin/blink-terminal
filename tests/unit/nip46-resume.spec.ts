@@ -11,9 +11,12 @@ describe("decideNip46Resume (same-device mobile sign-in resume)", () => {
   const base: ResumeInput = {
     stage: "signing",
     connectInFlight: false,
+    connectStalled: false,
     connected: false,
     hasPubkey: false,
     hasSession: false,
+    hasOwnPendingSession: false,
+    transportDiscarded: false,
   }
 
   it("leaves a non-in-flight flow alone (idle/complete/error)", () => {
@@ -22,15 +25,88 @@ describe("decideNip46Resume (same-device mobile sign-in resume)", () => {
     expect(decideNip46Resume({ ...base, stage: "error" })).toBeNull()
   })
 
-  it("leaves a pending fresh connect attempt alone, whatever the service state", () => {
+  it("leaves a pending fresh connect attempt alone while it is still legitimately waiting", () => {
     // The attempt's fromURI promise owns the flow: it will resolve and drive the
     // connection itself. Even with a stale session present, touching the service singleton
-    // here would race the pending attempt.
+    // here would race the pending attempt. connectStalled=false → not interrupted.
     for (const stage of ["waiting", "connected", "signing"] as const) {
       expect(
-        decideNip46Resume({ ...base, stage, connectInFlight: true, hasSession: true }),
+        decideNip46Resume({
+          ...base,
+          stage,
+          connectInFlight: true,
+          connectStalled: false,
+          hasSession: true,
+        }),
       ).toBeNull()
     }
+  })
+
+  it("reconnects when a stalled connect established NOTHING (no session persisted)", () => {
+    // The tab went hidden before the signer's connect-ack arrived, so no (pending) session
+    // was stored and the pending promise would hang until maxWait. With nothing established,
+    // the only way forward is a fresh connect for a new ack.
+    expect(
+      decideNip46Resume({
+        ...base,
+        stage: "waiting",
+        connectInFlight: true,
+        connectStalled: true,
+        hasSession: false,
+      }),
+    ).toBe("reconnect")
+  })
+
+  it("restores (not reconnects) when a stalled connect had ESTABLISHED (pending session present)", () => {
+    // The handshake reached the ack (signer pubkey known → pending session persisted) but the
+    // socket died before/at getPublicKey. The signer now considers itself connected and will
+    // NOT re-ack, so a fresh connect would hang — restore rebuilds via fromBunker and finishes
+    // getPublicKey on a live socket. This is the core same-device deeplink fix.
+    expect(
+      decideNip46Resume({
+        ...base,
+        stage: "waiting",
+        connectInFlight: true,
+        connectStalled: true,
+        hasSession: true,
+        hasOwnPendingSession: true,
+      }),
+    ).toBe("restore-session")
+  })
+
+  it("RECONNECTS (never restores signer A) when a stalled fresh connect has only a PREVIOUS confirmed session", () => {
+    // PR #66 review — wrong-signer restore. Signer A has a CONFIRMED stored session
+    // (hasSession=true, hasOwnPendingSession=false). The user starts signer B; the tab backgrounds
+    // before B's fromURI resolves, so B never wrote a pending record. hasSession alone would
+    // wrongly pick restore-session and authenticate A. The pending-record gate must reconnect.
+    expect(
+      decideNip46Resume({
+        ...base,
+        stage: "waiting",
+        connectInFlight: true,
+        connectStalled: true,
+        hasSession: true, // A's confirmed record on disk
+        hasOwnPendingSession: false, // but B never acked → no pending record for THIS attempt
+      }),
+    ).toBe("reconnect")
+  })
+
+  it("RECONNECTS (never restores signer A) when a stalled fresh connect finds only a STALE PENDING record from a previous attempt", () => {
+    // PR #66 review round 2 — stale-pending wrong-signer restore. Signer A reached its ack and
+    // wrote a PENDING record, then died. The user starts signer B; B backgrounds before its own
+    // ack. A bare pending check would be true (A's leftover record) and wrongly restore A. The
+    // secret-bound hasOwnPendingSession is false (A's record carries A's secret, not B's), so
+    // the decision must reconnect B.
+    expect(
+      decideNip46Resume({
+        ...base,
+        stage: "waiting",
+        connectInFlight: true,
+        connectStalled: true,
+        hasSession: true, // A's pending record is on disk
+        hasOwnPendingSession: false, // but it is bound to A's secret, not this attempt's
+      }),
+    ).toBe("reconnect")
   })
 
   it("re-drives only the NIP-98 sign step when the connection survived and we have the pubkey", () => {
@@ -39,6 +115,38 @@ describe("decideNip46Resume (same-device mobile sign-in resume)", () => {
         decideNip46Resume({ ...base, stage, connected: true, hasPubkey: true }),
       ).toBe("resume-signing")
     }
+  })
+
+  it("never resume-signs an established flow whose transport was DISCARDED by bfcache — restores instead (PR #66)", () => {
+    // Returning from the back-forward cache, `connected` still reads true (published singleton
+    // state + non-null signer) even though the WebSockets were discarded. resume-signing on
+    // that dead signer no-ops under the live auth token and leaves the request hung — so for an
+    // established stage with transportDiscarded, force a fresh liveness-checked restore.
+    for (const stage of ["connected", "signing"] as const) {
+      expect(
+        decideNip46Resume({
+          ...base,
+          stage,
+          connected: true, // stale "live" reading across bfcache
+          hasPubkey: true, // would otherwise pick resume-signing
+          hasSession: true,
+          transportDiscarded: true,
+        }),
+      ).toBe("restore-session")
+    }
+  })
+
+  it("restarts an established bfcache-discarded flow with NO stored session to restore (PR #66)", () => {
+    expect(
+      decideNip46Resume({
+        ...base,
+        stage: "signing",
+        connected: true,
+        hasPubkey: true,
+        hasSession: false,
+        transportDiscarded: true,
+      }),
+    ).toBe("restart")
   })
 
   it("restores the session when an ESTABLISHED connection (connected/signing) dropped", () => {

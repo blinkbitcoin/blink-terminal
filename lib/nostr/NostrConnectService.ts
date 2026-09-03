@@ -35,6 +35,22 @@ interface NIP46Session {
   signerPubkey: string
   relays: string[]
   connectedAt: number
+  /**
+   * True while the connection has been ESTABLISHED (the signer sent its connect-ack, so we
+   * know signerPubkey + relays) but the user pubkey has not been confirmed yet — persisted
+   * early in waitForConnection so a same-device deeplink backgrounding that kills the socket
+   * mid-handshake (before getPublicKey resolves) is recoverable: restoreSession rebuilds via
+   * fromBunker and completes getPublicKey on a fresh socket, with no pubkey-match to enforce.
+   */
+  pending?: boolean
+  /**
+   * The connection secret (unique per generateConnectionURI) of the attempt that wrote this
+   * PENDING record. It binds the record to a specific attempt: a stalled fresh connect (signer
+   * B) must NOT adopt a leftover pending record from a previous attempt (signer A) — since a
+   * pending record skips the user-pubkey match, adopting a foreign one would authenticate the
+   * wrong signer (PR #66 review). Only set on pending records; dropped on finalize.
+   */
+  secret?: string
 }
 
 /** Result returned by every connection attempt */
@@ -65,6 +81,8 @@ interface SignEventResult {
   success: boolean
   event?: SignedEvent
   error?: string
+  /** Set for deliberate cancellation so callers can distinguish it from a signing failure. */
+  errorType?: string
 }
 
 /** Options for generateConnectionURI */
@@ -86,6 +104,10 @@ interface StoreSessionData {
   signerPubkey: string
   relays: string[]
   connectedAt?: number
+  /** See NIP46Session.pending. */
+  pending?: boolean
+  /** See NIP46Session.secret. */
+  secret?: string
 }
 
 /**
@@ -111,7 +133,10 @@ interface BunkerSignerInstance {
  * Same subpath-export resolution issue as BunkerSigner.
  */
 interface SimplePoolInstance {
+  /** Closes ONLY the relay URLs passed in — `close([])` closes nothing. */
   close(relays: string[]): void
+  /** Closes every relay connection the pool holds. This is whole-pool teardown. */
+  destroy(): void
 }
 
 // =====================================================================
@@ -122,16 +147,74 @@ interface SimplePoolInstance {
 // Kept at parity with the Blink nostr-login plugin's defaults
 // (btcpay-nostr-login NostrLoginService.DefaultRelays); relay.nsec.app was dropped
 // with the discontinued signer it fronted.
+// Both the client and the signer use the relays advertised in the nostrconnect:// URI, so
+// this list is the shared rendezvous for the whole NIP-46 exchange (connect-ack AND
+// sign_event responses). On-device testing (2026-09-02) showed same-device sign-in timing out
+// when 2 of 3 relays were transiently down on the phone's network (damus 503, primal DNS
+// failure) — the sign request reached only one relay and the signer's response never routed
+// back. Extra reliable relays add rendezvous redundancy so a couple of flaky ones no longer
+// break the exchange. Keep this modest — every relay is a fan-out socket the mobile browser
+// must open on a backgrounding-prone tab.
 const DEFAULT_NIP46_RELAYS: string[] = [
   "wss://nos.lol", // Good uptime
   "wss://relay.damus.io", // Very reliable general relay
   "wss://relay.primal.net", // Primal relay
+  "wss://relay.nostr.band", // High-uptime aggregator (rendezvous redundancy)
 ]
 
 // Storage keys
 const NIP46_SESSION_KEY = "blinkpos_nip46_session"
 const NIP46_CLIENT_KEY = "blinkpos_nip46_clientkey"
 const NIP46_PENDING_KEY = "blinkpos_nip46_pending"
+
+/**
+ * Extract the per-attempt connection secret from a nostrconnect:// URI. The URI is the single
+ * IMMUTABLE source of attempt identity — unlike the mutable `blinkpos_nip46_pending`
+ * sessionStorage record, which a reconnect's disconnect() wipes and an overlapping attempt
+ * overwrites (PR #66 review). Returns undefined if the URI has no secret.
+ */
+export const secretFromUri = (uri: string): string | undefined => {
+  try {
+    return new URL(uri).searchParams.get("secret") ?? undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Acquire a Web Storage object, or null if it is unavailable OR inaccessible.
+ *
+ * A `typeof sessionStorage === "undefined"` check is NOT sufficient: evaluating the identifier
+ * invokes the Window storage GETTER, which itself can throw SecurityError when storage is
+ * denied (some privacy modes / partitioned third-party contexts). Because that evaluation used
+ * to sit outside the callers' try blocks, a denied getter escaped the "non-throwing" cleanup
+ * helpers and skipped the caller's socket teardown (PR #66 review). Acquiring the object here —
+ * with both the existence check and the getter access inside one try — makes every storage
+ * helper total: they get a usable Storage or null, and never see a throw.
+ */
+const storageWarned: Record<"session" | "local", boolean> = {
+  session: false,
+  local: false,
+}
+
+const safeStorage = (kind: "session" | "local"): Storage | null => {
+  try {
+    const storage = kind === "session" ? sessionStorage : localStorage
+    return storage ?? null
+  } catch (err: unknown) {
+    // Warn once per storage kind per page lifetime. This runs on every session read
+    // (getStoredSession/hasStoredSession/clearPendingConnection are called frequently), so in a
+    // persistently denied environment logging each time buries everything else (PR #66 review).
+    if (!storageWarned[kind]) {
+      storageWarned[kind] = true
+      console.warn(
+        `[NostrConnect] ${kind}Storage is inaccessible (further occurrences suppressed):`,
+        err,
+      )
+    }
+    return null
+  }
+}
 
 // Connection timeout (2 minutes)
 const CONNECTION_TIMEOUT = 120000
@@ -142,6 +225,41 @@ const POST_CONNECT_DELAY = 500
 
 // v49: Track connection attempt number to detect stale responses
 let connectionAttemptCounter = 0
+
+/**
+ * The client key for this page lifetime — the SINGLE source of truth, whatever its origin
+ * (loaded from storage, freshly generated and persisted, or generated when storage is
+ * unusable).
+ *
+ * The client key IS this client's identity: generateConnectionURI embeds its pubkey in the
+ * nostrconnect:// URI and the signer addresses its response to that pubkey, while
+ * BunkerSigner.fromURI subscribes and decrypts with whatever key it is handed. If those two
+ * ever disagree the handshake simply times out.
+ *
+ * Consulting storage on EVERY call made the identity a function of storage's current mood: a
+ * getter that starts working (or stops), a silent setItem failure, or a verification mismatch
+ * would each hand back a different key mid-flow (PR #66 review). So the key is resolved exactly
+ * once and cached here; storage is a persistence hint for that FIRST resolution only, and its
+ * later behavior cannot rotate the identity. Nothing in the app rotates the stored client key
+ * during a page lifetime, so a constant is the correct model.
+ */
+let clientKey: Uint8Array | null = null
+
+/**
+ * Fingerprint of a session record that restoreSession has REFUSED (wrong attempt, or wrong
+ * user). Refusal clears the record, but clearing is best-effort: if removeItem keeps throwing,
+ * the rejected record stays on disk and a later restore — including the startup one, which has
+ * no expectation to check it against — could adopt it and authenticate the wrong user
+ * (PR #66 review).
+ *
+ * So rejection is recorded in memory as well: getStoredSession treats a record matching this
+ * fingerprint as absent. Durability of the refusal then does not depend on storage cooperating.
+ */
+let rejectedSessionFingerprint: string | null = null
+
+/** Identity of a stored session record, for comparing a rejected record against a read one. */
+const sessionFingerprint = (session: NIP46Session): string =>
+  [session.publicKey, session.signerPubkey, session.secret ?? ""].join("|")
 
 // =====================================================================
 // Service class
@@ -220,6 +338,21 @@ class NostrConnectService {
    * @returns nostrconnect:// URI string
    */
   static generateConnectionURI(options: GenerateURIOptions = {}): string {
+    // A fresh attempt begins: supersede any still-pending earlier attempt (Kimi K3 review). A
+    // prior waitForConnection awaiting its ack does NOT hold the flow open across URI
+    // generation, so bumping the counter makes its late fromURI settle fail isCurrentAttempt()
+    // and close itself — it can neither publish nor stamp a pending record with this URI's
+    // secret and be mistaken for the new attempt.
+    connectionAttemptCounter++
+    // Also proactively drop any leftover PENDING record from an earlier, never-finished
+    // attempt so it cannot linger. Best-effort tidiness only — correctness rests on the secret
+    // binding (hasPendingSessionForCurrentAttempt + restoreSession's mismatch guard), which
+    // refuses a foreign pending record even if this clear fails or never runs. A CONFIRMED
+    // session is left intact (startup restore needs it).
+    if (this.getStoredSession()?.pending === true) {
+      this.clearSession()
+    }
+
     // Generate or retrieve ephemeral client keypair
     const clientSecretKey: Uint8Array = this.getOrCreateClientKey()
     const clientPubkey: string = getPublicKey(clientSecretKey)
@@ -267,6 +400,10 @@ class NostrConnectService {
     timeout: number = CONNECTION_TIMEOUT,
   ): Promise<ConnectionResult> {
     const clientSecretKey: Uint8Array = this.getOrCreateClientKey()
+    // Capture the attempt secret from the IMMUTABLE uri up front — not from mutable ambient
+    // storage after the await, which a reconnect wipes or an overlapping attempt overwrites
+    // (PR #66 review). This binds the pending record to THIS uri regardless of storage churn.
+    const attemptSecret: string | undefined = secretFromUri(uri)
 
     // v65: attempt ownership. This attempt takes the next ticket; only the LATEST attempt may
     // publish signer/session/state into the singleton or clear it on failure. A superseded
@@ -322,6 +459,27 @@ class NostrConnectService {
       // pointing at a closed instance if a later supersede check fired (Copilot review);
       // everything below works on the local `created` and the singleton is published
       // atomically at the single success point with state/pubkey/session.
+
+      // Persist a PENDING session the instant the connection is established (the signer's
+      // connect-ack gave us its pubkey + relays), BEFORE the fragile getPublicKey round-trip.
+      // On same-device mobile, the deeplink backgrounds this tab right about now and Android
+      // suspends the relay socket — often after the ack but before getPublicKey resolves.
+      // Without this, that progress is lost and the signer won't re-ack a connection it
+      // considers established, so the flow hangs. With it, the foreground-resume path rebuilds
+      // via fromBunker and finishes getPublicKey on a fresh socket. The user pubkey is unknown
+      // here, so it is left empty and filled in at restore/success.
+      // Bind the pending record to THIS attempt's secret (parsed from the uri at entry) so a
+      // later stalled attempt cannot mistake a leftover pending record from a previous signer
+      // for its own (PR #66 review — stale-pending wrong-signer restore). Sourced from the uri,
+      // not ambient storage, so reconnect (which wipes storage) and overlapping attempts (which
+      // overwrite it) cannot corrupt the stamp.
+      this.storeSession({
+        publicKey: "",
+        signerPubkey: created.bp.pubkey!,
+        relays: created.bp.relays!,
+        pending: true,
+        secret: attemptSecret,
+      })
 
       console.log("[NostrConnect] Connection established, getting public key...")
 
@@ -415,6 +573,7 @@ class NostrConnectService {
   static async signEvent(
     eventTemplate: UnsignedEvent,
     maxRetries: number = 3,
+    signal?: AbortSignal,
   ): Promise<SignEventResult> {
     if (!this.signer || this.connectionState !== "connected") {
       console.error("[NostrConnect] Cannot sign: not connected")
@@ -423,6 +582,11 @@ class NostrConnectService {
 
     let lastError: unknown = null
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      // Abortable (PR #66 review): the retry/backoff loop must stop when the caller has been
+      // cancelled, not keep the request outstanding while its owner has given up.
+      if (signal?.aborted) {
+        return { success: false, error: "Aborted", errorType: "superseded" }
+      }
       try {
         console.log(
           `[NostrConnect] Requesting signature for event kind: ${eventTemplate.kind} (attempt ${attempt}/${maxRetries})`,
@@ -440,10 +604,16 @@ class NostrConnectService {
         console.warn(`[NostrConnect] Signing attempt ${attempt} failed:`, msg)
 
         if (attempt < maxRetries) {
-          // Exponential backoff: 500ms, 1000ms, 1500ms...
+          // Exponential backoff: 500ms, 1000ms, 1500ms... — interruptible by abort.
           const delay: number = 500 * attempt
           console.log(`[NostrConnect] Retrying signature in ${delay}ms...`)
-          await new Promise<void>((resolve) => setTimeout(resolve, delay))
+          await new Promise<void>((resolve, reject) => {
+            const t = setTimeout(resolve, delay)
+            signal?.addEventListener("abort", () => {
+              clearTimeout(t)
+              reject(Object.assign(new Error("aborted"), { name: "AbortError" }))
+            })
+          })
         }
       }
     }
@@ -481,13 +651,50 @@ class NostrConnectService {
 
   /**
    * Attempt to restore a previous NIP-46 session.
-   * Called on app startup to reconnect if session exists.
+   * Called on app startup (no opts → confirmed session) and by the foreground-resume path,
+   * which passes `expectedSecret` (the secret of the uri it is driving) so a PENDING record is
+   * only adopted by the attempt that created it, and `expectedPublicKey` (the user pubkey the
+   * live flow already established) so a STALE confirmed record cannot replace it.
    */
-  static async restoreSession(): Promise<ConnectionResult> {
+  static async restoreSession(opts?: {
+    expectedSecret?: string
+    expectedPublicKey?: string
+  }): Promise<ConnectionResult> {
     const session: NIP46Session | null = this.getStoredSession()
     if (!session) {
       console.log("[NostrConnect] No stored session to restore")
       return { success: false, error: "No session found" }
+    }
+
+    // Defense-in-depth (PR #66 review): a PENDING record skips the user-pubkey match, so it
+    // must only be restored by the attempt that created it. If its bound secret does not match
+    // the caller's expected secret (the current uri's secret), it belongs to a PREVIOUS signer
+    // — refuse and clear it, so a decision-path bypass cannot authenticate the wrong signer.
+    // Restoration is gated on the MATCH (not on a successful removal), so a failed clear still
+    // cannot authorize adoption. A confirmed session (no `pending`) is unaffected — startup
+    // restore has no current attempt and passes no expectedSecret.
+    if (session.pending) {
+      const expectedSecret = opts?.expectedSecret
+      if (!expectedSecret || session.secret !== expectedSecret) {
+        console.warn(
+          "[NostrConnect] Pending session belongs to a different attempt — refusing restore",
+        )
+        this.rejectStoredSession(session)
+        return { success: false, error: "Session invalid" }
+      }
+    } else if (opts?.expectedPublicKey && session.publicKey !== opts.expectedPublicKey) {
+      // A CONFIRMED record for a DIFFERENT user than the flow that is asking to be restored.
+      // This is reachable when storeSession's write AND its fallback removal both failed, so a
+      // previous user A's record survived while user B went live: a bfcache-triggered restore
+      // would otherwise rebuild A, pass its own publicKey match, and authenticate the WRONG
+      // USER (PR #66 review). Refuse before building any signer, and reject the provably stale
+      // record so a later startup restore (which has no expectation to check against) cannot
+      // silently log in as A.
+      console.warn(
+        "[NostrConnect] Stored session belongs to a different user — refusing restore",
+      )
+      this.rejectStoredSession(session)
+      return { success: false, error: "Session invalid" }
     }
 
     console.log("[NostrConnect] Attempting to restore session...")
@@ -517,7 +724,8 @@ class NostrConnectService {
       }
       if (candidatePool) {
         try {
-          candidatePool.close([])
+          // destroy() closes every relay connection; close([]) would close nothing.
+          candidatePool.destroy()
         } catch {
           // best-effort cleanup
         }
@@ -566,38 +774,67 @@ class NostrConnectService {
         return { success: false, error: "Restore attempt superseded" }
       }
 
-      if (publicKey !== session.publicKey) {
+      // A PENDING session never confirmed a user pubkey (the original handshake was cut off
+      // before getPublicKey resolved), so there is nothing to match against — whatever this
+      // fresh restore's getPublicKey returns IS the user pubkey. For a confirmed session,
+      // enforce the match so a swapped signer can't hijack the session.
+      if (!session.pending && publicKey !== session.publicKey) {
         console.warn("[NostrConnect] Public key mismatch, clearing session")
+        // clearSession is now non-throwing, so the state cleanup and candidate teardown below
+        // always run — a storage failure can no longer escape here and leak the candidate.
         this.clearSession()
         this.connectionState = "disconnected"
         this.signer = null
+        this.userPublicKey = null // consistent invalid-state (PR #66 review)
         // Close the mismatched candidate — its sockets must not leak (round-5 review).
         await closeCandidate()
         return { success: false, error: "Session invalid" }
       }
 
-      // Single atomic publish point. The pool is detach-then-replace: the previous shared
-      // pool is captured, the fresh one installed, and only then is the old one closed —
-      // so closing it can never touch state this restore does not own.
+      // Single atomic publish point. Pool AND signer are detach-then-replace: the previous
+      // ones are captured, the fresh ones installed, and only then are the old ones torn down —
+      // so tearing them down can never touch state this restore does not own.
       const previousPool: SimplePoolInstance | null = this.pool
+      const previousSigner: BunkerSignerInstance | null = this.signer
       this.pool = candidatePool
       candidatePool = null // ownership transferred to the singleton
       this.signer = created
       candidate = null // ownership transferred to the singleton
       this.connectionState = "connected"
       this.userPublicKey = publicKey
+      // The REPLACED signer must be retired too, or its relay subscription outlives it — with
+      // repeated bfcache recoveries each publishing a new signer, those accumulate (PR #66
+      // review). Best-effort and not awaited before returning: the connection is already live.
+      if (previousSigner) {
+        try {
+          // Not awaited: the replacement connection is already live and must not wait on the
+          // old socket's teardown. Both a synchronous throw and a rejected promise are absorbed.
+          Promise.resolve(previousSigner.close()).catch((e: unknown) => {
+            console.warn("[NostrConnect] Error closing previous signer:", e)
+          })
+        } catch (e: unknown) {
+          console.warn("[NostrConnect] Error closing previous signer:", e)
+        }
+      }
       if (previousPool) {
         try {
-          previousPool.close([])
+          // destroy(), not close([]): close() only closes the relay URLs passed to it, so
+          // close([]) is a silent no-op and the pool's sockets would leak (PR #66 review).
+          previousPool.destroy()
         } catch (e: unknown) {
           console.warn("[NostrConnect] Error closing previous pool:", e)
         }
       }
 
-      // Update session timestamp
+      // Finalize the session: stamp the now-confirmed user pubkey, drop the pending flag AND
+      // its attempt-bound secret (a fully-established session is no longer attempt-scoped),
+      // refreshing the timestamp.
       this.storeSession({
         ...session,
+        publicKey,
         connectedAt: Date.now(),
+        pending: false,
+        secret: undefined,
       })
 
       console.log("[NostrConnect] Session restored successfully!")
@@ -609,8 +846,31 @@ class NostrConnectService {
       // failing late must not disconnect a newer connection.
       if (isCurrentAttempt()) {
         this.clearSession()
-        this.connectionState = "disconnected"
+        // Detach EVERYTHING atomically, then retire it. Nulling the signer while leaving the
+        // pool open and userPublicKey set left a mixed singleton: reported as disconnected but
+        // still holding live relay sockets under a stale identity, until some later caller
+        // happened to clean up (PR #66 review). Same detach-then-retire ordering as the
+        // success path, so the teardown can never touch a newer attempt's state.
+        const orphanedSigner: BunkerSignerInstance | null = this.signer
+        const orphanedPool: SimplePoolInstance | null = this.pool
         this.signer = null
+        this.pool = null
+        this.connectionState = "disconnected"
+        this.userPublicKey = null
+        if (orphanedSigner) {
+          try {
+            await orphanedSigner.close()
+          } catch (e: unknown) {
+            console.warn("[NostrConnect] Error closing orphaned signer:", e)
+          }
+        }
+        if (orphanedPool) {
+          try {
+            orphanedPool.destroy()
+          } catch (e: unknown) {
+            console.warn("[NostrConnect] Error closing orphaned pool:", e)
+          }
+        }
       }
       // The LOCAL candidate + pool are ours either way — close them so their sockets never
       // leak (round-5 review; e.g. a current-attempt ping/getPublicKey failure). Both are
@@ -655,7 +915,8 @@ class NostrConnectService {
     if (ownedPool) {
       console.log("[NostrConnect] v49: Closing SimplePool")
       try {
-        ownedPool.close([])
+        // destroy() closes every relay connection; close([]) would close nothing.
+        ownedPool.destroy()
       } catch (e: unknown) {
         console.warn("[NostrConnect] Error closing pool:", e)
       }
@@ -667,63 +928,71 @@ class NostrConnectService {
   // =============== Private Helper Methods ===============
 
   /**
-   * Get or create the ephemeral client keypair.
-   * This key is used to communicate with the remote signer.
+   * The client keypair used to talk to the remote signer.
+   *
+   * Resolved ONCE per page lifetime and cached, whatever the source. Callers
+   * (generateConnectionURI, waitForConnection, reconnect, restoreSession) are guaranteed the
+   * same identity, so the pubkey advertised in the URI always matches the key that fromURI
+   * decrypts with — regardless of how storage behaves between those calls (PR #66 review).
    */
   private static getOrCreateClientKey(): Uint8Array {
-    if (typeof localStorage === "undefined") {
-      // Server-side, generate temporary key
-      console.log("[NostrConnect] getOrCreateClientKey: Server-side, generating temp key")
-      return generateSecretKey()
-    }
+    if (clientKey) return clientKey
+    clientKey = this.resolveClientKeyOnce()
+    return clientKey
+  }
 
-    // Try to retrieve existing key
-    const stored: string | null = localStorage.getItem(NIP46_CLIENT_KEY)
-    console.log("[NostrConnect] getOrCreateClientKey: Stored key exists:", !!stored)
-    console.log(
-      "[NostrConnect] getOrCreateClientKey: Stored key length:",
-      stored?.length || 0,
-    )
+  /**
+   * First-resolution logic only; never consulted again. Storage is a best-effort persistence
+   * hint here: if it cannot be read or written, the generated key still becomes THE key for
+   * this page lifetime (it simply will not be reused after a reload).
+   */
+  private static resolveClientKeyOnce(): Uint8Array {
+    const storage = safeStorage("local")
 
+    // Reuse a valid persisted key so the client identity survives reloads.
+    const stored: string | null = storage ? this.readClientKey(storage) : null
     if (stored) {
       try {
         const key: Uint8Array = hexToBytes(stored)
-        const pubkey: string = getPublicKey(key)
         console.log(
           "[NostrConnect] getOrCreateClientKey: Using existing key, pubkey:",
-          pubkey.slice(0, 16) + "...",
+          getPublicKey(key).slice(0, 16) + "...",
         )
         return key
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err)
-        console.warn(
-          "[NostrConnect] getOrCreateClientKey: Invalid stored key, error:",
-          msg,
-        )
-        console.warn("[NostrConnect] getOrCreateClientKey: Generating new one")
+        console.warn("[NostrConnect] getOrCreateClientKey: Invalid stored key:", msg)
       }
     }
 
-    // Generate new ephemeral key
     console.log("[NostrConnect] getOrCreateClientKey: Generating new key")
     const newKey: Uint8Array = generateSecretKey()
-    const newKeyHex: string = bytesToHex(newKey)
-    localStorage.setItem(NIP46_CLIENT_KEY, newKeyHex)
-
-    // Verify it was stored correctly
-    const verifyStored: string | null = localStorage.getItem(NIP46_CLIENT_KEY)
-    console.log(
-      "[NostrConnect] getOrCreateClientKey: Storage verification:",
-      verifyStored === newKeyHex ? "OK" : "MISMATCH",
-    )
-
-    const newPubkey: string = getPublicKey(newKey)
+    if (storage) {
+      try {
+        storage.setItem(NIP46_CLIENT_KEY, bytesToHex(newKey))
+      } catch (err: unknown) {
+        console.warn(
+          "[NostrConnect] getOrCreateClientKey: Key not persisted (kept in memory " +
+            "for this page lifetime):",
+          err,
+        )
+      }
+    }
     console.log(
       "[NostrConnect] getOrCreateClientKey: New key pubkey:",
-      newPubkey.slice(0, 16) + "...",
+      getPublicKey(newKey).slice(0, 16) + "...",
     )
-
     return newKey
+  }
+
+  /** Read the stored client key, tolerating a throwing getItem (denied storage). */
+  private static readClientKey(storage: Storage): string | null {
+    try {
+      return storage.getItem(NIP46_CLIENT_KEY)
+    } catch (err: unknown) {
+      console.warn("[NostrConnect] getOrCreateClientKey: Failed to read stored key:", err)
+      return null
+    }
   }
 
   /**
@@ -732,14 +1001,20 @@ class NostrConnectService {
   private static storeConnectionParams(
     params: Omit<PendingConnectionParams, "timestamp">,
   ): void {
-    if (typeof sessionStorage !== "undefined") {
-      sessionStorage.setItem(
+    const storage = safeStorage("session")
+    if (!storage) return
+    try {
+      storage.setItem(
         NIP46_PENDING_KEY,
         JSON.stringify({
           ...params,
           timestamp: Date.now(),
         }),
       )
+    } catch (err: unknown) {
+      // Best-effort, like every storage path here: the connect flow must proceed even if the
+      // params cannot be cached (the uri carries the attempt identity regardless).
+      console.warn("[NostrConnect] Failed to store pending connection params:", err)
     }
   }
 
@@ -747,9 +1022,10 @@ class NostrConnectService {
    * Get pending connection parameters.
    */
   static getPendingConnection(): PendingConnectionParams | null {
-    if (typeof sessionStorage === "undefined") return null
+    const storage = safeStorage("session")
+    if (!storage) return null
     try {
-      const stored: string | null = sessionStorage.getItem(NIP46_PENDING_KEY)
+      const stored: string | null = storage.getItem(NIP46_PENDING_KEY)
       return stored ? (JSON.parse(stored) as PendingConnectionParams) : null
     } catch {
       return null
@@ -760,8 +1036,16 @@ class NostrConnectService {
    * Clear pending connection.
    */
   static clearPendingConnection(): void {
-    if (typeof sessionStorage !== "undefined") {
-      sessionStorage.removeItem(NIP46_PENDING_KEY)
+    // Best-effort and NON-THROWING: both the storage GETTER and removeItem can throw
+    // (SecurityError in some privacy modes). A failure to clear must never propagate — callers
+    // invoke this on cleanup/failure paths where a throw would skip subsequent socket teardown
+    // (PR #66 review).
+    const storage = safeStorage("session")
+    if (!storage) return
+    try {
+      storage.removeItem(NIP46_PENDING_KEY)
+    } catch (err: unknown) {
+      console.warn("[NostrConnect] Failed to clear pending connection:", err)
     }
   }
 
@@ -769,13 +1053,16 @@ class NostrConnectService {
    * Store session data for persistence.
    */
   private static storeSession(sessionData: StoreSessionData): void {
-    if (typeof localStorage === "undefined") return
+    const storage = safeStorage("local")
+    if (!storage) return
     const session: NIP46Session = {
       publicKey: sessionData.publicKey,
       signerPubkey: sessionData.signerPubkey,
       relays: sessionData.relays,
       // ?? not || so a legitimate 0 timestamp is not replaced by Date.now().
       connectedAt: sessionData.connectedAt ?? Date.now(),
+      pending: sessionData.pending,
+      secret: sessionData.secret,
     }
 
     // Persistence is best-effort: a storage failure must never throw (the caller's catch would
@@ -792,12 +1079,22 @@ class NostrConnectService {
     //  3. If removeItem ALSO fails, a stale session may genuinely remain — say so honestly.
     // The connection stays live in every branch.
     try {
-      localStorage.setItem(NIP46_SESSION_KEY, JSON.stringify(session))
+      storage.setItem(NIP46_SESSION_KEY, JSON.stringify(session))
+      // Lifted ONLY here, on the path where the new record is provably the one on disk. A
+      // successful write is an explicit assertion that this session is valid now, so it clears
+      // any earlier rejection — a later attempt may legitimately produce a record identical to
+      // one previously refused (same signer, same user) and the tombstone must not shadow it.
+      //
+      // Doing this before the write (or before knowing storage is usable) would erase the
+      // tombstone while the REJECTED record is still what physically remains on disk — the
+      // failure paths below and the no-storage early return above are exactly those cases, and
+      // there the refusal must survive (PR #66 review).
+      rejectedSessionFingerprint = null
       console.log("[NostrConnect] Session stored")
       return
     } catch (writeErr: unknown) {
       try {
-        localStorage.removeItem(NIP46_SESSION_KEY)
+        storage.removeItem(NIP46_SESSION_KEY)
         console.warn(
           "[NostrConnect] Session not persisted (write failed); cleared any previous session, " +
             "connection stays live, reload will require re-auth:",
@@ -818,10 +1115,21 @@ class NostrConnectService {
    * Get stored session data.
    */
   private static getStoredSession(): NIP46Session | null {
-    if (typeof localStorage === "undefined") return null
+    const storage = safeStorage("local")
+    if (!storage) return null
     try {
-      const stored: string | null = localStorage.getItem(NIP46_SESSION_KEY)
-      return stored ? (JSON.parse(stored) as NIP46Session) : null
+      const stored: string | null = storage.getItem(NIP46_SESSION_KEY)
+      if (!stored) return null
+      const session = JSON.parse(stored) as NIP46Session
+      // A record this page already refused is treated as absent even if clearing it failed,
+      // so the refusal cannot be undone by uncooperative storage (PR #66 review).
+      if (
+        rejectedSessionFingerprint !== null &&
+        sessionFingerprint(session) === rejectedSessionFingerprint
+      ) {
+        return null
+      }
+      return session
     } catch {
       return null
     }
@@ -835,14 +1143,62 @@ class NostrConnectService {
   }
 
   /**
+   * Whether the stored session is a PENDING record belonging to the CURRENT attempt — i.e. a
+   * handshake that reached the signer's connect-ack (signerPubkey + relays known) but was cut
+   * off before getPublicKey, AND whose bound secret matches the secret of `currentUri` (the
+   * URI of the attempt now in progress).
+   *
+   * The current secret comes from the IMMUTABLE uri, not mutable sessionStorage: a reconnect
+   * wipes that storage and overlapping attempts overwrite it, but the uri the modal is driving
+   * is stable (PR #66 review). The secret binding is what makes this attempt-owned rather than
+   * merely "some pending record exists": a leftover pending record from a PREVIOUS signer A
+   * carries A's secret, so when signer B's fresh attempt stalls before its own ack this
+   * returns false and the resume decision reconnects B instead of restoring (and
+   * authenticating) A.
+   */
+  static hasPendingSessionForCurrentAttempt(currentUri: string): boolean {
+    const session = this.getStoredSession()
+    if (session?.pending !== true) return false
+    const currentSecret = secretFromUri(currentUri)
+    return Boolean(currentSecret) && session.secret === currentSecret
+  }
+
+  /**
+   * Refuse a stored session record: remember it as rejected for this page lifetime, then try to
+   * clear it. The in-memory tombstone is what makes the refusal durable — clearing is
+   * best-effort and a persistently throwing removeItem would otherwise leave the record on disk
+   * for a later (unbound) restore to adopt (PR #66 review).
+   */
+  private static rejectStoredSession(session: NIP46Session): void {
+    rejectedSessionFingerprint = sessionFingerprint(session)
+    this.clearSession()
+  }
+
+  /**
    * Clear stored session data.
    */
   private static clearSession(): void {
-    if (typeof localStorage !== "undefined") {
-      localStorage.removeItem(NIP46_SESSION_KEY)
+    // Best-effort and NON-THROWING: clearSession runs on failure/cleanup paths (the
+    // restoreSession pubkey-mismatch branch and its catch) where a storage throw would escape
+    // the function and skip the candidate socket teardown that follows (PR #66 review). Both
+    // the storage GETTER and removeItem can throw (SecurityError in some privacy modes), so
+    // acquisition goes through safeStorage and the removal is guarded.
+    let cleared = true
+    const storage = safeStorage("local")
+    if (storage) {
+      try {
+        storage.removeItem(NIP46_SESSION_KEY)
+      } catch (err: unknown) {
+        cleared = false
+        console.warn("[NostrConnect] Failed to clear stored session:", err)
+      }
+    } else {
+      cleared = false
     }
     this.clearPendingConnection()
-    console.log("[NostrConnect] Session cleared")
+    // Only claim success when the removal actually happened — logging "cleared" after a caught
+    // failure would mislead operational diagnosis (PR #66 review).
+    if (cleared) console.log("[NostrConnect] Session cleared")
   }
 
   /**

@@ -75,7 +75,18 @@ jest.mock("nostr-tools/pool", () => {
   let seq = 0
   return {
     __esModule: true,
-    SimplePool: jest.fn(() => ({ id: ++seq, close: jest.fn() })),
+    // Semantically faithful to nostr-tools 2.22.1: close(relays) closes ONLY the URLs it is
+    // given (so close([]) is a no-op), while destroy() tears the whole pool down. The previous
+    // mock exposed a bare close() and so recorded close([]) as if it were teardown, concealing
+    // the leak (PR #66 review). `closedRelays` records what close() was actually asked to do.
+    SimplePool: jest.fn(() => ({
+      id: ++seq,
+      closedRelays: [] as string[],
+      close: jest.fn(function (this: { closedRelays: string[] }, relays: string[]) {
+        this.closedRelays.push(...relays)
+      }),
+      destroy: jest.fn(),
+    })),
   }
 })
 
@@ -341,6 +352,7 @@ describe("NostrConnectService — overlapping attempt ownership (round-4)", () =
     const livePool = NostrConnectService.pool as unknown as {
       id: number
       close: jest.Mock
+      destroy: jest.Mock
     }
     expect(livePool).not.toBeNull()
     expect(NostrConnectService.signer).toBe(signerB)
@@ -365,15 +377,24 @@ describe("NostrConnectService — overlapping attempt ownership (round-4)", () =
     // While the restore is pending, the live pool must be untouched — NOT closed, NOT
     // replaced (the old getPool(true) did both here).
     expect(NostrConnectService.pool).toBe(livePool)
-    expect(livePool.close).not.toHaveBeenCalled()
+    expect(livePool.destroy).not.toHaveBeenCalled()
 
-    // The restore fails: it closes ITS OWN local pool and still leaves the live one alone.
+    // The restore fails as the CURRENT attempt. The catch marks the singleton disconnected and
+    // drops the signer, so it must complete that teardown rather than leave a mixed state:
+    // previously the pool stayed open and userPublicKey stayed set, i.e. "disconnected" while
+    // still holding live relay sockets under a stale identity (PR #66 review). The
+    // do-not-touch-newer-state behavior is retained for SUPERSEDED failures, covered by
+    // "stale attempt's late FAILURE does not clear the newer live connection".
     failPing(new Error("dead"))
     await restore
     await flush()
 
-    expect(NostrConnectService.pool).toBe(livePool)
-    expect(livePool.close).not.toHaveBeenCalled()
+    expect(NostrConnectService.pool).toBeNull()
+    expect(NostrConnectService.signer).toBeNull()
+    expect(NostrConnectService.userPublicKey).toBeNull()
+    expect(NostrConnectService.connectionState).toBe("disconnected")
+    expect(livePool.destroy).toHaveBeenCalled() // sockets released, not leaked
+    expect(signerB.close).toHaveBeenCalled()
   })
 
   it("a failed restore closes its own local pool", async () => {
@@ -399,8 +420,10 @@ describe("NostrConnectService — overlapping attempt ownership (round-4)", () =
     // Exactly one pool was created for this restore, and it was closed.
     const createdPools = poolMock.mock.results.slice(before)
     expect(createdPools).toHaveLength(1)
-    const localPool = createdPools[0].value as { close: jest.Mock }
-    expect(localPool.close).toHaveBeenCalled()
+    // destroy(), not close([]): close only closes the URLs passed to it, so close([]) would
+    // leak every socket (PR #66 review).
+    const localPool = createdPools[0].value as { destroy: jest.Mock }
+    expect(localPool.destroy).toHaveBeenCalled()
     // Nothing was published.
     expect(NostrConnectService.pool).toBeNull()
   })
@@ -417,7 +440,7 @@ describe("NostrConnectService — overlapping attempt ownership (round-4)", () =
     )
     signerQueue.push(() => makeFakeSigner("signerB"))
     await NostrConnectService.restoreSession()
-    const previousPool = NostrConnectService.pool as unknown as { close: jest.Mock }
+    const previousPool = NostrConnectService.pool as unknown as { destroy: jest.Mock }
 
     // A second restore that succeeds (stored session matches the candidate's pubkey).
     localStorage.setItem(
@@ -438,7 +461,104 @@ describe("NostrConnectService — overlapping attempt ownership (round-4)", () =
     // The restore's own pool is now the singleton's, and the previous one was closed
     // only AFTER the replacement — never a window with a closed live pool.
     expect(NostrConnectService.pool).not.toBe(previousPool)
-    expect(previousPool.close).toHaveBeenCalled()
+    expect(previousPool.destroy).toHaveBeenCalled()
+  })
+
+  /**
+   * Supplemental finding (PR #66 review): repeated recoveries must not accumulate pools, relay
+   * sockets, or signer subscriptions. SimplePool.close(relays) closes ONLY the URLs it is given,
+   * so the old close([]) was a silent no-op; whole-pool teardown is destroy(). Replacing
+   * this.signer without closing the previous one leaked its subscription the same way.
+   */
+  it("retires every replaced pool AND signer across repeated restores, then on disconnect (PR #66)", async () => {
+    localStorage.setItem(
+      "blinkpos_nip46_session",
+      JSON.stringify({
+        publicKey: "user-signerR",
+        signerPubkey: "signerR",
+        relays: ["wss://r.example"],
+      }),
+    )
+
+    const poolMock = (jest.requireMock("nostr-tools/pool") as { SimplePool: jest.Mock })
+      .SimplePool
+    const before = poolMock.mock.results.length
+    const signers: FakeSigner[] = []
+    // Three successive restores: each publishes a fresh pool + signer, retiring the previous.
+    for (let i = 0; i < 3; i++) {
+      const signer = makeFakeSigner("signerR")
+      signers.push(signer)
+      signerQueue.push(() => signer)
+      const result = await NostrConnectService.restoreSession()
+      expect(result.success).toBe(true)
+      await flush() // the previous signer's close is best-effort and not awaited
+    }
+
+    const pools = poolMock.mock.results
+      .slice(before)
+      .map((r) => r.value as { destroy: jest.Mock; closedRelays: string[] })
+    expect(pools).toHaveLength(3)
+
+    // The two REPLACED pools were destroyed; the live one is still open.
+    expect(pools[0].destroy).toHaveBeenCalledTimes(1)
+    expect(pools[1].destroy).toHaveBeenCalledTimes(1)
+    expect(pools[2].destroy).not.toHaveBeenCalled()
+    // The two REPLACED signers were closed; the live one was not.
+    expect(signers[0].close).toHaveBeenCalled()
+    expect(signers[1].close).toHaveBeenCalled()
+    expect(signers[2].close).not.toHaveBeenCalled()
+
+    // disconnect() retires the live pair too, so nothing is left holding sockets.
+    await NostrConnectService.disconnect()
+    expect(pools[2].destroy).toHaveBeenCalledTimes(1)
+    expect(signers[2].close).toHaveBeenCalled()
+
+    // Nothing was ever torn down via close(relays) — that path closes only the URLs passed and
+    // would have left every socket open.
+    for (const pool of pools) expect(pool.closedRelays).toHaveLength(0)
+  })
+
+  /**
+   * MEDIUM (PR #66 review): a CURRENT-attempt restore failure must not leave a mixed singleton.
+   * The catch reports disconnected and drops the signer, so it must also release the previously
+   * published signer/pool and clear the identity — otherwise the service claims to be
+   * disconnected while still holding live relay sockets under a stale userPublicKey.
+   */
+  it("fully retires the previously published signer, pool and identity when the current restore fails (PR #66)", async () => {
+    // A live connection exists (published signer + pool + identity).
+    localStorage.setItem(
+      "blinkpos_nip46_session",
+      JSON.stringify({
+        publicKey: "user-signerLive",
+        signerPubkey: "signerLive",
+        relays: ["wss://r.example"],
+      }),
+    )
+    const liveSigner = makeFakeSigner("signerLive")
+    signerQueue.push(() => liveSigner)
+    expect((await NostrConnectService.restoreSession()).success).toBe(true)
+    const livePool = NostrConnectService.pool as unknown as { destroy: jest.Mock }
+    expect(NostrConnectService.userPublicKey).toBe("user-signerLive")
+
+    // A fresh restore for the same session fails (its ping rejects) as the current attempt.
+    const failing = makeFakeSigner("signerLive")
+    failing.ping = jest.fn(async () => {
+      throw new Error("dead socket")
+    })
+    signerQueue.push(() => failing)
+
+    const result = await NostrConnectService.restoreSession()
+    await flush()
+
+    expect(result.success).toBe(false)
+    // No half-state: nothing published, nothing left holding sockets, no stale identity.
+    expect(NostrConnectService.connectionState).toBe("disconnected")
+    expect(NostrConnectService.signer).toBeNull()
+    expect(NostrConnectService.pool).toBeNull()
+    expect(NostrConnectService.userPublicKey).toBeNull()
+    expect(liveSigner.close).toHaveBeenCalled()
+    expect(livePool.destroy).toHaveBeenCalled()
+    expect(failing.close).toHaveBeenCalled() // the failed candidate too
   })
 
   /** Round-5 verified follow-up: failure paths must close the candidate (no socket leaks). */
@@ -615,5 +735,898 @@ describe("NostrConnectService — storeSession failure is fail-safe", () => {
     const stored = JSON.parse(localStorage.getItem(SESSION_KEY) ?? "null")
     expect(stored.publicKey).toBe("user-signerNew")
     expect(stored.signerPubkey).toBe("signerNew")
+  })
+
+  it("clearPendingConnection swallows a throwing sessionStorage.removeItem (PR #66)", () => {
+    jest.spyOn(console, "warn").mockImplementation(() => {})
+    const spy = jest.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+      throw new Error("SecurityError")
+    })
+    try {
+      // Must not throw — cleanup/failure paths call this and a throw would skip teardown.
+      expect(() => NostrConnectService.clearPendingConnection()).not.toThrow()
+      expect(console.warn).toHaveBeenCalledWith(
+        expect.stringContaining("Failed to clear pending connection"),
+        expect.any(Error),
+      )
+    } finally {
+      spy.mockRestore()
+    }
+  })
+})
+
+/**
+ * hasPendingSessionForCurrentAttempt(uri) — the resume decision uses it to restore ONLY an
+ * attempt-owned pending record, never a previous signer's confirmed OR leftover-pending record
+ * (PR #66 review). The record's stored `secret` must match the secret parsed from the CURRENT
+ * uri (the immutable source of attempt identity — not mutable sessionStorage).
+ */
+describe("NostrConnectService — hasPendingSessionForCurrentAttempt", () => {
+  const SESSION_KEY = "blinkpos_nip46_session"
+
+  // Build a nostrconnect:// uri carrying the given attempt secret.
+  const uriFor = (secret: string): string =>
+    `nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example&secret=${secret}`
+
+  beforeEach(() => {
+    localStorage.clear()
+    sessionStorage.clear()
+  })
+
+  it("is false when there is no stored session", () => {
+    expect(
+      NostrConnectService.hasPendingSessionForCurrentAttempt(uriFor("secretB")),
+    ).toBe(false)
+  })
+
+  it("is false for a CONFIRMED session (no pending flag)", () => {
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        publicKey: "user-A",
+        signerPubkey: "signerA",
+        relays: [],
+        connectedAt: 0, // a legitimate 0 timestamp must round-trip untouched
+      }),
+    )
+    expect(
+      NostrConnectService.hasPendingSessionForCurrentAttempt(uriFor("secretB")),
+    ).toBe(false)
+    expect(NostrConnectService.hasStoredSession()).toBe(true)
+  })
+
+  it("is TRUE for a pending record whose secret matches the current uri", () => {
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        publicKey: "",
+        signerPubkey: "signerB",
+        relays: [],
+        connectedAt: Date.now(),
+        pending: true,
+        secret: "secretB",
+      }),
+    )
+    expect(
+      NostrConnectService.hasPendingSessionForCurrentAttempt(uriFor("secretB")),
+    ).toBe(true)
+  })
+
+  it("is FALSE for a stale pending record from a PREVIOUS attempt (secret mismatch)", () => {
+    // Signer A's leftover pending record (secret A) while the current uri carries secret B.
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        publicKey: "",
+        signerPubkey: "signerA",
+        relays: [],
+        connectedAt: Date.now(),
+        pending: true,
+        secret: "secretA",
+      }),
+    )
+    expect(
+      NostrConnectService.hasPendingSessionForCurrentAttempt(uriFor("secretB")),
+    ).toBe(false)
+  })
+
+  it("is FALSE for a pending record when the uri carries no secret", () => {
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        publicKey: "",
+        signerPubkey: "signerA",
+        relays: [],
+        connectedAt: Date.now(),
+        pending: true,
+        secret: "secretA",
+      }),
+    )
+    // A uri with no secret param → no attempt identity to own the record.
+    expect(
+      NostrConnectService.hasPendingSessionForCurrentAttempt(
+        "nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example",
+      ),
+    ).toBe(false)
+  })
+})
+
+/**
+ * Same-device deeplink recovery (verified on-device 2026-09-02): the connect handshake reaches
+ * the signer's ack (fromURI resolves), a PENDING session is persisted, then Android suspends
+ * the tab's socket before getPublicKey resolves. The connection is recoverable via
+ * restoreSession (fromBunker with the known signer pubkey), and a pending session skips the
+ * user-pubkey match since none was ever confirmed.
+ */
+describe("NostrConnectService — pending-session handshake recovery", () => {
+  const SESSION_KEY = "blinkpos_nip46_session"
+
+  beforeEach(() => {
+    signerQueue.length = 0
+    localStorage.clear()
+    sessionStorage.clear()
+    NostrConnectService.signer = null
+    NostrConnectService.pool = null
+    NostrConnectService.connectionState = "disconnected"
+    NostrConnectService.userPublicKey = null
+  })
+
+  it("persists a pending session as soon as the connection is established, before getPublicKey", async () => {
+    // getPublicKey never resolves (socket died) — the connect hangs, but the pending session
+    // must already be on disk from the moment fromURI resolved.
+    const signer = makeFakeSigner("signerX")
+    signer.getPublicKey = jest.fn(() => new Promise<string>(() => {})) // never resolves
+    signerQueue.push(() => signer)
+
+    NostrConnectService.waitForConnection(URI) // do not await — it hangs at getPublicKey
+    await flush()
+
+    const stored = JSON.parse(localStorage.getItem(SESSION_KEY) ?? "null")
+    expect(stored).not.toBeNull()
+    expect(stored.pending).toBe(true)
+    expect(stored.signerPubkey).toBe("signerX")
+    expect(stored.publicKey).toBe("") // user pubkey not known yet
+    // The pending record is stamped with the secret parsed from the URI (secret=s), not from
+    // ambient sessionStorage — this is what makes it attempt-owned and survives a reconnect
+    // that wipes sessionStorage (PR #66 review).
+    expect(stored.secret).toBe("s")
+  })
+
+  it("restores a pending session (matching secret) without enforcing a user-pubkey match, then finalizes it", async () => {
+    // A pending session left by an interrupted handshake, bound to THIS attempt's secret.
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        publicKey: "",
+        signerPubkey: "signerX",
+        relays: ["wss://r.example"],
+        connectedAt: Date.now(),
+        pending: true,
+        secret: "secretX",
+      }),
+    )
+    const restored = makeFakeSigner("signerX") // fromBunker candidate
+    signerQueue.push(() => restored)
+
+    // The caller passes the current uri's secret — it matches the pending record's, so restore
+    // proceeds and finalizes.
+    const result = await NostrConnectService.restoreSession({ expectedSecret: "secretX" })
+
+    expect(result.success).toBe(true)
+    expect(result.publicKey).toBe("user-signerX")
+    expect(NostrConnectService.isConnected()).toBe(true)
+    // Session finalized: real pubkey stamped, pending + attempt secret cleared.
+    const stored = JSON.parse(localStorage.getItem(SESSION_KEY) ?? "null")
+    expect(stored.publicKey).toBe("user-signerX")
+    expect(stored.pending).toBe(false)
+    expect(stored.secret).toBeUndefined()
+    expect(restored.close).not.toHaveBeenCalled()
+  })
+
+  it("REFUSES to restore a pending record whose secret does not match the current attempt (stale signer A)", async () => {
+    // Signer A's leftover pending record (secret A) while the current attempt is B (secret B).
+    // restoreSession must refuse and clear it — never rebuild A's signer — even if the resume
+    // decision were bypassed. (PR #66 review — stale-pending wrong-signer restore.)
+    jest.spyOn(console, "warn").mockImplementation(() => {})
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        publicKey: "",
+        signerPubkey: "signerA",
+        relays: ["wss://r.example"],
+        connectedAt: Date.now(),
+        pending: true,
+        secret: "secretA",
+      }),
+    )
+    // No signer queued: if restore wrongly proceeded it would try to build one and we'd catch
+    // it via the assertions below.
+
+    // The caller passes the current uri's secret (B), which does NOT match the record's (A).
+    const result = await NostrConnectService.restoreSession({ expectedSecret: "secretB" })
+
+    expect(result.success).toBe(false)
+    expect(result.error).toMatch(/invalid/i)
+    expect(NostrConnectService.isConnected()).toBe(false)
+    // The stale pending record was cleared so it cannot be adopted on a later attempt.
+    expect(localStorage.getItem(SESSION_KEY)).toBeNull()
+  })
+
+  it("still enforces the pubkey match for a CONFIRMED (non-pending) session", async () => {
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        publicKey: "user-EXPECTED",
+        signerPubkey: "signerX",
+        relays: ["wss://r.example"],
+        connectedAt: Date.now(),
+        // no pending flag → confirmed
+      }),
+    )
+    const mismatch = makeFakeSigner("signerX") // getPublicKey → "user-signerX" ≠ expected
+    signerQueue.push(() => mismatch)
+
+    const result = await NostrConnectService.restoreSession()
+
+    expect(result.success).toBe(false)
+    expect(result.error).toMatch(/invalid/i)
+    expect(mismatch.close).toHaveBeenCalled()
+  })
+
+  it("survives a throwing clearSession on the mismatch path: still returns, closes the candidate, clears state", async () => {
+    // Confirmed session + a mismatching signer + localStorage.removeItem throwing (e.g.
+    // SecurityError). clearSession() is now non-throwing, so restoreSession must still RETURN
+    // a failure result (not reject), close the mismatched candidate (no socket leak), and
+    // clear the singleton state. (PR #66 review.)
+    jest.spyOn(console, "warn").mockImplementation(() => {})
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        publicKey: "user-EXPECTED",
+        signerPubkey: "signerX",
+        relays: ["wss://r.example"],
+        connectedAt: Date.now(),
+      }),
+    )
+    const mismatch = makeFakeSigner("signerX") // getPublicKey → "user-signerX" ≠ expected
+    signerQueue.push(() => mismatch)
+
+    const realRemove = localStorage.removeItem
+    localStorage.removeItem = (key: string): void => {
+      if (key === SESSION_KEY) throw new Error("SecurityError")
+      realRemove.call(localStorage, key)
+    }
+    try {
+      const result = await NostrConnectService.restoreSession()
+
+      expect(result.success).toBe(false)
+      expect(result.error).toMatch(/invalid/i)
+      expect(mismatch.close).toHaveBeenCalled() // candidate torn down despite the storage throw
+      expect(NostrConnectService.signer).toBeNull()
+      expect(NostrConnectService.connectionState).toBe("disconnected")
+      expect(NostrConnectService.userPublicKey).toBeNull()
+    } finally {
+      localStorage.removeItem = realRemove
+    }
+  })
+
+  /**
+   * Finding 2 (PR #66 review — self-inflicted regression). The reconnect path calls
+   * disconnect() → clearSession() → clearPendingConnection(), wiping the
+   * `blinkpos_nip46_pending` sessionStorage record, then retries the SAME uri. If the pending
+   * record's secret were sourced from that wiped sessionStorage, the retry would stamp
+   * `secret: undefined` and a second recovery could no longer prove ownership. Sourcing the
+   * secret from the immutable uri makes the retry's pending record carry the right secret
+   * across the wipe, so restoreSession(expectedSecret) still matches.
+   */
+  it("re-stamps the attempt secret from the URI after a reconnect wipes sessionStorage, so a second recovery still matches (PR #66)", async () => {
+    const uriA = "nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example&secret=secretA"
+
+    // First attempt: stalls at getPublicKey after establishing (pending record persisted).
+    const first = makeFakeSigner("signerA")
+    first.getPublicKey = jest.fn(() => new Promise<string>(() => {})) // never resolves
+    signerQueue.push(() => first)
+    NostrConnectService.waitForConnection(uriA) // hangs
+    await flush()
+    expect(JSON.parse(localStorage.getItem(SESSION_KEY) ?? "null").secret).toBe("secretA")
+
+    // reconnect ≈ disconnect() (wipes sessionStorage + the pending record) then retry the uri.
+    await NostrConnectService.disconnect()
+    expect(sessionStorage.getItem("blinkpos_nip46_pending")).toBeNull()
+
+    // Retry the SAME uri; it also stalls after establishing.
+    const second = makeFakeSigner("signerA")
+    second.getPublicKey = jest.fn(() => new Promise<string>(() => {})) // never resolves
+    signerQueue.push(() => second)
+    NostrConnectService.waitForConnection(uriA) // hangs again
+    await flush()
+
+    // The retry's pending record is stamped with the URI's secret — NOT undefined — so a
+    // second recovery driven by the same uri can still prove ownership.
+    const stored = JSON.parse(localStorage.getItem(SESSION_KEY) ?? "null")
+    expect(stored.pending).toBe(true)
+    expect(stored.secret).toBe("secretA")
+    expect(NostrConnectService.hasPendingSessionForCurrentAttempt(uriA)).toBe(true)
+  })
+
+  /**
+   * Kimi K3 (PR #66 review — overlapping attempts). Attempt A is awaiting its ack when a fresh
+   * URI (attempt B) is generated. generateConnectionURI bumps the attempt counter, so A's late
+   * fromURI settle fails isCurrentAttempt(): it closes its candidate and neither publishes a
+   * signer nor stamps a pending record — so it cannot be mistaken for B or authenticate the
+   * wrong signer.
+   */
+  it("supersedes a still-pending attempt A when a new URI (attempt B) is generated — A's late ack publishes nothing (PR #66)", async () => {
+    jest.spyOn(console, "warn").mockImplementation(() => {})
+    const uriA = "nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example&secret=secretA"
+
+    // A's fromURI stays pending until we release it, so we can generate B in between.
+    let releaseA: (s: FakeSigner) => void = () => {}
+    const aSigner = makeFakeSigner("signerA")
+    signerQueue.push(() => new Promise<FakeSigner>((resolve) => (releaseA = resolve)))
+    const aResult = NostrConnectService.waitForConnection(uriA)
+    await flush()
+
+    // A fresh URI (attempt B) is generated while A is still awaiting its ack.
+    NostrConnectService.generateConnectionURI()
+
+    // Now A's ack finally arrives — but A has been superseded.
+    releaseA(aSigner)
+    const settled = await aResult
+
+    expect(settled.success).toBe(false)
+    expect(settled.error).toMatch(/superseded/i)
+    expect(aSigner.close).toHaveBeenCalled() // stale candidate torn down
+    // A published nothing: no signer on the singleton, no pending record stamped with A's data.
+    expect(NostrConnectService.signer).toBeNull()
+    expect(localStorage.getItem(SESSION_KEY)).toBeNull()
+
+    // ...and now B stalls before its OWN ack. B must not be able to own or restore anything
+    // left by A: no attempt-owned pending record exists, and a restore driven by B's secret is
+    // refused (the reviewer's exact generate A → wait → generate B → A ack → B stall sequence).
+    const uriB = "nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example&secret=secretB"
+    signerQueue.push(() => new Promise<FakeSigner>(() => {})) // B's fromURI never resolves
+    NostrConnectService.waitForConnection(uriB) // hangs pre-ack
+    await flush()
+
+    expect(NostrConnectService.hasPendingSessionForCurrentAttempt(uriB)).toBe(false)
+    // No signer queued for a restore: if it wrongly proceeded, fromBunker would reject and the
+    // assertions below would not hold.
+    const bRestore = await NostrConnectService.restoreSession({
+      expectedSecret: "secretB",
+    })
+    expect(bRestore.success).toBe(false)
+    expect(NostrConnectService.signer).toBeNull()
+    expect(NostrConnectService.isConnected()).toBe(false)
+  })
+
+  /**
+   * Divergent finding (PR #66 review, GPT-5.6): a stale CONFIRMED record must not replace a
+   * live different user. Reachable when storeSession's write AND its fallback removal both
+   * failed, leaving user A's confirmed record on disk while user B went live. A bfcache-driven
+   * restore would rebuild A, pass A's own publicKey match, and authenticate the WRONG USER.
+   */
+  it("REFUSES to restore a CONFIRMED record for a different user than the live flow, and clears it (PR #66)", async () => {
+    jest.spyOn(console, "warn").mockImplementation(() => {})
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        publicKey: "user-A", // stale: a PREVIOUS user's confirmed record
+        signerPubkey: "signerA",
+        relays: ["wss://r.example"],
+        connectedAt: Date.now(),
+        // no pending flag → confirmed, so the secret guard does not apply
+      }),
+    )
+    // No signer queued: if the restore wrongly proceeded, fromBunker would be called and the
+    // assertions below would fail.
+
+    // The live flow established user B and asks to restore — the record is for A.
+    const result = await NostrConnectService.restoreSession({
+      expectedPublicKey: "user-B",
+    })
+
+    expect(result.success).toBe(false)
+    expect(result.error).toMatch(/invalid/i)
+    expect(NostrConnectService.isConnected()).toBe(false)
+    expect(NostrConnectService.signer).toBeNull()
+    // Cleared, so a later startup restore (no expectation to check) cannot log in as A.
+    expect(localStorage.getItem(SESSION_KEY)).toBeNull()
+  })
+
+  it("still restores a CONFIRMED record when it matches the live flow's user", async () => {
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        publicKey: "user-signerX",
+        signerPubkey: "signerX",
+        relays: ["wss://r.example"],
+        connectedAt: Date.now(),
+      }),
+    )
+    signerQueue.push(() => makeFakeSigner("signerX")) // getPublicKey → "user-signerX"
+
+    const result = await NostrConnectService.restoreSession({
+      expectedPublicKey: "user-signerX",
+    })
+
+    expect(result.success).toBe(true)
+    expect(result.publicKey).toBe("user-signerX")
+  })
+
+  /**
+   * Divergent finding (PR #66 review, Codex GPT-5): a refusal must be DURABLE even when the
+   * record cannot be removed. If removeItem keeps throwing, the rejected record stays on disk,
+   * and the startup restore — which passes no expectation to check it against — would adopt it
+   * and authenticate the wrong user. An in-memory tombstone makes the refusal independent of
+   * storage cooperating.
+   */
+  it("keeps a refused session refused even when removal keeps failing (PR #66)", async () => {
+    jest.spyOn(console, "warn").mockImplementation(() => {})
+    const staleRecord = JSON.stringify({
+      publicKey: "user-A",
+      signerPubkey: "signerA",
+      relays: ["wss://r.example"],
+      connectedAt: Date.now(),
+    })
+    localStorage.setItem(SESSION_KEY, staleRecord)
+
+    // removeItem always throws, so the record can never actually be deleted.
+    const realRemove = localStorage.removeItem
+    localStorage.removeItem = (key: string): void => {
+      if (key === SESSION_KEY) throw new Error("SecurityError")
+      realRemove.call(localStorage, key)
+    }
+    try {
+      // The live flow (user B) refuses A's record.
+      const refused = await NostrConnectService.restoreSession({
+        expectedPublicKey: "user-B",
+      })
+      expect(refused.success).toBe(false)
+      // The record is still physically on disk — clearing failed.
+      expect(localStorage.getItem(SESSION_KEY)).toBe(staleRecord)
+
+      // The STARTUP restore shape (no opts at all) must still refuse it. No signer is queued:
+      // if it wrongly proceeded, fromBunker would be called and this would not report "no
+      // session".
+      const startup = await NostrConnectService.restoreSession()
+
+      expect(startup.success).toBe(false)
+      expect(NostrConnectService.signer).toBeNull()
+      expect(NostrConnectService.isConnected()).toBe(false)
+      // Also invisible to the session probes the resume decision relies on.
+      expect(NostrConnectService.hasStoredSession()).toBe(false)
+    } finally {
+      localStorage.removeItem = realRemove
+    }
+  })
+
+  /**
+   * LOW (PR #66 review + Copilot): the tombstone must only be lifted once the replacement
+   * record is provably the one on disk. Lifting it before the write — or before knowing storage
+   * is even usable — erases the refusal while the REJECTED record is still what physically
+   * remains, re-exposing it to the optionless (startup) restore.
+   */
+  it("keeps a refused record refused when the replacement write AND its fallback removal fail (PR #66)", async () => {
+    jest.spyOn(console, "warn").mockImplementation(() => {})
+    const staleA = JSON.stringify({
+      publicKey: "user-A",
+      signerPubkey: "signerA",
+      relays: ["wss://r.example"],
+      connectedAt: Date.now(),
+    })
+    localStorage.setItem(SESSION_KEY, staleA)
+
+    // A's removal fails, so A stays on disk when it is refused.
+    const realRemove = localStorage.removeItem
+    const realSet = localStorage.setItem
+    localStorage.removeItem = (key: string): void => {
+      if (key === SESSION_KEY) throw new Error("SecurityError")
+      realRemove.call(localStorage, key)
+    }
+    try {
+      const refused = await NostrConnectService.restoreSession({
+        expectedPublicKey: "user-B",
+      })
+      expect(refused.success).toBe(false)
+      expect(localStorage.getItem(SESSION_KEY)).toBe(staleA) // still physically present
+
+      // Now B connects, but persisting B fails BOTH ways (setItem throws, fallback removeItem
+      // throws too). A is therefore still the record on disk — its refusal must survive.
+      localStorage.setItem = (key: string, value: string): void => {
+        if (key === SESSION_KEY) throw new Error("QuotaExceededError")
+        realSet.call(localStorage, key, value)
+      }
+      signerQueue.push(() => makeFakeSigner("signerB"))
+      const connected = await NostrConnectService.waitForConnection(URI)
+      expect(connected.success).toBe(true) // the live connection is unaffected
+      expect(localStorage.getItem(SESSION_KEY)).toBe(staleA) // B never made it to disk
+
+      // The startup restore shape (no opts) must still refuse A. No signer is queued: if it
+      // wrongly proceeded, fromBunker would be called.
+      const startup = await NostrConnectService.restoreSession()
+      expect(startup.success).toBe(false)
+      expect(NostrConnectService.hasStoredSession()).toBe(false)
+    } finally {
+      localStorage.removeItem = realRemove
+      localStorage.setItem = realSet
+    }
+  })
+
+  it("keeps a refused record refused when storage is unusable during the replacement write (PR #66)", async () => {
+    jest.spyOn(console, "warn").mockImplementation(() => {})
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        publicKey: "user-A",
+        signerPubkey: "signerA",
+        relays: ["wss://r.example"],
+        connectedAt: Date.now(),
+      }),
+    )
+    await NostrConnectService.restoreSession({ expectedPublicKey: "user-B" })
+    expect(NostrConnectService.hasStoredSession()).toBe(false)
+
+    // The localStorage GETTER throws while B is being stored, so safeStorage returns null and
+    // storeSession returns early. The tombstone must NOT have been lifted on the way out.
+    const real = Object.getOwnPropertyDescriptor(window, "localStorage")
+    Object.defineProperty(window, "localStorage", {
+      get() {
+        throw new Error("SecurityError")
+      },
+      configurable: true,
+    })
+    try {
+      signerQueue.push(() => makeFakeSigner("signerB"))
+      await NostrConnectService.waitForConnection(URI)
+    } finally {
+      if (real) Object.defineProperty(window, "localStorage", real)
+    }
+
+    // Storage is back, and A is still on disk — it must still be refused.
+    expect(NostrConnectService.hasStoredSession()).toBe(false)
+    const startup = await NostrConnectService.restoreSession()
+    expect(startup.success).toBe(false)
+  })
+
+  it("lets a NEW session replace a previously refused one with the same fingerprint (PR #66)", async () => {
+    jest.spyOn(console, "warn").mockImplementation(() => {})
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        publicKey: "user-signerX",
+        signerPubkey: "signerX",
+        relays: ["wss://r.example"],
+        connectedAt: Date.now(),
+      }),
+    )
+    // Refuse it (the live flow is a different user).
+    await NostrConnectService.restoreSession({ expectedPublicKey: "user-OTHER" })
+    expect(NostrConnectService.hasStoredSession()).toBe(false)
+
+    // A fresh, legitimate connect for that same user/signer must NOT be shadowed by the
+    // tombstone — writing a session asserts it is valid now.
+    signerQueue.push(() => makeFakeSigner("signerX"))
+    const connected = await NostrConnectService.waitForConnection(URI)
+
+    expect(connected.success).toBe(true)
+    expect(NostrConnectService.hasStoredSession()).toBe(true)
+  })
+
+  /**
+   * LOW (PR #66 review, Codex GPT-5): the cleanup helpers must be non-throwing even when the
+   * Window storage GETTER itself throws (SecurityError in some privacy modes) — not only when
+   * removeItem throws. Previously the `typeof sessionStorage` check sat OUTSIDE the try, so a
+   * denied getter escaped clearPendingConnection() through clearSession() and skipped the
+   * caller's candidate teardown.
+   */
+  it("survives THROWING storage getters: cleanup stays non-throwing and the candidate is still torn down (PR #66)", async () => {
+    jest.spyOn(console, "warn").mockImplementation(() => {})
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        publicKey: "user-EXPECTED",
+        signerPubkey: "signerX",
+        relays: ["wss://r.example"],
+        connectedAt: Date.now(),
+      }),
+    )
+    const mismatch = makeFakeSigner("signerX") // getPublicKey → "user-signerX" ≠ expected
+    signerQueue.push(() => mismatch)
+
+    // Deny the sessionStorage getter outright — evaluating the identifier throws.
+    const realSession = Object.getOwnPropertyDescriptor(window, "sessionStorage")
+    Object.defineProperty(window, "sessionStorage", {
+      get() {
+        throw new Error("SecurityError")
+      },
+      configurable: true,
+    })
+    try {
+      // The standalone helper must not propagate the getter throw.
+      expect(() => NostrConnectService.clearPendingConnection()).not.toThrow()
+
+      // And the restore mismatch path (which calls clearSession → clearPendingConnection)
+      // must still RETURN a failure, close the candidate, and clear the singleton state.
+      const result = await NostrConnectService.restoreSession()
+
+      expect(result.success).toBe(false)
+      expect(result.error).toMatch(/invalid/i)
+      expect(mismatch.close).toHaveBeenCalled() // teardown NOT skipped by the getter throw
+      expect(NostrConnectService.signer).toBeNull()
+      expect(NostrConnectService.connectionState).toBe("disconnected")
+      expect(NostrConnectService.userPublicKey).toBeNull()
+    } finally {
+      if (realSession) Object.defineProperty(window, "sessionStorage", realSession)
+    }
+  })
+})
+
+/**
+ * Client-key consistency when storage is unusable (PR #66 review, GPT-5.6 + Kimi K3).
+ *
+ * The client key IS this client's identity: generateConnectionURI embeds its pubkey in the
+ * nostrconnect:// URI and the signer addresses its reply to that pubkey, while
+ * waitForConnection's fromURI subscribes and decrypts with whatever key it is handed. A storage
+ * fallback that mints a FRESH key per call therefore advertises key A and then listens with key
+ * B — the handshake can never complete, and reconnect rotates the key again.
+ *
+ * The file-level nostr-tools/pure + @noble/hashes mocks return constants, which conceals the
+ * mismatch, so this block makes them key-derived: every generateSecretKey() call yields a
+ * distinct key and getPublicKey/bytesToHex derive from the key bytes.
+ */
+describe("NostrConnectService — client-key consistency with unusable storage", () => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- reach the mocked modules
+  const pure = jest.requireMock("nostr-tools/pure") as {
+    generateSecretKey: jest.Mock
+    getPublicKey: jest.Mock
+  }
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- reach the mocked modules
+  const hashes = jest.requireMock("@noble/hashes/utils") as {
+    bytesToHex: jest.Mock
+    hexToBytes: jest.Mock
+  }
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- reach the mocked modules
+  const nip46 = jest.requireMock("nostr-tools/nip46") as {
+    BunkerSigner: { fromURI: jest.Mock }
+  }
+
+  const realImpls = {
+    generateSecretKey: pure.generateSecretKey.getMockImplementation(),
+    getPublicKey: pure.getPublicKey.getMockImplementation(),
+    bytesToHex: hashes.bytesToHex.getMockImplementation(),
+    hexToBytes: hashes.hexToBytes.getMockImplementation(),
+  }
+
+  let keySeq = 0
+  // A per-test module instance (see beforeEach): the client-key cache is page-lifetime state,
+  // so every test must start with it unresolved.
+  let freshService: typeof NostrConnectService
+
+  beforeEach(() => {
+    signerQueue.length = 0
+    localStorage.clear()
+    sessionStorage.clear()
+    NostrConnectService.signer = null
+    NostrConnectService.pool = null
+    NostrConnectService.connectionState = "disconnected"
+    NostrConnectService.userPublicKey = null
+    jest.spyOn(console, "warn").mockImplementation(() => {})
+
+    // fromURI call indices are per-test, so the helpers below can count from 0.
+    nip46.BunkerSigner.fromURI.mockClear()
+    // The service caches the client key for the PAGE lifetime, which is exactly the invariant
+    // under test — so each test needs a fresh module instance to start from "no key resolved
+    // yet". Re-requiring under isolateModules gives that without a test-only reset hook.
+    jest.isolateModules(() => {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports -- fresh module instance per test
+      freshService = require("../../lib/nostr/NostrConnectService")
+        .default as typeof NostrConnectService
+    })
+
+    // Distinct key per call; pubkey/hex derived from the key's first byte so a swapped key is
+    // immediately visible.
+    keySeq = 0
+    pure.generateSecretKey.mockImplementation(() => new Uint8Array(32).fill(++keySeq))
+    pure.getPublicKey.mockImplementation((k: Uint8Array) => `pub-${k[0]}`)
+    hashes.bytesToHex.mockImplementation((b: Uint8Array) => `hex-${b[0]}`)
+    hashes.hexToBytes.mockImplementation((h: string) =>
+      new Uint8Array(32).fill(Number(String(h).replace("hex-", "")) || 0),
+    )
+  })
+
+  afterAll(() => {
+    // Restore the file-level constant mocks for any later suite.
+    pure.generateSecretKey.mockImplementation(realImpls.generateSecretKey!)
+    pure.getPublicKey.mockImplementation(realImpls.getPublicKey!)
+    hashes.bytesToHex.mockImplementation(realImpls.bytesToHex!)
+    hashes.hexToBytes.mockImplementation(realImpls.hexToBytes!)
+  })
+
+  /** The key handed to fromURI on the Nth call. */
+  const keyPassedToFromURI = (call: number): Uint8Array =>
+    nip46.BunkerSigner.fromURI.mock.calls[call][0] as Uint8Array
+
+  /** The client pubkey advertised in a nostrconnect:// uri (its host). */
+  const pubkeyInUri = (uri: string): string =>
+    new URL(uri).hostname || uri.split("//")[1]!.split("?")[0]!
+
+  const expectUriAndWaiterAgree = (uri: string, call: number): void => {
+    const advertised = pubkeyInUri(uri)
+    const used = pure.getPublicKey(keyPassedToFromURI(call))
+    expect(used).toBe(advertised)
+  }
+
+  const denyStorage = (impl: PropertyDescriptor): (() => void) => {
+    const real = Object.getOwnPropertyDescriptor(window, "localStorage")
+    Object.defineProperty(window, "localStorage", { ...impl, configurable: true })
+    return () => {
+      if (real) Object.defineProperty(window, "localStorage", real)
+    }
+  }
+
+  it("uses ONE key for the URI and the waiter when the localStorage GETTER throws", async () => {
+    const restore = denyStorage({
+      get() {
+        throw new Error("SecurityError")
+      },
+    })
+    try {
+      const uri: string = freshService.generateConnectionURI()
+      const signer = makeFakeSigner("signerX")
+      signer.getPublicKey = jest.fn(() => new Promise<string>(() => {}))
+      signerQueue.push(() => signer)
+      freshService.waitForConnection(uri)
+      await flush()
+
+      expectUriAndWaiterAgree(uri, 0)
+    } finally {
+      restore()
+    }
+  })
+
+  it("uses ONE key for the URI and the waiter when getItem throws", async () => {
+    const restore = denyStorage({
+      get: () => ({
+        getItem: () => {
+          throw new Error("SecurityError")
+        },
+        setItem: () => undefined,
+        removeItem: () => undefined,
+      }),
+    })
+    try {
+      const uri: string = freshService.generateConnectionURI()
+      const signer = makeFakeSigner("signerX")
+      signer.getPublicKey = jest.fn(() => new Promise<string>(() => {}))
+      signerQueue.push(() => signer)
+      freshService.waitForConnection(uri)
+      await flush()
+
+      expectUriAndWaiterAgree(uri, 0)
+    } finally {
+      restore()
+    }
+  })
+
+  // The reviewer's transition cases: it is not enough that a single call handles failure — the
+  // identity must survive storage CHANGING its behavior between calls, in either direction.
+
+  it("keeps ONE key when storage is usable at URI generation but denied at the waiter", async () => {
+    // Usable: the URI is generated from a stored/generated key.
+    const uri: string = freshService.generateConnectionURI()
+
+    // ...then the getter starts throwing before the waiter runs.
+    const restore = denyStorage({
+      get() {
+        throw new Error("SecurityError")
+      },
+    })
+    try {
+      const signer = makeFakeSigner("signerX")
+      signer.getPublicKey = jest.fn(() => new Promise<string>(() => {}))
+      signerQueue.push(() => signer)
+      freshService.waitForConnection(uri)
+      await flush()
+
+      expectUriAndWaiterAgree(uri, 0)
+    } finally {
+      restore()
+    }
+  })
+
+  it("keeps ONE key when storage is denied at URI generation but usable at the waiter", async () => {
+    // Denied at generation: the key is generated and held in memory.
+    const restore = denyStorage({
+      get() {
+        throw new Error("SecurityError")
+      },
+    })
+    let uri: string
+    try {
+      uri = freshService.generateConnectionURI()
+    } finally {
+      restore() // storage comes back before the waiter
+    }
+
+    const signer = makeFakeSigner("signerX")
+    signer.getPublicKey = jest.fn(() => new Promise<string>(() => {}))
+    signerQueue.push(() => signer)
+    freshService.waitForConnection(uri)
+    await flush()
+
+    // Recovered storage must not hand back a DIFFERENT key than the URI advertises.
+    expectUriAndWaiterAgree(uri, 0)
+  })
+
+  it("keeps ONE key when setItem silently fails to persist (no throw, later read returns null)", async () => {
+    // The write appears to succeed but nothing is stored — the old code would read null on the
+    // next call and generate a fresh key, silently rotating the identity.
+    const restore = denyStorage({
+      get: () => ({
+        getItem: () => null, // never returns what was "written"
+        setItem: () => undefined, // silent no-op, no throw
+        removeItem: () => undefined,
+      }),
+    })
+    try {
+      const uri: string = freshService.generateConnectionURI()
+      const first = makeFakeSigner("signerX")
+      first.getPublicKey = jest.fn(() => new Promise<string>(() => {}))
+      signerQueue.push(() => first)
+      freshService.waitForConnection(uri)
+      await flush()
+
+      expectUriAndWaiterAgree(uri, 0)
+
+      // And it must still hold across a reconnect.
+      await freshService.disconnect()
+      const second = makeFakeSigner("signerX")
+      second.getPublicKey = jest.fn(() => new Promise<string>(() => {}))
+      signerQueue.push(() => second)
+      freshService.waitForConnection(uri)
+      await flush()
+
+      expectUriAndWaiterAgree(uri, 1)
+      expect(keyPassedToFromURI(1)).toEqual(keyPassedToFromURI(0))
+    } finally {
+      restore()
+    }
+  })
+
+  it("uses ONE key for the URI and the waiter when setItem fails, and keeps it across a reconnect", async () => {
+    const restore = denyStorage({
+      get: () => ({
+        getItem: () => null, // nothing stored, and the write below will fail
+        setItem: () => {
+          throw new Error("QuotaExceededError")
+        },
+        removeItem: () => undefined,
+      }),
+    })
+    try {
+      const uri: string = freshService.generateConnectionURI()
+      const first = makeFakeSigner("signerX")
+      first.getPublicKey = jest.fn(() => new Promise<string>(() => {}))
+      signerQueue.push(() => first)
+      freshService.waitForConnection(uri)
+      await flush()
+
+      expectUriAndWaiterAgree(uri, 0)
+
+      // Reconnect: disconnect and retry the SAME uri — the key must not rotate, or the retry
+      // would listen with a key the signer is not addressing.
+      await freshService.disconnect()
+      const second = makeFakeSigner("signerX")
+      second.getPublicKey = jest.fn(() => new Promise<string>(() => {}))
+      signerQueue.push(() => second)
+      freshService.waitForConnection(uri)
+      await flush()
+
+      expectUriAndWaiterAgree(uri, 1)
+      expect(keyPassedToFromURI(1)).toEqual(keyPassedToFromURI(0))
+    } finally {
+      restore()
+    }
   })
 })

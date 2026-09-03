@@ -33,9 +33,19 @@ Object.defineProperty(window.navigator, "userAgent", {
 // via jest.requireMock — the one reliable way to reach them.
 jest.mock("../../../lib/nostr/NostrConnectService", () => ({
   __esModule: true,
+  // The modal imports the real secretFromUri helper — provide a faithful parse so the resume
+  // path passes the correct expectedSecret / uri through to the mocked service methods.
+  secretFromUri: (uri: string): string | undefined => {
+    try {
+      return new URL(uri).searchParams.get("secret") ?? undefined
+    } catch {
+      return undefined
+    }
+  },
   default: {
     isConnected: jest.fn(() => false),
     hasStoredSession: jest.fn(() => false),
+    hasPendingSessionForCurrentAttempt: jest.fn(() => false),
     restoreSession: jest.fn(async () => ({ success: false })),
     waitForConnection: jest.fn(async () => ({ success: false })),
     disconnect: jest.fn(async () => undefined),
@@ -76,6 +86,23 @@ const foreground = async () => {
   })
 }
 
+// Drive a bfcache round-trip exactly as a returning mobile browser does after a same-document
+// deeplink nav: pagehide(persisted) freezes the page (sockets discarded), pageshow(persisted)
+// restores it. jsdom cannot construct PageTransitionEvent, so dispatch an Event with persisted
+// assigned. The modal's pageshow resume is deferred ~150ms, so flush past it.
+const bfcacheRoundTrip = async () => {
+  await act(async () => {
+    const hide = new Event("pagehide")
+    Object.defineProperty(hide, "persisted", { value: true })
+    window.dispatchEvent(hide)
+    const show = new Event("pageshow")
+    Object.defineProperty(show, "persisted", { value: true })
+    window.dispatchEvent(show)
+    // Past the 150ms settle defer + the 300ms show-connected delay before the sign step.
+    await new Promise<void>((r) => setTimeout(r, 500))
+  })
+}
+
 const PUBKEY = "a".repeat(64)
 
 const renderModal = (signInWithNostrConnect = jest.fn()) =>
@@ -91,6 +118,7 @@ describe("NostrConnectModal — same-device NIP-46 resume (review blockers)", ()
     jest.clearAllMocks()
     legacy().isConnected.mockReturnValue(false)
     legacy().hasStoredSession.mockReturnValue(false)
+    legacy().hasPendingSessionForCurrentAttempt.mockReturnValue(false)
     legacy().restoreSession.mockResolvedValue({ success: false })
     legacy().waitForConnection.mockResolvedValue({ success: false })
   })
@@ -244,6 +272,471 @@ describe("NostrConnectModal — same-device NIP-46 resume (review blockers)", ()
     })
     expect(onSuccess).toHaveBeenCalledTimes(1)
     expect(screen.queryByRole("button", { name: /Try Again/i })).toBeNull()
+  })
+
+  /**
+   * Finding 1 (PR #66 review): a bfcache round-trip discards the relay sockets, but
+   * isConnected() still reads TRUE (published state + non-null signer). If the resume trusted
+   * that stale reading it would pick resume-signing, which no-ops under the live auth token and
+   * leaves the hung request stuck forever. The pageshow(persisted) path must instead force a
+   * fresh, liveness-checked restore that SUPERSEDES the hung original — exactly one replacement
+   * sign runs through the restored signer.
+   */
+  it("does not trust a stale isConnected() after bfcache — restores and re-drives auth exactly once (PR #66)", async () => {
+    const deferreds: Array<{
+      resolve: (v: { success: boolean }) => void
+      reject: (e: Error) => void
+    }> = []
+    const signIn = jest.fn(
+      () =>
+        new Promise<{ success: boolean }>((resolve, reject) => {
+          deferreds.push({ resolve, reject })
+        }),
+    )
+    const onSuccess = jest.fn()
+    legacy().waitForConnection.mockResolvedValue({ success: true, publicKey: PUBKEY })
+    legacy().hasStoredSession.mockReturnValue(true)
+    legacy().restoreSession.mockResolvedValue({ success: true, publicKey: PUBKEY })
+    // The signer LOOKS live across the bfcache round-trip — the discarded transport is not
+    // reflected in this published flag. The fix must not rely on it.
+    legacy().isConnected.mockReturnValue(true)
+
+    render(
+      <NostrConnectModal
+        uri="nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example&secret=s&name=Blink%20POS"
+        signInWithNostrConnect={signIn}
+        onSuccess={onSuccess}
+      />,
+    )
+
+    // Connect, sign begins and hangs (the dead socket, though isConnected still says true).
+    await act(async () => {
+      fireClick(openInAmberButton())
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(1)
+
+    // bfcache round-trip: transport discarded. Despite isConnected()===true, the resume must
+    // restore (not resume-sign no-op) and issue exactly one replacement auth.
+    await bfcacheRoundTrip()
+
+    expect(legacy().restoreSession).toHaveBeenCalledTimes(1)
+    expect(signIn).toHaveBeenCalledTimes(2)
+
+    // Replacement completes → login completes exactly once.
+    await act(async () => {
+      deferreds[1].resolve({ success: true })
+      await new Promise((r) => setTimeout(r, 650))
+    })
+    expect(onSuccess).toHaveBeenCalledTimes(1)
+
+    // The hung original settles late → inert.
+    await act(async () => {
+      deferreds[0].reject(new Error("TIMEOUT"))
+      await flush()
+    })
+    expect(onSuccess).toHaveBeenCalledTimes(1)
+    expect(screen.queryByRole("button", { name: /Try Again/i })).toBeNull()
+  })
+
+  /**
+   * Divergent finding (PR #66 review, GPT-5.6): user B is live, but a stale CONFIRMED record
+   * for user A survived (session write AND fallback removal both failed). A bfcache restore
+   * must not authenticate as A. The modal passes expectedPublicKey, so the service refuses.
+   */
+  it("does not authenticate a stale other-user session after bfcache (PR #66)", async () => {
+    // The sign hangs on the dead socket, so the flow is still at the signing stage when the
+    // bfcache resume runs (a completed flow is not in flight and is left alone).
+    const signDeferreds: Array<(v: { success: boolean }) => void> = []
+    const signIn = jest.fn(
+      () => new Promise<{ success: boolean }>((r) => signDeferreds.push(r)),
+    )
+    const onSuccess = jest.fn()
+    legacy().waitForConnection.mockResolvedValue({ success: true, publicKey: PUBKEY })
+    legacy().hasStoredSession.mockReturnValue(true)
+    legacy().isConnected.mockReturnValue(true)
+    // The service refuses when the caller's expectedPublicKey does not match the stored record
+    // (here the stored record is a DIFFERENT user), exactly as the real implementation does.
+    const OTHER = "b".repeat(64)
+    legacy().restoreSession.mockImplementation(
+      async (opts?: { expectedPublicKey?: string }) =>
+        opts?.expectedPublicKey && opts.expectedPublicKey !== OTHER
+          ? { success: false, error: "Session invalid" }
+          : { success: true, publicKey: OTHER },
+    )
+
+    render(
+      <NostrConnectModal
+        uri="nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example&secret=s&name=Blink%20POS"
+        signInWithNostrConnect={signIn}
+        onSuccess={onSuccess}
+      />,
+    )
+
+    await act(async () => {
+      fireClick(openInAmberButton())
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(1)
+    expect(signIn).toHaveBeenCalledWith(PUBKEY, expect.anything())
+
+    await bfcacheRoundTrip()
+
+    // The restore was attempted with the live user's pubkey and refused — the OTHER user must
+    // never be signed in or reported as a success.
+    expect(legacy().restoreSession).toHaveBeenCalledWith(
+      expect.objectContaining({ expectedPublicKey: PUBKEY }),
+    )
+    expect(signIn).not.toHaveBeenCalledWith(OTHER, expect.anything())
+    expect(onSuccess).not.toHaveBeenCalledWith(OTHER)
+  })
+
+  /**
+   * Divergent finding (PR #66 review, Kimi K3): a SECOND bfcache discard while the first
+   * recovery is still in flight must not be dropped. The first recovery's fresh sockets were
+   * discarded too, so it is hanging; the second discard supersedes it and takes ownership.
+   */
+  it("supersedes an in-flight recovery when a second bfcache discard arrives (PR #66)", async () => {
+    // Call 1 (original) hangs on the dead socket so the flow stays at the signing stage; the
+    // replacement issued by the winning recovery resolves.
+    const signDeferreds: Array<(v: { success: boolean }) => void> = []
+    const signIn = jest.fn(
+      () => new Promise<{ success: boolean }>((r) => signDeferreds.push(r)),
+    )
+    const onSuccess = jest.fn()
+    legacy().waitForConnection.mockResolvedValue({ success: true, publicKey: PUBKEY })
+    legacy().hasStoredSession.mockReturnValue(true)
+    legacy().isConnected.mockReturnValue(true)
+
+    // Restore #1 hangs (its fresh sockets get discarded by the second bfcache); #2 succeeds.
+    const restoreResolvers: Array<(v: { success: boolean; publicKey: string }) => void> =
+      []
+    legacy().restoreSession.mockImplementation(
+      () =>
+        new Promise<{ success: boolean; publicKey: string }>((r) =>
+          restoreResolvers.push(r),
+        ),
+    )
+
+    render(
+      <NostrConnectModal
+        uri="nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example&secret=s&name=Blink%20POS"
+        signInWithNostrConnect={signIn}
+        onSuccess={onSuccess}
+      />,
+    )
+
+    await act(async () => {
+      fireClick(openInAmberButton())
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(1)
+
+    // First bfcache → recovery #1 starts and hangs on restoreSession.
+    await bfcacheRoundTrip()
+    expect(legacy().restoreSession).toHaveBeenCalledTimes(1)
+
+    // Second bfcache while #1 is still awaiting: it must NOT be dropped.
+    await bfcacheRoundTrip()
+    expect(legacy().restoreSession).toHaveBeenCalledTimes(2)
+
+    // #2 completes the recovery and issues exactly one replacement auth, which then succeeds.
+    await act(async () => {
+      restoreResolvers[1]({ success: true, publicKey: PUBKEY })
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      signDeferreds[1]({ success: true })
+      await new Promise((r) => setTimeout(r, 650))
+    })
+    expect(onSuccess).toHaveBeenCalledTimes(1)
+
+    // #1 settling late is inert: no third sign, no second success.
+    await act(async () => {
+      restoreResolvers[0]({ success: true, publicKey: PUBKEY })
+      await new Promise((r) => setTimeout(r, 650))
+    })
+    expect(signIn).toHaveBeenCalledTimes(2)
+    expect(onSuccess).toHaveBeenCalledTimes(1)
+  })
+
+  /**
+   * Divergent finding (PR #66 review, Codex GPT-5): the second discard must revoke recovery #1's
+   * AUTH ownership, not just its restore continuation. If #1 already finished restoring and is
+   * signing, it is past the generation check — so without retiring the auth token it could
+   * publish success (through a signer the discard just killed) while #2 is still restoring.
+   */
+  it("retires an in-flight recovery's auth owner on the second bfcache discard (PR #66)", async () => {
+    const signDeferreds: Array<(v: { success: boolean }) => void> = []
+    const signIn = jest.fn(
+      () => new Promise<{ success: boolean }>((r) => signDeferreds.push(r)),
+    )
+    const onSuccess = jest.fn()
+    legacy().waitForConnection.mockResolvedValue({ success: true, publicKey: PUBKEY })
+    legacy().hasStoredSession.mockReturnValue(true)
+    legacy().isConnected.mockReturnValue(true)
+
+    // Restore #1 SUCCEEDS immediately, so recovery #1 proceeds to signing; restore #2 hangs
+    // until the test releases it.
+    const restoreResolvers: Array<(v: { success: boolean; publicKey: string }) => void> =
+      []
+    legacy()
+      .restoreSession.mockResolvedValueOnce({ success: true, publicKey: PUBKEY })
+      .mockImplementation(
+        () =>
+          new Promise<{ success: boolean; publicKey: string }>((r) =>
+            restoreResolvers.push(r),
+          ),
+      )
+
+    render(
+      <NostrConnectModal
+        uri="nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example&secret=s&name=Blink%20POS"
+        signInWithNostrConnect={signIn}
+        onSuccess={onSuccess}
+      />,
+    )
+
+    await act(async () => {
+      fireClick(openInAmberButton())
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(1) // the original sign, hanging
+
+    // First bfcache: recovery #1 restores and starts its REPLACEMENT sign, which also hangs.
+    await bfcacheRoundTrip()
+    expect(legacy().restoreSession).toHaveBeenCalledTimes(1)
+    expect(signIn).toHaveBeenCalledTimes(2) // recovery #1 is now signing
+
+    // Second bfcache while recovery #1 is SIGNING: it must lose auth ownership.
+    await bfcacheRoundTrip()
+    expect(legacy().restoreSession).toHaveBeenCalledTimes(2)
+
+    // Recovery #1's sign now settles SUCCESSFULLY, before #2 finishes restoring. It is no
+    // longer the auth owner, so it must not complete the login.
+    await act(async () => {
+      signDeferreds[1]({ success: true })
+      await new Promise((r) => setTimeout(r, 650))
+    })
+    expect(onSuccess).not.toHaveBeenCalled()
+
+    // #2 completes the recovery and drives the only successful login.
+    await act(async () => {
+      restoreResolvers[0]({ success: true, publicKey: PUBKEY })
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(3)
+    await act(async () => {
+      signDeferreds[2]({ success: true })
+      await new Promise((r) => setTimeout(r, 650))
+    })
+    expect(onSuccess).toHaveBeenCalledTimes(1)
+  })
+
+  /**
+   * MEDIUM (PR #66 review): the FIRST bfcache discard must retire the pre-discard auth owner
+   * too. Retiring it only when a recovery was already in flight covered the second discard but
+   * not the first — so the ORIGINAL sign request stayed current, and if it settled successfully
+   * while the replacement restore was still pending it published success through a transport
+   * the browser had already discarded.
+   */
+  it("retires the ORIGINAL auth owner on the FIRST bfcache discard (PR #66)", async () => {
+    const signDeferreds: Array<(v: { success: boolean }) => void> = []
+    const signIn = jest.fn(
+      () => new Promise<{ success: boolean }>((r) => signDeferreds.push(r)),
+    )
+    const onSuccess = jest.fn()
+    legacy().waitForConnection.mockResolvedValue({ success: true, publicKey: PUBKEY })
+    legacy().hasStoredSession.mockReturnValue(true)
+    legacy().isConnected.mockReturnValue(true)
+
+    // The one and only restore stays pending until the test releases it, so the original sign
+    // settles INSIDE the window where the replacement has not yet taken ownership.
+    let releaseRestore: (v: { success: boolean; publicKey: string }) => void = () => {}
+    legacy().restoreSession.mockImplementation(
+      () =>
+        new Promise<{ success: boolean; publicKey: string }>((r) => {
+          releaseRestore = r
+        }),
+    )
+
+    render(
+      <NostrConnectModal
+        uri="nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example&secret=s&name=Blink%20POS"
+        signInWithNostrConnect={signIn}
+        onSuccess={onSuccess}
+      />,
+    )
+
+    await act(async () => {
+      fireClick(openInAmberButton())
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(1) // the original sign, hanging
+
+    // FIRST bfcache discard. Recovery starts and blocks on restoreSession.
+    await bfcacheRoundTrip()
+    expect(legacy().restoreSession).toHaveBeenCalledTimes(1)
+
+    // The ORIGINAL sign now settles successfully, while the replacement restore is still
+    // pending. Its transport was discarded, so it must not complete the login.
+    await act(async () => {
+      signDeferreds[0]({ success: true })
+      await new Promise((r) => setTimeout(r, 650))
+    })
+    expect(onSuccess).not.toHaveBeenCalled()
+
+    // The restore completes and drives the only successful login, through the restored signer.
+    await act(async () => {
+      releaseRestore({ success: true, publicKey: PUBKEY })
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(2)
+    await act(async () => {
+      signDeferreds[1]({ success: true })
+      await new Promise((r) => setTimeout(r, 650))
+    })
+    expect(onSuccess).toHaveBeenCalledTimes(1)
+  })
+
+  /**
+   * HIGH (PR #66 review): suppressing the modal's own continuation is not enough — the auth
+   * operation publishes durable state of its own (profile activation, server sync, provider
+   * authenticated state) after its awaits. The modal must hand it an ownership signal that goes
+   * false when the attempt is retired, so it can stop before those side effects. This asserts
+   * the signalling half; that the hook honors it is covered in useNostrAuth.signin.spec.tsx.
+   */
+  it("gives the auth operation an ownership signal that goes false once retired (PR #66)", async () => {
+    const signOptions: Array<{ isCurrent?: () => boolean }> = []
+    const signIn = jest.fn((_pubkey: string, opts: { isCurrent?: () => boolean }) => {
+      signOptions.push(opts)
+      return new Promise<{ success: boolean }>(() => {}) // never settles on its own
+    })
+    legacy().waitForConnection.mockResolvedValue({ success: true, publicKey: PUBKEY })
+    legacy().hasStoredSession.mockReturnValue(true)
+    legacy().isConnected.mockReturnValue(true)
+    legacy().restoreSession.mockImplementation(
+      () => new Promise<{ success: boolean; publicKey: string }>(() => {}),
+    )
+
+    renderModal(signIn as unknown as jest.Mock)
+
+    await act(async () => {
+      fireClick(openInAmberButton())
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(1)
+
+    // The operation is handed an ownership check, and while it owns the flow it reads true.
+    const isCurrent = signOptions[0]?.isCurrent
+    expect(typeof isCurrent).toBe("function")
+    expect(isCurrent!()).toBe(true)
+
+    // A bfcache discard retires this attempt — the signal must now read false, so the in-flight
+    // operation can abandon before publishing anything durable.
+    await bfcacheRoundTrip()
+    expect(isCurrent!()).toBe(false)
+  })
+
+  /**
+   * HIGH (PR #66 review): retiring the token alone only changes what a polled predicate returns
+   * at the transaction's own checkpoints; a hung request would keep the session mutex until its
+   * own deadline. The modal must hand the transaction a real AbortSignal and abort it when the
+   * attempt is retired, so cancellation is immediate rather than eventual.
+   */
+  it("aborts the transaction's signal immediately when the attempt is retired (PR #66)", async () => {
+    const signOptions: Array<{ signal?: AbortSignal }> = []
+    const signIn = jest.fn((_pubkey: string, opts: { signal?: AbortSignal }) => {
+      signOptions.push(opts)
+      return new Promise<{ success: boolean }>(() => {}) // hung, like a stuck signer
+    })
+    legacy().waitForConnection.mockResolvedValue({ success: true, publicKey: PUBKEY })
+    legacy().hasStoredSession.mockReturnValue(true)
+    legacy().isConnected.mockReturnValue(true)
+    legacy().restoreSession.mockImplementation(
+      () => new Promise<{ success: boolean; publicKey: string }>(() => {}),
+    )
+
+    renderModal(signIn as unknown as jest.Mock)
+
+    await act(async () => {
+      fireClick(openInAmberButton())
+      await flushThroughConnectDelay()
+    })
+    const signal = signOptions[0]?.signal
+    expect(signal).toBeInstanceOf(AbortSignal)
+    expect(signal!.aborted).toBe(false)
+
+    // Retirement (a bfcache discard) must ABORT the in-flight transaction, not just poll it.
+    await bfcacheRoundTrip()
+    expect(signal!.aborted).toBe(true)
+  })
+
+  /**
+   * Coverage gap (PR #66 review): the reconnect path — a connect stalled by the deeplink
+   * backgrounding — had no mounted coverage. pagehide(persisted) marks the in-flight connect
+   * stalled, the resume supersedes it and starts ONE fresh waiter, and the superseded waiter's
+   * late result must be inert.
+   */
+  it("reconnects a connect stalled by backgrounding, and the superseded waiter is inert (PR #66)", async () => {
+    const signIn = jest.fn(async () => ({ success: true }))
+    const onSuccess = jest.fn()
+
+    // Waiter 1 never settles on its own (its subscription died with the tab); waiter 2 resolves.
+    const waiterResolvers: Array<(v: { success: boolean; publicKey: string }) => void> =
+      []
+    legacy().waitForConnection.mockImplementation(
+      () =>
+        new Promise<{ success: boolean; publicKey: string }>((r) =>
+          waiterResolvers.push(r),
+        ),
+    )
+    // No pending record was persisted (the ack never arrived) → the decision picks reconnect.
+    legacy().hasPendingSessionForCurrentAttempt.mockReturnValue(false)
+    legacy().hasStoredSession.mockReturnValue(false)
+    legacy().isConnected.mockReturnValue(false)
+
+    render(
+      <NostrConnectModal
+        uri="nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example&secret=s&name=Blink%20POS"
+        signInWithNostrConnect={signIn}
+        onSuccess={onSuccess}
+      />,
+    )
+
+    await act(async () => {
+      fireClick(openInAmberButton())
+      await flush()
+    })
+    expect(legacy().waitForConnection).toHaveBeenCalledTimes(1)
+
+    // The deeplink backgrounds the tab into bfcache while the connect is in flight, then it
+    // returns: the stalled attempt is superseded and exactly one replacement waiter starts.
+    await bfcacheRoundTrip()
+
+    expect(legacy().disconnect).toHaveBeenCalled() // service-side attempt invalidated
+    expect(legacy().waitForConnection).toHaveBeenCalledTimes(2)
+
+    // The SUPERSEDED waiter settles late with a success — it must change nothing.
+    await act(async () => {
+      waiterResolvers[0]({ success: true, publicKey: PUBKEY })
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).not.toHaveBeenCalled()
+    expect(onSuccess).not.toHaveBeenCalled()
+
+    // The replacement waiter settles: it drives the flow, exactly once.
+    await act(async () => {
+      waiterResolvers[1]({ success: true, publicKey: PUBKEY })
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(1)
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 650))
+    })
+    expect(onSuccess).toHaveBeenCalledTimes(1)
   })
 
   /**

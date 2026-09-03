@@ -18,7 +18,7 @@ import { QRCodeSVG } from "qrcode.react"
 import { useState, useEffect, useCallback, useRef } from "react"
 
 import { decideNip46Resume } from "../../lib/nostr/nip46-resume"
-import NostrConnectService from "../../lib/nostr/NostrConnectService"
+import NostrConnectService, { secretFromUri } from "../../lib/nostr/NostrConnectService"
 import { logAuth, logAuthError, logAuthWarn } from "../../lib/version"
 
 import ProgressStepper from "./ProgressStepper"
@@ -56,6 +56,14 @@ type ConnectionStage =
 interface SignInProgressOptions {
   onProgress: (stage: string, message?: string) => void
   timeout: number
+  /**
+   * Ownership check handed to the auth operation so it can abandon before publishing durable
+   * state (profile activation, server sync, provider auth state) once this attempt has been
+   * retired — suppressing only this component's continuation is not enough (PR #66 review).
+   */
+  isCurrent: () => boolean
+  /** Cancels the transaction's in-flight work when the attempt is retired. */
+  signal: AbortSignal
 }
 
 /** Sign-in result from useNostrAuth */
@@ -100,9 +108,17 @@ export default function NostrConnectModal({
   // Timer refs (real refs so timers survive re-renders and can be
   // cleared from any code path, including unmount)
   const slowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // The bfcache pageshow resume is deferred with a short setTimeout; hold its id so it is
+  // cleared on unmount / effect re-registration and can never fire resumeOnForeground()
+  // against a stale or unmounted component.
+  const bfcacheResumeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Single-flight guard for the foreground-resume path so a burst of
   // visibilitychange/focus events doesn't fire the NIP-98 sign request twice.
   const resumeInFlightRef = useRef<boolean>(false)
+  // Ticket for the CURRENT resume owner. A second bfcache discard supersedes an in-flight
+  // recovery (whose fresh sockets were just discarded too); the superseded run's `finally` must
+  // not clear the new owner's in-flight flag (PR #66 review).
+  const resumeGenRef = useRef<number>(0)
   // Attempt-scoped authentication ownership. Round-3 replaced the Boolean guard with a
   // token; round-4 review found the token had an ABA hole: resetting it to 0 on idle let a
   // later attempt reuse token 1, reviving a superseded token-1 continuation. The counter is
@@ -111,9 +127,36 @@ export default function NostrConnectModal({
   // current again.
   const authAttemptSeqRef = useRef<number>(0)
   const authActiveTokenRef = useRef<number | null>(null)
+  // The active attempt's cancellation handle. Retiring the token alone only changes what the
+  // transaction's polled isCurrent() returns at its own checkpoints; a hung request would keep
+  // the session mutex until its own deadline. Aborting this cancels it immediately, so the
+  // replacement gets a usable budget rather than spending it queued (PR #66 review).
+  const authAbortRef = useRef<AbortController | null>(null)
+  /** Retire whatever attempt is current: drop its token AND cancel its in-flight work. */
+  const retireActiveAuth = (): void => {
+    authActiveTokenRef.current = null
+    authAbortRef.current?.abort()
+    authAbortRef.current = null
+  }
   // Whether a fresh waitForConnection() attempt is pending (BunkerSigner.fromURI has not
-  // settled). A pending attempt OWNS the flow — the foreground resume must leave it alone.
+  // settled). A pending attempt OWNS the flow — the foreground resume must leave it alone
+  // UNLESS it was stalled by a backgrounding (see connectStalledRef).
   const connectInFlightRef = useRef<boolean>(false)
+  // Set when the tab goes hidden while a connect is in flight (the deeplink launched the
+  // signer). It means the pending fromURI subscription was suspended and its ephemeral
+  // connect-ack was lost, so on return the resume path must abort and restart the connect
+  // rather than wait out the 2-minute maxWait. Cleared whenever a connect (re)starts.
+  const connectStalledRef = useRef<boolean>(false)
+  // Set on pagehide(persisted=true): the page is entering the browser's back-forward cache,
+  // which will DISCARD all WebSockets. The visibilitychange:visible that fires during the
+  // subsequent bfcache restoration must NOT run the resume then (its fresh sockets get killed
+  // mid-restore); the later pageshow(persisted=true) is the correct, settled trigger.
+  const cameFromBfcacheRef = useRef<boolean>(false)
+  // Set by the pageshow(persisted) handler right before it triggers the resume, and consumed
+  // (read + reset) by resumeOnForeground. Tells the decision the transport was discarded by
+  // bfcache so an established flow does a fresh liveness-checked restore instead of trusting
+  // the now-dead "live" signer (PR #66 review).
+  const transportDiscardedRef = useRef<boolean>(false)
   // Monotonic flow generation: every intentional reset/restart bumps it, and every long
   // async continuation (connect settle, session restore) captures it up front and bails
   // WITHOUT mutating state if it has moved — a superseded waiter must never resurrect the
@@ -127,6 +170,10 @@ export default function NostrConnectModal({
         clearTimeout(slowTimerRef.current)
         slowTimerRef.current = null
       }
+      if (bfcacheResumeTimerRef.current) {
+        clearTimeout(bfcacheResumeTimerRef.current)
+        bfcacheResumeTimerRef.current = null
+      }
     }
   }, [])
 
@@ -139,6 +186,8 @@ export default function NostrConnectModal({
     flowGenRef.current += 1
     const gen = flowGenRef.current
     connectInFlightRef.current = true
+    // A fresh attempt starts clean: any stall from a previous attempt is irrelevant now.
+    connectStalledRef.current = false
 
     try {
       const result = await NostrConnectService.waitForConnection(uri)
@@ -236,8 +285,12 @@ export default function NostrConnectModal({
     // Every attempt gets a fresh, never-reused token; a superseding call's token increment is
     // what retires the hung predecessor (its continuation goes inert the next time it checks
     // currency). The counter is never reset, so no stale token can collide with a future one.
+    // A superseding call cancels the predecessor's in-flight work, not just its token.
+    if (opts?.supersede === true) authAbortRef.current?.abort()
     const attempt = ++authAttemptSeqRef.current
     authActiveTokenRef.current = attempt
+    const abortController = new AbortController()
+    authAbortRef.current = abortController
     const isCurrent = () => attempt === authActiveTokenRef.current
     // Set in the success branch so the finally does not zero the token before the deferred
     // completion timeout runs — that timeout owns the release on success.
@@ -266,6 +319,14 @@ export default function NostrConnectModal({
 
       // Call the sign-in function with progress callback
       const result = await signInWithNostrConnect(pubkey, {
+        // Ownership, not just UI suppression: the auth operation publishes durable state of its
+        // own (server sync, provider authenticated state) after its awaits. Retiring this
+        // attempt's token must stop THAT too, not only this component's continuation
+        // (PR #66 review).
+        isCurrent,
+        // And cancellation, not just ownership: aborting this cancels the transaction's
+        // in-flight login/signing immediately when the attempt is retired.
+        signal: abortController.signal,
         onProgress: (progressStage: string, message?: string) => {
           // Stale attempts must not move the stepper mid-flight.
           if (!isCurrent()) return
@@ -294,7 +355,7 @@ export default function NostrConnectModal({
         // AND the guard release on success (finally skips it for completed attempts).
         setTimeout(() => {
           if (!isCurrent()) return
-          authActiveTokenRef.current = null
+          retireActiveAuth()
           onSuccess?.(pubkey)
         }, 600)
       } else {
@@ -315,7 +376,7 @@ export default function NostrConnectModal({
       // Only the CURRENT attempt may release the guard — a superseded attempt settling must
       // not free the slot its replacement still owns. On success the release is deferred to
       // the completion timeout below (which owns the final isCurrent check + onSuccess).
-      if (isCurrent() && !completedSuccessfully) authActiveTokenRef.current = null
+      if (isCurrent() && !completedSuccessfully) retireActiveAuth()
     }
   }
 
@@ -338,20 +399,74 @@ export default function NostrConnectModal({
     // The only connection path left is the direct nostrconnect:// deeplink flow, served by
     // NostrConnectService (the bunker flow and its NDK variant were removed).
     const service = NostrConnectService
+    // Consume the bfcache-discard signal (read + reset) so it applies to exactly this resume.
+    const transportDiscarded = transportDiscardedRef.current
+    transportDiscardedRef.current = false
     const action = decideNip46Resume({
       stage,
       // Round-2 blocker: a pending fresh connect attempt owns the flow — the resume must
-      // leave it alone (it resolves or times out by itself, generation-guarded).
+      // leave it alone WHILE it is still legitimately waiting. But if it stalled across a
+      // backgrounding (connectStalled), its subscription is dead and we must reconnect.
       connectInFlight: connectInFlightRef.current,
+      connectStalled: connectStalledRef.current,
       connected: service.isConnected(),
       hasPubkey: Boolean(connectedPubkey),
       hasSession: service.hasStoredSession(),
+      // Attempt-owned pending record (secret-bound to THIS uri): distinguishes this handshake's
+      // pending record from a previous signer's confirmed OR leftover-pending one, so a stalled
+      // pre-ack connect reconnects instead of restoring the wrong signer.
+      hasOwnPendingSession: service.hasPendingSessionForCurrentAttempt(uri),
+      transportDiscarded,
     })
     if (action === null) return
-    if (resumeInFlightRef.current) return
+    // The transport was discarded and we are acting on it: retire the CURRENT auth owner,
+    // whoever it is. This is unconditional by design — scoping it to the "a recovery is already
+    // in flight" branch covered a second discard but not the FIRST one, leaving the ORIGINAL
+    // sign request still current: if it settled successfully while the replacement restore was
+    // pending, it published success through a transport the browser had already discarded
+    // (PR #66 review). The invariant is simply: nothing started before a discard decision may
+    // complete after it, so it must not depend on who happens to be running.
+    if (transportDiscarded && authActiveTokenRef.current !== null) {
+      logAuth(
+        "NostrConnectModal",
+        "Transport discarded — retiring the current auth owner",
+      )
+      retireActiveAuth()
+    }
+    if (resumeInFlightRef.current) {
+      // A recovery is already running. Normally we leave it alone (a focus/visibility burst
+      // must not double-fire). But a NEW bfcache discard means the transport died AGAIN —
+      // including the fresh sockets the in-flight recovery just opened, so it is now hanging on
+      // a dead connection and will never complete. Supersede it and take ownership: bumping the
+      // flow generation makes its continuation a no-op (PR #66 review).
+      if (!transportDiscarded) return
+      logAuth(
+        "NostrConnectModal",
+        "Second bfcache discard — superseding the in-flight recovery",
+      )
+      flowGenRef.current += 1
+    }
     resumeInFlightRef.current = true
+    // Take the resume ticket AFTER claiming ownership, so a superseded run's finally sees a
+    // newer ticket and leaves the in-flight flag set for the new owner.
+    const myResumeGen = ++resumeGenRef.current
     logAuth("NostrConnectModal", `Foreground resume (stage=${stage}, action=${action})`)
     try {
+      if (action === "reconnect") {
+        // The connect stalled across the deeplink backgrounding: its fromURI subscription was
+        // suspended and the signer's connect-ack was lost. Supersede the stuck attempt (bump
+        // the generation so its eventual maxWait settle is inert, disconnect the service-side
+        // pending attempt) and start a fresh connect whose live subscription can catch the
+        // ack the signer re-publishes. Stay at the "waiting" stage — the UI never left it.
+        logAuth("NostrConnectModal", "Connect stalled by backgrounding — reconnecting")
+        connectStalledRef.current = false
+        connectInFlightRef.current = false
+        flowGenRef.current += 1
+        await NostrConnectService.disconnect().catch(() => undefined)
+        setStage("waiting")
+        startWaitingForConnection()
+        return
+      }
       if (action === "resume-signing" && connectedPubkey) {
         // The BunkerSigner survived backgrounding — re-drive only the NIP-98 step. The
         // authAttemptRef ownership guard inside handleConnectionSuccess makes this a no-op
@@ -363,11 +478,30 @@ export default function NostrConnectModal({
       }
       if (action === "restore-session") {
         // The socket died while suspended: rebuild from the stored session and re-drive.
+        // If we got here from a STALLED pending connect (its handshake reached the ack and
+        // persisted a pending session, but the socket died before/at getPublicKey), the stuck
+        // waitForConnection is still in flight — supersede it first so its eventual maxWait
+        // settle is inert and cannot race this restore. Bumping the generation below covers
+        // the continuation guard; clear the connect refs so the flow is owned by the restore.
+        if (connectInFlightRef.current) {
+          logAuth("NostrConnectModal", "Stalled connect — restoring the pending session")
+          connectStalledRef.current = false
+          connectInFlightRef.current = false
+        }
         // Capture the flow generation now so a superseding reset during the async restore
         // makes its continuation a no-op instead of resurrecting a stale session.
+        flowGenRef.current += 1
         const gen = flowGenRef.current
         logAuth("NostrConnectModal", "Connection lost — restoring session")
-        const restored = await service.restoreSession()
+        // Pass THIS uri's secret so a pending record is only adopted if it was created by this
+        // attempt (the service refuses + clears a secret-mismatched pending record).
+        // expectedPublicKey: if this flow already established a user, a stored record for a
+        // DIFFERENT user is stale (possible when both the session write and its fallback
+        // removal failed) and must not replace the live one (PR #66 review).
+        const restored = await service.restoreSession({
+          expectedSecret: secretFromUri(uri),
+          expectedPublicKey: connectedPubkey ?? undefined,
+        })
         if (gen !== flowGenRef.current) {
           logAuth("NostrConnectModal", "Restore superseded — dropping its result")
           return
@@ -393,19 +527,21 @@ export default function NostrConnectModal({
       // timeout must not flip this fresh idle UI to an error. disconnect() invalidates the
       // SERVICE-side pending attempt too (round-4 review), not just the modal refs.
       flowGenRef.current += 1
-      authActiveTokenRef.current = null
+      retireActiveAuth()
       setStage("idle")
       setConnectedPubkey(null)
       service.disconnect().catch(() => undefined)
     } catch (error: unknown) {
       logAuthError("NostrConnectModal", "Foreground resume failed:", error)
       flowGenRef.current += 1
-      authActiveTokenRef.current = null
+      retireActiveAuth()
       setStage("idle")
       setConnectedPubkey(null)
       service.disconnect().catch(() => undefined)
     } finally {
-      resumeInFlightRef.current = false
+      // Only the CURRENT owner releases the flag: a superseded run finishing late must not
+      // clear it out from under the recovery that replaced it.
+      if (myResumeGen === resumeGenRef.current) resumeInFlightRef.current = false
     }
     // stage/connectedPubkey are read at fire time; handleConnectionSuccess is stable per
     // render. Deliberately NOT reactive — this runs on visibility/focus events, not on state.
@@ -418,15 +554,85 @@ export default function NostrConnectModal({
     if (!isIOS && !isAndroid) return
 
     const onVisible = () => {
-      if (document.visibilityState === "visible") resumeOnForeground()
+      if (document.visibilityState === "visible") {
+        // If we are coming back via bfcache, defer to pageshow — running now would race the
+        // bfcache restoration and kill the restore's fresh sockets. pageshow clears the flag.
+        if (cameFromBfcacheRef.current) {
+          logAuth(
+            "NostrConnectModal",
+            "Visible during bfcache restore — waiting for pageshow",
+          )
+          return
+        }
+        resumeOnForeground()
+      } else if (connectInFlightRef.current) {
+        // Tab hidden while a connect is pending: the deeplink launched the signer and this
+        // tab (with its relay subscription) is about to be suspended. Mark the connect as
+        // stalled so the resume on return aborts-and-restarts it instead of hanging.
+        connectStalledRef.current = true
+        logAuth("NostrConnectModal", "Tab hidden during connect — marking stalled")
+      }
     }
-    const onFocus = () => resumeOnForeground()
+    const onFocus = () => {
+      // Same bfcache guard as visibility — pageshow owns the post-bfcache resume.
+      if (cameFromBfcacheRef.current) return
+      resumeOnForeground()
+    }
+    const onPageHide = (e: PageTransitionEvent) => {
+      // persisted=true → the page is being frozen into bfcache (sockets will be discarded).
+      if (!e.persisted) return
+      cameFromBfcacheRef.current = true
+      // Entering bfcache guarantees the relay sockets die. If a connect is in flight, its
+      // fromURI subscription is now dead — mark it stalled here directly (visibilitychange may
+      // not fire on a same-document deeplink nav), so the pageshow resume aborts-and-restarts
+      // instead of hanging (PR #66 review).
+      if (connectInFlightRef.current) {
+        connectStalledRef.current = true
+        logAuth("NostrConnectModal", "Entering bfcache during connect — marking stalled")
+      }
+    }
+
+    // pageshow with persisted=true means the page was restored from the browser's
+    // back-forward cache (bfcache). On mobile, the nostrconnect:// deeplink is a same-document
+    // navigation that Chrome serves via bfcache, which SUSPENDS and then DISCARDS all
+    // WebSockets. If the resume runs during that restoration, the fresh restore pool's sockets
+    // are killed mid-flight (observed on-device: "Page entered Back-Forward Cache" socket
+    // errors + a hung ping). pageshow fires AFTER restoration settles, so it is the correct
+    // trigger; a short defer lets the socket layer fully re-enable before restore opens its
+    // fresh pool.
+    const onPageShow = (e: PageTransitionEvent) => {
+      if (!e.persisted && !cameFromBfcacheRef.current) return
+      // Restored from bfcache: sockets were discarded and restoration has now settled. Clear
+      // the guard and run the resume after a short defer so the socket layer is fully
+      // re-enabled before restoreSession opens its fresh pool.
+      cameFromBfcacheRef.current = false
+      // Record that the transport was discarded so this resume forces a fresh liveness-checked
+      // restore for an established flow instead of trusting the now-dead "live" signer. Set
+      // BEFORE the deferred fire; resumeOnForeground reads + resets it (PR #66 review).
+      transportDiscardedRef.current = true
+      logAuth("NostrConnectModal", "Restored from bfcache — resuming after settle")
+      if (bfcacheResumeTimerRef.current) clearTimeout(bfcacheResumeTimerRef.current)
+      bfcacheResumeTimerRef.current = setTimeout(() => {
+        bfcacheResumeTimerRef.current = null
+        resumeOnForeground()
+      }, 150)
+    }
 
     document.addEventListener("visibilitychange", onVisible)
     window.addEventListener("focus", onFocus)
+    window.addEventListener("pageshow", onPageShow)
+    window.addEventListener("pagehide", onPageHide)
     return () => {
       document.removeEventListener("visibilitychange", onVisible)
       window.removeEventListener("focus", onFocus)
+      window.removeEventListener("pageshow", onPageShow)
+      window.removeEventListener("pagehide", onPageHide)
+      // Cancel a pending bfcache-resume defer so it cannot fire after this effect is torn
+      // down (unmount, or re-registration when resumeOnForeground changes).
+      if (bfcacheResumeTimerRef.current) {
+        clearTimeout(bfcacheResumeTimerRef.current)
+        bfcacheResumeTimerRef.current = null
+      }
     }
   }, [resumeOnForeground])
 
@@ -456,7 +662,7 @@ export default function NostrConnectModal({
     // a no-op rather than resurrecting a flow the user just cancelled. Releasing the auth
     // slot likewise retires any hung sign request so its late timeout can't error the UI.
     flowGenRef.current += 1
-    authActiveTokenRef.current = null
+    retireActiveAuth()
     // Clean disconnect
     if (slowTimerRef.current) {
       clearTimeout(slowTimerRef.current)
@@ -469,7 +675,7 @@ export default function NostrConnectModal({
   const handleBackToOptions = () => {
     // Same guard as cancel: leaving the flow supersedes any in-flight attempt or hung sign.
     flowGenRef.current += 1
-    authActiveTokenRef.current = null
+    retireActiveAuth()
     setStage("idle")
     setShowSlowWarning(false)
     setErrorMessage("")
