@@ -463,6 +463,79 @@ describe("NostrConnectModal — same-device NIP-46 resume (review blockers)", ()
   })
 
   /**
+   * Divergent finding (PR #66 review, Codex GPT-5): the second discard must revoke recovery #1's
+   * AUTH ownership, not just its restore continuation. If #1 already finished restoring and is
+   * signing, it is past the generation check — so without retiring the auth token it could
+   * publish success (through a signer the discard just killed) while #2 is still restoring.
+   */
+  it("retires an in-flight recovery's auth owner on the second bfcache discard (PR #66)", async () => {
+    const signDeferreds: Array<(v: { success: boolean }) => void> = []
+    const signIn = jest.fn(
+      () => new Promise<{ success: boolean }>((r) => signDeferreds.push(r)),
+    )
+    const onSuccess = jest.fn()
+    legacy().waitForConnection.mockResolvedValue({ success: true, publicKey: PUBKEY })
+    legacy().hasStoredSession.mockReturnValue(true)
+    legacy().isConnected.mockReturnValue(true)
+
+    // Restore #1 SUCCEEDS immediately, so recovery #1 proceeds to signing; restore #2 hangs
+    // until the test releases it.
+    const restoreResolvers: Array<(v: { success: boolean; publicKey: string }) => void> =
+      []
+    legacy()
+      .restoreSession.mockResolvedValueOnce({ success: true, publicKey: PUBKEY })
+      .mockImplementation(
+        () =>
+          new Promise<{ success: boolean; publicKey: string }>((r) =>
+            restoreResolvers.push(r),
+          ),
+      )
+
+    render(
+      <NostrConnectModal
+        uri="nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example&secret=s&name=Blink%20POS"
+        signInWithNostrConnect={signIn}
+        onSuccess={onSuccess}
+      />,
+    )
+
+    await act(async () => {
+      fireClick(openInAmberButton())
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(1) // the original sign, hanging
+
+    // First bfcache: recovery #1 restores and starts its REPLACEMENT sign, which also hangs.
+    await bfcacheRoundTrip()
+    expect(legacy().restoreSession).toHaveBeenCalledTimes(1)
+    expect(signIn).toHaveBeenCalledTimes(2) // recovery #1 is now signing
+
+    // Second bfcache while recovery #1 is SIGNING: it must lose auth ownership.
+    await bfcacheRoundTrip()
+    expect(legacy().restoreSession).toHaveBeenCalledTimes(2)
+
+    // Recovery #1's sign now settles SUCCESSFULLY, before #2 finishes restoring. It is no
+    // longer the auth owner, so it must not complete the login.
+    await act(async () => {
+      signDeferreds[1]({ success: true })
+      await new Promise((r) => setTimeout(r, 650))
+    })
+    expect(onSuccess).not.toHaveBeenCalled()
+
+    // #2 completes the recovery and drives the only successful login.
+    await act(async () => {
+      restoreResolvers[0]({ success: true, publicKey: PUBKEY })
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(3)
+    await act(async () => {
+      signDeferreds[2]({ success: true })
+      await new Promise((r) => setTimeout(r, 650))
+    })
+    expect(onSuccess).toHaveBeenCalledTimes(1)
+  })
+
+  /**
    * ABA regression (round-4 review): auth tokens must NEVER be reused. Sequence: sign A hangs
    * → foreground restart resets the flow (old code zeroed the token) → fresh attempt starts
    * sign B (old code reused token 1 — A's late settle would then read CURRENT and mutate B's

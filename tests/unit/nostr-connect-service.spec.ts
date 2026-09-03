@@ -1035,6 +1035,77 @@ describe("NostrConnectService — pending-session handshake recovery", () => {
   })
 
   /**
+   * Divergent finding (PR #66 review, Codex GPT-5): a refusal must be DURABLE even when the
+   * record cannot be removed. If removeItem keeps throwing, the rejected record stays on disk,
+   * and the startup restore — which passes no expectation to check it against — would adopt it
+   * and authenticate the wrong user. An in-memory tombstone makes the refusal independent of
+   * storage cooperating.
+   */
+  it("keeps a refused session refused even when removal keeps failing (PR #66)", async () => {
+    jest.spyOn(console, "warn").mockImplementation(() => {})
+    const staleRecord = JSON.stringify({
+      publicKey: "user-A",
+      signerPubkey: "signerA",
+      relays: ["wss://r.example"],
+      connectedAt: Date.now(),
+    })
+    localStorage.setItem(SESSION_KEY, staleRecord)
+
+    // removeItem always throws, so the record can never actually be deleted.
+    const realRemove = localStorage.removeItem
+    localStorage.removeItem = (key: string): void => {
+      if (key === SESSION_KEY) throw new Error("SecurityError")
+      realRemove.call(localStorage, key)
+    }
+    try {
+      // The live flow (user B) refuses A's record.
+      const refused = await NostrConnectService.restoreSession({
+        expectedPublicKey: "user-B",
+      })
+      expect(refused.success).toBe(false)
+      // The record is still physically on disk — clearing failed.
+      expect(localStorage.getItem(SESSION_KEY)).toBe(staleRecord)
+
+      // The STARTUP restore shape (no opts at all) must still refuse it. No signer is queued:
+      // if it wrongly proceeded, fromBunker would be called and this would not report "no
+      // session".
+      const startup = await NostrConnectService.restoreSession()
+
+      expect(startup.success).toBe(false)
+      expect(NostrConnectService.signer).toBeNull()
+      expect(NostrConnectService.isConnected()).toBe(false)
+      // Also invisible to the session probes the resume decision relies on.
+      expect(NostrConnectService.hasStoredSession()).toBe(false)
+    } finally {
+      localStorage.removeItem = realRemove
+    }
+  })
+
+  it("lets a NEW session replace a previously refused one with the same fingerprint (PR #66)", async () => {
+    jest.spyOn(console, "warn").mockImplementation(() => {})
+    localStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        publicKey: "user-signerX",
+        signerPubkey: "signerX",
+        relays: ["wss://r.example"],
+        connectedAt: Date.now(),
+      }),
+    )
+    // Refuse it (the live flow is a different user).
+    await NostrConnectService.restoreSession({ expectedPublicKey: "user-OTHER" })
+    expect(NostrConnectService.hasStoredSession()).toBe(false)
+
+    // A fresh, legitimate connect for that same user/signer must NOT be shadowed by the
+    // tombstone — writing a session asserts it is valid now.
+    signerQueue.push(() => makeFakeSigner("signerX"))
+    const connected = await NostrConnectService.waitForConnection(URI)
+
+    expect(connected.success).toBe(true)
+    expect(NostrConnectService.hasStoredSession()).toBe(true)
+  })
+
+  /**
    * LOW (PR #66 review, Codex GPT-5): the cleanup helpers must be non-throwing even when the
    * Window storage GETTER itself throws (SecurityError in some privacy modes) — not only when
    * removeItem throws. Previously the `typeof sessionStorage` check sat OUTSIDE the try, so a
@@ -1120,6 +1191,9 @@ describe("NostrConnectService — client-key consistency with unusable storage",
   }
 
   let keySeq = 0
+  // A per-test module instance (see beforeEach): the client-key cache is page-lifetime state,
+  // so every test must start with it unresolved.
+  let freshService: typeof NostrConnectService
 
   beforeEach(() => {
     signerQueue.length = 0
@@ -1130,6 +1204,17 @@ describe("NostrConnectService — client-key consistency with unusable storage",
     NostrConnectService.connectionState = "disconnected"
     NostrConnectService.userPublicKey = null
     jest.spyOn(console, "warn").mockImplementation(() => {})
+
+    // fromURI call indices are per-test, so the helpers below can count from 0.
+    nip46.BunkerSigner.fromURI.mockClear()
+    // The service caches the client key for the PAGE lifetime, which is exactly the invariant
+    // under test — so each test needs a fresh module instance to start from "no key resolved
+    // yet". Re-requiring under isolateModules gives that without a test-only reset hook.
+    jest.isolateModules(() => {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports -- fresh module instance per test
+      freshService = require("../../lib/nostr/NostrConnectService")
+        .default as typeof NostrConnectService
+    })
 
     // Distinct key per call; pubkey/hex derived from the key's first byte so a swapped key is
     // immediately visible.
@@ -1179,11 +1264,11 @@ describe("NostrConnectService — client-key consistency with unusable storage",
       },
     })
     try {
-      const uri: string = NostrConnectService.generateConnectionURI()
+      const uri: string = freshService.generateConnectionURI()
       const signer = makeFakeSigner("signerX")
       signer.getPublicKey = jest.fn(() => new Promise<string>(() => {}))
       signerQueue.push(() => signer)
-      NostrConnectService.waitForConnection(uri)
+      freshService.waitForConnection(uri)
       await flush()
 
       expectUriAndWaiterAgree(uri, 0)
@@ -1203,14 +1288,99 @@ describe("NostrConnectService — client-key consistency with unusable storage",
       }),
     })
     try {
-      const uri: string = NostrConnectService.generateConnectionURI()
+      const uri: string = freshService.generateConnectionURI()
       const signer = makeFakeSigner("signerX")
       signer.getPublicKey = jest.fn(() => new Promise<string>(() => {}))
       signerQueue.push(() => signer)
-      NostrConnectService.waitForConnection(uri)
+      freshService.waitForConnection(uri)
       await flush()
 
       expectUriAndWaiterAgree(uri, 0)
+    } finally {
+      restore()
+    }
+  })
+
+  // The reviewer's transition cases: it is not enough that a single call handles failure — the
+  // identity must survive storage CHANGING its behavior between calls, in either direction.
+
+  it("keeps ONE key when storage is usable at URI generation but denied at the waiter", async () => {
+    // Usable: the URI is generated from a stored/generated key.
+    const uri: string = freshService.generateConnectionURI()
+
+    // ...then the getter starts throwing before the waiter runs.
+    const restore = denyStorage({
+      get() {
+        throw new Error("SecurityError")
+      },
+    })
+    try {
+      const signer = makeFakeSigner("signerX")
+      signer.getPublicKey = jest.fn(() => new Promise<string>(() => {}))
+      signerQueue.push(() => signer)
+      freshService.waitForConnection(uri)
+      await flush()
+
+      expectUriAndWaiterAgree(uri, 0)
+    } finally {
+      restore()
+    }
+  })
+
+  it("keeps ONE key when storage is denied at URI generation but usable at the waiter", async () => {
+    // Denied at generation: the key is generated and held in memory.
+    const restore = denyStorage({
+      get() {
+        throw new Error("SecurityError")
+      },
+    })
+    let uri: string
+    try {
+      uri = freshService.generateConnectionURI()
+    } finally {
+      restore() // storage comes back before the waiter
+    }
+
+    const signer = makeFakeSigner("signerX")
+    signer.getPublicKey = jest.fn(() => new Promise<string>(() => {}))
+    signerQueue.push(() => signer)
+    freshService.waitForConnection(uri)
+    await flush()
+
+    // Recovered storage must not hand back a DIFFERENT key than the URI advertises.
+    expectUriAndWaiterAgree(uri, 0)
+  })
+
+  it("keeps ONE key when setItem silently fails to persist (no throw, later read returns null)", async () => {
+    // The write appears to succeed but nothing is stored — the old code would read null on the
+    // next call and generate a fresh key, silently rotating the identity.
+    const restore = denyStorage({
+      get: () => ({
+        getItem: () => null, // never returns what was "written"
+        setItem: () => undefined, // silent no-op, no throw
+        removeItem: () => undefined,
+      }),
+    })
+    try {
+      const uri: string = freshService.generateConnectionURI()
+      const first = makeFakeSigner("signerX")
+      first.getPublicKey = jest.fn(() => new Promise<string>(() => {}))
+      signerQueue.push(() => first)
+      freshService.waitForConnection(uri)
+      await flush()
+
+      expectUriAndWaiterAgree(uri, 0)
+
+      // And it must still hold across a reconnect.
+      await freshService.disconnect()
+      const second = makeFakeSigner("signerX")
+      second.getPublicKey = jest.fn(() => new Promise<string>(() => {}))
+      signerQueue.push(() => second)
+      freshService.waitForConnection(uri)
+      await flush()
+
+      expectUriAndWaiterAgree(uri, 1)
+      expect(keyPassedToFromURI(1)).toEqual(keyPassedToFromURI(0))
     } finally {
       restore()
     }
@@ -1227,22 +1397,22 @@ describe("NostrConnectService — client-key consistency with unusable storage",
       }),
     })
     try {
-      const uri: string = NostrConnectService.generateConnectionURI()
+      const uri: string = freshService.generateConnectionURI()
       const first = makeFakeSigner("signerX")
       first.getPublicKey = jest.fn(() => new Promise<string>(() => {}))
       signerQueue.push(() => first)
-      NostrConnectService.waitForConnection(uri)
+      freshService.waitForConnection(uri)
       await flush()
 
       expectUriAndWaiterAgree(uri, 0)
 
       // Reconnect: disconnect and retry the SAME uri — the key must not rotate, or the retry
       // would listen with a key the signer is not addressing.
-      await NostrConnectService.disconnect()
+      await freshService.disconnect()
       const second = makeFakeSigner("signerX")
       second.getPublicKey = jest.fn(() => new Promise<string>(() => {}))
       signerQueue.push(() => second)
-      NostrConnectService.waitForConnection(uri)
+      freshService.waitForConnection(uri)
       await flush()
 
       expectUriAndWaiterAgree(uri, 1)

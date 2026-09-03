@@ -684,10 +684,20 @@ export function NostrAuthProvider({
                 // Dynamic import to avoid circular dependency
                 const NostrConnectServiceModule = (
                   await import("../nostr/NostrConnectService")
-                ).default as { restoreSession: () => Promise<ConnectionResult> }
+                ).default as {
+                  restoreSession: (opts?: {
+                    expectedPublicKey?: string
+                  }) => Promise<ConnectionResult>
+                }
 
+                // Bind the restore to the user this session belongs to. Without it, a stale
+                // record for a DIFFERENT user (possible when a previous session write and its
+                // fallback removal both failed) would be restored here and authenticated as
+                // that other user (PR #66 review).
                 const restoreResult: ConnectionResult =
-                  await NostrConnectServiceModule.restoreSession()
+                  await NostrConnectServiceModule.restoreSession({
+                    expectedPublicKey: publicKey,
+                  })
 
                 if (!restoreResult.success) {
                   console.warn(

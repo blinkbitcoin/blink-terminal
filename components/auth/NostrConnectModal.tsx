@@ -400,6 +400,12 @@ export default function NostrConnectModal({
         "Second bfcache discard — superseding the in-flight recovery",
       )
       flowGenRef.current += 1
+      // Retire the auth owner too. The generation bump only makes the superseded recovery's
+      // RESTORE continuation inert; if that recovery already got as far as signing, it is past
+      // that check and would otherwise publish success — through a signer this discard just
+      // killed — while this recovery is still restoring. Nothing started before a discard
+      // decision may complete after it (PR #66 review).
+      authActiveTokenRef.current = null
     }
     resumeInFlightRef.current = true
     // Take the resume ticket AFTER claiming ownership, so a superseded run's finally sees a

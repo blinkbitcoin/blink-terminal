@@ -208,18 +208,39 @@ const POST_CONNECT_DELAY = 500
 let connectionAttemptCounter = 0
 
 /**
- * Process-lifetime fallback client key, used ONLY when storage is unusable (denied getter,
- * throwing getItem, failing setItem).
+ * The client key for this page lifetime — the SINGLE source of truth, whatever its origin
+ * (loaded from storage, freshly generated and persisted, or generated when storage is
+ * unusable).
  *
  * The client key IS this client's identity: generateConnectionURI embeds its pubkey in the
- * nostrconnect:// URI, and the signer addresses its response to that pubkey. If the storage
- * fallback minted a fresh random key per call, the URI would advertise key A while
- * waitForConnection's fromURI subscribed and decrypted with key B — the signer's reply would be
- * undecryptable and the handshake could never complete (PR #66 review). Caching one key for the
- * page lifetime keeps URI generation, the initial wait, reconnect, and restore on a single
- * identity even with no storage.
+ * nostrconnect:// URI and the signer addresses its response to that pubkey, while
+ * BunkerSigner.fromURI subscribes and decrypts with whatever key it is handed. If those two
+ * ever disagree the handshake simply times out.
+ *
+ * Consulting storage on EVERY call made the identity a function of storage's current mood: a
+ * getter that starts working (or stops), a silent setItem failure, or a verification mismatch
+ * would each hand back a different key mid-flow (PR #66 review). So the key is resolved exactly
+ * once and cached here; storage is a persistence hint for that FIRST resolution only, and its
+ * later behavior cannot rotate the identity. Nothing in the app rotates the stored client key
+ * during a page lifetime, so a constant is the correct model.
  */
-let ephemeralClientKey: Uint8Array | null = null
+let clientKey: Uint8Array | null = null
+
+/**
+ * Fingerprint of a session record that restoreSession has REFUSED (wrong attempt, or wrong
+ * user). Refusal clears the record, but clearing is best-effort: if removeItem keeps throwing,
+ * the rejected record stays on disk and a later restore — including the startup one, which has
+ * no expectation to check it against — could adopt it and authenticate the wrong user
+ * (PR #66 review).
+ *
+ * So rejection is recorded in memory as well: getStoredSession treats a record matching this
+ * fingerprint as absent. Durability of the refusal then does not depend on storage cooperating.
+ */
+let rejectedSessionFingerprint: string | null = null
+
+/** Identity of a stored session record, for comparing a rejected record against a read one. */
+const sessionFingerprint = (session: NIP46Session): string =>
+  [session.publicKey, session.signerPubkey, session.secret ?? ""].join("|")
 
 // =====================================================================
 // Service class
@@ -627,7 +648,7 @@ class NostrConnectService {
         console.warn(
           "[NostrConnect] Pending session belongs to a different attempt — refusing restore",
         )
-        this.clearSession()
+        this.rejectStoredSession(session)
         return { success: false, error: "Session invalid" }
       }
     } else if (opts?.expectedPublicKey && session.publicKey !== opts.expectedPublicKey) {
@@ -635,13 +656,13 @@ class NostrConnectService {
       // This is reachable when storeSession's write AND its fallback removal both failed, so a
       // previous user A's record survived while user B went live: a bfcache-triggered restore
       // would otherwise rebuild A, pass its own publicKey match, and authenticate the WRONG
-      // USER (PR #66 review). Refuse before building any signer, and clear the provably stale
+      // USER (PR #66 review). Refuse before building any signer, and reject the provably stale
       // record so a later startup restore (which has no expectation to check against) cannot
       // silently log in as A.
       console.warn(
         "[NostrConnect] Stored session belongs to a different user — refusing restore",
       )
-      this.clearSession()
+      this.rejectStoredSession(session)
       return { success: false, error: "Session invalid" }
     }
 
@@ -834,108 +855,71 @@ class NostrConnectService {
   // =============== Private Helper Methods ===============
 
   /**
-   * Get or create the ephemeral client keypair.
-   * This key is used to communicate with the remote signer.
+   * The client keypair used to talk to the remote signer.
+   *
+   * Resolved ONCE per page lifetime and cached, whatever the source. Callers
+   * (generateConnectionURI, waitForConnection, reconnect, restoreSession) are guaranteed the
+   * same identity, so the pubkey advertised in the URI always matches the key that fromURI
+   * decrypts with — regardless of how storage behaves between those calls (PR #66 review).
    */
-  /**
-   * Read the stored client key, tolerating a throwing getItem (denied storage). `onThrow` lets
-   * the caller distinguish "no key stored" (null) from "storage is unusable" (threw), which
-   * must fall back to the stable ephemeral key rather than minting a fresh one.
-   */
-  private static readClientKey(storage: Storage, onThrow?: () => void): string | null {
-    try {
-      return storage.getItem(NIP46_CLIENT_KEY)
-    } catch (err: unknown) {
-      console.warn("[NostrConnect] getOrCreateClientKey: Failed to read stored key:", err)
-      onThrow?.()
-      return null
-    }
+  private static getOrCreateClientKey(): Uint8Array {
+    if (clientKey) return clientKey
+    clientKey = this.resolveClientKeyOnce()
+    return clientKey
   }
 
-  private static getOrCreateClientKey(): Uint8Array {
-    // Server-side, or storage denied (the getter itself can throw): fall back to the
-    // process-lifetime key. The connect flow must not fail just because the key cannot be
-    // persisted — it simply will not be reused across reloads (PR #66 review).
+  /**
+   * First-resolution logic only; never consulted again. Storage is a best-effort persistence
+   * hint here: if it cannot be read or written, the generated key still becomes THE key for
+   * this page lifetime (it simply will not be reused after a reload).
+   */
+  private static resolveClientKeyOnce(): Uint8Array {
     const storage = safeStorage("local")
-    if (!storage) return this.getEphemeralClientKey("no usable storage")
 
-    // Try to retrieve existing key. readClientKey returns null if getItem THREW (denied
-    // storage) as well as if no key is stored — a throw means we cannot trust this storage, so
-    // fall back to the stable in-memory key rather than minting a fresh one per call.
-    let readFailed = false
-    const stored: string | null = this.readClientKey(storage, () => {
-      readFailed = true
-    })
-    if (readFailed) return this.getEphemeralClientKey("stored key unreadable")
-
-    console.log("[NostrConnect] getOrCreateClientKey: Stored key exists:", !!stored)
-    console.log(
-      "[NostrConnect] getOrCreateClientKey: Stored key length:",
-      stored?.length || 0,
-    )
-
+    // Reuse a valid persisted key so the client identity survives reloads.
+    const stored: string | null = storage ? this.readClientKey(storage) : null
     if (stored) {
       try {
         const key: Uint8Array = hexToBytes(stored)
-        const pubkey: string = getPublicKey(key)
         console.log(
           "[NostrConnect] getOrCreateClientKey: Using existing key, pubkey:",
-          pubkey.slice(0, 16) + "...",
+          getPublicKey(key).slice(0, 16) + "...",
         )
         return key
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err)
-        console.warn(
-          "[NostrConnect] getOrCreateClientKey: Invalid stored key, error:",
-          msg,
-        )
-        console.warn("[NostrConnect] getOrCreateClientKey: Generating new one")
+        console.warn("[NostrConnect] getOrCreateClientKey: Invalid stored key:", msg)
       }
     }
 
-    // Generate new key and persist it. If the write fails we cannot rely on storage to hand
-    // the SAME key back on the next call (URI generation and the waiter each call this), so
-    // the key must come from the process-lifetime cache instead (PR #66 review).
     console.log("[NostrConnect] getOrCreateClientKey: Generating new key")
     const newKey: Uint8Array = generateSecretKey()
-    const newKeyHex: string = bytesToHex(newKey)
-    try {
-      storage.setItem(NIP46_CLIENT_KEY, newKeyHex)
-    } catch (err: unknown) {
-      console.warn("[NostrConnect] getOrCreateClientKey: Failed to persist key:", err)
-      return this.getEphemeralClientKey("key not persistable")
+    if (storage) {
+      try {
+        storage.setItem(NIP46_CLIENT_KEY, bytesToHex(newKey))
+      } catch (err: unknown) {
+        console.warn(
+          "[NostrConnect] getOrCreateClientKey: Key not persisted (kept in memory " +
+            "for this page lifetime):",
+          err,
+        )
+      }
     }
-
-    // Verify it was stored correctly
-    const verifyStored: string | null = this.readClientKey(storage)
-    console.log(
-      "[NostrConnect] getOrCreateClientKey: Storage verification:",
-      verifyStored === newKeyHex ? "OK" : "MISMATCH",
-    )
-
-    const newPubkey: string = getPublicKey(newKey)
     console.log(
       "[NostrConnect] getOrCreateClientKey: New key pubkey:",
-      newPubkey.slice(0, 16) + "...",
+      getPublicKey(newKey).slice(0, 16) + "...",
     )
-
     return newKey
   }
 
-  /**
-   * The process-lifetime fallback key, minted once. Every storage-failure path routes here so
-   * URI generation, the initial wait, reconnect, and restore all use ONE identity — otherwise
-   * the URI would advertise one pubkey while the waiter decrypted with another.
-   */
-  private static getEphemeralClientKey(reason: string): Uint8Array {
-    if (ephemeralClientKey) return ephemeralClientKey
-    const key: Uint8Array = generateSecretKey()
-    ephemeralClientKey = key
-    console.warn(
-      `[NostrConnect] getOrCreateClientKey: ${reason} — using a process-lifetime ` +
-        "ephemeral key (not persisted across reloads)",
-    )
-    return key
+  /** Read the stored client key, tolerating a throwing getItem (denied storage). */
+  private static readClientKey(storage: Storage): string | null {
+    try {
+      return storage.getItem(NIP46_CLIENT_KEY)
+    } catch (err: unknown) {
+      console.warn("[NostrConnect] getOrCreateClientKey: Failed to read stored key:", err)
+      return null
+    }
   }
 
   /**
@@ -996,6 +980,11 @@ class NostrConnectService {
    * Store session data for persistence.
    */
   private static storeSession(sessionData: StoreSessionData): void {
+    // Writing a session is an explicit assertion that it is valid NOW, so it lifts any earlier
+    // rejection: a later attempt may legitimately produce a record identical to one previously
+    // refused (same signer, same user), and the tombstone must not shadow it.
+    rejectedSessionFingerprint = null
+
     const storage = safeStorage("local")
     if (!storage) return
     const session: NIP46Session = {
@@ -1052,7 +1041,17 @@ class NostrConnectService {
     if (!storage) return null
     try {
       const stored: string | null = storage.getItem(NIP46_SESSION_KEY)
-      return stored ? (JSON.parse(stored) as NIP46Session) : null
+      if (!stored) return null
+      const session = JSON.parse(stored) as NIP46Session
+      // A record this page already refused is treated as absent even if clearing it failed,
+      // so the refusal cannot be undone by uncooperative storage (PR #66 review).
+      if (
+        rejectedSessionFingerprint !== null &&
+        sessionFingerprint(session) === rejectedSessionFingerprint
+      ) {
+        return null
+      }
+      return session
     } catch {
       return null
     }
@@ -1084,6 +1083,17 @@ class NostrConnectService {
     if (session?.pending !== true) return false
     const currentSecret = secretFromUri(currentUri)
     return Boolean(currentSecret) && session.secret === currentSecret
+  }
+
+  /**
+   * Refuse a stored session record: remember it as rejected for this page lifetime, then try to
+   * clear it. The in-memory tombstone is what makes the refusal durable — clearing is
+   * best-effort and a persistently throwing removeItem would otherwise leave the record on disk
+   * for a later (unbound) restore to adopt (PR #66 review).
+   */
+  private static rejectStoredSession(session: NIP46Session): void {
+    rejectedSessionFingerprint = sessionFingerprint(session)
+    this.clearSession()
   }
 
   /**
