@@ -28,13 +28,14 @@ import NostrAuthService, {
   type EncryptedNsecData,
 } from "../nostr/NostrAuthService"
 import { type ConnectionResult } from "../nostr/NostrConnectService"
+import { runNostrConnectSignIn } from "../nostr/NostrConnectSignIn"
 import NostrProfileService, { type NostrProfile } from "../nostr/NostrProfileService"
 import CryptoUtils, { type EncryptedData } from "../storage/CryptoUtils"
 import ProfileStorage, {
   type StoredProfile,
   type StoredBlinkAccount,
 } from "../storage/ProfileStorage"
-import { AUTH_VERSION_FULL, logAuth, logAuthError, logAuthWarn } from "../version"
+import { AUTH_VERSION_FULL, logAuth, logAuthWarn } from "../version"
 
 // ============= Helper Types =============
 
@@ -87,7 +88,7 @@ export interface NostrAuthState {
 }
 
 interface NostrConnectSignInOptions {
-  onProgress?: (stage: string, message: string) => void
+  onProgress?: (stage: string, message?: string) => void
   timeout?: number
   /**
    * Ownership check for the caller's attempt. Returns false once this sign-in has been
@@ -171,32 +172,6 @@ export function NostrAuthProvider({
 
   // Track if challenge flow is being handled to prevent duplicate processing
   const challengeFlowHandling = useRef<boolean>(false)
-
-  /**
-   * Provider-wide ownership for Nostr Connect sign-ins.
-   *
-   * The caller's own `isCurrent` predicate defaults to true and two overlapping calls can both
-   * believe they own the flow, so effective ownership is that predicate AND still holding the
-   * latest ticket (PR #66 review).
-   */
-  const authAttemptSeqRef = useRef<number>(0)
-  /**
-   * The in-flight session critical section, if any: the attempt's completion promise AND the
-   * means to cancel it.
-   *
-   * A completion promise alone is not a concurrency primitive — a replacement whose bounded wait
-   * expired could only WATCH a stuck predecessor, never stop it, and then start its own login
-   * while the predecessor could still commit or destroy the session (PR #66 review). Carrying
-   * the controller lets a replacement whose wait expired abort the predecessor and then wait for
-   * it to become inert, so the exclusivity the section promises is real.
-   */
-  interface SessionCritical {
-    /** Resolves when this attempt can no longer create or destroy a session. */
-    done: Promise<void>
-    /** Cancels this attempt's in-flight login. */
-    abort: () => void
-  }
-  const sessionCriticalRef = useRef<SessionCritical | null>(null)
 
   // Re-check extension availability after short delay (extensions may inject asynchronously)
   useEffect(() => {
@@ -323,30 +298,6 @@ export function NostrAuthProvider({
    * Sync Blink account from server (for cross-device consistency)
    * Called after NIP-98 session is established
    */
-  /**
-   * Give up a server session this attempt established but is not entitled to keep.
-   *
-   * This is the ONLY compensation the sign-in flow needs. Local auth, the profile and provider
-   * state are published after the ownership gate, so a superseded or failed attempt has nothing
-   * local to undo; the session is the single resource that must exist before the outcome is
-   * known, because signing is what proves the user (PR #66 review).
-   *
-   * Safe to call unconditionally: session establishment is serialized, so no replacement can
-   * have a session of its own at this point for this to destroy.
-   */
-  const discardSession = useCallback(
-    async (reason: string): Promise<AuthActionResult> => {
-      logAuthWarn("useNostrAuth", `Sign-in superseded ${reason} — discarding its session`)
-      try {
-        await fetch("/api/auth/logout", { method: "POST", credentials: "include" })
-      } catch (e: unknown) {
-        logAuthWarn("useNostrAuth", "Server logout while discarding session failed:", e)
-      }
-      return { success: false, error: "Superseded", errorType: "superseded" }
-    },
-    [],
-  )
-
   const syncBlinkAccountFromServer = useCallback(
     async (opts?: { isCurrent?: () => boolean }): Promise<SyncResult> => {
       // Optional ownership check for callers that can be superseded mid-flight. This function
@@ -1686,207 +1637,69 @@ export function NostrAuthProvider({
       )
       // Note: Don't set loading state here - modal handles its own UI
 
-      // Wait for any in-flight session critical section, BOUNDED by this attempt's own budget:
-      // a predecessor whose login never settles must not wedge every later sign-in (PR #66
-      // review). If the wait expires, the predecessor is CANCELLED, not merely left running —
-      // otherwise this attempt would start a second cookie-mutating login while the first could
-      // still commit or log out the new session. After aborting, we wait for the predecessor to
-      // become inert so the exclusivity is real, not just the promise of it.
-      const previousCritical: SessionCritical | null = sessionCriticalRef.current
-      if (previousCritical) {
-        let waitTimer: ReturnType<typeof setTimeout> | undefined
-        try {
-          await Promise.race([
-            previousCritical.done,
-            new Promise<void>((resolve) => {
-              waitTimer = setTimeout(resolve, timeout)
-            }),
-          ])
-          // If the section is still held after that bounded wait, the predecessor is stuck:
-          // abort it and wait for it to settle so it can no longer touch the session.
-          if (sessionCriticalRef.current === previousCritical) {
-            logAuthWarn(
-              "useNostrAuth",
-              "Predecessor session timed out — aborting it before proceeding",
-            )
-            previousCritical.abort()
-            try {
-              await previousCritical.done
-            } catch {
-              // a failed predecessor must not block this attempt
-            }
-          }
-        } catch {
-          // a failed predecessor must not block this attempt
-        } finally {
-          if (waitTimer) clearTimeout(waitTimer)
-        }
-      }
+      // The whole lifecycle — serialization, signing, session establishment, ownership, and the
+      // durable commit — is owned by a single transaction unit (issue #67). This wrapper only
+      // translates the result into provider state, so the concurrency and cancellation
+      // invariants live in one tested place rather than being re-derived here (PR #66 review).
+      const result = await runNostrConnectSignIn(publicKey, {
+        timeout,
+        isCurrent,
+        onProgress,
+      })
 
-      // Ownership ticket, taken after that wait so tickets order consistently with the sessions
-      // they follow. Effective ownership is the caller's predicate AND still being the latest
-      // attempt: the caller's default is `true`, so on its own it cannot stop two overlapping
-      // calls from both believing they own the flow.
-      const myTicket: number = ++authAttemptSeqRef.current
-      const stillOwned = (): boolean =>
-        myTicket === authAttemptSeqRef.current && (isCurrent?.() ?? true)
-
-      try {
-        // Step 1: Establish the server session.
-        //
-        // Nothing local is mutated first. Signing is dispatched with an explicit method rather
-        // than by registering this user as the current one, so an attempt that is superseded,
-        // fails or times out has no local auth, no profile and no provider state to undo. That
-        // removes the compensating-rollback problem instead of managing it (PR #66 review).
-        logAuth("useNostrAuth", "Starting NIP-98 login (blocking)...")
-        onProgress?.("signing", "Signing authentication event...")
-
-        // The request is ABORTABLE: a timed-out or superseded attempt cancels its login, so it
-        // cannot commit a cookie later. That removes the precondition that made overlap unsafe —
-        // a predecessor that has been aborted can never win a race against its replacement
-        // (PR #66 review). Without this, any ordering of an uncancelled request is racy.
-        const controller = new AbortController()
-
-        // Open the critical section, exposing both this attempt's completion AND its abort so a
-        // replacement whose wait expires can cancel it rather than merely watch it. It stays
-        // held across the login, the ownership decision and any logout below.
-        let releaseCritical: () => void = () => {}
-        const done = new Promise<void>((resolve) => {
-          releaseCritical = resolve
-        })
-        const critical: SessionCritical = {
-          done,
-          abort: () => controller.abort(),
-        }
-        sessionCriticalRef.current = critical
-
-        const sessionAttempt: Promise<Nip98LoginResult> = NostrAuthService.nip98Login({
-          signWithMethod: "nostrConnect",
-          signal: controller.signal,
-        })
-
-        let sessionResult: Nip98LoginResult
-        try {
-          sessionResult = await Promise.race([
-            sessionAttempt,
-            new Promise<never>(
-              (_: (value: never) => void, reject: (reason: Error) => void) =>
-                setTimeout(() => reject(new Error("TIMEOUT")), timeout),
-            ),
-          ])
-        } catch (raceErr: unknown) {
-          // Timed out (or the race threw): cancel the underlying request so it cannot commit,
-          // then release the section so a replacement is not wedged on this attempt.
-          controller.abort()
-          releaseCritical()
-          if (sessionCriticalRef.current === critical) sessionCriticalRef.current = null
-          throw raceErr
-        }
-
-        let profile: StoredProfile
-        try {
-          if (!sessionResult.success) {
-            // An aborted login is a deliberate cancellation (timeout or supersession), not a
-            // session failure, and it committed nothing.
-            if (sessionResult.errorType === "superseded") {
-              return { success: false, error: "Superseded", errorType: "superseded" }
-            }
-            logAuthWarn("useNostrAuth", "NIP-98 login failed:", sessionResult.error)
-            return {
-              success: false,
-              error: sessionResult.error || "Failed to establish session",
-              errorType: "session",
-            }
-          }
-
-          logAuth("useNostrAuth", "Server session established")
-
-          // Step 2: Ownership gate. Everything below is durable, and this is the only point
-          // where an established session has to be surrendered — the single resource this flow
-          // can have created before knowing it owns the outcome. Still inside the critical
-          // section, so a replacement cannot install its own cookie while this decides.
-          if (!stillOwned()) return await discardSession("during signing")
-
-          // Step 3: Register locally and publish. From here the attempt owns the flow, so these
-          // run together with no awaits in between that could hand ownership away.
-          const result: AuthResult = NostrAuthService.signInWithNostrConnect(publicKey)
-          if (!result.success) {
-            // Registration is local and synchronous; if it fails, only the session exists.
-            await discardSession("after a failed registration")
-            return { success: false, error: result.error }
-          }
-
-          profile = ProfileStorage.createProfile(publicKey, "nostrConnect")
-          ProfileStorage.setActiveProfile(profile.id)
-          const activeBlinkAccount: StoredBlinkAccount | null =
-            profile.blinkAccounts.find((a) => a.isActive) || null
-
-          updateState({
-            loading: false,
-            isAuthenticated: true,
-            publicKey: publicKey.toLowerCase(),
-            method: "nostrConnect",
-            profile,
-            activeBlinkAccount,
-            hasServerSession: true,
-            nostrProfile: null,
-            error: null,
-          })
-        } finally {
-          // Session lifecycle decided: a replacement may now establish its own.
-          releaseCritical()
-          if (sessionCriticalRef.current === critical) sessionCriticalRef.current = null
-        }
-
-        // Fetch Nostr profile metadata in background (non-blocking). Guarded on entry AND
-        // handed the ownership check so a stale attempt's late relay response cannot publish
-        // its metadata into a replacement's state (PR #66 review).
-        if (stillOwned()) fetchNostrProfile(publicKey, stillOwned)
-
-        // Step 4: Sync data from the server. This runs AFTER the commit, so a failure or a late
-        // supersession here can no longer strand a half-built sign-in; ownership is still
-        // threaded in so a retired attempt does not overwrite a replacement's profile state.
-        logAuth("useNostrAuth", "Syncing data from server...")
-        onProgress?.("syncing", "Loading your data...")
-        try {
-          const syncResult = await syncBlinkAccountFromServer({ isCurrent: stillOwned })
-          logAuth("useNostrAuth", "Sync result:", syncResult)
-        } catch (syncError: unknown) {
-          // Soft failure - don't block sign-in for sync issues
-          logAuthWarn("useNostrAuth", "Sync failed (non-blocking):", syncError)
-        }
-
-        // Ownership can be lost across the sync await. Reporting completion and success after
-        // that would tell the caller a superseded attempt had won (PR #66 review). No logout
-        // here: the session belongs to the replacement now, not to this attempt.
-        if (!stillOwned()) {
-          logAuthWarn(
-            "useNostrAuth",
-            "Sign-in superseded during sync — reporting superseded",
-          )
-          return { success: false, error: "Superseded", errorType: "superseded" }
-        }
-
-        onProgress?.("complete", "Done!")
-        logAuth("useNostrAuth", "Nostr Connect sign-in complete")
-        return { success: true, profile, publicKey }
-      } catch (error: unknown) {
-        const err = error as Error
-        logAuthError("useNostrAuth", "Nostr Connect sign-in failed:", error)
-
-        // Handle timeout specifically
-        if (err.message === "TIMEOUT") {
+      if (!result.success) {
+        if (result.errorType === "timeout") {
           return {
             success: false,
             error: "Signing timed out. Make sure Amber is open and approve the request.",
             errorType: "timeout",
           }
         }
-
-        return { success: false, error: err.message, errorType: "unknown" }
+        if (result.errorType === "superseded") {
+          return { success: false, error: "Superseded", errorType: "superseded" }
+        }
+        if (result.errorType === "session") {
+          return {
+            success: false,
+            error: result.error || "Failed to establish session",
+            errorType: "session",
+          }
+        }
+        return { success: false, error: result.error, errorType: "unknown" }
       }
+
+      // Committed by the transaction inside the mutex; publish to provider state.
+      updateState({
+        loading: false,
+        isAuthenticated: true,
+        publicKey: result.publicKey!.toLowerCase(),
+        method: "nostrConnect",
+        profile: result.profile!,
+        activeBlinkAccount: result.activeBlinkAccount ?? null,
+        hasServerSession: true,
+        nostrProfile: null,
+        error: null,
+      })
+
+      // Fetch Nostr profile metadata in background (non-blocking), still ownership-gated so a
+      // stale attempt's late relay response cannot publish into a replacement's state.
+      if (isCurrent?.() ?? true) fetchNostrProfile(result.publicKey!, isCurrent)
+
+      // Sync data from the server AFTER the commit. Ownership is threaded in so a retired
+      // attempt does not overwrite a replacement's profile state.
+      logAuth("useNostrAuth", "Syncing data from server...")
+      onProgress?.("syncing", "Loading your data...")
+      try {
+        const syncResult = await syncBlinkAccountFromServer({ isCurrent })
+        logAuth("useNostrAuth", "Sync result:", syncResult)
+      } catch (syncError: unknown) {
+        logAuthWarn("useNostrAuth", "Sync failed (non-blocking):", syncError)
+      }
+
+      logAuth("useNostrAuth", "Nostr Connect sign-in complete")
+      return { success: true, profile: result.profile, publicKey: result.publicKey }
     },
-    [updateState, fetchNostrProfile, syncBlinkAccountFromServer, discardSession],
+    [updateState, fetchNostrProfile, syncBlinkAccountFromServer],
   )
 
   /**

@@ -152,10 +152,15 @@ interface DebugChallengeInfo {
  */
 interface NostrConnectServiceLike {
   isConnected: () => boolean
-  signEvent: (event: UnsignedEvent) => Promise<{
+  signEvent: (
+    event: UnsignedEvent,
+    maxRetries?: number,
+    signal?: AbortSignal,
+  ) => Promise<{
     success: boolean
     event?: SignedEvent
     error?: string
+    errorType?: string
   }>
 }
 
@@ -1125,7 +1130,9 @@ class NostrAuthService {
       throw new Error("Nostr Connect session not active. Please reconnect.")
     }
 
-    const result = await NostrConnectService.signEvent(event)
+    // Forward the signal into the relay round-trip so a cancelled caller cannot leave a
+    // signing request outstanding (PR #66 review).
+    const result = await NostrConnectService.signEvent(event, 3, signal)
     if (signal?.aborted) throw new Error("aborted")
 
     if (!result.success) {

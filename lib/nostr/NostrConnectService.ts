@@ -81,6 +81,8 @@ interface SignEventResult {
   success: boolean
   event?: SignedEvent
   error?: string
+  /** Set for deliberate cancellation so callers can distinguish it from a signing failure. */
+  errorType?: string
 }
 
 /** Options for generateConnectionURI */
@@ -571,6 +573,7 @@ class NostrConnectService {
   static async signEvent(
     eventTemplate: UnsignedEvent,
     maxRetries: number = 3,
+    signal?: AbortSignal,
   ): Promise<SignEventResult> {
     if (!this.signer || this.connectionState !== "connected") {
       console.error("[NostrConnect] Cannot sign: not connected")
@@ -579,6 +582,11 @@ class NostrConnectService {
 
     let lastError: unknown = null
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      // Abortable (PR #66 review): the retry/backoff loop must stop when the caller has been
+      // cancelled, not keep the request outstanding while its owner has given up.
+      if (signal?.aborted) {
+        return { success: false, error: "Aborted", errorType: "superseded" }
+      }
       try {
         console.log(
           `[NostrConnect] Requesting signature for event kind: ${eventTemplate.kind} (attempt ${attempt}/${maxRetries})`,
@@ -596,10 +604,16 @@ class NostrConnectService {
         console.warn(`[NostrConnect] Signing attempt ${attempt} failed:`, msg)
 
         if (attempt < maxRetries) {
-          // Exponential backoff: 500ms, 1000ms, 1500ms...
+          // Exponential backoff: 500ms, 1000ms, 1500ms... — interruptible by abort.
           const delay: number = 500 * attempt
           console.log(`[NostrConnect] Retrying signature in ${delay}ms...`)
-          await new Promise<void>((resolve) => setTimeout(resolve, delay))
+          await new Promise<void>((resolve, reject) => {
+            const t = setTimeout(resolve, delay)
+            signal?.addEventListener("abort", () => {
+              clearTimeout(t)
+              reject(Object.assign(new Error("aborted"), { name: "AbortError" }))
+            })
+          })
         }
       }
     }

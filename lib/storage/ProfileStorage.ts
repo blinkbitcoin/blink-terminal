@@ -199,18 +199,6 @@ class ProfileStorage {
   }
 
   /**
-   * Clear the active-profile pointer without deleting any profile.
-   *
-   * Needed to restore a baseline where nothing was active: rolling back a superseded sign-in
-   * must be able to put the pointer back to "none" without destroying a profile that existed
-   * before the attempt (PR #66 review).
-   */
-  static clearActiveProfile(): void {
-    if (typeof localStorage === "undefined") return
-    localStorage.removeItem(ACTIVE_PROFILE_KEY)
-  }
-
-  /**
    * Get active profile
    */
   static getActiveProfile(): StoredProfile | null {
