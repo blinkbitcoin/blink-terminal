@@ -1072,7 +1072,7 @@ class NostrAuthService {
    */
   static async signEvent(
     event: UnsignedEvent,
-    methodOverride?: string,
+    methodOverride?: SignInMethod,
   ): Promise<SignedEvent> {
     const method = methodOverride ?? this.getCurrentMethod()
 
@@ -1269,7 +1269,7 @@ class NostrAuthService {
   static async createAuthEvent(
     url: string,
     method: string = "GET",
-    signWithMethod?: string,
+    signWithMethod?: SignInMethod,
   ): Promise<SignedEvent> {
     const event: UnsignedEvent = {
       kind: 27235, // NIP-98 HTTP Auth
@@ -1490,7 +1490,9 @@ class NostrAuthService {
    *
    * @returns {Promise<Nip98LoginResult>}
    */
-  static async nip98Login(opts?: { signWithMethod?: string }): Promise<Nip98LoginResult> {
+  static async nip98Login(opts?: {
+    signWithMethod?: SignInMethod
+  }): Promise<Nip98LoginResult> {
     logAuth("NostrAuthService", "nip98Login called")
 
     // With an explicit signing method the caller has not registered itself yet — deliberately,

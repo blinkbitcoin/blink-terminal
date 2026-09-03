@@ -379,6 +379,155 @@ describe("useNostrAuth — signInWithNostrConnect ownership (PR #66)", () => {
     expect(authed()).toBe("true")
   })
 
+  /**
+   * HIGH (PR #66 review): Promise.race abandons the wait but does not cancel the request, so a
+   * timed-out attempt must neither wedge later sign-ins nor leave a late-arriving session
+   * unmanaged.
+   */
+  it("a timed-out attempt does not wedge the next sign-in, even if its login never settles", async () => {
+    // A's login never settles at all.
+    authService.nip98Login
+      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockImplementation(async () => ({ success: true }))
+
+    await renderProvider()
+
+    let aResult: { errorType?: string } | undefined
+    let bResult: { success: boolean } | undefined
+    await act(async () => {
+      const aPending = signIn(PUBKEY, { timeout: 5 })
+      await new Promise<void>((r) => setTimeout(r, 20))
+      aResult = await aPending
+
+      // B must not inherit A's never-settling wait.
+      const bPending = signIn(PUBKEY_B, { timeout: 50 })
+      await new Promise<void>((r) => setTimeout(r, 10))
+      bResult = await bPending
+    })
+
+    expect(aResult?.errorType).toBe("timeout")
+    expect(bResult?.success).toBe(true)
+    expect(authed()).toBe("true")
+  })
+
+  it("discards a session that arrives after the attempt already timed out", async () => {
+    let finishLate: (v: { success: boolean }) => void = () => {}
+    authService.nip98Login.mockImplementationOnce(
+      () => new Promise((r) => (finishLate = r)),
+    )
+
+    await renderProvider()
+    ;(global.fetch as jest.Mock).mockClear()
+
+    await act(async () => {
+      const pending = signIn(PUBKEY, { timeout: 5 })
+      await new Promise<void>((r) => setTimeout(r, 20))
+      const result = await pending
+      expect(result.errorType).toBe("timeout")
+
+      // The login succeeds AFTER the caller gave up: that cookie belongs to nobody.
+      finishLate({ success: true })
+      await new Promise<void>((r) => setTimeout(r, 10))
+    })
+
+    expect(global.fetch).toHaveBeenCalledWith(
+      "/api/auth/logout",
+      expect.objectContaining({ method: "POST" }),
+    )
+    // It was never published as a sign-in.
+    expect(authed()).toBe("false")
+    expect(authService.signInWithNostrConnect).not.toHaveBeenCalled()
+  })
+
+  /**
+   * HIGH (PR #66 review): the critical section must cover the stale-session logout too, not
+   * just the login. Otherwise a retired attempt can still be deciding to log out while its
+   * replacement installs a cookie, and then delete it.
+   */
+  it("a replacement cannot begin session establishment until a retired attempt's logout completes", async () => {
+    const order: string[] = []
+    let finishLogout: (v: unknown) => void = () => {}
+    global.fetch = jest.fn(async (url: string) => {
+      if (String(url).includes("logout")) {
+        order.push("A:logout:start")
+        return new Promise((r) => {
+          finishLogout = (v) => {
+            order.push("A:logout:done")
+            r(v)
+          }
+        })
+      }
+      return { ok: true, status: 200, json: async () => ({}) }
+    }) as unknown as typeof fetch
+
+    authService.nip98Login
+      .mockImplementationOnce(async () => {
+        order.push("A:login")
+        return { success: true }
+      })
+      .mockImplementation(async () => {
+        order.push("B:login")
+        return { success: true }
+      })
+
+    await renderProvider()
+
+    await act(async () => {
+      // A is already retired, so it will establish a session and then discard it.
+      const aPending = signIn(PUBKEY, { isCurrent: () => false })
+      await new Promise<void>((r) => setTimeout(r, 0))
+
+      // B starts while A's logout is still in flight.
+      const bPending = signIn(PUBKEY_B, { timeout: 200 })
+      await new Promise<void>((r) => setTimeout(r, 10))
+
+      finishLogout({ ok: true, status: 200, json: async () => ({}) })
+      await Promise.all([aPending, bPending])
+    })
+
+    // B's login only began after A's logout had completed — so A cannot delete B's session.
+    expect(order).toEqual(["A:login", "A:logout:start", "A:logout:done", "B:login"])
+    expect(authed()).toBe("true")
+  })
+
+  /**
+   * MEDIUM (PR #66 review): losing ownership during the post-commit sync must be reported as
+   * superseded rather than success, and must not log out the replacement's session.
+   */
+  it("reports superseded, not success, when ownership is lost during sync", async () => {
+    let finishSync: (v: unknown) => void = () => {}
+    global.fetch = jest.fn(async (url: string) => {
+      if (String(url).includes("nostr-blink-account")) {
+        return new Promise((r) => (finishSync = r))
+      }
+      return { ok: true, status: 200, json: async () => ({}) }
+    }) as unknown as typeof fetch
+
+    const progress: string[] = []
+
+    await renderProvider()
+
+    let owned = true
+    let result: { success: boolean; errorType?: string } | undefined
+    await act(async () => {
+      const pending = signIn(PUBKEY, {
+        isCurrent: () => owned,
+        onProgress: (stage: string) => progress.push(stage),
+      })
+      await new Promise<void>((r) => setTimeout(r, 0))
+      owned = false
+      finishSync({ ok: true, status: 200, json: async () => ({ hasAccount: false }) })
+      result = await pending
+    })
+
+    expect(result?.success).toBe(false)
+    expect(result?.errorType).toBe("superseded")
+    // It must not claim completion to the caller...
+    expect(progress).not.toContain("complete")
+    // ...and must not log out, since the session now belongs to the replacement.
+    expect(global.fetch).not.toHaveBeenCalledWith("/api/auth/logout", expect.anything())
+  })
+
   it("completes normally and publishes state when it owns the flow", async () => {
     await renderProvider()
 

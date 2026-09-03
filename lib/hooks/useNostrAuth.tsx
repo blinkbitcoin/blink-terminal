@@ -181,14 +181,15 @@ export function NostrAuthProvider({
    */
   const authAttemptSeqRef = useRef<number>(0)
   /**
-   * The in-flight session establishment, if any.
+   * The in-flight session CRITICAL SECTION, if any.
    *
-   * A new attempt waits for it before taking its ticket. Promise.race does not cancel a NIP-98
-   * login, so without this a retired attempt's late response could install a session behind a
-   * replacement that had already finished. Serializing means at most one attempt is ever
-   * establishing a session, which is what makes the single-resource cleanup below sufficient.
+   * Spans login, the ownership decision, and any stale-session logout — not just the login.
+   * Serializing only the login left a window where a retired attempt was still deciding to log
+   * out while a replacement had already installed its own cookie, so the retired attempt's
+   * logout deleted a valid session (PR #66 review). A replacement waits for this whole section,
+   * so at most one attempt is ever creating or destroying a session.
    */
-  const pendingSessionRef = useRef<Promise<unknown> | null>(null)
+  const sessionCriticalRef = useRef<Promise<void> | null>(null)
 
   // Re-check extension availability after short delay (extensions may inject asynchronously)
   useEffect(() => {
@@ -1666,16 +1667,24 @@ export function NostrAuthProvider({
       )
       // Note: Don't set loading state here - modal handles its own UI
 
-      // Session establishment is serialized across attempts. Promise.race below does not cancel
-      // an in-flight NIP-98 login, so without this a retired attempt's response could land
-      // after a replacement had finished and quietly install a session behind it (PR #66
-      // review). Waiting means at most one attempt is ever establishing a session.
-      const previousSession: Promise<unknown> | null = pendingSessionRef.current
-      if (previousSession) {
+      // Wait for any in-flight session critical section, BOUNDED by this attempt's own budget:
+      // a predecessor whose login never settles must not wedge every later sign-in (PR #66
+      // review). Timing out the wait simply means proceeding without the guarantee, which is
+      // strictly better than hanging forever.
+      const previousCritical: Promise<void> | null = sessionCriticalRef.current
+      if (previousCritical) {
+        let waitTimer: ReturnType<typeof setTimeout> | undefined
         try {
-          await previousSession
+          await Promise.race([
+            previousCritical,
+            new Promise<void>((resolve) => {
+              waitTimer = setTimeout(resolve, timeout)
+            }),
+          ])
         } catch {
           // a failed predecessor must not block this attempt
+        } finally {
+          if (waitTimer) clearTimeout(waitTimer)
         }
       }
 
@@ -1697,10 +1706,45 @@ export function NostrAuthProvider({
         logAuth("useNostrAuth", "Starting NIP-98 login (blocking)...")
         onProgress?.("signing", "Signing authentication event...")
 
+        // Open the critical section. It stays held across the login, the ownership decision and
+        // any logout below, and is released in the finally at the end of that block.
+        let releaseCritical: () => void = () => {}
+        const critical = new Promise<void>((resolve) => {
+          releaseCritical = resolve
+        })
+        sessionCriticalRef.current = critical
+
         const sessionAttempt: Promise<Nip98LoginResult> = NostrAuthService.nip98Login({
           signWithMethod: "nostrConnect",
         })
-        pendingSessionRef.current = sessionAttempt
+
+        // Promise.race abandons the wait, it does not cancel the request. If this attempt gives
+        // up (timeout) and the login then succeeds anyway, the cookie it installs belongs to
+        // nobody — so retire it. The cleanup is chained onto the critical section so it is
+        // ordered against any replacement rather than racing it.
+        let abandoned = false
+        sessionAttempt
+          .then((late: Nip98LoginResult) => {
+            if (!abandoned || !late.success) return
+            const cleanup = (sessionCriticalRef.current ?? Promise.resolve()).then(
+              async () => {
+                logAuthWarn(
+                  "useNostrAuth",
+                  "Abandoned login succeeded late — discarding its session",
+                )
+                try {
+                  await fetch("/api/auth/logout", {
+                    method: "POST",
+                    credentials: "include",
+                  })
+                } catch (e: unknown) {
+                  logAuthWarn("useNostrAuth", "Late-session logout failed:", e)
+                }
+              },
+            )
+            sessionCriticalRef.current = cleanup
+          })
+          .catch(() => undefined)
 
         let sessionResult: Nip98LoginResult
         try {
@@ -1711,61 +1755,66 @@ export function NostrAuthProvider({
                 setTimeout(() => reject(new Error("TIMEOUT")), timeout),
             ),
           ])
+        } catch (raceErr: unknown) {
+          abandoned = true
+          releaseCritical()
+          if (sessionCriticalRef.current === critical) sessionCriticalRef.current = null
+          throw raceErr
+        }
+
+        let profile: StoredProfile
+        try {
+          if (!sessionResult.success) {
+            logAuthWarn("useNostrAuth", "NIP-98 login failed:", sessionResult.error)
+            return {
+              success: false,
+              error: sessionResult.error || "Failed to establish session",
+              errorType: "session",
+            }
+          }
+
+          logAuth("useNostrAuth", "Server session established")
+
+          // Step 2: Ownership gate. Everything below is durable, and this is the only point
+          // where an established session has to be surrendered — the single resource this flow
+          // can have created before knowing it owns the outcome. Still inside the critical
+          // section, so a replacement cannot install its own cookie while this decides.
+          if (!stillOwned()) return await discardSession("during signing")
+
+          // Step 3: Register locally and publish. From here the attempt owns the flow, so these
+          // run together with no awaits in between that could hand ownership away.
+          const result: AuthResult = NostrAuthService.signInWithNostrConnect(publicKey)
+          if (!result.success) {
+            // Registration is local and synchronous; if it fails, only the session exists.
+            await discardSession("after a failed registration")
+            return { success: false, error: result.error }
+          }
+
+          profile = ProfileStorage.createProfile(publicKey, "nostrConnect")
+          ProfileStorage.setActiveProfile(profile.id)
+          const activeBlinkAccount: StoredBlinkAccount | null =
+            profile.blinkAccounts.find((a) => a.isActive) || null
+
+          updateState({
+            loading: false,
+            isAuthenticated: true,
+            publicKey: publicKey.toLowerCase(),
+            method: "nostrConnect",
+            profile,
+            activeBlinkAccount,
+            hasServerSession: true,
+            nostrProfile: null,
+            error: null,
+          })
         } finally {
-          // The next attempt waits on this settling, including on the timeout path where the
-          // request itself is still outstanding.
-          if (pendingSessionRef.current === sessionAttempt) {
-            pendingSessionRef.current = sessionAttempt.catch(() => undefined)
-          }
+          // Session lifecycle decided: a replacement may now establish its own.
+          releaseCritical()
+          if (sessionCriticalRef.current === critical) sessionCriticalRef.current = null
         }
 
-        if (!sessionResult.success) {
-          logAuthWarn("useNostrAuth", "NIP-98 login failed:", sessionResult.error)
-          return {
-            success: false,
-            error: sessionResult.error || "Failed to establish session",
-            errorType: "session",
-          }
-        }
-
-        logAuth("useNostrAuth", "Server session established")
-
-        // Step 2: Ownership gate. Everything below is durable, and this is the only point where
-        // an established session has to be surrendered — the single resource this flow can have
-        // created before knowing it owns the outcome.
-        if (!stillOwned()) return await discardSession("during signing")
-
-        // Step 3: Register locally and publish. From here the attempt owns the flow, so these
-        // run together with no awaits in between that could hand ownership away.
-        const result: AuthResult = NostrAuthService.signInWithNostrConnect(publicKey)
-        if (!result.success) {
-          // Registration is local and synchronous; if it fails, only the session exists.
-          await discardSession("after a failed registration")
-          return { success: false, error: result.error }
-        }
-
-        const profile: StoredProfile = ProfileStorage.createProfile(
-          publicKey,
-          "nostrConnect",
-        )
-        ProfileStorage.setActiveProfile(profile.id)
-        const activeBlinkAccount: StoredBlinkAccount | null =
-          profile.blinkAccounts.find((a) => a.isActive) || null
-
-        updateState({
-          loading: false,
-          isAuthenticated: true,
-          publicKey: publicKey.toLowerCase(),
-          method: "nostrConnect",
-          profile,
-          activeBlinkAccount,
-          hasServerSession: true,
-          nostrProfile: null,
-          error: null,
-        })
-
-        // Fetch Nostr profile metadata in background (non-blocking)
-        fetchNostrProfile(publicKey)
+        // Fetch Nostr profile metadata in background (non-blocking). Guarded so a stale
+        // attempt's metadata cannot be published into a replacement's state.
+        if (stillOwned()) fetchNostrProfile(publicKey)
 
         // Step 4: Sync data from the server. This runs AFTER the commit, so a failure or a late
         // supersession here can no longer strand a half-built sign-in; ownership is still
@@ -1778,6 +1827,17 @@ export function NostrAuthProvider({
         } catch (syncError: unknown) {
           // Soft failure - don't block sign-in for sync issues
           logAuthWarn("useNostrAuth", "Sync failed (non-blocking):", syncError)
+        }
+
+        // Ownership can be lost across the sync await. Reporting completion and success after
+        // that would tell the caller a superseded attempt had won (PR #66 review). No logout
+        // here: the session belongs to the replacement now, not to this attempt.
+        if (!stillOwned()) {
+          logAuthWarn(
+            "useNostrAuth",
+            "Sign-in superseded during sync — reporting superseded",
+          )
+          return { success: false, error: "Superseded", errorType: "superseded" }
         }
 
         onProgress?.("complete", "Done!")
