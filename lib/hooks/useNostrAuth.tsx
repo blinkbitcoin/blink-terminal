@@ -100,6 +100,8 @@ interface NostrConnectSignInOptions {
    * authenticate the app through a transport that is already gone (PR #66 review).
    */
   isCurrent?: () => boolean
+  /** External cancellation, forwarded to the sign-in transaction. */
+  signal?: AbortSignal
 }
 
 export interface NostrAuthContextValue extends NostrAuthState {
@@ -1628,7 +1630,7 @@ export function NostrAuthProvider({
       publicKey: string,
       options: NostrConnectSignInOptions = {},
     ): Promise<AuthActionResult> => {
-      const { onProgress, timeout = 30000, isCurrent } = options
+      const { onProgress, timeout = 30000, isCurrent, signal } = options
 
       logAuth(
         "useNostrAuth",
@@ -1644,6 +1646,7 @@ export function NostrAuthProvider({
       const result = await runNostrConnectSignIn(publicKey, {
         timeout,
         isCurrent,
+        signal,
         onProgress,
       })
 

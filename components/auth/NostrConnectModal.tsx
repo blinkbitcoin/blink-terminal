@@ -62,6 +62,8 @@ interface SignInProgressOptions {
    * retired — suppressing only this component's continuation is not enough (PR #66 review).
    */
   isCurrent: () => boolean
+  /** Cancels the transaction's in-flight work when the attempt is retired. */
+  signal: AbortSignal
 }
 
 /** Sign-in result from useNostrAuth */
@@ -125,6 +127,17 @@ export default function NostrConnectModal({
   // current again.
   const authAttemptSeqRef = useRef<number>(0)
   const authActiveTokenRef = useRef<number | null>(null)
+  // The active attempt's cancellation handle. Retiring the token alone only changes what the
+  // transaction's polled isCurrent() returns at its own checkpoints; a hung request would keep
+  // the session mutex until its own deadline. Aborting this cancels it immediately, so the
+  // replacement gets a usable budget rather than spending it queued (PR #66 review).
+  const authAbortRef = useRef<AbortController | null>(null)
+  /** Retire whatever attempt is current: drop its token AND cancel its in-flight work. */
+  const retireActiveAuth = (): void => {
+    authActiveTokenRef.current = null
+    authAbortRef.current?.abort()
+    authAbortRef.current = null
+  }
   // Whether a fresh waitForConnection() attempt is pending (BunkerSigner.fromURI has not
   // settled). A pending attempt OWNS the flow — the foreground resume must leave it alone
   // UNLESS it was stalled by a backgrounding (see connectStalledRef).
@@ -272,8 +285,12 @@ export default function NostrConnectModal({
     // Every attempt gets a fresh, never-reused token; a superseding call's token increment is
     // what retires the hung predecessor (its continuation goes inert the next time it checks
     // currency). The counter is never reset, so no stale token can collide with a future one.
+    // A superseding call cancels the predecessor's in-flight work, not just its token.
+    if (opts?.supersede === true) authAbortRef.current?.abort()
     const attempt = ++authAttemptSeqRef.current
     authActiveTokenRef.current = attempt
+    const abortController = new AbortController()
+    authAbortRef.current = abortController
     const isCurrent = () => attempt === authActiveTokenRef.current
     // Set in the success branch so the finally does not zero the token before the deferred
     // completion timeout runs — that timeout owns the release on success.
@@ -307,6 +324,9 @@ export default function NostrConnectModal({
         // attempt's token must stop THAT too, not only this component's continuation
         // (PR #66 review).
         isCurrent,
+        // And cancellation, not just ownership: aborting this cancels the transaction's
+        // in-flight login/signing immediately when the attempt is retired.
+        signal: abortController.signal,
         onProgress: (progressStage: string, message?: string) => {
           // Stale attempts must not move the stepper mid-flight.
           if (!isCurrent()) return
@@ -335,7 +355,7 @@ export default function NostrConnectModal({
         // AND the guard release on success (finally skips it for completed attempts).
         setTimeout(() => {
           if (!isCurrent()) return
-          authActiveTokenRef.current = null
+          retireActiveAuth()
           onSuccess?.(pubkey)
         }, 600)
       } else {
@@ -356,7 +376,7 @@ export default function NostrConnectModal({
       // Only the CURRENT attempt may release the guard — a superseded attempt settling must
       // not free the slot its replacement still owns. On success the release is deferred to
       // the completion timeout below (which owns the final isCurrent check + onSuccess).
-      if (isCurrent() && !completedSuccessfully) authActiveTokenRef.current = null
+      if (isCurrent() && !completedSuccessfully) retireActiveAuth()
     }
   }
 
@@ -411,7 +431,7 @@ export default function NostrConnectModal({
         "NostrConnectModal",
         "Transport discarded — retiring the current auth owner",
       )
-      authActiveTokenRef.current = null
+      retireActiveAuth()
     }
     if (resumeInFlightRef.current) {
       // A recovery is already running. Normally we leave it alone (a focus/visibility burst
@@ -507,14 +527,14 @@ export default function NostrConnectModal({
       // timeout must not flip this fresh idle UI to an error. disconnect() invalidates the
       // SERVICE-side pending attempt too (round-4 review), not just the modal refs.
       flowGenRef.current += 1
-      authActiveTokenRef.current = null
+      retireActiveAuth()
       setStage("idle")
       setConnectedPubkey(null)
       service.disconnect().catch(() => undefined)
     } catch (error: unknown) {
       logAuthError("NostrConnectModal", "Foreground resume failed:", error)
       flowGenRef.current += 1
-      authActiveTokenRef.current = null
+      retireActiveAuth()
       setStage("idle")
       setConnectedPubkey(null)
       service.disconnect().catch(() => undefined)
@@ -642,7 +662,7 @@ export default function NostrConnectModal({
     // a no-op rather than resurrecting a flow the user just cancelled. Releasing the auth
     // slot likewise retires any hung sign request so its late timeout can't error the UI.
     flowGenRef.current += 1
-    authActiveTokenRef.current = null
+    retireActiveAuth()
     // Clean disconnect
     if (slowTimerRef.current) {
       clearTimeout(slowTimerRef.current)
@@ -655,7 +675,7 @@ export default function NostrConnectModal({
   const handleBackToOptions = () => {
     // Same guard as cancel: leaving the flow supersedes any in-flight attempt or hung sign.
     flowGenRef.current += 1
-    authActiveTokenRef.current = null
+    retireActiveAuth()
     setStage("idle")
     setShowSlowWarning(false)
     setErrorMessage("")

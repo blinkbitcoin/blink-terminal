@@ -641,6 +641,40 @@ describe("NostrConnectModal — same-device NIP-46 resume (review blockers)", ()
   })
 
   /**
+   * HIGH (PR #66 review): retiring the token alone only changes what a polled predicate returns
+   * at the transaction's own checkpoints; a hung request would keep the session mutex until its
+   * own deadline. The modal must hand the transaction a real AbortSignal and abort it when the
+   * attempt is retired, so cancellation is immediate rather than eventual.
+   */
+  it("aborts the transaction's signal immediately when the attempt is retired (PR #66)", async () => {
+    const signOptions: Array<{ signal?: AbortSignal }> = []
+    const signIn = jest.fn((_pubkey: string, opts: { signal?: AbortSignal }) => {
+      signOptions.push(opts)
+      return new Promise<{ success: boolean }>(() => {}) // hung, like a stuck signer
+    })
+    legacy().waitForConnection.mockResolvedValue({ success: true, publicKey: PUBKEY })
+    legacy().hasStoredSession.mockReturnValue(true)
+    legacy().isConnected.mockReturnValue(true)
+    legacy().restoreSession.mockImplementation(
+      () => new Promise<{ success: boolean; publicKey: string }>(() => {}),
+    )
+
+    renderModal(signIn as unknown as jest.Mock)
+
+    await act(async () => {
+      fireClick(openInAmberButton())
+      await flushThroughConnectDelay()
+    })
+    const signal = signOptions[0]?.signal
+    expect(signal).toBeInstanceOf(AbortSignal)
+    expect(signal!.aborted).toBe(false)
+
+    // Retirement (a bfcache discard) must ABORT the in-flight transaction, not just poll it.
+    await bfcacheRoundTrip()
+    expect(signal!.aborted).toBe(true)
+  })
+
+  /**
    * Coverage gap (PR #66 review): the reconnect path — a connect stalled by the deeplink
    * backgrounding — had no mounted coverage. pagehide(persisted) marks the in-flight connect
    * stalled, the resume supersedes it and starts ONE fresh waiter, and the superseded waiter's

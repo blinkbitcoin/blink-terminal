@@ -33,6 +33,13 @@ export interface SignInTransactionOptions {
   timeout: number
   /** Caller ownership check; defaults to owned. */
   isCurrent?: () => boolean
+  /**
+   * External cancellation. The caller aborts this when it retires the attempt, which cancels
+   * the transaction's in-flight work immediately. A polled predicate alone cannot do that — it
+   * is only consulted at the transaction's own checkpoints, so a hung request would keep the
+   * mutex until its own deadline while the replacement waited (PR #66 review).
+   */
+  signal?: AbortSignal
   onProgress?: (stage: string, message?: string) => void
 }
 
@@ -65,81 +72,123 @@ function acquireSessionMutex(signal: AbortSignal): Promise<() => void> {
   })
   const previous = sessionMutexTail
   sessionMutexTail = slot
+
+  // A cancelled waiter rejects its OWN acquisition immediately, but its slot must not resolve
+  // on cancellation: a successor is chained to this slot, and resolving it would release the
+  // successor while the real holder is still active — the very A/B/C race this mutex exists
+  // to prevent (PR #66 review). Instead the slot forwards its predecessor's release, so
+  // successors stay transitively chained to the live holder whether or not this node ran.
   return new Promise((resolveAcquired, rejectAcquired) => {
+    let settled = false
     const onAbort = (): void => {
+      if (settled) return
+      settled = true
       signal.removeEventListener("abort", onAbort)
-      // Leave the queue: this slot is released immediately so the chain can move on.
-      release()
       rejectAcquired(new Error("aborted before entering"))
     }
     if (signal.aborted) {
-      release()
-      rejectAcquired(new Error("aborted before entering"))
-      return
+      onAbort()
+    } else {
+      signal.addEventListener("abort", onAbort)
     }
-    signal.addEventListener("abort", onAbort)
+    // ONE continuation decides, atomically, what happens when our turn comes: either this node
+    // was cancelled while queued (forward the release so successors are not stranded), or it
+    // acquires (and releases when it is done). Two separate continuations on `previous` would
+    // race each other and release the slot for every node.
     previous.then(() => {
       signal.removeEventListener("abort", onAbort)
+      if (settled) {
+        // Cancelled while queued: hand the turn straight to the successor.
+        release()
+        return
+      }
+      settled = true
       resolveAcquired(release)
     })
   })
 }
 
-async function discardSession(): Promise<void> {
+/** Ceiling on the compensating logout, so a hung request cannot hold the mutex slot. */
+const LOGOUT_CEILING_MS = 5000
+
+/**
+ * Give up a session this attempt created. Bounded: the logout races the transaction's signal
+ * AND a fixed ceiling, so a never-settling request cannot hold the mutex slot open and wedge
+ * the successor. The successor is chained to THIS attempt's release, so it cannot log in
+ * before this logout has either completed or been cut off — the shared cookie is never
+ * mutated by two attempts at once (PR #66 review).
+ */
+async function discardSession(signal: AbortSignal): Promise<void> {
+  const ceiling = new AbortController()
+  const timer = setTimeout(() => ceiling.abort(), LOGOUT_CEILING_MS)
+  const onOuterAbort = (): void => ceiling.abort()
+  signal.addEventListener("abort", onOuterAbort)
   try {
-    await fetch("/api/auth/logout", { method: "POST", credentials: "include" })
+    await fetch("/api/auth/logout", {
+      method: "POST",
+      credentials: "include",
+      signal: ceiling.signal,
+    })
   } catch {
     // best-effort: the session is abandoned regardless
+  } finally {
+    clearTimeout(timer)
+    signal.removeEventListener("abort", onOuterAbort)
   }
 }
 
-const superseded = (): SignInTransactionResult => ({
-  success: false,
-  error: "Superseded",
-  errorType: "superseded",
-})
+type AbortCause = "timeout" | "superseded"
+
+const aborted = (cause: AbortCause): SignInTransactionResult =>
+  cause === "timeout"
+    ? { success: false, error: "Timed out", errorType: "timeout" }
+    : { success: false, error: "Superseded", errorType: "superseded" }
 
 export async function runNostrConnectSignIn(
   publicKey: string,
   options: SignInTransactionOptions,
 ): Promise<SignInTransactionResult> {
-  const { timeout, isCurrent, onProgress } = options
+  const { timeout, isCurrent, onProgress, signal: external } = options
   const stillOwned = (): boolean => isCurrent?.() ?? true
 
-  // One signal for the whole transaction. Timeout and supersession both abort it, so the login
-  // and the signing round-trip cannot outlive the decision (PR #66 review).
+  // One signal for the whole transaction. The deadline and external cancellation both abort it,
+  // so the login, the signing round-trip and the compensating logout cannot outlive the
+  // decision (PR #66 review). The CAUSE is tracked so the caller can tell a genuine timeout
+  // from supersession — every abort path used to report "superseded", which showed a normal
+  // Amber-approval timeout to the user as if they had been replaced.
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), timeout)
+  let cause: AbortCause = "superseded"
+  const abortWith = (c: AbortCause): void => {
+    if (controller.signal.aborted) return
+    cause = c
+    controller.abort()
+  }
+  const timer = setTimeout(() => abortWith("timeout"), timeout)
+  const onExternalAbort = (): void => abortWith("superseded")
+  if (external?.aborted) abortWith("superseded")
+  external?.addEventListener("abort", onExternalAbort)
 
   let release: (() => void) | null = null
-  let released = false
-  const releaseOnce = (): void => {
-    if (released) return
-    released = true
-    release?.()
-  }
-  // Releasing the slot cannot depend on the attempt's own async work completing: a login that
-  // never settles even when aborted would otherwise hold the queue forever (PR #66 review).
-  // On abort we hand the slot to the next waiter immediately; this attempt's work is dead
-  // regardless.
-  controller.signal.addEventListener("abort", () => releaseOnce())
 
   try {
     release = await acquireSessionMutex(controller.signal)
   } catch {
     clearTimeout(timer)
-    return superseded()
+    external?.removeEventListener("abort", onExternalAbort)
+    return aborted(cause)
   }
 
   // Ownership can be lost while QUEUED (before any work begins). This attempt has not created
-  // anything yet, so there is nothing to discard — just leave without logging in.
+  // anything yet, so there is nothing to discard — just leave without logging in. The slot is
+  // released in the finally below so the successor is not stranded.
   if (!stillOwned()) {
     clearTimeout(timer)
-    releaseOnce()
-    return superseded()
+    external?.removeEventListener("abort", onExternalAbort)
+    release()
+    return aborted("superseded")
   }
 
-  // The transaction resolves on timeout even if the underlying request never settles — an
+  // The transaction resolves on abort even if the underlying request never settles — an
   // aborted-but-stuck login must not hold this attempt open forever (PR #66 review).
   const onAbort = new Promise<never>((_, reject) => {
     controller.signal.addEventListener("abort", () =>
@@ -161,7 +210,7 @@ export async function runNostrConnectSignIn(
       ])
 
     if (controller.signal.aborted) {
-      return superseded()
+      return aborted(cause)
     }
     if (!sessionResult.success) {
       return {
@@ -172,34 +221,46 @@ export async function runNostrConnectSignIn(
     }
 
     // Ownership gate. The session exists but nothing local does. If this attempt no longer owns
-    // the flow, give the session up; because establishment is serialised, no replacement has a
-    // session of its own for this to destroy.
+    // the flow, give the session up; because establishment is serialised and the successor is
+    // chained to THIS slot's release, no replacement has a session of its own for this to
+    // destroy, and none can log in until this logout has completed or been cut off.
     if (!stillOwned()) {
-      await discardSession()
-      return superseded()
+      await discardSession(controller.signal)
+      return aborted("superseded")
     }
 
-    // Commit. Synchronous and inside the mutex; a storage throw discards the session so the app
-    // is not left authenticated under a user the caller was told failed (PR #66 review).
+    // Commit. Synchronous and inside the mutex. FAIL-CLOSED rather than snapshot-and-restore:
+    // the only write that makes the app read as authenticated (the auth data that startup's
+    // isAuthenticated() consults) is done LAST, after the profile writes. If anything throws,
+    // the auth data is cleared and the session discarded, so a half-commit can never be
+    // consumed as a login. An orphaned profile record is harmless — startup never reads a
+    // profile without auth data (PR #66 review).
+    // Validate before touching storage, so an invalid key never creates a profile.
+    if (!publicKey || publicKey.length !== 64 || !/^[0-9a-f]{64}$/i.test(publicKey)) {
+      await discardSession(controller.signal)
+      return { success: false, error: "Invalid public key" }
+    }
+
+    let profile: StoredProfile
     try {
+      profile = ProfileStorage.createProfile(publicKey, "nostrConnect")
+      ProfileStorage.setActiveProfile(profile.id)
+
+      // Last: the write that makes the app read as authenticated.
       const registration = NostrAuthService.signInWithNostrConnect(publicKey)
       if (!registration.success) {
-        await discardSession()
-        return { success: false, error: registration.error }
+        // Unreachable for a validated key (registration only fails validation), but keep the
+        // fail-closed contract if that ever changes.
+        throw new Error(registration.error || "Registration failed")
       }
-
-      const profile: StoredProfile = ProfileStorage.createProfile(
-        publicKey,
-        "nostrConnect",
-      )
-      ProfileStorage.setActiveProfile(profile.id)
-      const activeBlinkAccount: StoredBlinkAccount | null =
-        profile.blinkAccounts.find((a) => a.isActive) || null
-
-      onProgress?.("complete", "Done!")
-      return { success: true, publicKey, profile, activeBlinkAccount }
     } catch (commitErr: unknown) {
-      await discardSession()
+      // Fail closed: whatever partial state exists, the app must not read as signed in.
+      try {
+        NostrAuthService.clearAuthData()
+      } catch {
+        // storage is already failing; the session discard below is what matters
+      }
+      await discardSession(controller.signal)
       return {
         success: false,
         error:
@@ -207,10 +268,16 @@ export async function runNostrConnectSignIn(
         errorType: "unknown",
       }
     }
+
+    const activeBlinkAccount: StoredBlinkAccount | null =
+      profile.blinkAccounts.find((a) => a.isActive) || null
+
+    onProgress?.("complete", "Done!")
+    return { success: true, publicKey, profile, activeBlinkAccount }
   } catch (error: unknown) {
     // An abort during login lands here as a thrown AbortError from the fetch.
     if (controller.signal.aborted) {
-      return superseded()
+      return aborted(cause)
     }
     return {
       success: false,
@@ -219,6 +286,9 @@ export async function runNostrConnectSignIn(
     }
   } finally {
     clearTimeout(timer)
+    external?.removeEventListener("abort", onExternalAbort)
+    // Released only here, after any logout has completed or been cut off — never on abort
+    // while a compensating logout could still be mutating the shared cookie.
     release()
   }
 }

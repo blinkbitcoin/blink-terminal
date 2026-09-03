@@ -199,6 +199,9 @@ describe("useNostrAuth.signInWithNostrConnect — transaction delegation (issue 
   })
 
   it("maps a timeout to the user-facing timeout message", async () => {
+    // The transaction genuinely produces errorType "timeout" on its deadline (proven against
+    // the real unit in nostr-connect-signin.spec.ts, "cancels the login on timeout"); this
+    // covers only the hook's mapping of that result to the user-facing message.
     runSignIn.mockResolvedValue({
       success: false,
       error: "timeout",
