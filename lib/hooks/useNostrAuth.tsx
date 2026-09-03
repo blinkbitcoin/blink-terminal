@@ -181,15 +181,22 @@ export function NostrAuthProvider({
    */
   const authAttemptSeqRef = useRef<number>(0)
   /**
-   * The in-flight session CRITICAL SECTION, if any.
+   * The in-flight session critical section, if any: the attempt's completion promise AND the
+   * means to cancel it.
    *
-   * Spans login, the ownership decision, and any stale-session logout — not just the login.
-   * Serializing only the login left a window where a retired attempt was still deciding to log
-   * out while a replacement had already installed its own cookie, so the retired attempt's
-   * logout deleted a valid session (PR #66 review). A replacement waits for this whole section,
-   * so at most one attempt is ever creating or destroying a session.
+   * A completion promise alone is not a concurrency primitive — a replacement whose bounded wait
+   * expired could only WATCH a stuck predecessor, never stop it, and then start its own login
+   * while the predecessor could still commit or destroy the session (PR #66 review). Carrying
+   * the controller lets a replacement whose wait expired abort the predecessor and then wait for
+   * it to become inert, so the exclusivity the section promises is real.
    */
-  const sessionCriticalRef = useRef<Promise<void> | null>(null)
+  interface SessionCritical {
+    /** Resolves when this attempt can no longer create or destroy a session. */
+    done: Promise<void>
+    /** Cancels this attempt's in-flight login. */
+    abort: () => void
+  }
+  const sessionCriticalRef = useRef<SessionCritical | null>(null)
 
   // Re-check extension availability after short delay (extensions may inject asynchronously)
   useEffect(() => {
@@ -1681,18 +1688,34 @@ export function NostrAuthProvider({
 
       // Wait for any in-flight session critical section, BOUNDED by this attempt's own budget:
       // a predecessor whose login never settles must not wedge every later sign-in (PR #66
-      // review). Timing out the wait simply means proceeding without the guarantee, which is
-      // strictly better than hanging forever.
-      const previousCritical: Promise<void> | null = sessionCriticalRef.current
+      // review). If the wait expires, the predecessor is CANCELLED, not merely left running —
+      // otherwise this attempt would start a second cookie-mutating login while the first could
+      // still commit or log out the new session. After aborting, we wait for the predecessor to
+      // become inert so the exclusivity is real, not just the promise of it.
+      const previousCritical: SessionCritical | null = sessionCriticalRef.current
       if (previousCritical) {
         let waitTimer: ReturnType<typeof setTimeout> | undefined
         try {
           await Promise.race([
-            previousCritical,
+            previousCritical.done,
             new Promise<void>((resolve) => {
               waitTimer = setTimeout(resolve, timeout)
             }),
           ])
+          // If the section is still held after that bounded wait, the predecessor is stuck:
+          // abort it and wait for it to settle so it can no longer touch the session.
+          if (sessionCriticalRef.current === previousCritical) {
+            logAuthWarn(
+              "useNostrAuth",
+              "Predecessor session timed out — aborting it before proceeding",
+            )
+            previousCritical.abort()
+            try {
+              await previousCritical.done
+            } catch {
+              // a failed predecessor must not block this attempt
+            }
+          }
         } catch {
           // a failed predecessor must not block this attempt
         } finally {
@@ -1718,26 +1741,31 @@ export function NostrAuthProvider({
         logAuth("useNostrAuth", "Starting NIP-98 login (blocking)...")
         onProgress?.("signing", "Signing authentication event...")
 
-        // Open the critical section. It stays held across the login, the ownership decision and
-        // any logout below, and is released in the finally at the end of that block.
-        let releaseCritical: () => void = () => {}
-        const critical = new Promise<void>((resolve) => {
-          releaseCritical = resolve
-        })
-        sessionCriticalRef.current = critical
-
         // The request is ABORTABLE: a timed-out or superseded attempt cancels its login, so it
         // cannot commit a cookie later. That removes the precondition that made overlap unsafe —
         // a predecessor that has been aborted can never win a race against its replacement
         // (PR #66 review). Without this, any ordering of an uncancelled request is racy.
         const controller = new AbortController()
+
+        // Open the critical section, exposing both this attempt's completion AND its abort so a
+        // replacement whose wait expires can cancel it rather than merely watch it. It stays
+        // held across the login, the ownership decision and any logout below.
+        let releaseCritical: () => void = () => {}
+        const done = new Promise<void>((resolve) => {
+          releaseCritical = resolve
+        })
+        const critical: SessionCritical = {
+          done,
+          abort: () => controller.abort(),
+        }
+        sessionCriticalRef.current = critical
+
         const sessionAttempt: Promise<Nip98LoginResult> = NostrAuthService.nip98Login({
           signWithMethod: "nostrConnect",
           signal: controller.signal,
         })
 
         let sessionResult: Nip98LoginResult
-        let timedOut = false
         try {
           sessionResult = await Promise.race([
             sessionAttempt,
@@ -1749,15 +1777,10 @@ export function NostrAuthProvider({
         } catch (raceErr: unknown) {
           // Timed out (or the race threw): cancel the underlying request so it cannot commit,
           // then release the section so a replacement is not wedged on this attempt.
-          timedOut = true
           controller.abort()
           releaseCritical()
           if (sessionCriticalRef.current === critical) sessionCriticalRef.current = null
           throw raceErr
-        }
-        if (timedOut) {
-          // unreachable given the throw above, but keeps the invariant explicit
-          controller.abort()
         }
 
         let profile: StoredProfile

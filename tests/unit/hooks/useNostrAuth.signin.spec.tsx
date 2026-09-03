@@ -612,6 +612,67 @@ describe("useNostrAuth — signInWithNostrConnect ownership (PR #66)", () => {
     expect(authed()).toBe("true")
   })
 
+  /**
+   * HIGH (PR #66 review): a completion promise alone is not a concurrency primitive. If B's
+   * bounded wait expires while A is still active, B must CANCEL A and wait for it to become
+   * inert — not start its own login while A can still commit or destroy the session. Modelled
+   * with A having a long budget and B a short one, so B's wait genuinely expires first.
+   */
+  it("aborts a still-active predecessor whose wait expired before starting its own session", async () => {
+    const order: string[] = []
+    let aSignal: AbortSignal | null = null
+    let finishA: (v: {
+      success: boolean
+      error: string
+      errorType: string
+    }) => void = () => {}
+    authService.nip98Login
+      .mockImplementationOnce((opts: { signal?: AbortSignal }): Promise<never> => {
+        order.push("A:login:start")
+        aSignal = opts.signal ?? null
+        // A's login hangs until aborted.
+        return new Promise((_, reject) => {
+          finishA = (v) => {
+            // reachable only if NOT aborted; we expect abort instead
+            reject(new Error("A should have been aborted"))
+          }
+          opts.signal?.addEventListener("abort", () => {
+            order.push("A:aborted")
+            reject(Object.assign(new Error("aborted"), { name: "AbortError" }))
+          })
+        })
+      })
+      .mockImplementation(async () => {
+        order.push("B:login:start")
+        return { success: true }
+      })
+
+    await renderProvider()
+    ;(global.fetch as jest.Mock).mockClear()
+
+    let bResult: { success: boolean } | undefined
+    await act(async () => {
+      // A has a long budget; B a short one, so B's wait expires while A is still active.
+      const aPending = signIn(PUBKEY, { timeout: 5000, isCurrent: () => true })
+      await new Promise<void>((r) => setTimeout(r, 0))
+
+      const bPending = signIn(PUBKEY_B, { timeout: 20 })
+      await new Promise<void>((r) => setTimeout(r, 0))
+
+      await Promise.all([
+        aPending.catch(() => undefined),
+        bPending.then((r) => (bResult = r)),
+      ])
+    })
+
+    // A was aborted (its signal fired) BEFORE B's login began.
+    expect((aSignal as AbortSignal | null)?.aborted).toBe(true)
+    expect(order).toEqual(["A:login:start", "A:aborted", "B:login:start"])
+    expect(bResult?.success).toBe(true)
+    // And no late A logout ran to erase B's session.
+    expect(global.fetch).not.toHaveBeenCalledWith("/api/auth/logout", expect.anything())
+  })
+
   it("completes normally and publishes state when it owns the flow", async () => {
     await renderProvider()
 
