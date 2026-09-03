@@ -36,22 +36,35 @@ jest.mock("../../../lib/nostr/NostrAuthService", () => ({
   },
 }))
 
-jest.mock("../../../lib/storage/ProfileStorage", () => ({
-  __esModule: true,
-  default: {
-    createProfile: jest.fn((publicKey: string) => ({
-      id: "profile-1",
-      publicKey,
-      blinkAccounts: [],
-    })),
-    setActiveProfile: jest.fn(),
-    getActiveProfileId: jest.fn(() => "profile-1"),
-    getProfileById: jest.fn(() => ({ id: "profile-1", blinkAccounts: [] })),
-    getProfileByPublicKey: jest.fn(() => ({ id: "profile-1", blinkAccounts: [] })),
-    loadProfile: jest.fn(() => ({ id: "profile-1", blinkAccounts: [] })),
-    updateProfile: jest.fn(),
-  },
-}))
+// Stateful for the active-profile pointer: getActiveProfileId must reflect setActiveProfile and
+// deleteProfile, otherwise rollback's "is my profile still the active one?" check cannot be
+// exercised and the mock would hide the behavior under test.
+jest.mock("../../../lib/storage/ProfileStorage", () => {
+  let activeId: string | null = null
+  return {
+    __esModule: true,
+    default: {
+      __setActiveId: (id: string | null): void => {
+        activeId = id
+      },
+      createProfile: jest.fn((publicKey: string) => {
+        activeId = "profile-1" // the real one activates a newly created profile
+        return { id: "profile-1", publicKey, blinkAccounts: [] }
+      }),
+      setActiveProfile: jest.fn((id: string) => {
+        activeId = id
+      }),
+      getActiveProfileId: jest.fn(() => activeId),
+      deleteProfile: jest.fn((id: string) => {
+        if (activeId === id) activeId = null
+      }),
+      getProfileById: jest.fn(() => ({ id: "profile-1", blinkAccounts: [] })),
+      getProfileByPublicKey: jest.fn(() => ({ id: "profile-1", blinkAccounts: [] })),
+      loadProfile: jest.fn(() => ({ id: "profile-1", blinkAccounts: [] })),
+      updateProfile: jest.fn(),
+    },
+  }
+})
 
 jest.mock("../../../lib/nostr/NostrProfileService", () => ({
   __esModule: true,
@@ -111,6 +124,7 @@ describe("useNostrAuth — signInWithNostrConnect ownership (PR #66)", () => {
     authService.isExtensionAvailable.mockReturnValue(false)
     authService.isMobileDevice.mockReturnValue(false)
     authService.getAvailableMethods.mockReturnValue([])
+    profileStorage.__setActiveId(null)
     authService.signInWithNostrConnect.mockReturnValue({ success: true })
     authService.nip98Login.mockResolvedValue({ success: true })
     // Any sync/account fetch the flow makes.
@@ -138,7 +152,7 @@ describe("useNostrAuth — signInWithNostrConnect ownership (PR #66)", () => {
       publicKey: "previous-user",
       method: "extension",
     })
-    profileStorage.getActiveProfileId.mockReturnValue("previous-profile")
+    profileStorage.__setActiveId("previous-profile")
     // Forget anything the provider's own mount did, so the assertions below describe only what
     // the sign-in attempt caused.
     profileStorage.createProfile.mockClear()
@@ -164,9 +178,10 @@ describe("useNostrAuth — signInWithNostrConnect ownership (PR #66)", () => {
     expect(authed()).toBe("false")
 
     // The profile mutations are DEFERRED past the ownership check, so the retired user never
-    // got a profile created or activated for them.
+    // got a profile created or activated for them — and the active pointer is therefore
+    // untouched rather than restored.
     expect(profileStorage.createProfile).not.toHaveBeenCalled()
-    expect(profileStorage.setActiveProfile).not.toHaveBeenCalledWith("profile-1")
+    expect(profileStorage.getActiveProfileId()).toBe("previous-profile")
 
     // The server session established by nip98Login was cleared.
     expect(global.fetch).toHaveBeenCalledWith(
@@ -176,8 +191,6 @@ describe("useNostrAuth — signInWithNostrConnect ownership (PR #66)", () => {
     // Local auth was restored to the PREVIOUS user, not left as the retired one.
     expect(authService.storeAuthData).toHaveBeenCalledWith("previous-user", "extension")
     expect(authService.clearAuthData).not.toHaveBeenCalled()
-    // ...and so was the previously active profile.
-    expect(profileStorage.setActiveProfile).toHaveBeenCalledWith("previous-profile")
     // No account sync was attempted for the retired attempt.
     expect(global.fetch).not.toHaveBeenCalledWith(
       "/api/auth/nostr-blink-account",
@@ -187,7 +200,6 @@ describe("useNostrAuth — signInWithNostrConnect ownership (PR #66)", () => {
 
   it("clears local auth on rollback when there was no previous user", async () => {
     authService.getStoredAuthData.mockReturnValue({ publicKey: null, method: null })
-    profileStorage.getActiveProfileId.mockReturnValue(null)
 
     let finishSigning: (v: { success: boolean }) => void = () => {}
     authService.nip98Login.mockImplementation(
@@ -228,7 +240,7 @@ describe("useNostrAuth — signInWithNostrConnect ownership (PR #66)", () => {
       publicKey: "previous-user",
       method: "extension",
     })
-    profileStorage.getActiveProfileId.mockReturnValue("previous-profile")
+    profileStorage.__setActiveId("previous-profile")
 
     let owned = true
     let result: { success: boolean; errorType?: string } | undefined
@@ -253,9 +265,121 @@ describe("useNostrAuth — signInWithNostrConnect ownership (PR #66)", () => {
     // The sync must not have written the account into profile storage.
     expect(profileStorage.updateProfile).not.toHaveBeenCalled()
     expect(authed()).toBe("false")
-    // And the attempt was rolled back.
+    // And the attempt was rolled back: the profile it activated is no longer active, the
+    // previous one is.
     expect(authService.storeAuthData).toHaveBeenCalledWith("previous-user", "extension")
-    expect(profileStorage.setActiveProfile).toHaveBeenCalledWith("previous-profile")
+    expect(profileStorage.getActiveProfileId()).toBe("previous-profile")
+  })
+
+  /**
+   * HIGH (PR #66 review): rollback operates on SHARED state — auth data, the session cookie and
+   * the active profile. A superseded attempt A must never undo a replacement B's work. These
+   * cover the overlapping case with B completing first and A settling late.
+   */
+  it("a superseded attempt does not log out or overwrite a replacement that already completed", async () => {
+    // A hangs at signing; B (started later) signs immediately.
+    const signingGates: Array<(v: { success: boolean }) => void> = []
+    authService.nip98Login.mockImplementation(
+      () =>
+        new Promise((r) => {
+          signingGates.push(r)
+        }),
+    )
+
+    await renderProvider()
+    profileStorage.__setActiveId("previous-profile")
+    authService.getStoredAuthData.mockReturnValue({
+      publicKey: "previous-user",
+      method: "extension",
+    })
+    ;(global.fetch as jest.Mock).mockClear()
+    authService.storeAuthData.mockClear()
+    authService.clearAuthData.mockClear()
+
+    let aOwned = true
+    let aResult: { errorType?: string } | undefined
+    await act(async () => {
+      // A starts and reaches its signing await.
+      const aPending = signIn(PUBKEY, { isCurrent: () => aOwned })
+      await new Promise<void>((r) => setTimeout(r, 0))
+
+      // A is retired, and B starts and COMPLETES fully while A is still hanging.
+      aOwned = false
+      const bPending = signIn(PUBKEY, { isCurrent: () => true })
+      await new Promise<void>((r) => setTimeout(r, 0))
+      signingGates[1]({ success: true }) // B's signing succeeds
+      await bPending
+
+      // Only now does A settle and try to clean up.
+      signingGates[0]({ success: true })
+      aResult = await aPending
+    })
+
+    expect(aResult?.errorType).toBe("superseded")
+
+    // B is still current everywhere: its session was not logged out...
+    expect(global.fetch).not.toHaveBeenCalledWith("/api/auth/logout", expect.anything())
+    // ...its local auth was not overwritten with A's snapshot...
+    expect(authService.storeAuthData).not.toHaveBeenCalledWith(
+      "previous-user",
+      "extension",
+    )
+    expect(authService.clearAuthData).not.toHaveBeenCalled()
+    // ...its profile is still the active one, not the pre-A profile...
+    expect(profileStorage.getActiveProfileId()).toBe("profile-1")
+    expect(profileStorage.deleteProfile).not.toHaveBeenCalled()
+    // ...and the provider still reports B's authenticated state.
+    expect(authed()).toBe("true")
+  })
+
+  it("a replacement waits for a superseded attempt's rollback before registering", async () => {
+    // A's rollback hangs inside the logout request; B must not start on top of it.
+    let finishLogout: (v: unknown) => void = () => {}
+    const order: string[] = []
+    global.fetch = jest.fn(async (url: string) => {
+      if (String(url).includes("logout")) {
+        order.push("logout:start")
+        return new Promise((r) => {
+          finishLogout = (v) => {
+            order.push("logout:done")
+            r(v)
+          }
+        })
+      }
+      return { ok: true, status: 200, json: async () => ({}) }
+    }) as unknown as typeof fetch
+
+    let finishSigningA: (v: { success: boolean }) => void = () => {}
+    authService.nip98Login.mockImplementationOnce(
+      () => new Promise((r) => (finishSigningA = r)),
+    )
+
+    await renderProvider()
+    ;(global.fetch as jest.Mock).mockClear()
+
+    let aOwned = true
+    await act(async () => {
+      const aPending = signIn(PUBKEY, { isCurrent: () => aOwned })
+      await new Promise<void>((r) => setTimeout(r, 0))
+      aOwned = false
+      finishSigningA({ success: true }) // A settles → rollback begins, hangs on logout
+      await new Promise<void>((r) => setTimeout(r, 0))
+
+      // B starts while A's cleanup is still in flight.
+      authService.nip98Login.mockImplementation(async () => {
+        order.push("B:signing")
+        return { success: true }
+      })
+      const bPending = signIn(PUBKEY, { isCurrent: () => true })
+      await new Promise<void>((r) => setTimeout(r, 0))
+
+      finishLogout({ ok: true, status: 200, json: async () => ({}) })
+      await Promise.all([aPending, bPending])
+    })
+
+    // B's work began only after A's cleanup finished — no interleaving.
+    expect(order).toEqual(["logout:start", "logout:done", "B:signing"])
+    expect(authed()).toBe("true")
   })
 
   it("still completes normally while the attempt is still owned", async () => {

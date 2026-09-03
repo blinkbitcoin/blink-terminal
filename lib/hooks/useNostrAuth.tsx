@@ -172,6 +172,16 @@ export function NostrAuthProvider({
   // Track if challenge flow is being handled to prevent duplicate processing
   const challengeFlowHandling = useRef<boolean>(false)
 
+  // Provider-wide ownership for Nostr Connect sign-ins. Auth data, the server session and the
+  // active profile are SHARED state, so a superseded attempt's cleanup must never run against a
+  // replacement's work: A could otherwise log out B's session, overwrite B's auth and reactivate
+  // the profile that predates A (PR #66 review). Each attempt takes a ticket; only the latest
+  // one may clean up.
+  const authAttemptSeqRef = useRef<number>(0)
+  // The in-flight cleanup, if any. A new attempt waits for it before taking its ticket, so a
+  // replacement can never start on top of a rollback that is about to undo shared state.
+  const pendingAuthCleanupRef = useRef<Promise<void> | null>(null)
+
   // Re-check extension availability after short delay (extensions may inject asynchronously)
   useEffect(() => {
     // Immediate check
@@ -1626,34 +1636,99 @@ export function NostrAuthProvider({
       )
       // Note: Don't set loading state here - modal handles its own UI
 
+      // Never start on top of a rollback that is still undoing shared state.
+      if (pendingAuthCleanupRef.current) {
+        try {
+          await pendingAuthCleanupRef.current
+        } catch {
+          // a failed cleanup must not block a fresh attempt
+        }
+      }
+
+      // Ownership ticket. Taken AFTER the wait above, so tickets are ordered consistently with
+      // the cleanups they follow.
+      const myTicket: number = ++authAttemptSeqRef.current
+      const isLatestAttempt = (): boolean => myTicket === authAttemptSeqRef.current
+
       // What this attempt must restore if it turns out not to own the flow. Captured BEFORE any
       // mutation: being superseded has to leave no trace of the retired user, and returning
       // early is not enough when local auth and a server session have already been created
       // (PR #66 review).
       const previousAuth = NostrAuthService.getStoredAuthData()
       const previousActiveProfileId: string | null = ProfileStorage.getActiveProfileId()
+      // Set once this attempt creates/activates a profile, so rollback knows what to undo.
+      let createdProfileId: string | null = null
+      // Whether that profile already existed. createProfile RETURNS an existing profile for a
+      // known pubkey, so only a profile this attempt genuinely created may be deleted —
+      // removing a returning user's profile would destroy their accounts and settings.
+      let profileWasNew = false
 
       /**
        * Undo everything this attempt established, including the server session — nip98Login
        * sets a session cookie, so simply not publishing would still leave the app logged in
        * server-side after a reload.
+       *
+       * Gated on still being the latest attempt. Auth data, the session cookie and the active
+       * profile are shared, and a replacement that has already started owns all of them: an
+       * unconditional cleanup here would log out the replacement, overwrite its auth and
+       * reactivate the profile from before this attempt (PR #66 review). When a replacement
+       * exists there is also nothing to undo — it has overwritten this attempt's registration
+       * already.
        */
       const rollback = async (reason: string): Promise<AuthActionResult> => {
+        const superseded: AuthActionResult = {
+          success: false,
+          error: "Superseded",
+          errorType: "superseded",
+        }
+        if (!isLatestAttempt()) {
+          logAuthWarn(
+            "useNostrAuth",
+            `Sign-in superseded ${reason} — a replacement owns the session, leaving it alone`,
+          )
+          return superseded
+        }
         logAuthWarn("useNostrAuth", `Sign-in superseded ${reason} — rolling back`)
+
+        // Published synchronously (no await between the check above and this assignment) so a
+        // replacement starting now waits for the cleanup instead of racing it.
+        const cleanup: Promise<void> = (async (): Promise<void> => {
+          try {
+            await fetch("/api/auth/logout", { method: "POST", credentials: "include" })
+          } catch (e: unknown) {
+            logAuthWarn("useNostrAuth", "Server logout during rollback failed:", e)
+          }
+          if (previousAuth.publicKey && previousAuth.method) {
+            NostrAuthService.storeAuthData(previousAuth.publicKey, previousAuth.method)
+          } else {
+            NostrAuthService.clearAuthData()
+          }
+          // Only touch the profile pointer if this attempt's profile is the active one.
+          if (
+            createdProfileId &&
+            ProfileStorage.getActiveProfileId() === createdProfileId
+          ) {
+            if (previousActiveProfileId) {
+              ProfileStorage.setActiveProfile(previousActiveProfileId)
+            } else if (profileWasNew) {
+              // Nothing to fall back to and this attempt created it: remove it entirely, which
+              // also clears the active pointer. Otherwise a retired attempt's profile would
+              // stay active with no auth behind it.
+              ProfileStorage.deleteProfile(createdProfileId)
+            }
+            // A pre-existing profile with no previous active pointer is the user's own data
+            // from before this attempt; it is left in place.
+          }
+        })()
+        pendingAuthCleanupRef.current = cleanup
         try {
-          await fetch("/api/auth/logout", { method: "POST", credentials: "include" })
-        } catch (e: unknown) {
-          logAuthWarn("useNostrAuth", "Server logout during rollback failed:", e)
+          await cleanup
+        } finally {
+          if (pendingAuthCleanupRef.current === cleanup) {
+            pendingAuthCleanupRef.current = null
+          }
         }
-        if (previousAuth.publicKey && previousAuth.method) {
-          NostrAuthService.storeAuthData(previousAuth.publicKey, previousAuth.method)
-        } else {
-          NostrAuthService.clearAuthData()
-        }
-        if (previousActiveProfileId) {
-          ProfileStorage.setActiveProfile(previousActiveProfileId)
-        }
-        return { success: false, error: "Superseded", errorType: "superseded" }
+        return superseded
       }
 
       try {
@@ -1697,10 +1772,14 @@ export function NostrAuthProvider({
         // Step 3: Create profile (local storage). DEFERRED until ownership is confirmed —
         // nip98Login does not need it, so a superseded attempt must not leave a profile
         // created and activated for the retired user.
+        // Checked first so rollback can tell a profile this attempt created from one that
+        // already existed (createProfile returns the existing one for a known pubkey).
+        profileWasNew = ProfileStorage.getProfileByPublicKey(publicKey) === null
         const profile: StoredProfile = ProfileStorage.createProfile(
           publicKey,
           "nostrConnect",
         )
+        createdProfileId = profile.id
         ProfileStorage.setActiveProfile(profile.id)
         const activeBlinkAccount: StoredBlinkAccount | null =
           profile.blinkAccounts.find((a) => a.isActive) || null
