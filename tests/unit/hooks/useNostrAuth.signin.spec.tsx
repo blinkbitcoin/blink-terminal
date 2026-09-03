@@ -126,6 +126,11 @@ jest.mock("../../../lib/storage/ProfileStorage", () => {
   }
 })
 
+jest.mock("../../../lib/nostr/NostrProfileService", () => ({
+  __esModule: true,
+  default: { fetchProfile: jest.fn(async () => null) },
+}))
+
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- required after the mocks above
 const { NostrAuthProvider, useNostrAuth } =
   require("../../../lib/hooks/useNostrAuth") as typeof import("../../../lib/hooks/useNostrAuth")
@@ -133,6 +138,12 @@ const { NostrAuthProvider, useNostrAuth } =
 const authService = (
   jest.requireMock("../../../lib/nostr/NostrAuthService") as {
     default: Record<string, jest.Mock>
+  }
+).default
+
+const profileService = (
+  jest.requireMock("../../../lib/nostr/NostrProfileService") as {
+    default: { fetchProfile: jest.Mock }
   }
 ).default
 
@@ -149,7 +160,14 @@ let signIn: ReturnType<typeof useNostrAuth>["signInWithNostrConnect"]
 const Probe = (): React.JSX.Element => {
   const auth = useNostrAuth()
   signIn = auth.signInWithNostrConnect
-  return <div data-testid="authed">{String(auth.isAuthenticated)}</div>
+  return (
+    <>
+      <div data-testid="authed">{String(auth.isAuthenticated)}</div>
+      <div data-testid="profile">
+        {(auth.nostrProfile as { display_name?: string } | null)?.display_name ?? "none"}
+      </div>
+    </>
+  )
 }
 
 const renderProvider = async (): Promise<void> => {
@@ -178,6 +196,7 @@ describe("useNostrAuth — signInWithNostrConnect ownership (PR #66)", () => {
     authService.getAvailableMethods.mockReturnValue([])
     authService.signInWithNostrConnect.mockReturnValue({ success: true })
     authService.nip98Login.mockResolvedValue({ success: true })
+    profileService.fetchProfile.mockResolvedValue(null)
     profileStorage.__reset()
     global.fetch = jest.fn(async () => ({
       ok: true,
@@ -410,10 +429,21 @@ describe("useNostrAuth — signInWithNostrConnect ownership (PR #66)", () => {
     expect(authed()).toBe("true")
   })
 
-  it("discards a session that arrives after the attempt already timed out", async () => {
-    let finishLate: (v: { success: boolean }) => void = () => {}
+  it("cancels its login on timeout, so it cannot commit a session late", async () => {
+    // The attempt gets a real signal and its login hangs until aborted — which is the point: a
+    // timed-out request must be cancellable, or it could install a cookie after the caller
+    // already saw a failure (PR #66 review).
+    let observedSignal: AbortSignal | null = null
     authService.nip98Login.mockImplementationOnce(
-      () => new Promise((r) => (finishLate = r)),
+      (opts: {
+        signal?: AbortSignal
+      }): Promise<{ success: boolean; error: string; errorType: string }> =>
+        new Promise((resolve) => {
+          observedSignal = opts.signal ?? null
+          opts.signal?.addEventListener("abort", () =>
+            resolve({ success: false, error: "Aborted", errorType: "superseded" }),
+          )
+        }),
     )
 
     await renderProvider()
@@ -424,26 +454,16 @@ describe("useNostrAuth — signInWithNostrConnect ownership (PR #66)", () => {
       await new Promise<void>((r) => setTimeout(r, 20))
       const result = await pending
       expect(result.errorType).toBe("timeout")
-
-      // The login succeeds AFTER the caller gave up: that cookie belongs to nobody.
-      finishLate({ success: true })
       await new Promise<void>((r) => setTimeout(r, 10))
     })
 
-    expect(global.fetch).toHaveBeenCalledWith(
-      "/api/auth/logout",
-      expect.objectContaining({ method: "POST" }),
-    )
-    // It was never published as a sign-in.
+    // The request was aborted, so there is nothing to commit later and nothing to clean up.
+    expect((observedSignal as AbortSignal | null)?.aborted).toBe(true)
+    expect(global.fetch).not.toHaveBeenCalledWith("/api/auth/logout", expect.anything())
     expect(authed()).toBe("false")
     expect(authService.signInWithNostrConnect).not.toHaveBeenCalled()
   })
 
-  /**
-   * HIGH (PR #66 review): the critical section must cover the stale-session logout too, not
-   * just the login. Otherwise a retired attempt can still be deciding to log out while its
-   * replacement installs a cookie, and then delete it.
-   */
   it("a replacement cannot begin session establishment until a retired attempt's logout completes", async () => {
     const order: string[] = []
     let finishLogout: (v: unknown) => void = () => {}
@@ -528,6 +548,70 @@ describe("useNostrAuth — signInWithNostrConnect ownership (PR #66)", () => {
     expect(global.fetch).not.toHaveBeenCalledWith("/api/auth/logout", expect.anything())
   })
 
+  /**
+   * HIGH (PR #66 review): the background profile fetch checked ownership only before STARTING.
+   * An attempt that commits while CURRENT starts the fetch, and can be superseded afterwards;
+   * its late relay response must not publish stale metadata over the replacement's identity.
+   */
+  it("does not publish a stale attempt's profile metadata after a replacement commits", async () => {
+    let finishAProfile: (v: unknown) => void = () => {}
+    profileService.fetchProfile.mockImplementation((pubkey: string) => {
+      if (pubkey === PUBKEY) return new Promise((r) => (finishAProfile = r))
+      return Promise.resolve(null)
+    })
+
+    await renderProvider()
+
+    let owned = true
+    await act(async () => {
+      // A is CURRENT through its commit, so its background fetch starts and hangs.
+      const aPending = signIn(PUBKEY, { isCurrent: () => owned })
+      await new Promise<void>((r) => setTimeout(r, 0))
+      await aPending // committed; fetch now in flight
+
+      // A is retired only AFTER committing, and B commits for a different user.
+      owned = false
+      await signIn(PUBKEY_B, { isCurrent: () => true })
+
+      // A's stale relay response arrives.
+      finishAProfile({ display_name: "stale-A" })
+      await new Promise<void>((r) => setTimeout(r, 10))
+    })
+
+    expect(screen.getByTestId("profile").textContent).not.toBe("stale-A")
+    expect(authed()).toBe("true") // B is the live one
+  })
+
+  /**
+   * Coverage gap (PR #66 review): the never-settling test started B only after A had cleared
+   * the ref, so it did not exercise the bounded predecessor-wait branch. Here B waits on a
+   * section A still holds, and its wait is bounded by its own budget.
+   */
+  it("bounds the predecessor wait by the waiter's own timeout, not the predecessor's", async () => {
+    // A's login never settles, so it holds its critical section until its OWN timeout.
+    authService.nip98Login
+      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockImplementation(async () => ({ success: true }))
+
+    await renderProvider()
+
+    let bResult: { success: boolean } | undefined
+    await act(async () => {
+      const aPending = signIn(PUBKEY, { timeout: 30 })
+      await new Promise<void>((r) => setTimeout(r, 0))
+
+      // B arrives while A still holds the section; it waits only its own budget, then proceeds.
+      const started = Date.now()
+      const bPending = signIn(PUBKEY_B, { timeout: 30 })
+      await aPending
+      bResult = await bPending
+      expect(Date.now() - started).toBeLessThan(3000)
+    })
+
+    expect(bResult?.success).toBe(true)
+    expect(authed()).toBe("true")
+  })
+
   it("completes normally and publishes state when it owns the flow", async () => {
     await renderProvider()
 
@@ -556,6 +640,7 @@ describe("useNostrAuth — signInWithNostrConnect ownership (PR #66)", () => {
     // storage, which is what lets registration happen after the ownership gate.
     expect(authService.nip98Login).toHaveBeenCalledWith({
       signWithMethod: "nostrConnect",
+      signal: expect.any(AbortSignal),
     })
     const loginOrder = authService.nip98Login.mock.invocationCallOrder[0]
     const registerOrder = authService.signInWithNostrConnect.mock.invocationCallOrder[0]

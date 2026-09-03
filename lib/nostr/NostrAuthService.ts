@@ -112,6 +112,8 @@ interface Nip98LoginResult {
   user?: Record<string, unknown>
   error?: string
   details?: string
+  /** Set for deliberate cancellation (timeout/supersession) so callers can distinguish it. */
+  errorType?: string
 }
 
 /** Result from server session verification */
@@ -1073,7 +1075,9 @@ class NostrAuthService {
   static async signEvent(
     event: UnsignedEvent,
     methodOverride?: SignInMethod,
+    signal?: AbortSignal,
   ): Promise<SignedEvent> {
+    if (signal?.aborted) throw new Error("aborted")
     const method = methodOverride ?? this.getCurrentMethod()
 
     if (!method) {
@@ -1096,7 +1100,7 @@ class NostrAuthService {
       return this.signEventWithPrivateKey(event, privateKey)
     } else if (method === "nostrConnect") {
       // Sign with remote signer via NIP-46
-      return this.signEventWithNostrConnect(event)
+      return this.signEventWithNostrConnect(event, signal)
     }
 
     throw new Error(`Unknown sign-in method: ${method}`)
@@ -1108,7 +1112,11 @@ class NostrAuthService {
    * @param event
    * @returns {Promise<SignedEvent>}
    */
-  static async signEventWithNostrConnect(event: UnsignedEvent): Promise<SignedEvent> {
+  static async signEventWithNostrConnect(
+    event: UnsignedEvent,
+    signal?: AbortSignal,
+  ): Promise<SignedEvent> {
+    if (signal?.aborted) throw new Error("aborted")
     const NostrConnectService: NostrConnectServiceLike = (
       await import("./NostrConnectService")
     ).default
@@ -1118,6 +1126,7 @@ class NostrAuthService {
     }
 
     const result = await NostrConnectService.signEvent(event)
+    if (signal?.aborted) throw new Error("aborted")
 
     if (!result.success) {
       throw new Error(result.error || "Failed to sign event via Nostr Connect")
@@ -1270,6 +1279,7 @@ class NostrAuthService {
     url: string,
     method: string = "GET",
     signWithMethod?: SignInMethod,
+    signal?: AbortSignal,
   ): Promise<SignedEvent> {
     const event: UnsignedEvent = {
       kind: 27235, // NIP-98 HTTP Auth
@@ -1281,7 +1291,7 @@ class NostrAuthService {
       content: "",
     }
 
-    return this.signEvent(event, signWithMethod)
+    return this.signEvent(event, signWithMethod, signal)
   }
 
   /**
@@ -1492,6 +1502,7 @@ class NostrAuthService {
    */
   static async nip98Login(opts?: {
     signWithMethod?: SignInMethod
+    signal?: AbortSignal
   }): Promise<Nip98LoginResult> {
     logAuth("NostrAuthService", "nip98Login called")
 
@@ -1513,6 +1524,7 @@ class NostrAuthService {
         loginUrl,
         "POST",
         opts?.signWithMethod,
+        opts?.signal,
       )
       logAuth("NostrAuthService", "Signed event created:", signedEvent ? "yes" : "no")
 
@@ -1532,6 +1544,7 @@ class NostrAuthService {
           "Content-Type": "application/json",
         },
         credentials: "include", // Include cookies in response
+        signal: opts?.signal, // Abortable: a superseded/timed-out attempt must not commit a cookie
       })
 
       const data = (await response.json()) as Record<string, unknown>
@@ -1550,6 +1563,11 @@ class NostrAuthService {
         user: data.user as Record<string, unknown> | undefined,
       }
     } catch (err: unknown) {
+      // An aborted request is a deliberate cancellation (timeout or supersession), not a
+      // failure to surface — and it must not commit a session.
+      if (opts?.signal?.aborted || (err instanceof Error && err.name === "AbortError")) {
+        return { success: false, error: "Aborted", errorType: "superseded" }
+      }
       logAuthError("NostrAuthService", "NIP-98 login error:", err)
       return {
         success: false,

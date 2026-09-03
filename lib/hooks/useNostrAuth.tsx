@@ -239,7 +239,10 @@ export function NostrAuthProvider({
    * Fetch Nostr profile metadata from relays
    */
   const fetchNostrProfile = useCallback(
-    async (publicKey: string): Promise<NostrProfile | null> => {
+    async (
+      publicKey: string,
+      isCurrent?: () => boolean,
+    ): Promise<NostrProfile | null> => {
       if (!publicKey) return null
 
       try {
@@ -251,6 +254,15 @@ export function NostrAuthProvider({
           await NostrProfileService.fetchProfile(publicKey)
 
         if (nostrProfile) {
+          // Recheck ownership AFTER the await: a caller that started this fetch while current
+          // may have been superseded by the time the relay responds, and publishing its metadata
+          // would overwrite a replacement's identity (PR #66 review).
+          if (isCurrent && !isCurrent()) {
+            console.warn(
+              "[useNostrAuth] Profile fetch superseded — not publishing metadata",
+            )
+            return nostrProfile
+          }
           console.log(
             "[useNostrAuth] ✓ Fetched Nostr profile:",
             nostrProfile.display_name || nostrProfile.name || "No name",
@@ -1714,39 +1726,18 @@ export function NostrAuthProvider({
         })
         sessionCriticalRef.current = critical
 
+        // The request is ABORTABLE: a timed-out or superseded attempt cancels its login, so it
+        // cannot commit a cookie later. That removes the precondition that made overlap unsafe —
+        // a predecessor that has been aborted can never win a race against its replacement
+        // (PR #66 review). Without this, any ordering of an uncancelled request is racy.
+        const controller = new AbortController()
         const sessionAttempt: Promise<Nip98LoginResult> = NostrAuthService.nip98Login({
           signWithMethod: "nostrConnect",
+          signal: controller.signal,
         })
 
-        // Promise.race abandons the wait, it does not cancel the request. If this attempt gives
-        // up (timeout) and the login then succeeds anyway, the cookie it installs belongs to
-        // nobody — so retire it. The cleanup is chained onto the critical section so it is
-        // ordered against any replacement rather than racing it.
-        let abandoned = false
-        sessionAttempt
-          .then((late: Nip98LoginResult) => {
-            if (!abandoned || !late.success) return
-            const cleanup = (sessionCriticalRef.current ?? Promise.resolve()).then(
-              async () => {
-                logAuthWarn(
-                  "useNostrAuth",
-                  "Abandoned login succeeded late — discarding its session",
-                )
-                try {
-                  await fetch("/api/auth/logout", {
-                    method: "POST",
-                    credentials: "include",
-                  })
-                } catch (e: unknown) {
-                  logAuthWarn("useNostrAuth", "Late-session logout failed:", e)
-                }
-              },
-            )
-            sessionCriticalRef.current = cleanup
-          })
-          .catch(() => undefined)
-
         let sessionResult: Nip98LoginResult
+        let timedOut = false
         try {
           sessionResult = await Promise.race([
             sessionAttempt,
@@ -1756,15 +1747,27 @@ export function NostrAuthProvider({
             ),
           ])
         } catch (raceErr: unknown) {
-          abandoned = true
+          // Timed out (or the race threw): cancel the underlying request so it cannot commit,
+          // then release the section so a replacement is not wedged on this attempt.
+          timedOut = true
+          controller.abort()
           releaseCritical()
           if (sessionCriticalRef.current === critical) sessionCriticalRef.current = null
           throw raceErr
+        }
+        if (timedOut) {
+          // unreachable given the throw above, but keeps the invariant explicit
+          controller.abort()
         }
 
         let profile: StoredProfile
         try {
           if (!sessionResult.success) {
+            // An aborted login is a deliberate cancellation (timeout or supersession), not a
+            // session failure, and it committed nothing.
+            if (sessionResult.errorType === "superseded") {
+              return { success: false, error: "Superseded", errorType: "superseded" }
+            }
             logAuthWarn("useNostrAuth", "NIP-98 login failed:", sessionResult.error)
             return {
               success: false,
@@ -1812,9 +1815,10 @@ export function NostrAuthProvider({
           if (sessionCriticalRef.current === critical) sessionCriticalRef.current = null
         }
 
-        // Fetch Nostr profile metadata in background (non-blocking). Guarded so a stale
-        // attempt's metadata cannot be published into a replacement's state.
-        if (stillOwned()) fetchNostrProfile(publicKey)
+        // Fetch Nostr profile metadata in background (non-blocking). Guarded on entry AND
+        // handed the ownership check so a stale attempt's late relay response cannot publish
+        // its metadata into a replacement's state (PR #66 review).
+        if (stillOwned()) fetchNostrProfile(publicKey, stillOwned)
 
         // Step 4: Sync data from the server. This runs AFTER the commit, so a failure or a late
         // supersession here can no longer strand a half-built sign-in; ownership is still
