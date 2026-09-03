@@ -89,6 +89,16 @@ export interface NostrAuthState {
 interface NostrConnectSignInOptions {
   onProgress?: (stage: string, message: string) => void
   timeout?: number
+  /**
+   * Ownership check for the caller's attempt. Returns false once this sign-in has been
+   * cancelled or superseded (e.g. a bfcache discard retired it).
+   *
+   * The caller suppressing its OWN continuation is not enough: this operation publishes durable
+   * state of its own — profile activation, server-account sync, and the provider's
+   * authenticated state — after awaiting the network. Without this check a stale request could
+   * authenticate the app through a transport that is already gone (PR #66 review).
+   */
+  isCurrent?: () => boolean
 }
 
 export interface NostrAuthContextValue extends NostrAuthState {
@@ -1586,7 +1596,9 @@ export function NostrAuthProvider({
       publicKey: string,
       options: NostrConnectSignInOptions = {},
     ): Promise<AuthActionResult> => {
-      const { onProgress, timeout = 30000 } = options
+      const { onProgress, timeout = 30000, isCurrent } = options
+      // Defaults to "still mine" so callers that do not track ownership are unaffected.
+      const stillOwned = (): boolean => isCurrent?.() ?? true
 
       logAuth(
         "useNostrAuth",
@@ -1635,6 +1647,18 @@ export function NostrAuthProvider({
 
         logAuth("useNostrAuth", "Server session established")
 
+        // This request may have been cancelled or superseded while the signing round-trip was
+        // in flight (e.g. a bfcache discard retired it). Everything below is DURABLE — server
+        // sync and the provider's authenticated state — so stop here rather than authenticate
+        // the app through a transport that is already gone (PR #66 review).
+        if (!stillOwned()) {
+          logAuthWarn(
+            "useNostrAuth",
+            "Sign-in superseded during signing — publishing nothing",
+          )
+          return { success: false, error: "Superseded", errorType: "superseded" }
+        }
+
         // Step 4: Sync data from server
         logAuth("useNostrAuth", "Syncing data from server...")
         onProgress?.("syncing", "Loading your data...")
@@ -1645,6 +1669,16 @@ export function NostrAuthProvider({
         } catch (syncError: unknown) {
           // Soft failure - don't block sign-in for sync issues
           logAuthWarn("useNostrAuth", "Sync failed (non-blocking):", syncError)
+        }
+
+        // Re-check after the sync await: ownership can be lost during it too, and the state
+        // published below is what actually authenticates the app.
+        if (!stillOwned()) {
+          logAuthWarn(
+            "useNostrAuth",
+            "Sign-in superseded during sync — publishing nothing",
+          )
+          return { success: false, error: "Superseded", errorType: "superseded" }
         }
 
         // Step 5: NOW set authenticated state (after session is established)

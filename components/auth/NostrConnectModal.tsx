@@ -56,6 +56,12 @@ type ConnectionStage =
 interface SignInProgressOptions {
   onProgress: (stage: string, message?: string) => void
   timeout: number
+  /**
+   * Ownership check handed to the auth operation so it can abandon before publishing durable
+   * state (profile activation, server sync, provider auth state) once this attempt has been
+   * retired — suppressing only this component's continuation is not enough (PR #66 review).
+   */
+  isCurrent: () => boolean
 }
 
 /** Sign-in result from useNostrAuth */
@@ -296,6 +302,11 @@ export default function NostrConnectModal({
 
       // Call the sign-in function with progress callback
       const result = await signInWithNostrConnect(pubkey, {
+        // Ownership, not just UI suppression: the auth operation publishes durable state of its
+        // own (server sync, provider authenticated state) after its awaits. Retiring this
+        // attempt's token must stop THAT too, not only this component's continuation
+        // (PR #66 review).
+        isCurrent,
         onProgress: (progressStage: string, message?: string) => {
           // Stale attempts must not move the stepper mid-flight.
           if (!isCurrent()) return

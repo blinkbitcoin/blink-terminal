@@ -379,13 +379,22 @@ describe("NostrConnectService — overlapping attempt ownership (round-4)", () =
     expect(NostrConnectService.pool).toBe(livePool)
     expect(livePool.destroy).not.toHaveBeenCalled()
 
-    // The restore fails: it closes ITS OWN local pool and still leaves the live one alone.
+    // The restore fails as the CURRENT attempt. The catch marks the singleton disconnected and
+    // drops the signer, so it must complete that teardown rather than leave a mixed state:
+    // previously the pool stayed open and userPublicKey stayed set, i.e. "disconnected" while
+    // still holding live relay sockets under a stale identity (PR #66 review). The
+    // do-not-touch-newer-state behavior is retained for SUPERSEDED failures, covered by
+    // "stale attempt's late FAILURE does not clear the newer live connection".
     failPing(new Error("dead"))
     await restore
     await flush()
 
-    expect(NostrConnectService.pool).toBe(livePool)
-    expect(livePool.destroy).not.toHaveBeenCalled()
+    expect(NostrConnectService.pool).toBeNull()
+    expect(NostrConnectService.signer).toBeNull()
+    expect(NostrConnectService.userPublicKey).toBeNull()
+    expect(NostrConnectService.connectionState).toBe("disconnected")
+    expect(livePool.destroy).toHaveBeenCalled() // sockets released, not leaked
+    expect(signerB.close).toHaveBeenCalled()
   })
 
   it("a failed restore closes its own local pool", async () => {
@@ -507,6 +516,49 @@ describe("NostrConnectService — overlapping attempt ownership (round-4)", () =
     // Nothing was ever torn down via close(relays) — that path closes only the URLs passed and
     // would have left every socket open.
     for (const pool of pools) expect(pool.closedRelays).toHaveLength(0)
+  })
+
+  /**
+   * MEDIUM (PR #66 review): a CURRENT-attempt restore failure must not leave a mixed singleton.
+   * The catch reports disconnected and drops the signer, so it must also release the previously
+   * published signer/pool and clear the identity — otherwise the service claims to be
+   * disconnected while still holding live relay sockets under a stale userPublicKey.
+   */
+  it("fully retires the previously published signer, pool and identity when the current restore fails (PR #66)", async () => {
+    // A live connection exists (published signer + pool + identity).
+    localStorage.setItem(
+      "blinkpos_nip46_session",
+      JSON.stringify({
+        publicKey: "user-signerLive",
+        signerPubkey: "signerLive",
+        relays: ["wss://r.example"],
+      }),
+    )
+    const liveSigner = makeFakeSigner("signerLive")
+    signerQueue.push(() => liveSigner)
+    expect((await NostrConnectService.restoreSession()).success).toBe(true)
+    const livePool = NostrConnectService.pool as unknown as { destroy: jest.Mock }
+    expect(NostrConnectService.userPublicKey).toBe("user-signerLive")
+
+    // A fresh restore for the same session fails (its ping rejects) as the current attempt.
+    const failing = makeFakeSigner("signerLive")
+    failing.ping = jest.fn(async () => {
+      throw new Error("dead socket")
+    })
+    signerQueue.push(() => failing)
+
+    const result = await NostrConnectService.restoreSession()
+    await flush()
+
+    expect(result.success).toBe(false)
+    // No half-state: nothing published, nothing left holding sockets, no stale identity.
+    expect(NostrConnectService.connectionState).toBe("disconnected")
+    expect(NostrConnectService.signer).toBeNull()
+    expect(NostrConnectService.pool).toBeNull()
+    expect(NostrConnectService.userPublicKey).toBeNull()
+    expect(liveSigner.close).toHaveBeenCalled()
+    expect(livePool.destroy).toHaveBeenCalled()
+    expect(failing.close).toHaveBeenCalled() // the failed candidate too
   })
 
   /** Round-5 verified follow-up: failure paths must close the candidate (no socket leaks). */

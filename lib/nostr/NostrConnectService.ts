@@ -190,12 +190,26 @@ export const secretFromUri = (uri: string): string | undefined => {
  * with both the existence check and the getter access inside one try — makes every storage
  * helper total: they get a usable Storage or null, and never see a throw.
  */
+const storageWarned: Record<"session" | "local", boolean> = {
+  session: false,
+  local: false,
+}
+
 const safeStorage = (kind: "session" | "local"): Storage | null => {
   try {
     const storage = kind === "session" ? sessionStorage : localStorage
     return storage ?? null
   } catch (err: unknown) {
-    console.warn(`[NostrConnect] ${kind}Storage is inaccessible:`, err)
+    // Warn once per storage kind per page lifetime. This runs on every session read
+    // (getStoredSession/hasStoredSession/clearPendingConnection are called frequently), so in a
+    // persistently denied environment logging each time buries everything else (PR #66 review).
+    if (!storageWarned[kind]) {
+      storageWarned[kind] = true
+      console.warn(
+        `[NostrConnect] ${kind}Storage is inaccessible (further occurrences suppressed):`,
+        err,
+      )
+    }
     return null
   }
 }
@@ -818,8 +832,31 @@ class NostrConnectService {
       // failing late must not disconnect a newer connection.
       if (isCurrentAttempt()) {
         this.clearSession()
-        this.connectionState = "disconnected"
+        // Detach EVERYTHING atomically, then retire it. Nulling the signer while leaving the
+        // pool open and userPublicKey set left a mixed singleton: reported as disconnected but
+        // still holding live relay sockets under a stale identity, until some later caller
+        // happened to clean up (PR #66 review). Same detach-then-retire ordering as the
+        // success path, so the teardown can never touch a newer attempt's state.
+        const orphanedSigner: BunkerSignerInstance | null = this.signer
+        const orphanedPool: SimplePoolInstance | null = this.pool
         this.signer = null
+        this.pool = null
+        this.connectionState = "disconnected"
+        this.userPublicKey = null
+        if (orphanedSigner) {
+          try {
+            await orphanedSigner.close()
+          } catch (e: unknown) {
+            console.warn("[NostrConnect] Error closing orphaned signer:", e)
+          }
+        }
+        if (orphanedPool) {
+          try {
+            orphanedPool.destroy()
+          } catch (e: unknown) {
+            console.warn("[NostrConnect] Error closing orphaned pool:", e)
+          }
+        }
       }
       // The LOCAL candidate + pool are ours either way — close them so their sockets never
       // leak (round-5 review; e.g. a current-attempt ping/getPublicKey failure). Both are

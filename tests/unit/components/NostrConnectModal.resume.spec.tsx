@@ -602,6 +602,45 @@ describe("NostrConnectModal — same-device NIP-46 resume (review blockers)", ()
   })
 
   /**
+   * HIGH (PR #66 review): suppressing the modal's own continuation is not enough — the auth
+   * operation publishes durable state of its own (profile activation, server sync, provider
+   * authenticated state) after its awaits. The modal must hand it an ownership signal that goes
+   * false when the attempt is retired, so it can stop before those side effects. This asserts
+   * the signalling half; that the hook honors it is covered in useNostrAuth.signin.spec.tsx.
+   */
+  it("gives the auth operation an ownership signal that goes false once retired (PR #66)", async () => {
+    const signOptions: Array<{ isCurrent?: () => boolean }> = []
+    const signIn = jest.fn((_pubkey: string, opts: { isCurrent?: () => boolean }) => {
+      signOptions.push(opts)
+      return new Promise<{ success: boolean }>(() => {}) // never settles on its own
+    })
+    legacy().waitForConnection.mockResolvedValue({ success: true, publicKey: PUBKEY })
+    legacy().hasStoredSession.mockReturnValue(true)
+    legacy().isConnected.mockReturnValue(true)
+    legacy().restoreSession.mockImplementation(
+      () => new Promise<{ success: boolean; publicKey: string }>(() => {}),
+    )
+
+    renderModal(signIn as unknown as jest.Mock)
+
+    await act(async () => {
+      fireClick(openInAmberButton())
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(1)
+
+    // The operation is handed an ownership check, and while it owns the flow it reads true.
+    const isCurrent = signOptions[0]?.isCurrent
+    expect(typeof isCurrent).toBe("function")
+    expect(isCurrent!()).toBe(true)
+
+    // A bfcache discard retires this attempt — the signal must now read false, so the in-flight
+    // operation can abandon before publishing anything durable.
+    await bfcacheRoundTrip()
+    expect(isCurrent!()).toBe(false)
+  })
+
+  /**
    * Coverage gap (PR #66 review): the reconnect path — a connect stalled by the deeplink
    * backgrounding — had no mounted coverage. pagehide(persisted) marks the in-flight connect
    * stalled, the resume supersedes it and starts ONE fresh waiter, and the superseded waiter's

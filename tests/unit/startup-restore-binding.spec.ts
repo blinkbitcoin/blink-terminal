@@ -28,7 +28,9 @@ describe("startup restore binding guard", () => {
   })
 
   it("has no unbound restoreSession() call in the hook", () => {
+    // Regex, not a substring check: `restoreSession( )` and other whitespace-only variants
+    // would otherwise slip through even after flattening and defeat the intent of this guard.
     const flat = src.replace(/\s+/g, " ")
-    expect(flat).not.toContain("restoreSession()")
+    expect(flat).not.toMatch(/restoreSession\(\s*\)/)
   })
 })
