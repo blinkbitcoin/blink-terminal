@@ -131,7 +131,10 @@ interface BunkerSignerInstance {
  * Same subpath-export resolution issue as BunkerSigner.
  */
 interface SimplePoolInstance {
+  /** Closes ONLY the relay URLs passed in — `close([])` closes nothing. */
   close(relays: string[]): void
+  /** Closes every relay connection the pool holds. This is whole-pool teardown. */
+  destroy(): void
 }
 
 // =====================================================================
@@ -693,7 +696,8 @@ class NostrConnectService {
       }
       if (candidatePool) {
         try {
-          candidatePool.close([])
+          // destroy() closes every relay connection; close([]) would close nothing.
+          candidatePool.destroy()
         } catch {
           // best-effort cleanup
         }
@@ -759,19 +763,36 @@ class NostrConnectService {
         return { success: false, error: "Session invalid" }
       }
 
-      // Single atomic publish point. The pool is detach-then-replace: the previous shared
-      // pool is captured, the fresh one installed, and only then is the old one closed —
-      // so closing it can never touch state this restore does not own.
+      // Single atomic publish point. Pool AND signer are detach-then-replace: the previous
+      // ones are captured, the fresh ones installed, and only then are the old ones torn down —
+      // so tearing them down can never touch state this restore does not own.
       const previousPool: SimplePoolInstance | null = this.pool
+      const previousSigner: BunkerSignerInstance | null = this.signer
       this.pool = candidatePool
       candidatePool = null // ownership transferred to the singleton
       this.signer = created
       candidate = null // ownership transferred to the singleton
       this.connectionState = "connected"
       this.userPublicKey = publicKey
+      // The REPLACED signer must be retired too, or its relay subscription outlives it — with
+      // repeated bfcache recoveries each publishing a new signer, those accumulate (PR #66
+      // review). Best-effort and not awaited before returning: the connection is already live.
+      if (previousSigner) {
+        try {
+          // Not awaited: the replacement connection is already live and must not wait on the
+          // old socket's teardown. Both a synchronous throw and a rejected promise are absorbed.
+          Promise.resolve(previousSigner.close()).catch((e: unknown) => {
+            console.warn("[NostrConnect] Error closing previous signer:", e)
+          })
+        } catch (e: unknown) {
+          console.warn("[NostrConnect] Error closing previous signer:", e)
+        }
+      }
       if (previousPool) {
         try {
-          previousPool.close([])
+          // destroy(), not close([]): close() only closes the relay URLs passed to it, so
+          // close([]) is a silent no-op and the pool's sockets would leak (PR #66 review).
+          previousPool.destroy()
         } catch (e: unknown) {
           console.warn("[NostrConnect] Error closing previous pool:", e)
         }
@@ -843,7 +864,8 @@ class NostrConnectService {
     if (ownedPool) {
       console.log("[NostrConnect] v49: Closing SimplePool")
       try {
-        ownedPool.close([])
+        // destroy() closes every relay connection; close([]) would close nothing.
+        ownedPool.destroy()
       } catch (e: unknown) {
         console.warn("[NostrConnect] Error closing pool:", e)
       }
@@ -980,11 +1002,6 @@ class NostrConnectService {
    * Store session data for persistence.
    */
   private static storeSession(sessionData: StoreSessionData): void {
-    // Writing a session is an explicit assertion that it is valid NOW, so it lifts any earlier
-    // rejection: a later attempt may legitimately produce a record identical to one previously
-    // refused (same signer, same user), and the tombstone must not shadow it.
-    rejectedSessionFingerprint = null
-
     const storage = safeStorage("local")
     if (!storage) return
     const session: NIP46Session = {
@@ -1012,6 +1029,16 @@ class NostrConnectService {
     // The connection stays live in every branch.
     try {
       storage.setItem(NIP46_SESSION_KEY, JSON.stringify(session))
+      // Lifted ONLY here, on the path where the new record is provably the one on disk. A
+      // successful write is an explicit assertion that this session is valid now, so it clears
+      // any earlier rejection — a later attempt may legitimately produce a record identical to
+      // one previously refused (same signer, same user) and the tombstone must not shadow it.
+      //
+      // Doing this before the write (or before knowing storage is usable) would erase the
+      // tombstone while the REJECTED record is still what physically remains on disk — the
+      // failure paths below and the no-storage early return above are exactly those cases, and
+      // there the refusal must survive (PR #66 review).
+      rejectedSessionFingerprint = null
       console.log("[NostrConnect] Session stored")
       return
     } catch (writeErr: unknown) {

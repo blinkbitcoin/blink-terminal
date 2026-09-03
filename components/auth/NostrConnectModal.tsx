@@ -388,6 +388,20 @@ export default function NostrConnectModal({
       transportDiscarded,
     })
     if (action === null) return
+    // The transport was discarded and we are acting on it: retire the CURRENT auth owner,
+    // whoever it is. This is unconditional by design — scoping it to the "a recovery is already
+    // in flight" branch covered a second discard but not the FIRST one, leaving the ORIGINAL
+    // sign request still current: if it settled successfully while the replacement restore was
+    // pending, it published success through a transport the browser had already discarded
+    // (PR #66 review). The invariant is simply: nothing started before a discard decision may
+    // complete after it, so it must not depend on who happens to be running.
+    if (transportDiscarded && authActiveTokenRef.current !== null) {
+      logAuth(
+        "NostrConnectModal",
+        "Transport discarded — retiring the current auth owner",
+      )
+      authActiveTokenRef.current = null
+    }
     if (resumeInFlightRef.current) {
       // A recovery is already running. Normally we leave it alone (a focus/visibility burst
       // must not double-fire). But a NEW bfcache discard means the transport died AGAIN —
@@ -400,12 +414,6 @@ export default function NostrConnectModal({
         "Second bfcache discard — superseding the in-flight recovery",
       )
       flowGenRef.current += 1
-      // Retire the auth owner too. The generation bump only makes the superseded recovery's
-      // RESTORE continuation inert; if that recovery already got as far as signing, it is past
-      // that check and would otherwise publish success — through a signer this discard just
-      // killed — while this recovery is still restoring. Nothing started before a discard
-      // decision may complete after it (PR #66 review).
-      authActiveTokenRef.current = null
     }
     resumeInFlightRef.current = true
     // Take the resume ticket AFTER claiming ownership, so a superseded run's finally sees a

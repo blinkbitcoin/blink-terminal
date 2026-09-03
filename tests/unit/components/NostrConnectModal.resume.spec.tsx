@@ -536,6 +536,137 @@ describe("NostrConnectModal — same-device NIP-46 resume (review blockers)", ()
   })
 
   /**
+   * MEDIUM (PR #66 review): the FIRST bfcache discard must retire the pre-discard auth owner
+   * too. Retiring it only when a recovery was already in flight covered the second discard but
+   * not the first — so the ORIGINAL sign request stayed current, and if it settled successfully
+   * while the replacement restore was still pending it published success through a transport
+   * the browser had already discarded.
+   */
+  it("retires the ORIGINAL auth owner on the FIRST bfcache discard (PR #66)", async () => {
+    const signDeferreds: Array<(v: { success: boolean }) => void> = []
+    const signIn = jest.fn(
+      () => new Promise<{ success: boolean }>((r) => signDeferreds.push(r)),
+    )
+    const onSuccess = jest.fn()
+    legacy().waitForConnection.mockResolvedValue({ success: true, publicKey: PUBKEY })
+    legacy().hasStoredSession.mockReturnValue(true)
+    legacy().isConnected.mockReturnValue(true)
+
+    // The one and only restore stays pending until the test releases it, so the original sign
+    // settles INSIDE the window where the replacement has not yet taken ownership.
+    let releaseRestore: (v: { success: boolean; publicKey: string }) => void = () => {}
+    legacy().restoreSession.mockImplementation(
+      () =>
+        new Promise<{ success: boolean; publicKey: string }>((r) => {
+          releaseRestore = r
+        }),
+    )
+
+    render(
+      <NostrConnectModal
+        uri="nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example&secret=s&name=Blink%20POS"
+        signInWithNostrConnect={signIn}
+        onSuccess={onSuccess}
+      />,
+    )
+
+    await act(async () => {
+      fireClick(openInAmberButton())
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(1) // the original sign, hanging
+
+    // FIRST bfcache discard. Recovery starts and blocks on restoreSession.
+    await bfcacheRoundTrip()
+    expect(legacy().restoreSession).toHaveBeenCalledTimes(1)
+
+    // The ORIGINAL sign now settles successfully, while the replacement restore is still
+    // pending. Its transport was discarded, so it must not complete the login.
+    await act(async () => {
+      signDeferreds[0]({ success: true })
+      await new Promise((r) => setTimeout(r, 650))
+    })
+    expect(onSuccess).not.toHaveBeenCalled()
+
+    // The restore completes and drives the only successful login, through the restored signer.
+    await act(async () => {
+      releaseRestore({ success: true, publicKey: PUBKEY })
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(2)
+    await act(async () => {
+      signDeferreds[1]({ success: true })
+      await new Promise((r) => setTimeout(r, 650))
+    })
+    expect(onSuccess).toHaveBeenCalledTimes(1)
+  })
+
+  /**
+   * Coverage gap (PR #66 review): the reconnect path — a connect stalled by the deeplink
+   * backgrounding — had no mounted coverage. pagehide(persisted) marks the in-flight connect
+   * stalled, the resume supersedes it and starts ONE fresh waiter, and the superseded waiter's
+   * late result must be inert.
+   */
+  it("reconnects a connect stalled by backgrounding, and the superseded waiter is inert (PR #66)", async () => {
+    const signIn = jest.fn(async () => ({ success: true }))
+    const onSuccess = jest.fn()
+
+    // Waiter 1 never settles on its own (its subscription died with the tab); waiter 2 resolves.
+    const waiterResolvers: Array<(v: { success: boolean; publicKey: string }) => void> =
+      []
+    legacy().waitForConnection.mockImplementation(
+      () =>
+        new Promise<{ success: boolean; publicKey: string }>((r) =>
+          waiterResolvers.push(r),
+        ),
+    )
+    // No pending record was persisted (the ack never arrived) → the decision picks reconnect.
+    legacy().hasPendingSessionForCurrentAttempt.mockReturnValue(false)
+    legacy().hasStoredSession.mockReturnValue(false)
+    legacy().isConnected.mockReturnValue(false)
+
+    render(
+      <NostrConnectModal
+        uri="nostrconnect://clientpubkey?relay=wss%3A%2F%2Fr.example&secret=s&name=Blink%20POS"
+        signInWithNostrConnect={signIn}
+        onSuccess={onSuccess}
+      />,
+    )
+
+    await act(async () => {
+      fireClick(openInAmberButton())
+      await flush()
+    })
+    expect(legacy().waitForConnection).toHaveBeenCalledTimes(1)
+
+    // The deeplink backgrounds the tab into bfcache while the connect is in flight, then it
+    // returns: the stalled attempt is superseded and exactly one replacement waiter starts.
+    await bfcacheRoundTrip()
+
+    expect(legacy().disconnect).toHaveBeenCalled() // service-side attempt invalidated
+    expect(legacy().waitForConnection).toHaveBeenCalledTimes(2)
+
+    // The SUPERSEDED waiter settles late with a success — it must change nothing.
+    await act(async () => {
+      waiterResolvers[0]({ success: true, publicKey: PUBKEY })
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).not.toHaveBeenCalled()
+    expect(onSuccess).not.toHaveBeenCalled()
+
+    // The replacement waiter settles: it drives the flow, exactly once.
+    await act(async () => {
+      waiterResolvers[1]({ success: true, publicKey: PUBKEY })
+      await flushThroughConnectDelay()
+    })
+    expect(signIn).toHaveBeenCalledTimes(1)
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 650))
+    })
+    expect(onSuccess).toHaveBeenCalledTimes(1)
+  })
+
+  /**
    * ABA regression (round-4 review): auth tokens must NEVER be reused. Sequence: sign A hangs
    * → foreground restart resets the flow (old code zeroed the token) → fresh attempt starts
    * sign B (old code reused token 1 — A's late settle would then read CURRENT and mutate B's
