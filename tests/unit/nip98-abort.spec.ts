@@ -83,6 +83,56 @@ describe("NostrAuthService.nip98Login — abortable (PR #66)", () => {
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
+  /**
+   * HIGH (PR #66 post-merge review): the server sets the auth-token cookie with the response
+   * HEADERS, and reading the JSON body is a second await. An abort landing in that window used
+   * to be reported as "no session", so the caller skipped compensation and a live cookie
+   * survived for a cancelled attempt. The session is now considered established at header
+   * receipt, so cancellation compensates instead of assuming nothing happened.
+   */
+  it("reports the session as established when the body is aborted after the headers arrived", async () => {
+    const controller = new AbortController()
+    // Headers (and therefore the cookie) arrive; body consumption then aborts.
+    global.fetch = jest.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: () =>
+        new Promise((_, reject) => {
+          controller.signal.addEventListener("abort", () =>
+            reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+          )
+        }),
+    })) as unknown as typeof fetch
+
+    const pending = NostrAuthService.nip98Login({
+      signWithMethod: "nostrConnect",
+      signal: controller.signal,
+    })
+    await new Promise((r) => setTimeout(r, 0))
+    controller.abort()
+    const result = await pending
+
+    // NOT "superseded": the cookie exists, so the caller must compensate.
+    expect(result.success).toBe(true)
+    expect(result.errorType).toBeUndefined()
+  })
+
+  it("still reports failure when the body fails on a NON-ok response", async () => {
+    global.fetch = jest.fn(async () => ({
+      ok: false,
+      status: 401,
+      json: async () => {
+        throw new Error("unparsable")
+      },
+    })) as unknown as typeof fetch
+
+    const result = await NostrAuthService.nip98Login({
+      signWithMethod: "nostrConnect",
+    })
+    // No session was created, so this is a genuine failure.
+    expect(result.success).toBe(false)
+  })
+
   it("without an explicit method it still requires stored auth", async () => {
     const fetchMock = abortableFetch()
     // No stored auth data, no override → refuses before signing or the network.

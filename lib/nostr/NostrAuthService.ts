@@ -1554,7 +1554,30 @@ class NostrAuthService {
         signal: opts?.signal, // Abortable: a superseded/timed-out attempt must not commit a cookie
       })
 
-      const data = (await response.json()) as Record<string, unknown>
+      // THE SESSION IS ESTABLISHED AT HEADER RECEIPT, not at body consumption. The server sets
+      // the auth-token cookie with the response headers, so by the time this fetch resolves OK
+      // the browser already holds a live session. Reading the body is a SECOND await, and an
+      // abort landing there used to be reported as "no session" — the caller then skipped
+      // compensation and the cookie survived as a live session for a cancelled attempt
+      // (PR #66 post-merge review). From here on, cancellation must compensate, never assume
+      // nothing happened.
+      const established = response.ok
+
+      let data: Record<string, unknown> = {}
+      try {
+        data = (await response.json()) as Record<string, unknown>
+      } catch (bodyErr: unknown) {
+        // An abort (or any failure) while consuming the body does not undo the cookie.
+        if (established) {
+          logAuthWarn(
+            "NostrAuthService",
+            "Login response body unreadable, but the session was established:",
+            bodyErr,
+          )
+          return { success: true, user: undefined }
+        }
+        throw bodyErr
+      }
       logAuth("NostrAuthService", "NIP-98 login response:", response.status, data)
 
       if (!response.ok) {
