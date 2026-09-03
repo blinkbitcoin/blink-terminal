@@ -39,42 +39,92 @@ jest.mock("../../../lib/nostr/NostrAuthService", () => ({
 // Stateful for the active-profile pointer: getActiveProfileId must reflect setActiveProfile and
 // deleteProfile, otherwise rollback's "is my profile still the active one?" check cannot be
 // exercised and the mock would hide the behavior under test.
+// Stateful and keyed by pubkey, so the tests can exercise distinct users, the difference
+// between a profile this attempt CREATED and one that already existed, and the active-profile
+// pointer transitions that rollback branches on. A double that always returns the same id and
+// always reports an existing profile cannot express any of that, and would let these tests pass
+// without proving the invariant (PR #66 review).
 jest.mock("../../../lib/storage/ProfileStorage", () => {
   let activeId: string | null = null
+  const profiles = new Map<
+    string,
+    {
+      id: string
+      publicKey: string
+      blinkAccounts: []
+      lastLogin?: number
+      signInMethod?: string
+    }
+  >()
+  let seq = 0
   return {
     __esModule: true,
     default: {
+      // --- test helpers ---
       __setActiveId: (id: string | null): void => {
         activeId = id
       },
-      createProfile: jest.fn((publicKey: string) => {
-        activeId = "profile-1" // the real one activates a newly created profile
-        return { id: "profile-1", publicKey, blinkAccounts: [] }
+      __seedProfile: (publicKey: string, id: string, extra?: Record<string, unknown>) => {
+        const p = { id, publicKey, blinkAccounts: [] as [], ...extra }
+        profiles.set(publicKey, p)
+        return p
+      },
+      __getProfile: (publicKey: string) => profiles.get(publicKey) ?? null,
+      __reset: (): void => {
+        activeId = null
+        profiles.clear()
+        seq = 0
+      },
+      // --- production surface ---
+      createProfile: jest.fn((publicKey: string, signInMethod: string) => {
+        const existing = profiles.get(publicKey)
+        if (existing) {
+          // Mirrors the real one: mutates the existing record instead of creating.
+          existing.lastLogin = 999
+          existing.signInMethod = signInMethod
+          return existing
+        }
+        const created = {
+          id: `created-${++seq}`,
+          publicKey,
+          blinkAccounts: [] as [],
+          lastLogin: 999,
+          signInMethod,
+        }
+        profiles.set(publicKey, created)
+        activeId = created.id // the real one activates a newly created profile
+        return created
       }),
       setActiveProfile: jest.fn((id: string) => {
         activeId = id
       }),
+      clearActiveProfile: jest.fn(() => {
+        activeId = null
+      }),
       getActiveProfileId: jest.fn(() => activeId),
       deleteProfile: jest.fn((id: string) => {
+        for (const [key, value] of profiles) {
+          if (value.id === id) profiles.delete(key)
+        }
         if (activeId === id) activeId = null
       }),
-      getProfileById: jest.fn(() => ({ id: "profile-1", blinkAccounts: [] })),
-      getProfileByPublicKey: jest.fn(() => ({ id: "profile-1", blinkAccounts: [] })),
-      loadProfile: jest.fn(() => ({ id: "profile-1", blinkAccounts: [] })),
-      updateProfile: jest.fn(),
+      getProfileById: jest.fn((id: string) => {
+        for (const value of profiles.values()) if (value.id === id) return value
+        return null
+      }),
+      // Copies, like the real one: profiles come from JSON.parse, so callers never receive a
+      // live reference into storage. Sharing references here would hide aliasing bugs.
+      getProfileByPublicKey: jest.fn((publicKey: string) => {
+        const p = profiles.get(publicKey)
+        return p ? { ...p } : null
+      }),
+      loadProfile: jest.fn((publicKey: string) => profiles.get(publicKey) ?? null),
+      updateProfile: jest.fn((profile: { publicKey: string }) => {
+        profiles.set(profile.publicKey, profile as never)
+      }),
     },
   }
 })
-
-jest.mock("../../../lib/nostr/NostrProfileService", () => ({
-  __esModule: true,
-  default: { fetchProfile: jest.fn(async () => null) },
-}))
-
-jest.mock("../../../lib/storage/CryptoUtils", () => ({
-  __esModule: true,
-  default: { encryptWithDeviceKey: jest.fn(async () => ({ ciphertext: "x" })) },
-}))
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports -- required after the mocks above
 const { NostrAuthProvider, useNostrAuth } =
@@ -124,7 +174,7 @@ describe("useNostrAuth — signInWithNostrConnect ownership (PR #66)", () => {
     authService.isExtensionAvailable.mockReturnValue(false)
     authService.isMobileDevice.mockReturnValue(false)
     authService.getAvailableMethods.mockReturnValue([])
-    profileStorage.__setActiveId(null)
+    profileStorage.__reset()
     authService.signInWithNostrConnect.mockReturnValue({ success: true })
     authService.nip98Login.mockResolvedValue({ success: true })
     // Any sync/account fetch the flow makes.
@@ -326,7 +376,10 @@ describe("useNostrAuth — signInWithNostrConnect ownership (PR #66)", () => {
     )
     expect(authService.clearAuthData).not.toHaveBeenCalled()
     // ...its profile is still the active one, not the pre-A profile...
-    expect(profileStorage.getActiveProfileId()).toBe("profile-1")
+    expect(profileStorage.getActiveProfileId()).toBe(
+      profileStorage.__getProfile(PUBKEY)?.id,
+    )
+    expect(profileStorage.getActiveProfileId()).not.toBe("previous-profile")
     expect(profileStorage.deleteProfile).not.toHaveBeenCalled()
     // ...and the provider still reports B's authenticated state.
     expect(authed()).toBe("true")
@@ -380,6 +433,176 @@ describe("useNostrAuth — signInWithNostrConnect ownership (PR #66)", () => {
     // B's work began only after A's cleanup finished — no interleaving.
     expect(order).toEqual(["logout:start", "logout:done", "B:signing"])
     expect(authed()).toBe("true")
+  })
+
+  /**
+   * HIGH (PR #66 review): the ownership ticket alone left a hole. If A is superseded by B and
+   * then B FAILS, A skips cleanup (no longer latest) while B has nothing of its own to undo —
+   * so A's server session survives under B's local auth. The baseline is therefore captured
+   * once per chain and inherited, and whichever attempt ends the chain unsuccessfully restores
+   * the state from before ALL of them.
+   */
+  const PUBKEY_B = "c".repeat(64)
+
+  it("restores the pre-A baseline when A establishes a session and the replacement B then fails", async () => {
+    // A hangs at signing; B (distinct user) fails its NIP-98 login.
+    const gates: Array<(v: { success: boolean; error?: string }) => void> = []
+    authService.nip98Login.mockImplementation(() => new Promise((r) => gates.push(r)))
+
+    await renderProvider()
+    // The true pre-A baseline: a different user was signed in, with their own active profile.
+    authService.getStoredAuthData.mockReturnValue({
+      publicKey: "baseline-user",
+      method: "extension",
+    })
+    profileStorage.__seedProfile("baseline-user", "baseline-profile")
+    profileStorage.__setActiveId("baseline-profile")
+    ;(global.fetch as jest.Mock).mockClear()
+    authService.storeAuthData.mockClear()
+
+    let aOwned = true
+    await act(async () => {
+      const aPending = signIn(PUBKEY, { isCurrent: () => aOwned })
+      await new Promise<void>((r) => setTimeout(r, 0))
+
+      // A is retired and B starts; A's session is established as it settles.
+      aOwned = false
+      const bPending = signIn(PUBKEY_B, { isCurrent: () => true })
+      await new Promise<void>((r) => setTimeout(r, 0))
+
+      gates[0]({ success: true }) // A's cookie now exists; A defers cleanup to the chain
+      await aPending
+      gates[1]({ success: false, error: "nope" }) // B fails AFTER registering
+      await bPending
+    })
+
+    // The chain ended unsuccessfully, so the session A created is gone...
+    expect(global.fetch).toHaveBeenCalledWith(
+      "/api/auth/logout",
+      expect.objectContaining({ method: "POST" }),
+    )
+    // ...and the true pre-A baseline is restored, not B's or A's registration.
+    expect(authService.storeAuthData).toHaveBeenLastCalledWith(
+      "baseline-user",
+      "extension",
+    )
+    expect(profileStorage.getActiveProfileId()).toBe("baseline-profile")
+    expect(authed()).toBe("false")
+  })
+
+  it("restores the pre-A baseline when the replacement B times out", async () => {
+    const gates: Array<(v: { success: boolean }) => void> = []
+    authService.nip98Login.mockImplementation(() => new Promise((r) => gates.push(r)))
+
+    await renderProvider()
+    authService.getStoredAuthData.mockReturnValue({
+      publicKey: "baseline-user",
+      method: "extension",
+    })
+    profileStorage.__seedProfile("baseline-user", "baseline-profile")
+    profileStorage.__setActiveId("baseline-profile")
+    ;(global.fetch as jest.Mock).mockClear()
+    authService.storeAuthData.mockClear()
+
+    let aOwned = true
+    await act(async () => {
+      const aPending = signIn(PUBKEY, { isCurrent: () => aOwned })
+      await new Promise<void>((r) => setTimeout(r, 0))
+      aOwned = false
+      // B uses a tiny timeout and never resolves its signing, so it throws TIMEOUT.
+      const bPending = signIn(PUBKEY_B, { isCurrent: () => true, timeout: 5 })
+      await new Promise<void>((r) => setTimeout(r, 0))
+      gates[0]({ success: true })
+      await aPending
+      await new Promise<void>((r) => setTimeout(r, 20)) // let B's timeout fire
+      const bResult = await bPending
+      expect(bResult.errorType).toBe("timeout")
+    })
+
+    expect(global.fetch).toHaveBeenCalledWith(
+      "/api/auth/logout",
+      expect.objectContaining({ method: "POST" }),
+    )
+    expect(authService.storeAuthData).toHaveBeenLastCalledWith(
+      "baseline-user",
+      "extension",
+    )
+    expect(profileStorage.getActiveProfileId()).toBe("baseline-profile")
+  })
+
+  /**
+   * MEDIUM (PR #66 review): rollback must restore the COMPLETE prior profile state — deleting a
+   * profile this attempt created is a separate obligation from restoring the pointer, and a
+   * pre-existing profile must be left intact with its metadata unchanged.
+   */
+  it("deletes an attempt-created profile AND restores the previous pointer", async () => {
+    // Signing succeeds so the profile is created and activated; ownership is then lost during
+    // the SYNC, which is the window where a created profile actually exists.
+    let finishSync: (v: unknown) => void = () => {}
+    global.fetch = jest.fn(async (url: string) => {
+      if (String(url).includes("nostr-blink-account")) {
+        return new Promise((r) => (finishSync = r))
+      }
+      return { ok: true, status: 200, json: async () => ({}) }
+    }) as unknown as typeof fetch
+
+    await renderProvider()
+    // Another profile is active, and this pubkey has NO profile yet.
+    profileStorage.__seedProfile("other-user", "other-profile")
+    profileStorage.__setActiveId("other-profile")
+
+    let owned = true
+    await act(async () => {
+      const pending = signIn(PUBKEY, { isCurrent: () => owned })
+      await new Promise<void>((r) => setTimeout(r, 0))
+      owned = false
+      finishSync({ ok: true, status: 200, json: async () => ({}) })
+      await pending
+    })
+
+    // The created profile is gone (not merely deactivated) AND the pointer is back.
+    expect(profileStorage.__getProfile(PUBKEY)).toBeNull()
+    expect(profileStorage.deleteProfile).toHaveBeenCalled()
+    expect(profileStorage.getActiveProfileId()).toBe("other-profile")
+  })
+
+  it("keeps a pre-existing profile, restores its metadata, and clears a null pointer", async () => {
+    // Ownership is lost during the SYNC, so createProfile has already stamped the existing
+    // profile — which is exactly the mutation the restore has to undo. Superseding earlier
+    // would make this pass trivially.
+    let finishSync: (v: unknown) => void = () => {}
+    global.fetch = jest.fn(async (url: string) => {
+      if (String(url).includes("nostr-blink-account")) {
+        return new Promise((r) => (finishSync = r))
+      }
+      return { ok: true, status: 200, json: async () => ({}) }
+    }) as unknown as typeof fetch
+
+    await renderProvider()
+    // This pubkey already has a profile, and NOTHING is active.
+    profileStorage.__seedProfile(PUBKEY, "existing-profile", {
+      lastLogin: 111,
+      signInMethod: "extension",
+    })
+    profileStorage.__setActiveId(null)
+
+    let owned = true
+    await act(async () => {
+      const pending = signIn(PUBKEY, { isCurrent: () => owned })
+      await new Promise<void>((r) => setTimeout(r, 0))
+      owned = false
+      finishSync({ ok: true, status: 200, json: async () => ({}) })
+      await pending
+    })
+
+    // The user's own profile survives, with the metadata createProfile stamped put back...
+    const profile = profileStorage.__getProfile(PUBKEY)
+    expect(profile?.id).toBe("existing-profile")
+    expect(profile?.lastLogin).toBe(111)
+    expect(profile?.signInMethod).toBe("extension")
+    expect(profileStorage.deleteProfile).not.toHaveBeenCalled()
+    // ...and "nothing was active" is restored rather than leaving the retired attempt active.
+    expect(profileStorage.getActiveProfileId()).toBeNull()
   })
 
   it("still completes normally while the attempt is still owned", async () => {

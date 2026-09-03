@@ -181,6 +181,22 @@ export function NostrAuthProvider({
   // The in-flight cleanup, if any. A new attempt waits for it before taking its ticket, so a
   // replacement can never start on top of a rollback that is about to undo shared state.
   const pendingAuthCleanupRef = useRef<Promise<void> | null>(null)
+  /**
+   * The true pre-attempt state, and the obligation to restore it.
+   *
+   * Captured by the FIRST attempt of a chain and INHERITED by every replacement, then cleared
+   * only when an attempt actually commits. Ownership alone is not enough: if A is superseded by
+   * B and then B fails, A skips cleanup because it is no longer the latest while B has nothing
+   * of its own to undo — leaving A's server session alive under B's local auth. Carrying the
+   * baseline forward means whichever attempt ends the chain unsuccessfully restores the state
+   * from before ANY of them ran (PR #66 review).
+   */
+  const authBaselineRef = useRef<{
+    auth: { publicKey: string | null; method: string | null }
+    activeProfileId: string | null
+    /** The profile record for this pubkey as it was before the attempt, if one existed. */
+    profile: StoredProfile | null
+  } | null>(null)
 
   // Re-check extension availability after short delay (extensions may inject asynchronously)
   useEffect(() => {
@@ -1650,12 +1666,22 @@ export function NostrAuthProvider({
       const myTicket: number = ++authAttemptSeqRef.current
       const isLatestAttempt = (): boolean => myTicket === authAttemptSeqRef.current
 
-      // What this attempt must restore if it turns out not to own the flow. Captured BEFORE any
-      // mutation: being superseded has to leave no trace of the retired user, and returning
-      // early is not enough when local auth and a server session have already been created
-      // (PR #66 review).
-      const previousAuth = NostrAuthService.getStoredAuthData()
-      const previousActiveProfileId: string | null = ProfileStorage.getActiveProfileId()
+      // Capture the baseline once per chain of overlapping attempts; a replacement inherits the
+      // state from before the FIRST of them, which is what must be restored if the chain ends
+      // without a commit.
+      if (!authBaselineRef.current) {
+        authBaselineRef.current = {
+          auth: NostrAuthService.getStoredAuthData(),
+          activeProfileId: ProfileStorage.getActiveProfileId(),
+          // Copied, not referenced: createProfile mutates the stored record in place for a
+          // known pubkey, and the baseline must keep the values from BEFORE that.
+          profile: ((): StoredProfile | null => {
+            const existing = ProfileStorage.getProfileByPublicKey(publicKey)
+            return existing ? { ...existing } : null
+          })(),
+        }
+      }
+      const baseline = authBaselineRef.current
       // Set once this attempt creates/activates a profile, so rollback knows what to undo.
       let createdProfileId: string | null = null
       // Whether that profile already existed. createProfile RETURNS an existing profile for a
@@ -1675,20 +1701,18 @@ export function NostrAuthProvider({
        * exists there is also nothing to undo — it has overwritten this attempt's registration
        * already.
        */
-      const rollback = async (reason: string): Promise<AuthActionResult> => {
-        const superseded: AuthActionResult = {
-          success: false,
-          error: "Superseded",
-          errorType: "superseded",
-        }
+      const restoreBaseline = async (reason: string): Promise<void> => {
+        // Only the latest attempt restores. An older one has been replaced, and the replacement
+        // carries the same baseline obligation — so if IT also fails, IT will restore, and the
+        // chain still cannot end with leftover state.
         if (!isLatestAttempt()) {
           logAuthWarn(
             "useNostrAuth",
-            `Sign-in superseded ${reason} — a replacement owns the session, leaving it alone`,
+            `Sign-in ended ${reason} — a replacement owns the chain, leaving it alone`,
           )
-          return superseded
+          return
         }
-        logAuthWarn("useNostrAuth", `Sign-in superseded ${reason} — rolling back`)
+        logAuthWarn("useNostrAuth", `Sign-in ended ${reason} — restoring the baseline`)
 
         // Published synchronously (no await between the check above and this assignment) so a
         // replacement starting now waits for the cleanup instead of racing it.
@@ -1698,26 +1722,31 @@ export function NostrAuthProvider({
           } catch (e: unknown) {
             logAuthWarn("useNostrAuth", "Server logout during rollback failed:", e)
           }
-          if (previousAuth.publicKey && previousAuth.method) {
-            NostrAuthService.storeAuthData(previousAuth.publicKey, previousAuth.method)
+          if (baseline.auth.publicKey && baseline.auth.method) {
+            NostrAuthService.storeAuthData(baseline.auth.publicKey, baseline.auth.method)
           } else {
             NostrAuthService.clearAuthData()
           }
-          // Only touch the profile pointer if this attempt's profile is the active one.
-          if (
-            createdProfileId &&
-            ProfileStorage.getActiveProfileId() === createdProfileId
-          ) {
-            if (previousActiveProfileId) {
-              ProfileStorage.setActiveProfile(previousActiveProfileId)
-            } else if (profileWasNew) {
-              // Nothing to fall back to and this attempt created it: remove it entirely, which
-              // also clears the active pointer. Otherwise a retired attempt's profile would
-              // stay active with no auth behind it.
+
+          // Profile restoration, in three independent steps — deleting a created profile and
+          // restoring the pointer are separate obligations, and doing only one of them (the
+          // previous `else if`) left durable traces behind (PR #66 review).
+          if (createdProfileId) {
+            if (profileWasNew) {
+              // This attempt genuinely created it, so it goes away regardless of what the
+              // pointer is restored to below.
               ProfileStorage.deleteProfile(createdProfileId)
+            } else if (baseline.profile) {
+              // Pre-existing profile: createProfile mutated lastLogin/signInMethod on it, so
+              // put the recorded values back rather than leaving the attempt's stamp.
+              ProfileStorage.updateProfile(baseline.profile)
             }
-            // A pre-existing profile with no previous active pointer is the user's own data
-            // from before this attempt; it is left in place.
+          }
+          // Restore the pointer to exactly what it was, including "nothing was active".
+          if (baseline.activeProfileId) {
+            ProfileStorage.setActiveProfile(baseline.activeProfileId)
+          } else {
+            ProfileStorage.clearActiveProfile()
           }
         })()
         pendingAuthCleanupRef.current = cleanup
@@ -1727,8 +1756,15 @@ export function NostrAuthProvider({
           if (pendingAuthCleanupRef.current === cleanup) {
             pendingAuthCleanupRef.current = null
           }
+          // Obligation discharged: the chain is back at its starting state.
+          authBaselineRef.current = null
         }
-        return superseded
+      }
+
+      /** Restore the baseline and report this attempt as superseded. */
+      const rollback = async (reason: string): Promise<AuthActionResult> => {
+        await restoreBaseline(reason)
+        return { success: false, error: "Superseded", errorType: "superseded" }
       }
 
       try {
@@ -1755,6 +1791,10 @@ export function NostrAuthProvider({
 
         if (!sessionResult.success) {
           logAuthWarn("useNostrAuth", "NIP-98 login failed:", sessionResult.error)
+          // Registration already happened, so a failure here must restore the baseline too —
+          // otherwise this attempt's local auth (and any session a PREVIOUS attempt in this
+          // chain established) survives an unsuccessful chain (PR #66 review).
+          await restoreBaseline("after a failed NIP-98 login")
           return {
             success: false,
             error: sessionResult.error || "Failed to establish session",
@@ -1820,12 +1860,19 @@ export function NostrAuthProvider({
         // Fetch Nostr profile metadata in background (non-blocking)
         fetchNostrProfile(publicKey)
 
+        // Committed: this state is now the truth, so there is nothing to restore any more.
+        authBaselineRef.current = null
+
         onProgress?.("complete", "Done!")
         logAuth("useNostrAuth", "Nostr Connect sign-in complete")
         return { success: true, profile, publicKey }
       } catch (error: unknown) {
         const err = error as Error
         logAuthError("useNostrAuth", "Nostr Connect sign-in failed:", error)
+
+        // A throw (most commonly the signing timeout) is a post-registration failure like any
+        // other: restore the baseline so an unsuccessful chain leaves nothing behind.
+        await restoreBaseline("with an error")
 
         // Handle timeout specifically
         if (err.message === "TIMEOUT") {
