@@ -363,6 +363,96 @@ describe("runNostrConnectSignIn (issue #67)", () => {
     )
   })
 
+  /**
+   * HIGH (PR #66 post-merge review): the server commits the auth-token cookie with the response
+   * HEADERS. If cancellation lands while the JSON body is still being consumed, the login has
+   * in fact established a session — so the transaction must COMPENSATE rather than return
+   * cancelled and leave a live cookie for an attempt the caller was told failed.
+   */
+  it("discards the session when the attempt is cancelled after the server committed the cookie", async () => {
+    const order: string[] = []
+    global.fetch = jest.fn(async (url: string) => {
+      if (String(url).includes("logout")) order.push("A:logout")
+      return { ok: true, status: 200, json: async () => ({}) }
+    }) as unknown as typeof fetch
+
+    // Owns the flow at entry, and is retired WHILE the login is in flight — so the request goes
+    // out, the server commits the cookie (the login resolves as established), and only then is
+    // the attempt cancelled. This is the exact window the review identified.
+    let owned = true
+    authService.nip98Login.mockImplementationOnce(async () => {
+      order.push("A:login:established")
+      owned = false // retired mid-request; the cookie is already committed
+      return { success: true }
+    })
+    const result = await runNostrConnectSignIn(PUBKEY, {
+      timeout: 1000,
+      isCurrent: () => owned,
+    })
+
+    expect(result.success).toBe(false)
+    // The cookie the server committed is given up, not left live.
+    expect(order).toEqual(["A:login:established", "A:logout"])
+    expect(global.fetch).toHaveBeenCalledWith(
+      "/api/auth/logout",
+      expect.objectContaining({ method: "POST" }),
+    )
+    // Nothing local was published for the cancelled attempt.
+    expect(authService.signInWithNostrConnect).not.toHaveBeenCalled()
+  })
+
+  it("a successor cannot log in until that compensation has settled", async () => {
+    const order: string[] = []
+    let finishLogout: (v: unknown) => void = () => {}
+    authService.nip98Login
+      .mockImplementationOnce(async () => {
+        order.push("A:login:established")
+        return { success: true }
+      })
+      .mockImplementation(async () => {
+        order.push("B:login")
+        return { success: true }
+      })
+    global.fetch = jest.fn(async (url: string) => {
+      if (String(url).includes("logout")) {
+        order.push("A:logout:start")
+        return new Promise((r) => {
+          finishLogout = (v) => {
+            order.push("A:logout:done")
+            r(v)
+          }
+        })
+      }
+      return { ok: true, status: 200, json: async () => ({}) }
+    }) as unknown as typeof fetch
+
+    let aOwned = true
+    authService.nip98Login.mockReset()
+    authService.nip98Login
+      .mockImplementationOnce(async () => {
+        order.push("A:login:established")
+        aOwned = false
+        return { success: true }
+      })
+      .mockImplementation(async () => {
+        order.push("B:login")
+        return { success: true }
+      })
+    const a = runNostrConnectSignIn(PUBKEY, { timeout: 5000, isCurrent: () => aOwned })
+    const b = runNostrConnectSignIn(PUBKEY_B, { timeout: 5000 })
+    await new Promise((r) => setTimeout(r, 0))
+    finishLogout({ ok: true, status: 200, json: async () => ({}) })
+    await Promise.all([a, b])
+
+    // B's login is strictly after A's compensating logout completed.
+    expect(order).toEqual([
+      "A:login:established",
+      "A:logout:start",
+      "A:logout:done",
+      "B:login",
+    ])
+  })
+
   it("a failing attempt releases the mutex so the next attempt is not wedged", async () => {
     // First attempt's login hangs then times out; the second must still run. A's own promise is
     // left to settle on its own — the point is that B is not held up by it.
@@ -375,7 +465,6 @@ describe("runNostrConnectSignIn (issue #67)", () => {
     const bResult = await runNostrConnectSignIn(PUBKEY_B, { timeout: 200 })
     const aResult = await a // A times out (10ms), releasing the slot for B
 
-    console.log("PROBE a:", JSON.stringify(aResult), "b:", JSON.stringify(bResult))
     expect(aResult.errorType).toBe("timeout")
     expect(bResult.success).toBe(true)
     expect(Date.now() - started).toBeLessThan(3000)
