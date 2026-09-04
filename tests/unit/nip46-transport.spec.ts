@@ -315,6 +315,47 @@ describe("Nip46Transport.waitForConnectAck", () => {
     transport.close()
   })
 
+  /**
+   * A nostrconnect:// handshake has no client request to correlate with, so the
+   * response id is signer-chosen and optional — nostr-tools' own
+   * BunkerSigner.fromURI accepts the ack on `result === secret` alone. Requiring
+   * an id dropped acks from conforming signers and timed the session out as
+   * connect_timeout, i.e. the exact failure #70 exists to fix (PR #71 review).
+   */
+  it("accepts a secret-bearing ack that carries no RPC id", async () => {
+    const { transport, relay } = await openTransport()
+    const waiting = transport.waitForConnectAck({ secret: "s3cret", timeoutMs: 1000 })
+
+    relay.emit({ result: "s3cret" })
+
+    await expect(waiting).resolves.toEqual({ signerPubkey: SIGNER })
+    expect(transport.pinnedSignerPubkey).toBe(SIGNER)
+    transport.close()
+  })
+
+  it("accepts a secret-bearing ack whose id is not a string", async () => {
+    const { transport, relay } = await openTransport()
+    const waiting = transport.waitForConnectAck({ secret: "s3cret", timeoutMs: 1000 })
+
+    relay.emit({ id: 7, result: "s3cret" })
+
+    await expect(waiting).resolves.toEqual({ signerPubkey: SIGNER })
+    transport.close()
+  })
+
+  it("still rejects an id-less ack that does not carry the secret", async () => {
+    const { transport, relay } = await openTransport()
+    const waiting = transport.waitForConnectAck({ secret: "s3cret", timeoutMs: 40 })
+
+    // Dropping the id requirement must not reopen the pinning hole.
+    relay.emit({ result: "ack" }, "f".repeat(64))
+    relay.emit({ result: "s3cr" }, "f".repeat(64))
+
+    await expect(waiting).rejects.toThrow("connect ack timed out")
+    expect(transport.pinnedSignerPubkey).toBeNull()
+    transport.close()
+  })
+
   it("ignores a near-miss secret", async () => {
     const { transport, relay } = await openTransport()
     const waiting = transport.waitForConnectAck({ secret: "s3cret", timeoutMs: 40 })
@@ -443,6 +484,20 @@ describe("Nip46Transport.request", () => {
     ) as { id: string }
 
     relay.emit({ id: sent.id, result: "auth_url", error: "https://signer.example" })
+    await expect(pending).rejects.toThrow("timed out")
+    transport.close()
+  })
+
+  it("ignores id-less events once the signer is pinned", async () => {
+    const { transport, relay } = await connected()
+    const pending = transport.request("get_public_key", [], { timeoutMs: 40 })
+
+    await Promise.resolve()
+    // The ack listener is cleared after pinning, so a stray id-less payload has
+    // nothing to resolve and must not settle an in-flight request.
+    relay.emit({ result: "c".repeat(64) })
+    relay.emit({ result: "s" })
+
     await expect(pending).rejects.toThrow("timed out")
     transport.close()
   })

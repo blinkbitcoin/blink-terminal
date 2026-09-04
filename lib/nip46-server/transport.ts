@@ -406,23 +406,35 @@ export class Nip46Transport {
       // public; unrelated traffic is expected.
       return
     }
-    if (!payload || typeof payload.id !== "string") return
+    if (!payload) return
 
     // auth_url is an out-of-band prompt, not an RPC result. We cannot surface a
     // signer-hosted popup from a headless worker, so ignore it and let the
     // request time out with its own error.
     if (payload.result === "auth_url") return
 
-    const waiter = this.pending.get(payload.id)
-    if (waiter) {
-      if (payload.error) {
-        waiter.reject(new Nip46TransportError(payload.error))
-      } else {
-        waiter.resolve(payload.result ?? "")
+    // The id correlates a response with a request WE sent, so it only gates the
+    // pending-request lookup. It must NOT gate the connect ack: a
+    // nostrconnect:// handshake has no client request to correlate with, so the
+    // id is signer-chosen and optional. nostr-tools' own BunkerSigner.fromURI
+    // accepts the ack on `result === secret` alone. Requiring an id here dropped
+    // acks from conforming signers and timed the session out as connect_timeout
+    // — reintroducing the very failure #70 is about (PR #71 review).
+    if (typeof payload.id === "string") {
+      const waiter = this.pending.get(payload.id)
+      if (waiter) {
+        if (payload.error) {
+          waiter.reject(new Nip46TransportError(payload.error))
+        } else {
+          waiter.resolve(payload.result ?? "")
+        }
+        return
       }
-      return
     }
 
+    // Reached only before pinning: the listener is cleared once the ack settles,
+    // so a later id-less event is ignored. Possession of the secret remains the
+    // sole pinning authority (see waitForConnectAck).
     this.ackListener?.(event, payload)
   }
 
