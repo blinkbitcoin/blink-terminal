@@ -25,6 +25,7 @@
 import { QRCodeSVG } from "qrcode.react"
 import { useState, useEffect, useCallback, useRef } from "react"
 
+import { nip46BindingCookieRequiresSecureContext } from "../../lib/auth/cookies"
 import {
   cancelSession,
   createSession,
@@ -128,9 +129,40 @@ function describeFailure(reason: string | undefined): string {
       return "The sign-in session was interrupted. Please try again."
     case "cancelled":
       return "Sign-in was cancelled."
+    case "insecure_context":
+      return (
+        "Sign-in needs a secure connection. This page is served over plain HTTP, " +
+        "so the browser blocks the cookie that keeps your sign-in session. " +
+        "Open it over HTTPS (or on localhost) and try again."
+      )
     default:
       return "Sign-in did not complete. Please try again."
   }
+}
+
+/**
+ * Whether this page can hold the `Secure` sign-in cookie at all.
+ *
+ * Browsers discard `Secure` cookies on a non-secure origin, and they do it
+ * silently: the session is created server-side, the browser just never keeps
+ * the binding. Every later poll is then an unbound caller, which is
+ * deliberately indistinguishable from "no such session" (a 404), so the user
+ * sees a generic failure and each retry strands another server session until
+ * the per-IP cap starts answering 429. Checking up front turns all of that into
+ * one accurate message.
+ *
+ * Gated on whether the cookie actually carries `Secure`, which is a
+ * production-only attribute (lib/auth/cookies.ts). In development it is omitted
+ * precisely so a device on the LAN can sign in over plain HTTP; blocking that
+ * unconditionally was a development-only regression (PR #77 review). Deriving
+ * the condition from the cookie builder rather than restating it is what keeps
+ * the two from drifting apart again.
+ */
+function canHoldSecureCookie(): boolean {
+  if (typeof window === "undefined") return true
+  // No `Secure` attribute means the browser will keep the cookie on any origin.
+  if (!nip46BindingCookieRequiresSecureContext()) return true
+  return window.isSecureContext
 }
 
 export default function NostrConnectModal({
@@ -146,6 +178,12 @@ export default function NostrConnectModal({
   const [uri, setUri] = useState<string>("")
   const [stage, setStage] = useState<ConnectionStage>("creating")
   const [errorMessage, setErrorMessage] = useState<string>("")
+  /**
+   * Whether the current error can be resolved by retrying. False only for
+   * conditions no retry can change — an insecure origin needs the page to be
+   * reopened over HTTPS, so offering "Try Again" would just fail identically.
+   */
+  const [errorRetryable, setErrorRetryable] = useState<boolean>(true)
   const [showSlowWarning, setShowSlowWarning] = useState<boolean>(false)
 
   /**
@@ -260,9 +298,25 @@ export default function NostrConnectModal({
 
     setShowSlowWarning(false)
     setErrorMessage("")
+    setErrorRetryable(true)
     setCopied(false)
     setUri("")
     setStage("creating")
+
+    // Fail before creating anything: on an insecure origin the browser will
+    // discard the binding cookie, so the session would be stranded server-side
+    // (holding relay sockets and a per-IP capacity slot) for a sign-in that
+    // cannot possibly complete.
+    if (!canHoldSecureCookie()) {
+      logAuthError(
+        "NostrConnectModal",
+        "Insecure context; Secure cookie would be dropped",
+      )
+      setErrorMessage(describeFailure("insecure_context"))
+      setErrorRetryable(false)
+      setStage("error")
+      return
+    }
 
     const controller = new AbortController()
     abortRef.current = controller
@@ -578,12 +632,15 @@ export default function NostrConnectModal({
               <p className="text-gray-700 dark:text-gray-300 mb-2">{errorMessage}</p>
 
               <div className="flex gap-3 mt-6">
-                <button
-                  onClick={handleRetry}
-                  className="flex-1 py-3 px-4 text-base font-semibold text-white bg-purple-600 hover:bg-purple-700 rounded-xl transition-colors"
-                >
-                  Try Again
-                </button>
+                {/* Offered only when a retry could actually change the outcome. */}
+                {errorRetryable && (
+                  <button
+                    onClick={handleRetry}
+                    className="flex-1 py-3 px-4 text-base font-semibold text-white bg-purple-600 hover:bg-purple-700 rounded-xl transition-colors"
+                  >
+                    Try Again
+                  </button>
+                )}
                 <button
                   onClick={handleCancel}
                   className="flex-1 py-3 px-4 text-base font-medium text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 rounded-xl transition-colors"

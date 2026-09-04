@@ -10,7 +10,10 @@
 
 import type { NextApiRequest, NextApiResponse } from "next"
 
-import { NIP46_COOKIE_NAME } from "../auth/cookies"
+import {
+  NIP46_COOKIE_NAME,
+  nip46BindingCookieRequiresSecureContext,
+} from "../auth/cookies"
 
 import { Nip46StorageError } from "./errors"
 import { bindingMatches, sha256Hex } from "./sessionStore"
@@ -25,6 +28,55 @@ export function getRequestOrigin(req: NextApiRequest): string {
   const protocol = req.headers["x-forwarded-proto"] || "http"
   const host = req.headers["x-forwarded-host"] || req.headers.host
   return `${protocol}://${host}`
+}
+
+/** Logged at most once per process, so a misconfigured deployment is not a log flood. */
+let warnedInsecureOrigin = false
+
+/**
+ * Warn when this app is served over plain HTTP on a non-localhost origin.
+ *
+ * The NIP-46 binding cookie is `Secure`, so on such an origin the browser
+ * silently DISCARDS it. Sign-in then fails in a way that looks like anything
+ * but a cookie problem: the poll 404s (the caller is unbound), and because the
+ * cookie never comes back, a retry cannot supersede the previous attempt
+ * either, so sessions stack until the per-IP cap answers 429 instead.
+ *
+ * Browsers treat localhost/127.0.0.1 as a secure context, which is why this is
+ * invisible in local development and on an HTTPS deployment — but a
+ * self-hosted terminal reached over a LAN IP hits it every time. The client
+ * shows the actionable message; this line makes it visible server-side too.
+ *
+ * Silent when the cookie carries no `Secure` attribute — in development it is
+ * omitted deliberately, so the browser keeps the cookie and there is nothing to
+ * warn about. The condition comes from the cookie builder rather than being
+ * restated here, so the warning cannot claim a failure that will not happen
+ * (PR #77 review).
+ */
+export function warnIfInsecureOrigin(origin: string): void {
+  if (warnedInsecureOrigin || !origin.startsWith("http://")) return
+  if (!nip46BindingCookieRequiresSecureContext()) return
+
+  // Strip the port without mangling a bracketed IPv6 literal, whose address
+  // itself contains colons ("[::1]:3000" splits on ":" into "[").
+  const authority = origin.slice("http://".length)
+  const host = authority.startsWith("[")
+    ? authority.slice(0, authority.indexOf("]") + 1)
+    : authority.split(":")[0]
+
+  if (host === "localhost" || host === "127.0.0.1" || host === "[::1]") return
+
+  warnedInsecureOrigin = true
+  console.warn(
+    `[nip46] served over plain HTTP on a non-localhost origin (${origin}). ` +
+      "The Secure sign-in cookie will be dropped by browsers and sign-in cannot " +
+      "complete. Serve the terminal over HTTPS.",
+  )
+}
+
+/** Test-only: forget that the insecure-origin warning was already emitted. */
+export function __resetInsecureOriginWarningForTests(): void {
+  warnedInsecureOrigin = false
 }
 
 export function getClientIp(req: NextApiRequest): string {

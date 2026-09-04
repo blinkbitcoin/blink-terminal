@@ -132,6 +132,26 @@ export function buildClearChallengeCookie(): string {
 }
 
 /**
+ * Whether the NIP-46 binding cookie is emitted with `Secure`, and therefore
+ * whether the page must be a secure context for sign-in to work at all.
+ *
+ * THE SINGLE SOURCE OF TRUTH for that policy. A browser silently discards a
+ * `Secure` cookie on a non-secure origin, so anything that diagnoses or
+ * pre-empts that failure — the sign-in modal's pre-flight check, the
+ * server-side misconfiguration warning — must agree with the attribute
+ * actually emitted below. Stating the rule in more than one place is what made
+ * an earlier version of the guard reject plain-HTTP LAN origins in development,
+ * where the cookie carries no `Secure` and sign-in genuinely worked (PR #77
+ * review). tests/unit/auth-cookies.spec.ts pins the two together.
+ *
+ * Safe to import from client code: this module has no imports and only builds
+ * strings.
+ */
+export function nip46BindingCookieRequiresSecureContext(): boolean {
+  return isProduction()
+}
+
+/**
  * Build the Set-Cookie header value that binds a NIP-46 sign-in session to this
  * browser.
  */
@@ -143,7 +163,7 @@ export function buildNip46BindingCookie(secret: string): string {
     "SameSite=Strict",
     `Max-Age=${NIP46_COOKIE_MAX_AGE_SECONDS}`,
   ]
-  if (isProduction()) {
+  if (nip46BindingCookieRequiresSecureContext()) {
     parts.push("Secure")
   }
   return parts.join("; ")
@@ -161,7 +181,7 @@ export function buildClearNip46BindingCookie(): string {
     "SameSite=Strict",
     "Max-Age=0",
   ]
-  if (isProduction()) {
+  if (nip46BindingCookieRequiresSecureContext()) {
     parts.push("Secure")
   }
   return parts.join("; ")
