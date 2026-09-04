@@ -16,10 +16,15 @@ import {
 jest.mock("../../lib/nostr/NostrAuthService", () => ({
   __esModule: true,
   default: {
-    nip98Login: jest.fn(async () => ({ success: true })),
     signInWithNostrConnect: jest.fn(() => ({ success: true })),
     clearAuthData: jest.fn(),
   },
+}))
+
+// Since #70 the transaction exchanges a server-verified approval for a session
+// cookie instead of signing in-browser; this is the network edge it drives.
+jest.mock("../../lib/nostr/NostrConnectClient", () => ({
+  consumeSession: jest.fn(async () => ({ success: true })),
 }))
 
 jest.mock("../../lib/storage/ProfileStorage", () => ({
@@ -44,11 +49,16 @@ const profileStorage = (
     default: Record<string, jest.Mock>
   }
 ).default
+const connectClient = jest.requireMock("../../lib/nostr/NostrConnectClient") as {
+  consumeSession: jest.Mock
+}
 
 const PUBKEY = "a".repeat(64)
 const PUBKEY_B = "c".repeat(64)
 
-const ok = (timeout = 1000) => ({ timeout })
+const SESSION_ID = "s".repeat(32)
+
+const ok = (timeout = 1000) => ({ sessionId: SESSION_ID, timeout })
 
 describe("runNostrConnectSignIn (issue #67)", () => {
   beforeEach(() => {
@@ -61,7 +71,8 @@ describe("runNostrConnectSignIn (issue #67)", () => {
       publicKey,
       blinkAccounts: [],
     }))
-    authService.nip98Login.mockResolvedValue({ success: true })
+    connectClient.consumeSession.mockReset()
+    connectClient.consumeSession.mockResolvedValue({ success: true })
     authService.signInWithNostrConnect.mockReset()
     authService.signInWithNostrConnect.mockReturnValue({ success: true })
     profileStorage.setActiveProfile.mockReset()
@@ -84,10 +95,13 @@ describe("runNostrConnectSignIn (issue #67)", () => {
 
   it("registers nothing and discards the session when superseded during signing", async () => {
     let finish: (v: { success: boolean }) => void = () => {}
-    authService.nip98Login.mockImplementation(() => new Promise((r) => (finish = r)))
+    connectClient.consumeSession.mockImplementation(
+      () => new Promise((r) => (finish = r)),
+    )
 
     let owned = true
     const pending = runNostrConnectSignIn(PUBKEY, {
+      sessionId: SESSION_ID,
       timeout: 1000,
       isCurrent: () => owned,
     })
@@ -107,17 +121,20 @@ describe("runNostrConnectSignIn (issue #67)", () => {
 
   it("cancels the login on timeout so nothing commits late", async () => {
     let observed: AbortSignal | null = null
-    authService.nip98Login.mockImplementation(
-      (opts: { signal?: AbortSignal }) =>
+    connectClient.consumeSession.mockImplementation(
+      (_sessionId: string, signal?: AbortSignal) =>
         new Promise((resolve) => {
-          observed = opts.signal ?? null
-          opts.signal?.addEventListener("abort", () =>
+          observed = signal ?? null
+          signal?.addEventListener("abort", () =>
             resolve({ success: false, error: "Aborted", errorType: "superseded" }),
           )
         }),
     )
 
-    const result = await runNostrConnectSignIn(PUBKEY, { timeout: 10 })
+    const result = await runNostrConnectSignIn(PUBKEY, {
+      sessionId: SESSION_ID,
+      timeout: 10,
+    })
     await new Promise((r) => setTimeout(r, 20))
     // A genuine deadline reports "timeout", not "superseded" — this is the production path the
     // hook's friendly "timed out" message is keyed on (PR #66 review). Previously every abort
@@ -133,7 +150,7 @@ describe("runNostrConnectSignIn (issue #67)", () => {
     // A's login hangs until released, so B and C can only enter if the mutex lets them in — this
     // is what distinguishes real serialization from incidental FIFO ordering.
     let finishA: (v: { success: boolean }) => void = () => {}
-    authService.nip98Login
+    connectClient.consumeSession
       .mockImplementationOnce(
         () =>
           new Promise((r) => {
@@ -162,14 +179,22 @@ describe("runNostrConnectSignIn (issue #67)", () => {
 
   it("a waiter superseded while queued leaves the queue and never runs", async () => {
     let finishA: (v: { success: boolean }) => void = () => {}
-    authService.nip98Login
+    connectClient.consumeSession
       .mockImplementationOnce(() => new Promise((r) => (finishA = r)))
       .mockImplementation(async () => ({ success: true }))
 
     let aOwned = true
     let bOwned = true
-    const a = runNostrConnectSignIn(PUBKEY, { timeout: 5000, isCurrent: () => aOwned })
-    const b = runNostrConnectSignIn(PUBKEY_B, { timeout: 5000, isCurrent: () => bOwned })
+    const a = runNostrConnectSignIn(PUBKEY, {
+      sessionId: SESSION_ID,
+      timeout: 5000,
+      isCurrent: () => aOwned,
+    })
+    const b = runNostrConnectSignIn(PUBKEY_B, {
+      sessionId: SESSION_ID,
+      timeout: 5000,
+      isCurrent: () => bOwned,
+    })
     await new Promise((r) => setTimeout(r, 0))
 
     // B is superseded while still queued behind A. A polled predicate cannot wake a queued
@@ -183,7 +208,7 @@ describe("runNostrConnectSignIn (issue #67)", () => {
     const [, bResult] = await Promise.all([a, b])
 
     expect(bResult.errorType).toBe("superseded")
-    expect(authService.nip98Login).toHaveBeenCalledTimes(1) // B never logged in
+    expect(connectClient.consumeSession).toHaveBeenCalledTimes(1) // B never logged in
   })
 
   it("rejects an invalid key before touching storage, and discards the session", async () => {
@@ -219,13 +244,17 @@ describe("runNostrConnectSignIn (issue #67)", () => {
    */
   it("A holds, B is cancelled while queued, C must still wait for A (transitive chain)", async () => {
     let finishA: (v: { success: boolean }) => void = () => {}
-    authService.nip98Login
+    connectClient.consumeSession
       .mockImplementationOnce(() => new Promise((r) => (finishA = r)))
       .mockImplementation(async () => ({ success: true }))
 
     const bAbort = new AbortController()
     const a = runNostrConnectSignIn(PUBKEY, ok())
-    const b = runNostrConnectSignIn(PUBKEY_B, { timeout: 1000, signal: bAbort.signal })
+    const b = runNostrConnectSignIn(PUBKEY_B, {
+      sessionId: SESSION_ID,
+      timeout: 1000,
+      signal: bAbort.signal,
+    })
     const c = runNostrConnectSignIn(PUBKEY, ok())
     await new Promise((r) => setTimeout(r, 0))
 
@@ -236,12 +265,12 @@ describe("runNostrConnectSignIn (issue #67)", () => {
     await new Promise((r) => setTimeout(r, 0))
 
     // The invariant: while A is STILL unresolved, C has not entered. Only A's login has run.
-    expect(authService.nip98Login).toHaveBeenCalledTimes(1)
+    expect(connectClient.consumeSession).toHaveBeenCalledTimes(1)
 
     finishA({ success: true })
     await Promise.all([a, c])
     // Now C ran, exactly once, after A.
-    expect(authService.nip98Login).toHaveBeenCalledTimes(2)
+    expect(connectClient.consumeSession).toHaveBeenCalledTimes(2)
   })
 
   /**
@@ -251,12 +280,12 @@ describe("runNostrConnectSignIn (issue #67)", () => {
    */
   it("an external abort cancels the holder immediately and the replacement proceeds", async () => {
     let aSignal: AbortSignal | null = null
-    authService.nip98Login
+    connectClient.consumeSession
       .mockImplementationOnce(
-        (opts: { signal?: AbortSignal }) =>
+        (_sessionId: string, signal?: AbortSignal) =>
           new Promise((resolve) => {
-            aSignal = opts.signal ?? null
-            opts.signal?.addEventListener("abort", () =>
+            aSignal = signal ?? null
+            signal?.addEventListener("abort", () =>
               resolve({ success: false, error: "Aborted", errorType: "superseded" }),
             )
           }),
@@ -267,7 +296,7 @@ describe("runNostrConnectSignIn (issue #67)", () => {
     const started = Date.now()
     // A has a LONG deadline; without external cancellation B would wait it out.
     const a = runNostrConnectSignIn(PUBKEY, { timeout: 60_000, signal: aAbort.signal })
-    const b = runNostrConnectSignIn(PUBKEY_B, { timeout: 5000 })
+    const b = runNostrConnectSignIn(PUBKEY_B, { sessionId: SESSION_ID, timeout: 5000 })
     await new Promise((r) => setTimeout(r, 0))
 
     aAbort.abort() // the modal retires A
@@ -288,7 +317,7 @@ describe("runNostrConnectSignIn (issue #67)", () => {
   it("a never-settling logout is cut off, and the successor logs in only after it", async () => {
     const order: string[] = []
     let finishLogin: (v: { success: boolean }) => void = () => {}
-    authService.nip98Login
+    connectClient.consumeSession
       .mockImplementationOnce(
         () =>
           new Promise((r) => {
@@ -315,8 +344,12 @@ describe("runNostrConnectSignIn (issue #67)", () => {
     }) as unknown as typeof fetch
 
     let aOwned = true
-    const a = runNostrConnectSignIn(PUBKEY, { timeout: 200, isCurrent: () => aOwned })
-    const b = runNostrConnectSignIn(PUBKEY_B, { timeout: 5000 })
+    const a = runNostrConnectSignIn(PUBKEY, {
+      sessionId: SESSION_ID,
+      timeout: 200,
+      isCurrent: () => aOwned,
+    })
+    const b = runNostrConnectSignIn(PUBKEY_B, { sessionId: SESSION_ID, timeout: 5000 })
     await new Promise((r) => setTimeout(r, 0))
 
     // A establishes its session, then is superseded → it must discard (the hanging logout).
@@ -385,12 +418,13 @@ describe("runNostrConnectSignIn (issue #67)", () => {
     // out, the server commits the cookie (the login resolves as established), and only then is
     // the attempt cancelled. This is the exact window the review identified.
     let owned = true
-    authService.nip98Login.mockImplementationOnce(async () => {
+    connectClient.consumeSession.mockImplementationOnce(async () => {
       order.push("A:login:established")
       owned = false // retired mid-request; the cookie is already committed
       return { success: true }
     })
     const result = await runNostrConnectSignIn(PUBKEY, {
+      sessionId: SESSION_ID,
       timeout: 1000,
       isCurrent: () => owned,
     })
@@ -417,10 +451,10 @@ describe("runNostrConnectSignIn (issue #67)", () => {
     const order: string[] = []
     // Established at header receipt, reported only once the signal aborts — exactly what the
     // service now does when the body read is cancelled after the cookie was committed.
-    authService.nip98Login.mockImplementationOnce(
-      (opts: { signal?: AbortSignal }) =>
+    connectClient.consumeSession.mockImplementationOnce(
+      (_sessionId: string, signal?: AbortSignal) =>
         new Promise((resolve) => {
-          opts.signal?.addEventListener("abort", () => {
+          signal?.addEventListener("abort", () => {
             order.push("A:login:established-after-abort")
             resolve({ success: true })
           })
@@ -432,7 +466,11 @@ describe("runNostrConnectSignIn (issue #67)", () => {
     }) as unknown as typeof fetch
 
     const abort = new AbortController()
-    const pending = runNostrConnectSignIn(PUBKEY, { timeout: 5000, signal: abort.signal })
+    const pending = runNostrConnectSignIn(PUBKEY, {
+      sessionId: SESSION_ID,
+      timeout: 5000,
+      signal: abort.signal,
+    })
     await new Promise((r) => setTimeout(r, 0))
     abort.abort() // retired while the response body was being read
     const result = await pending
@@ -446,10 +484,10 @@ describe("runNostrConnectSignIn (issue #67)", () => {
 
   it("compensates the same way when the DEADLINE fires during body consumption", async () => {
     const order: string[] = []
-    authService.nip98Login.mockImplementationOnce(
-      (opts: { signal?: AbortSignal }) =>
+    connectClient.consumeSession.mockImplementationOnce(
+      (_sessionId: string, signal?: AbortSignal) =>
         new Promise((resolve) => {
-          opts.signal?.addEventListener("abort", () => {
+          signal?.addEventListener("abort", () => {
             order.push("A:login:established-after-abort")
             resolve({ success: true })
           })
@@ -462,7 +500,10 @@ describe("runNostrConnectSignIn (issue #67)", () => {
 
     // No isCurrent change: a deadline does not flip caller ownership, so only the gate's
     // abort check catches this. Reports "timeout", and still compensates.
-    const result = await runNostrConnectSignIn(PUBKEY, { timeout: 10 })
+    const result = await runNostrConnectSignIn(PUBKEY, {
+      sessionId: SESSION_ID,
+      timeout: 10,
+    })
 
     expect(result.errorType).toBe("timeout")
     expect(order).toEqual(["A:login:established-after-abort", "A:logout"])
@@ -472,10 +513,10 @@ describe("runNostrConnectSignIn (issue #67)", () => {
   it("does NOT log out when the abort happened before any session existed", async () => {
     const order: string[] = []
     // Cancelled BEFORE the headers: the service reports superseded, no session was created.
-    authService.nip98Login.mockImplementationOnce(
-      (opts: { signal?: AbortSignal }) =>
+    connectClient.consumeSession.mockImplementationOnce(
+      (_sessionId: string, signal?: AbortSignal) =>
         new Promise((resolve) => {
-          opts.signal?.addEventListener("abort", () =>
+          signal?.addEventListener("abort", () =>
             resolve({ success: false, error: "Aborted", errorType: "superseded" }),
           )
         }),
@@ -486,7 +527,11 @@ describe("runNostrConnectSignIn (issue #67)", () => {
     }) as unknown as typeof fetch
 
     const abort = new AbortController()
-    const pending = runNostrConnectSignIn(PUBKEY, { timeout: 5000, signal: abort.signal })
+    const pending = runNostrConnectSignIn(PUBKEY, {
+      sessionId: SESSION_ID,
+      timeout: 5000,
+      signal: abort.signal,
+    })
     await new Promise((r) => setTimeout(r, 0))
     abort.abort()
     const result = await pending
@@ -499,7 +544,7 @@ describe("runNostrConnectSignIn (issue #67)", () => {
   it("a successor cannot log in until that compensation has settled", async () => {
     const order: string[] = []
     let finishLogout: (v: unknown) => void = () => {}
-    authService.nip98Login
+    connectClient.consumeSession
       .mockImplementationOnce(async () => {
         order.push("A:login:established")
         return { success: true }
@@ -522,8 +567,8 @@ describe("runNostrConnectSignIn (issue #67)", () => {
     }) as unknown as typeof fetch
 
     let aOwned = true
-    authService.nip98Login.mockReset()
-    authService.nip98Login
+    connectClient.consumeSession.mockReset()
+    connectClient.consumeSession
       .mockImplementationOnce(async () => {
         order.push("A:login:established")
         aOwned = false
@@ -533,8 +578,12 @@ describe("runNostrConnectSignIn (issue #67)", () => {
         order.push("B:login")
         return { success: true }
       })
-    const a = runNostrConnectSignIn(PUBKEY, { timeout: 5000, isCurrent: () => aOwned })
-    const b = runNostrConnectSignIn(PUBKEY_B, { timeout: 5000 })
+    const a = runNostrConnectSignIn(PUBKEY, {
+      sessionId: SESSION_ID,
+      timeout: 5000,
+      isCurrent: () => aOwned,
+    })
+    const b = runNostrConnectSignIn(PUBKEY_B, { sessionId: SESSION_ID, timeout: 5000 })
     await new Promise((r) => setTimeout(r, 0))
     finishLogout({ ok: true, status: 200, json: async () => ({}) })
     await Promise.all([a, b])
@@ -551,15 +600,18 @@ describe("runNostrConnectSignIn (issue #67)", () => {
   it("a failing attempt releases the mutex so the next attempt is not wedged", async () => {
     // First attempt's login hangs then times out; the second must still run. A's own promise is
     // left to settle on its own — the point is that B is not held up by it.
-    authService.nip98Login
+    connectClient.consumeSession
       .mockImplementationOnce(() => new Promise(() => {})) // never settles
       .mockImplementation(async () => ({ success: true }))
 
-    const a = runNostrConnectSignIn(PUBKEY, { timeout: 10 })
+    const a = runNostrConnectSignIn(PUBKEY, { sessionId: SESSION_ID, timeout: 10 })
     const started = Date.now()
     // B's budget must exceed A's deadline plus the post-abort grace during which A's ignored
     // login is still being waited on; otherwise B legitimately times out in the queue.
-    const bResult = await runNostrConnectSignIn(PUBKEY_B, { timeout: 2000 })
+    const bResult = await runNostrConnectSignIn(PUBKEY_B, {
+      sessionId: SESSION_ID,
+      timeout: 2000,
+    })
     const aResult = await a // A times out (10ms), releasing the slot for B
 
     expect(aResult.errorType).toBe("timeout")
