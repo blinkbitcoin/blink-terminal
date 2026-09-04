@@ -100,6 +100,16 @@ if (cleanupTimer.unref) cleanupTimer.unref()
 
 // ---------- Redis (lazy singleton, opt-in) ----------
 
+/**
+ * How long an initial Redis connection may take before we stop trying. The manager reserves
+ * session capacity synchronously and opens the relay transport before persisting, so a hang
+ * here would hold all three with no 503 — the connect must actually reject (PR #71 review).
+ */
+const REDIS_CONNECT_TIMEOUT_MS = 2000
+
+/** Attempts before the initial connect gives up (each with its own connectTimeout). */
+const REDIS_CONNECT_MAX_ATTEMPTS = 3
+
 let redisClient: RedisClientType | null = null
 let redisConnected = false
 let redisInitPromise: Promise<RedisClientType> | null = null
@@ -141,7 +151,21 @@ async function getRedisClient(): Promise<RedisClientType | null> {
         socket: {
           host: process.env.REDIS_HOST || "localhost",
           port: parseInt(process.env.REDIS_PORT || "6379", 10),
+          // Bound the connection attempt: with the library defaults, an unreachable Redis makes
+          // connect() retry INDEFINITELY, so it never rejects and the caller hangs instead of
+          // getting the retryable 503 the design promises. Measured against redis@4.7.0: after
+          // 7s and 20 connection errors the promise was still pending (PR #71 post-merge review).
+          connectTimeout: REDIS_CONNECT_TIMEOUT_MS,
+          // Give up after a few attempts so the initial connect() actually rejects. The default
+          // strategy retries forever, which is what turned an outage into a hang.
+          reconnectStrategy: (retries: number) =>
+            retries >= REDIS_CONNECT_MAX_ATTEMPTS
+              ? new Error("Redis unreachable")
+              : Math.min(100 * retries, 500),
         },
+        // Commands issued while disconnected must reject immediately, not queue until the
+        // connection returns — in the disconnect window that could be unbounded (PR #71 review).
+        disableOfflineQueue: true,
         password: process.env.REDIS_PASSWORD || undefined,
         database: parseInt(process.env.REDIS_DB || "0", 10),
       }) as RedisClientType
