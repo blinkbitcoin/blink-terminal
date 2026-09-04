@@ -22,7 +22,9 @@
  */
 
 import type { NextApiRequest, NextApiResponse, NextApiHandler } from "next"
-import { createClient, type RedisClientType } from "redis"
+import type { RedisClientType } from "redis"
+
+import { getSharedRedisClient } from "./redis"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -72,61 +74,27 @@ const REDIS_KEY_PREFIX = "blink-terminal:ratelimit:"
 // Shared Redis client (lazy singleton)
 // ---------------------------------------------------------------------------
 
-let redisClient: RedisClientType | null = null
-let redisConnected = false
-let redisInitPromise: Promise<RedisClientType | null> | null = null
-
-/**
- * Redis-backed limiting is opt-in via ENABLE_HYBRID_STORAGE (the same flag that
- * gates the rest of the Redis/Postgres stack). When disabled — including in unit
- * tests — the limiter stays purely in-memory and never attempts a connection.
- */
 function redisEnabled(): boolean {
   return process.env.ENABLE_HYBRID_STORAGE === "true"
 }
 
+/**
+ * The limiter's Redis access goes through the shared client (lib/redis.ts), which owns the
+ * connection lifecycle: a bounded initial connect (so a cold-start outage fails fast instead of
+ * hanging the request) and recoverable established operation. The limiter degrades to in-memory
+ * on any Redis failure — a rate limiter must never take a request down with it (PR #71/#73).
+ */
 async function getRedisClient(): Promise<RedisClientType | null> {
   if (!redisEnabled()) return null
-  if (redisClient && redisConnected) return redisClient
-  if (redisInitPromise) return redisInitPromise
-
-  redisInitPromise = (async () => {
-    try {
-      const client = createClient({
-        socket: {
-          host: process.env.REDIS_HOST || "localhost",
-          port: parseInt(process.env.REDIS_PORT || "6379", 10),
-        },
-        password: process.env.REDIS_PASSWORD || undefined,
-        database: parseInt(process.env.REDIS_DB || "0", 10),
-      }) as RedisClientType
-
-      client.on("error", (err: Error) => {
-        console.error("Rate limit Redis error:", err.message)
-        redisConnected = false
-      })
-      client.on("connect", () => {
-        redisConnected = true
-      })
-
-      await client.connect()
-      redisClient = client
-      redisConnected = true
-      return client
-    } catch (error: unknown) {
-      console.warn(
-        "Rate limit Redis connection failed; falling back to in-memory:",
-        (error as Error).message,
-      )
-      redisConnected = false
-      redisClient = null
-      return null
-    } finally {
-      redisInitPromise = null
-    }
-  })()
-
-  return redisInitPromise
+  try {
+    return await getSharedRedisClient()
+  } catch (error: unknown) {
+    console.warn(
+      "Rate limit Redis unavailable; falling back to in-memory:",
+      (error as Error).message,
+    )
+    return null
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -172,7 +140,7 @@ function createRateLimiter(opts: RateLimitOptions) {
      */
     async check(key: string, ip: string): Promise<boolean> {
       const redis = await getRedisClient()
-      if (!redis || !redisConnected) {
+      if (!redis) {
         return checkInMemory(ip)
       }
 

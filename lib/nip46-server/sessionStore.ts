@@ -21,25 +21,32 @@
  * Backed by Redis when ENABLE_HYBRID_STORAGE is set — the same flag that gates
  * the rest of the Redis stack — and by a per-process Map otherwise.
  *
- * ONE BACKEND PER SESSION. The backend is chosen by CONFIGURATION, never by
- * whether Redis happens to be reachable right now: with ENABLE_HYBRID_STORAGE
- * set, Redis is the backend and nothing is ever written to the Map. Any Redis
- * unavailability — a command failure, a failed initial connection, or a client
- * that dropped after connecting — raises Nip46StorageError, which the routes
- * turn into a retryable 503.
+ * ONE BACKEND PER SESSION, CHOSEN ONCE AT CREATION. The backend is decided by
+ * reachability at the moment the session is created, and never re-evaluated
+ * for that session's life:
  *
- * Both halves matter. Falling back per-command split a session across two
- * stores (a failed SET wrote to memory; the next GET against a recovered Redis
- * missed and 404'd a session whose relay worker was still running). Falling
- * back on connection state did the same one layer up: a session created in
- * memory during an outage vanished when Redis recovered, and a Redis-backed
- * session read during a drop looked expired (PR #71 review). Failing closed on
- * both keeps every session on exactly one backend for its whole life.
+ *  - Redis configured and reachable  → Redis.
+ *  - Redis configured but UNREACHABLE at creation (getRedisClient throws) → the
+ *    in-process Map, so an outage does not take sign-in down. The record lives
+ *    there for its whole short life; every read/transition/delete consults the
+ *    Map FIRST, precisely so a later Redis recovery cannot orphan it.
+ *  - A command FAILING on a reachable Redis → Nip46StorageError (retryable
+ *    503). A data-integrity failure is never degraded to memory, and a session
+ *    never straddles the two stores.
+ *
+ * This is the one-backend-per-session invariant the store promised: the earlier
+ * bug was re-choosing the backend from live connectivity on every operation,
+ * which split sessions across backends whenever Redis flapped — a session
+ * created in memory during an outage vanished when Redis recovered, and a
+ * Redis-backed session read during a drop looked expired while its relay worker
+ * was still live (PR #71 review, then confirmed live on staging).
  */
 
 import crypto from "crypto"
 
-import { createClient, type RedisClientType } from "redis"
+import type { RedisClientType } from "redis"
+
+import { getSharedRedisClient, __closeSharedRedisForTests } from "../redis"
 
 import { Nip46StorageError } from "./errors"
 
@@ -98,87 +105,28 @@ const cleanupTimer = setInterval((): void => {
 }, 60 * 1000)
 if (cleanupTimer.unref) cleanupTimer.unref()
 
-// ---------- Redis (lazy singleton, opt-in) ----------
-
-let redisClient: RedisClientType | null = null
-let redisConnected = false
-let redisInitPromise: Promise<RedisClientType> | null = null
+// ---------- Redis (shared client, opt-in) ----------
 
 function redisEnabled(): boolean {
   return process.env.ENABLE_HYBRID_STORAGE === "true"
 }
 
 /**
- * The single Redis client, created once and reused across connection attempts.
+ * The session backend's Redis access goes through the shared client (lib/redis.ts), which owns
+ * the connection lifecycle for the whole process: a bounded initial connect (covering the
+ * handshake, which socket.connectTimeout does not) and recoverable established operation.
  *
  * Returns null ONLY when Redis is not configured — that is the one case in which the
- * in-process Map is the session backend. When Redis IS configured but unavailable (the
- * initial connection failed, or a connected client has since dropped), this throws
- * Nip46StorageError rather than returning null. Returning null there silently switched every
- * subsequent operation to the Map, which split sessions across backends exactly as the
- * header forbids: a session created in memory during an outage vanished when Redis recovered,
- * and a Redis-backed session read during a drop 404'd while its relay worker was still live
- * (PR #71 review). Failing closed turns both into a retryable 503.
- *
- * One client, not one per attempt: a failed connect used to null the client and build a fresh
- * one on the next call. node-redis reconnects on its own; the same instance is kept and its
- * readiness re-checked, so a recovering Redis is picked up without a pile of half-built clients.
+ * in-process Map is a session backend. When Redis IS configured but unreachable at creation,
+ * this throws: a session that is memory-resident for its whole life is fine, but re-choosing
+ * the backend from live connectivity on every operation is what split sessions across backends
+ * (PR #71 review, then live on staging). The degrade decision happens once, at creation, in
+ * createSession below.
  */
 async function getRedisClient(): Promise<RedisClientType | null> {
   if (!redisEnabled()) return null
-  if (redisClient && redisConnected) return redisClient
-
-  // A client exists but is not ready: it dropped after connecting. node-redis is already
-  // reconnecting it; `ready` will flip the flag back. Do NOT fall back to memory and do NOT
-  // build a second client — fail closed until it recovers.
-  if (redisClient) {
-    throw new Nip46StorageError("Redis is configured but currently disconnected")
-  }
-
-  if (!redisInitPromise) {
-    redisInitPromise = (async (): Promise<RedisClientType> => {
-      const client = createClient({
-        socket: {
-          host: process.env.REDIS_HOST || "localhost",
-          port: parseInt(process.env.REDIS_PORT || "6379", 10),
-        },
-        password: process.env.REDIS_PASSWORD || undefined,
-        database: parseInt(process.env.REDIS_DB || "0", 10),
-      }) as RedisClientType
-
-      client.on("error", (err: Error) => {
-        console.error("NIP-46 session store Redis error:", err.message)
-        redisConnected = false
-      })
-      // `ready` (not `connect`): the socket can be open before the handshake completes,
-      // and a command sent in that gap fails. Readiness is what "connected" means here.
-      client.on("ready", () => {
-        redisConnected = true
-      })
-      client.on("end", () => {
-        redisConnected = false
-      })
-
-      try {
-        await client.connect()
-      } catch (error: unknown) {
-        // The initial connection never came up, so there is nothing for node-redis to
-        // reconnect. Leave `redisClient` unset so the next call retries from scratch — but
-        // that retry is the ONLY thing that happens; nothing is written to memory meanwhile.
-        redisConnected = false
-        throw error
-      }
-
-      redisClient = client
-      redisConnected = true
-      return client
-    })().finally(() => {
-      redisInitPromise = null
-    })
-  }
-
   try {
-    return await redisInitPromise
+    return await getSharedRedisClient()
   } catch (error: unknown) {
     throw new Nip46StorageError(
       `Redis is configured but unavailable: ${(error as Error).message}`,
@@ -243,8 +191,23 @@ export async function createSession(
     challenge: input.challenge,
   }
 
-  // Non-null means connected; configured-but-unavailable throws, unconfigured is null.
-  const redis = await getRedisClient()
+  // Reachability is decided ONCE, at creation, and never re-evaluated for this session's life
+  // (PR #71 review). Two distinct Redis problems must not be conflated:
+  //
+  //  - CONFIGURED-BUT-UNREACHABLE (getRedisClient throws): an operational condition. Degrade to
+  //    the in-process Map, so a Redis outage does not take down sign-in on a single-instance
+  //    deployment. The record lives in memory for its full short life; the reads consult memory
+  //    first precisely so a later Redis recovery does not orphan it.
+  //  - A COMMAND FAILING on a reachable Redis: a data-integrity failure. Fail closed (503) —
+  //    the one-backend-per-session invariant means a session never straddles the two stores.
+  let redis: RedisClientType | null = null
+  try {
+    redis = await getRedisClient()
+  } catch {
+    // Unreachable: degrade to memory below. Nothing is thrown.
+    redis = null
+  }
+
   if (redis) {
     try {
       await redis.set(REDIS_KEY_PREFIX + record.id, JSON.stringify(record), {
@@ -257,6 +220,7 @@ export async function createSession(
       })
       return record
     } catch (error: unknown) {
+      // A command failure on a live connection is a real failure — never degrade it to memory.
       throw new Nip46StorageError(`could not persist session: ${asMessage(error)}`)
     }
   }
@@ -266,6 +230,19 @@ export async function createSession(
 }
 
 export async function getSession(id: string): Promise<Nip46SessionRecord | null> {
+  // Memory is consulted FIRST. A session written to memory during a Redis outage must stay
+  // readable for its whole life even after Redis recovers — re-deciding the backend from live
+  // connectivity on every read is what orphaned those sessions (PR #71 review). Ids are
+  // per-session and distinct across backends, so a memory hit is authoritative.
+  const inMemory = memoryStore.get(id)
+  if (inMemory) {
+    if (isExpired(inMemory)) {
+      memoryStore.delete(id)
+      return null
+    }
+    return inMemory
+  }
+
   // Non-null means connected; configured-but-unavailable throws, unconfigured is null.
   const redis = await getRedisClient()
   if (redis) {
@@ -279,13 +256,7 @@ export async function getSession(id: string): Promise<Nip46SessionRecord | null>
     }
   }
 
-  const record = memoryStore.get(id)
-  if (!record) return null
-  if (isExpired(record)) {
-    memoryStore.delete(id)
-    return null
-  }
-  return record
+  return null
 }
 
 // ---------- Atomic state transitions ----------
@@ -360,6 +331,12 @@ async function transition(
   id: string,
   options: TransitionOptions,
 ): Promise<TransitionResult> {
+  // A session's backend is fixed at creation, so the Map is consulted first: a record written
+  // there during an outage must transition in memory even after Redis recovers (PR #71 review).
+  if (memoryStore.has(id)) {
+    return transitionInMemory(id, options)
+  }
+
   // Non-null means connected; configured-but-unavailable throws, unconfigured is null.
   const redis = await getRedisClient()
   if (redis) {
@@ -450,6 +427,13 @@ export async function markFailed(
 }
 
 export async function deleteSession(id: string): Promise<void> {
+  // Backend fixed at creation: delete where the record actually lives. A memory-resident record
+  // is removed there even if Redis has recovered (PR #71 review).
+  if (memoryStore.has(id)) {
+    memoryStore.delete(id)
+    return
+  }
+
   // Non-null means connected; configured-but-unavailable throws, unconfigured is null.
   const redis = await getRedisClient()
   if (redis) {
@@ -530,9 +514,5 @@ export function __resetSessionStoreForTests(): void {
 
 /** Test-only: close the Redis connection so a test process can exit. */
 export async function __closeSessionStoreRedisForTests(): Promise<void> {
-  const client = redisClient
-  redisClient = null
-  redisConnected = false
-  redisInitPromise = null
-  if (client) await client.quit().catch(() => undefined)
+  await __closeSharedRedisForTests()
 }
