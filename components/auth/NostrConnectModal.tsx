@@ -25,6 +25,7 @@
 import { QRCodeSVG } from "qrcode.react"
 import { useState, useEffect, useCallback, useRef } from "react"
 
+import { nip46BindingCookieRequiresSecureContext } from "../../lib/auth/cookies"
 import {
   cancelSession,
   createSession,
@@ -148,11 +149,20 @@ function describeFailure(reason: string | undefined): string {
  * deliberately indistinguishable from "no such session" (a 404), so the user
  * sees a generic failure and each retry strands another server session until
  * the per-IP cap starts answering 429. Checking up front turns all of that into
- * one accurate message. localhost/127.0.0.1 are secure contexts, so local
- * development is unaffected.
+ * one accurate message.
+ *
+ * Gated on whether the cookie actually carries `Secure`, which is a
+ * production-only attribute (lib/auth/cookies.ts). In development it is omitted
+ * precisely so a device on the LAN can sign in over plain HTTP; blocking that
+ * unconditionally was a development-only regression (PR #77 review). Deriving
+ * the condition from the cookie builder rather than restating it is what keeps
+ * the two from drifting apart again.
  */
 function canHoldSecureCookie(): boolean {
-  return typeof window === "undefined" || window.isSecureContext
+  if (typeof window === "undefined") return true
+  // No `Secure` attribute means the browser will keep the cookie on any origin.
+  if (!nip46BindingCookieRequiresSecureContext()) return true
+  return window.isSecureContext
 }
 
 export default function NostrConnectModal({

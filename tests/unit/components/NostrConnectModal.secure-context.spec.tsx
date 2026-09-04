@@ -15,6 +15,11 @@
  * which also means no server session — and no relay sockets or capacity slot —
  * is created for a sign-in that cannot complete.
  *
+ * The check is gated on whether the cookie actually carries `Secure`, which is
+ * a production-only attribute. In development it is omitted deliberately so a
+ * device on the LAN can sign in over plain HTTP, and an unconditional guard
+ * broke exactly that (PR #77 review) — so both environments are covered here.
+ *
  * @jest-environment jsdom
  */
 import { render, screen, waitFor } from "@testing-library/react"
@@ -42,6 +47,14 @@ function setSecureContext(value: boolean): void {
   })
 }
 
+const ORIGINAL_NODE_ENV = process.env.NODE_ENV
+
+// process.env.NODE_ENV is typed read-only under Next's types; set it via a cast.
+// The cookie builder reads it per call, so this drives the guard's condition.
+function setNodeEnv(value: string): void {
+  ;(process.env as Record<string, string | undefined>).NODE_ENV = value
+}
+
 function renderModal() {
   return render(
     <NostrConnectModal
@@ -60,7 +73,17 @@ beforeEach(() => {
   pollSession.mockImplementation(() => new Promise(() => {}))
 })
 
-describe("NostrConnectModal on an insecure origin", () => {
+afterEach(() => {
+  setNodeEnv(ORIGINAL_NODE_ENV ?? "test")
+})
+
+describe("NostrConnectModal on an insecure origin in production", () => {
+  beforeEach(() => {
+    // Production is where the binding cookie carries `Secure`, so this is the
+    // only environment in which an insecure origin actually breaks sign-in.
+    setNodeEnv("production")
+  })
+
   it("explains that HTTPS is required instead of failing generically", async () => {
     setSecureContext(false)
 
@@ -95,6 +118,33 @@ describe("NostrConnectModal on an insecure origin", () => {
   })
 
   it("proceeds normally on a secure origin", async () => {
+    setSecureContext(true)
+
+    renderModal()
+
+    await waitFor(() => expect(createSession).toHaveBeenCalled())
+    expect(screen.queryByText(/Sign-in needs a secure connection/i)).toBeNull()
+  })
+})
+
+describe("NostrConnectModal on an insecure origin in development", () => {
+  beforeEach(() => {
+    setNodeEnv("development")
+  })
+
+  it("still signs in, because the cookie carries no Secure attribute", async () => {
+    // A developer opening http://<LAN-IP>:3000 from a phone. The binding cookie
+    // is deliberately non-Secure outside production, so the browser keeps it
+    // and sign-in works. Blocking this was a development-only regression.
+    setSecureContext(false)
+
+    renderModal()
+
+    await waitFor(() => expect(createSession).toHaveBeenCalled())
+    expect(screen.queryByText(/Sign-in needs a secure connection/i)).toBeNull()
+  })
+
+  it("still signs in on localhost, which is a secure context anyway", async () => {
     setSecureContext(true)
 
     renderModal()

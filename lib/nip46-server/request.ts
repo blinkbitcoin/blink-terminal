@@ -10,7 +10,10 @@
 
 import type { NextApiRequest, NextApiResponse } from "next"
 
-import { NIP46_COOKIE_NAME } from "../auth/cookies"
+import {
+  NIP46_COOKIE_NAME,
+  nip46BindingCookieRequiresSecureContext,
+} from "../auth/cookies"
 
 import { Nip46StorageError } from "./errors"
 import { bindingMatches, sha256Hex } from "./sessionStore"
@@ -43,9 +46,16 @@ let warnedInsecureOrigin = false
  * invisible in local development and on an HTTPS deployment — but a
  * self-hosted terminal reached over a LAN IP hits it every time. The client
  * shows the actionable message; this line makes it visible server-side too.
+ *
+ * Silent when the cookie carries no `Secure` attribute — in development it is
+ * omitted deliberately, so the browser keeps the cookie and there is nothing to
+ * warn about. The condition comes from the cookie builder rather than being
+ * restated here, so the warning cannot claim a failure that will not happen
+ * (PR #77 review).
  */
 export function warnIfInsecureOrigin(origin: string): void {
   if (warnedInsecureOrigin || !origin.startsWith("http://")) return
+  if (!nip46BindingCookieRequiresSecureContext()) return
 
   // Strip the port without mangling a bracketed IPv6 literal, whose address
   // itself contains colons ("[::1]:3000" splits on ":" into "[").

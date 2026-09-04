@@ -13,10 +13,14 @@ import {
   AUTH_COOKIE_MAX_AGE_SECONDS,
   CHALLENGE_COOKIE_NAME,
   CHALLENGE_COOKIE_MAX_AGE_SECONDS,
+  NIP46_COOKIE_NAME,
   buildSessionCookie,
   buildClearSessionCookie,
   buildChallengeCookie,
   buildClearChallengeCookie,
+  buildNip46BindingCookie,
+  buildClearNip46BindingCookie,
+  nip46BindingCookieRequiresSecureContext,
 } from "../../lib/auth/cookies"
 
 const ORIGINAL_NODE_ENV = process.env.NODE_ENV
@@ -118,5 +122,58 @@ describe("buildClearChallengeCookie", () => {
     expect(cookie).toContain("Max-Age=0")
     expect(cookie).toContain("HttpOnly")
     expect(cookie).toContain("SameSite=Lax")
+  })
+})
+
+/**
+ * The NIP-46 binding cookie and the diagnostics that pre-empt its failure must
+ * never disagree about whether `Secure` is emitted.
+ *
+ * A browser discards a `Secure` cookie on a non-secure origin silently, so the
+ * sign-in modal refuses to start and the server logs a misconfiguration warning
+ * when that would happen. An earlier version restated the production condition
+ * in each of those places instead of deriving it, and the copies drifted: the
+ * guard rejected plain-HTTP LAN origins in development, where the cookie has no
+ * `Secure` attribute and sign-in genuinely worked (PR #77 review).
+ *
+ * These tests pin the predicate to the emitted attribute in BOTH environments,
+ * so any future change to one has to change the other.
+ */
+describe("nip46BindingCookieRequiresSecureContext", () => {
+  it.each(["development", "test", "production"])(
+    "matches whether the emitted cookie carries Secure (NODE_ENV=%s)",
+    (env) => {
+      setNodeEnv(env)
+
+      const emitsSecure = buildNip46BindingCookie("s").includes("Secure")
+
+      expect(nip46BindingCookieRequiresSecureContext()).toBe(emitsSecure)
+      // The clear cookie must agree too, or the browser will not overwrite the
+      // one that was set.
+      expect(buildClearNip46BindingCookie().includes("Secure")).toBe(emitsSecure)
+    },
+  )
+
+  it("is true in production, where the cookie is Secure", () => {
+    setNodeEnv("production")
+    expect(nip46BindingCookieRequiresSecureContext()).toBe(true)
+    expect(buildNip46BindingCookie("s")).toContain("Secure")
+  })
+
+  it("is false in development, so LAN testing over plain HTTP still works", () => {
+    setNodeEnv("development")
+    expect(nip46BindingCookieRequiresSecureContext()).toBe(false)
+    expect(buildNip46BindingCookie("s")).not.toContain("Secure")
+  })
+})
+
+describe("buildNip46BindingCookie", () => {
+  it("is HttpOnly, path-scoped and SameSite=Strict", () => {
+    setNodeEnv("production")
+    const cookie = buildNip46BindingCookie("secret123")
+    expect(cookie).toContain(`${NIP46_COOKIE_NAME}=secret123`)
+    expect(cookie).toContain("HttpOnly")
+    expect(cookie).toContain("Path=/api/nostr-connect")
+    expect(cookie).toContain("SameSite=Strict")
   })
 })

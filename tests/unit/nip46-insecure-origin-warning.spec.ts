@@ -20,13 +20,23 @@ import {
 
 let warn: jest.SpyInstance
 
+const ORIGINAL_NODE_ENV = process.env.NODE_ENV
+
+// process.env.NODE_ENV is typed read-only under Next's types; set it via a cast.
+function setNodeEnv(value: string): void {
+  ;(process.env as Record<string, string | undefined>).NODE_ENV = value
+}
+
 beforeEach(() => {
   __resetInsecureOriginWarningForTests()
   warn = jest.spyOn(console, "warn").mockImplementation(() => {})
+  // The warning only applies where the cookie is actually `Secure`.
+  setNodeEnv("production")
 })
 
 afterEach(() => {
   warn.mockRestore()
+  setNodeEnv(ORIGINAL_NODE_ENV ?? "test")
 })
 
 describe("warnIfInsecureOrigin", () => {
@@ -63,4 +73,15 @@ describe("warnIfInsecureOrigin", () => {
       expect(warn).not.toHaveBeenCalled()
     },
   )
+
+  it("stays silent outside production, where the cookie is not Secure", () => {
+    // `next dev` on a LAN IP: the cookie carries no `Secure` attribute, so the
+    // browser keeps it and sign-in works. Warning that it "will be dropped"
+    // would be plainly false (PR #77 review).
+    setNodeEnv("development")
+
+    warnIfInsecureOrigin("http://192.168.0.101:3000")
+
+    expect(warn).not.toHaveBeenCalled()
+  })
 })
