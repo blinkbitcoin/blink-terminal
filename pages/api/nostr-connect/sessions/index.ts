@@ -24,7 +24,11 @@ import {
   Nip46CapacityError,
   Nip46RelayUnavailableError,
 } from "../../../../lib/nip46-server"
-import { getClientIp, getRequestOrigin } from "../../../../lib/nip46-server/request"
+import {
+  getClientIp,
+  getRequestOrigin,
+  respondToStorageError,
+} from "../../../../lib/nip46-server/request"
 import { sha256Hex } from "../../../../lib/nip46-server/sessionStore"
 import { withRateLimit, RATE_LIMIT_AUTH } from "../../../../lib/rate-limit"
 
@@ -67,6 +71,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse): Promise<void>
       })
       return
     }
+    if (respondToStorageError(res, error)) return
     console.error("[nip46] session creation failed:", error)
     res.status(500).json({ error: "Could not start sign-in session" })
   }

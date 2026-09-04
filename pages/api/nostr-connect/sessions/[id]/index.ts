@@ -20,7 +20,11 @@ import type { NextApiRequest, NextApiResponse } from "next"
 
 import { buildClearNip46BindingCookie } from "../../../../../lib/auth/cookies"
 import { getNip46SessionManager, getSession } from "../../../../../lib/nip46-server"
-import { isBoundCaller, getSessionId } from "../../../../../lib/nip46-server/request"
+import {
+  isBoundCaller,
+  getSessionId,
+  respondToStorageError,
+} from "../../../../../lib/nip46-server/request"
 import { withRateLimit, RATE_LIMIT_POLL } from "../../../../../lib/rate-limit"
 
 const NOT_FOUND = { error: "Session not found or expired" }
@@ -32,40 +36,46 @@ async function handler(req: NextApiRequest, res: NextApiResponse): Promise<void>
     return
   }
 
-  const sessionId = getSessionId(req)
-  if (!sessionId) {
-    res.status(404).json(NOT_FOUND)
-    return
+  try {
+    const sessionId = getSessionId(req)
+    if (!sessionId) {
+      res.status(404).json(NOT_FOUND)
+      return
+    }
+
+    const record = await getSession(sessionId)
+    if (!record || !isBoundCaller(req, record.bindingHash)) {
+      res.status(404).json(NOT_FOUND)
+      return
+    }
+
+    const manager = getNip46SessionManager()
+
+    if (req.method === "DELETE") {
+      await manager.cancel(sessionId)
+      res.setHeader("Set-Cookie", buildClearNip46BindingCookie())
+      res.status(200).json({ status: "cancelled" })
+      return
+    }
+
+    const status = await manager.resolveStatus(record)
+    res.status(200).json({
+      sessionId,
+      status: status.status,
+      // Advisory only — the pubkey is not trusted until consume returns it.
+      pubkey: status.pubkey,
+      error: status.error,
+      expiresAt: status.expiresAt,
+    })
+  } catch (error: unknown) {
+    if (respondToStorageError(res, error)) return
+    throw error
   }
-
-  const record = await getSession(sessionId)
-  if (!record || !isBoundCaller(req, record.bindingHash)) {
-    res.status(404).json(NOT_FOUND)
-    return
-  }
-
-  const manager = getNip46SessionManager()
-
-  if (req.method === "DELETE") {
-    await manager.cancel(sessionId)
-    res.setHeader("Set-Cookie", buildClearNip46BindingCookie())
-    res.status(200).json({ status: "cancelled" })
-    return
-  }
-
-  const status = await manager.resolveStatus(record)
-  res.status(200).json({
-    sessionId,
-    status: status.status,
-    // Advisory only — the pubkey is not trusted until consume returns it.
-    pubkey: status.pubkey,
-    error: status.error,
-    expiresAt: status.expiresAt,
-  })
 }
 
 // DELETE shares this handler, so it also lands on the POLL tier. That is
 // intentional: cancellation is cheap, idempotent, and gated by the binding
 // cookie, and rate-limiting it aggressively would only strand abandoned relay
 // sockets that we want released promptly.
+
 export default withRateLimit(handler, RATE_LIMIT_POLL, "nostr-connect/sessions/status")

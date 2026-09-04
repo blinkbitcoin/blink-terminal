@@ -35,6 +35,8 @@ export interface SessionStatusResult {
   status: Nip46SessionStatus | "unknown"
   pubkey?: string
   error?: string
+  /** Server pushed back or faulted; retry rather than treating it as an answer. */
+  transient?: boolean
 }
 
 export interface ConsumeResult {
@@ -97,12 +99,15 @@ export async function getSessionStatus(
     signal,
   })
 
-  if (response.status === 429) {
-    // Treat push-back as "still pending", with backoff applied by the caller.
-    return { status: "pending" }
+  // Only a definitive "this session is gone" ends the poll. Rate-limit
+  // push-back and server-side faults (e.g. a transient session-store outage,
+  // which now surfaces as 503) are transient: the session is still live on the
+  // server, so we keep polling with backoff rather than throwing it away.
+  if (response.status === 404 || response.status === 410) {
+    return { status: "failed", error: "session_not_found" }
   }
   if (!response.ok) {
-    return { status: "failed", error: "session_not_found" }
+    return { status: "pending", transient: true }
   }
 
   const data = (await response.json()) as Record<string, unknown>
@@ -135,11 +140,12 @@ export async function pollSession(
 
     try {
       result = await getSessionStatus(sessionId, signal)
+      if (result.transient) delay = POLL_BACKOFF_MS
     } catch (error: unknown) {
       if (isAbort(error, signal)) return { status: "failed", error: "aborted" }
       // A transient network blip must not end the sign-in; the session lives on
       // the server and is still valid until its TTL.
-      result = { status: "pending" }
+      result = { status: "pending", transient: true }
       delay = POLL_BACKOFF_MS
     }
 

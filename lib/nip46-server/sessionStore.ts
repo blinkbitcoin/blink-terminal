@@ -20,11 +20,22 @@
  *
  * Backed by Redis when ENABLE_HYBRID_STORAGE is set — the same flag that gates
  * the rest of the Redis stack — and by a per-process Map otherwise.
+ *
+ * ONE BACKEND PER SESSION. The backend is chosen by whether a Redis client is
+ * connected, never per command: when Redis is in use, a command failure raises
+ * Nip46StorageError rather than quietly writing to the Map. Falling back
+ * per-command split a session across two stores — a failed SET wrote the record
+ * to memory, and the next GET (Redis healthy again) missed in Redis and
+ * reported the session as expired, 404-ing a session whose relay worker was
+ * still running (PR #71 review). A transient fault now surfaces as a retryable
+ * 503 instead of silently losing the session.
  */
 
 import crypto from "crypto"
 
 import { createClient, type RedisClientType } from "redis"
+
+import { Nip46StorageError } from "./errors"
 
 // ---------- Types ----------
 
@@ -137,6 +148,10 @@ async function getRedisClient(): Promise<RedisClientType | null> {
 
 // ---------- Helpers ----------
 
+function asMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
 export function sha256Hex(input: string): string {
   return crypto.createHash("sha256").update(input).digest("hex")
 }
@@ -197,10 +212,7 @@ export async function createSession(
       })
       return record
     } catch (error: unknown) {
-      console.warn(
-        "NIP-46 session store Redis set failed; using in-memory:",
-        (error as Error).message,
-      )
+      throw new Nip46StorageError(`could not persist session: ${asMessage(error)}`)
     }
   }
 
@@ -217,10 +229,7 @@ export async function getSession(id: string): Promise<Nip46SessionRecord | null>
       const record = JSON.parse(raw) as Nip46SessionRecord
       return isExpired(record) ? null : record
     } catch (error: unknown) {
-      console.warn(
-        "NIP-46 session store Redis get failed; using in-memory:",
-        (error as Error).message,
-      )
+      throw new Nip46StorageError(`could not read session: ${asMessage(error)}`)
     }
   }
 
@@ -310,13 +319,7 @@ async function transition(
     try {
       return await transitionRedis(redis, id, options)
     } catch (error: unknown) {
-      // Fails closed: on a Redis error we fall through to the per-process map,
-      // which will not hold a record written to Redis, so the transition is
-      // denied rather than double-applied.
-      console.warn(
-        "NIP-46 session store Redis transition failed; using in-memory:",
-        (error as Error).message,
-      )
+      throw new Nip46StorageError(`could not update session: ${asMessage(error)}`)
     }
   }
   return transitionInMemory(id, options)
@@ -404,10 +407,13 @@ export async function deleteSession(id: string): Promise<void> {
   if (redis && redisConnected) {
     try {
       await redis.del(REDIS_KEY_PREFIX + id)
-      return
-    } catch {
-      // fall through to memory
+    } catch (error: unknown) {
+      // Deletion is best-effort cleanup: the TTL removes the record anyway, and
+      // no caller's correctness depends on it. Nothing is written to memory,
+      // which would split the session across two backends.
+      console.warn("NIP-46 session store delete failed:", asMessage(error))
     }
+    return
   }
   memoryStore.delete(id)
 }

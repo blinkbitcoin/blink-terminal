@@ -25,6 +25,7 @@ import {
   getBindingSecret,
   isBoundCaller,
   getSessionId,
+  respondToStorageError,
 } from "../../../../../lib/nip46-server/request"
 import { withRateLimit, RATE_LIMIT_AUTH } from "../../../../../lib/rate-limit"
 
@@ -37,42 +38,53 @@ async function handler(req: NextApiRequest, res: NextApiResponse): Promise<void>
     return
   }
 
-  const sessionId = getSessionId(req)
-  if (!sessionId) {
-    res.status(404).json(NOT_FOUND)
-    return
-  }
+  try {
+    const sessionId = getSessionId(req)
+    if (!sessionId) {
+      res.status(404).json(NOT_FOUND)
+      return
+    }
 
-  const record = await getSession(sessionId)
-  if (!record || !isBoundCaller(req, record.bindingHash)) {
-    res.status(404).json(NOT_FOUND)
-    return
-  }
+    const record = await getSession(sessionId)
+    if (!record || !isBoundCaller(req, record.bindingHash)) {
+      res.status(404).json(NOT_FOUND)
+      return
+    }
 
-  const result = await getNip46SessionManager().consume(sessionId, getBindingSecret(req))
+    const result = await getNip46SessionManager().consume(
+      sessionId,
+      getBindingSecret(req),
+    )
 
-  if (!result.ok || !result.pubkey) {
-    res.status(409).json({
-      error: result.error || "Session could not be completed",
-      status: record.status,
+    if (!result.ok || !result.pubkey) {
+      res.status(409).json({
+        error: result.error || "Session could not be completed",
+        status: record.status,
+      })
+      return
+    }
+
+    // Same session shape as /api/auth/nostr-login so downstream routes that key
+    // off "nostr:<pubkey>" keep working unchanged.
+    const sessionUsername = `nostr:${result.pubkey}`
+    const token = AuthManager.generateSession(sessionUsername)
+
+    res.setHeader("Set-Cookie", [
+      buildSessionCookie(token),
+      buildClearNip46BindingCookie(),
+    ])
+    res.status(200).json({
+      success: true,
+      user: {
+        pubkey: result.pubkey,
+        username: sessionUsername,
+        authMethod: "nostr",
+      },
     })
-    return
+  } catch (error: unknown) {
+    if (respondToStorageError(res, error)) return
+    throw error
   }
-
-  // Same session shape as /api/auth/nostr-login so downstream routes that key
-  // off "nostr:<pubkey>" keep working unchanged.
-  const sessionUsername = `nostr:${result.pubkey}`
-  const token = AuthManager.generateSession(sessionUsername)
-
-  res.setHeader("Set-Cookie", [buildSessionCookie(token), buildClearNip46BindingCookie()])
-  res.status(200).json({
-    success: true,
-    user: {
-      pubkey: result.pubkey,
-      username: sessionUsername,
-      authMethod: "nostr",
-    },
-  })
 }
 
 export default withRateLimit(handler, RATE_LIMIT_AUTH, "nostr-connect/sessions/consume")

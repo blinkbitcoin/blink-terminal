@@ -41,6 +41,7 @@ jest.mock("../../lib/nip46-server", () => {
     getSession: (...args: unknown[]) => getSessionMock(...args),
     Nip46CapacityError: errors.Nip46CapacityError,
     Nip46RelayUnavailableError: errors.Nip46RelayUnavailableError,
+    Nip46StorageError: errors.Nip46StorageError,
   }
 })
 
@@ -50,6 +51,7 @@ import { NIP46_COOKIE_NAME } from "../../lib/auth/cookies"
 import {
   Nip46CapacityError,
   Nip46RelayUnavailableError,
+  Nip46StorageError,
 } from "../../lib/nip46-server/errors"
 import { sha256Hex } from "../../lib/nip46-server/sessionStore"
 import consumeRoute from "../../pages/api/nostr-connect/sessions/[id]/consume"
@@ -396,5 +398,66 @@ describe("POST /api/nostr-connect/sessions/:id/consume", () => {
       res,
     )
     expect(res._status).toBe(405)
+  })
+})
+
+/**
+ * A session-store outage must surface as a retryable 503, never as a 404. A 404
+ * tells the browser the session is gone and to start over, but the relay worker
+ * is still running server-side and the signer may be mid-approval.
+ */
+describe("session store outage", () => {
+  const outage = (): Nip46StorageError => new Nip46StorageError("could not read session")
+
+  it("returns 503 from create", async () => {
+    managerMock.create.mockRejectedValue(outage())
+
+    const res = makeRes()
+    await createRoute(makeReq({ method: "POST" }), res)
+
+    expect(res._status).toBe(503)
+    expect((res._json as { reason: string }).reason).toBe("storage_unavailable")
+    expect(res._headers["Set-Cookie"]).toBeUndefined()
+  })
+
+  it("returns 503 from the status poll, not 404", async () => {
+    getSessionMock.mockRejectedValue(outage())
+
+    const res = makeRes()
+    await statusRoute(
+      makeReq({ method: "GET", query: { id: SESSION_ID }, cookies: cookies() }),
+      res,
+    )
+
+    expect(res._status).toBe(503)
+    expect((res._json as { reason: string }).reason).toBe("storage_unavailable")
+  })
+
+  it("returns 503 from consume and mints no session cookie", async () => {
+    getSessionMock.mockResolvedValue(
+      pendingRecord({ status: "approved", pubkey: PUBKEY }),
+    )
+    managerMock.consume.mockRejectedValue(outage())
+
+    const res = makeRes()
+    await consumeRoute(
+      makeReq({ method: "POST", query: { id: SESSION_ID }, cookies: cookies() }),
+      res,
+    )
+
+    expect(res._status).toBe(503)
+    expect(res._headers["Set-Cookie"]).toBeUndefined()
+  })
+
+  it("returns 503 from cancel", async () => {
+    getSessionMock.mockRejectedValue(outage())
+
+    const res = makeRes()
+    await statusRoute(
+      makeReq({ method: "DELETE", query: { id: SESSION_ID }, cookies: cookies() }),
+      res,
+    )
+
+    expect(res._status).toBe(503)
   })
 })

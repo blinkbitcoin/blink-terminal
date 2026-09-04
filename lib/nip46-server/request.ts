@@ -8,10 +8,11 @@
  * request to it would have thrown at runtime (PR #71 review).
  */
 
-import type { NextApiRequest } from "next"
+import type { NextApiRequest, NextApiResponse } from "next"
 
 import { NIP46_COOKIE_NAME } from "../auth/cookies"
 
+import { Nip46StorageError } from "./errors"
 import { bindingMatches, sha256Hex } from "./sessionStore"
 
 /**
@@ -59,4 +60,21 @@ export function getSessionId(req: NextApiRequest): string | null {
   const value = Array.isArray(id) ? id[0] : id
   if (!value || !/^[0-9a-f]{32}$/.test(value)) return null
   return value
+}
+
+/**
+ * Turn a session-store outage into a retryable 503 rather than a 500 or, worse,
+ * a 404 that tells the browser to throw away a session whose relay worker is
+ * still running server-side.
+ *
+ * Returns true when it handled the error; the caller should rethrow otherwise.
+ */
+export function respondToStorageError(res: NextApiResponse, error: unknown): boolean {
+  if (!(error instanceof Nip46StorageError)) return false
+  console.error("[nip46] session store unavailable:", error.message)
+  res.status(503).json({
+    error: "Sign-in is temporarily unavailable. Please try again.",
+    reason: "storage_unavailable",
+  })
+  return true
 }

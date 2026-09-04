@@ -142,6 +142,39 @@ describe("pollSession", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
+  /**
+   * A 5xx means the SERVER hiccuped (e.g. a transient session-store outage),
+   * not that the session is gone — its relay worker is still running and the
+   * signer may be mid-approval. Ending the poll there would throw away a live
+   * sign-in (PR #71 review).
+   */
+  it("keeps polling through a server-side fault", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(503, { reason: "storage_unavailable" }))
+      .mockResolvedValueOnce(jsonResponse(500, {}))
+      .mockResolvedValueOnce(
+        jsonResponse(200, { status: "approved", pubkey: "d".repeat(64) }),
+      )
+
+    const result = await drain(
+      pollSession("abc", { signal: new AbortController().signal }),
+    )
+
+    expect(result.status).toBe("approved")
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+  })
+
+  it("stops only when the session is definitively gone", async () => {
+    fetchMock.mockResolvedValue(jsonResponse(404, { error: "Session not found" }))
+
+    const result = await drain(
+      pollSession("abc", { signal: new AbortController().signal }),
+    )
+
+    expect(result).toMatchObject({ status: "failed", error: "session_not_found" })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
   it("treats rate-limit push-back as still pending", async () => {
     fetchMock
       .mockResolvedValueOnce(jsonResponse(429, {}))

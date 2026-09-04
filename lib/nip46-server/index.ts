@@ -5,7 +5,11 @@
  * sessionManager.ts for the live/persisted split.
  */
 
-export { Nip46CapacityError, Nip46RelayUnavailableError } from "./errors"
+export {
+  Nip46CapacityError,
+  Nip46RelayUnavailableError,
+  Nip46StorageError,
+} from "./errors"
 export { getNip46Relays, DEFAULT_NIP46_RELAYS } from "./relays"
 export {
   getBindingSecret,

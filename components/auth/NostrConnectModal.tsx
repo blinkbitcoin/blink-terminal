@@ -112,6 +112,8 @@ function describeFailure(reason: string | undefined): string {
   switch (reason) {
     case "relays_unavailable":
       return "Could not reach any Nostr relay. Check your connection and try again."
+    case "storage_unavailable":
+      return "Sign-in is temporarily unavailable. Please try again in a moment."
     case "capacity":
       return "Too many sign-in attempts in progress. Please wait a moment and try again."
     case "connect_timeout":
