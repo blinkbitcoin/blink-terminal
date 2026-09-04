@@ -10,11 +10,11 @@
  *
  *  - Serialisation is a real FIFO mutex: each attempt chains onto the tail and only the head
  *    runs, so N overlapping attempts can never observe a stale snapshot and enter together.
- *  - The login and the relay signing round-trip are driven by ONE AbortSignal owned by the
- *    transaction. A timeout or supersession cancels the request, so it cannot commit a session
- *    late; there is no abandoned-request window to paper over.
+ *  - The consume request is driven by ONE AbortSignal owned by the transaction. A timeout or
+ *    supersession cancels the request, so it cannot commit a session late; there is no
+ *    abandoned-request window to paper over.
  *  - The only resource that exists before the outcome is known is the server session, because
- *    signing is what proves the user. If the attempt loses ownership, times out, fails, or its
+ *    the signature (verified server-side, see lib/nip46-server) is what proves the user. If the attempt loses ownership, times out, fails, or its
  *    local commit throws, that session is discarded. Local state is written only after the
  *    ownership gate, inside the mutex, so there is never a partial local commit to roll back.
  *
@@ -27,8 +27,14 @@ import ProfileStorage, {
 } from "../storage/ProfileStorage"
 
 import NostrAuthService from "./NostrAuthService"
+import { consumeSession } from "./NostrConnectClient"
 
 export interface SignInTransactionOptions {
+  /**
+   * The server-held NIP-46 session to finalize. The signer's approval was
+   * verified server-side; consuming it is what mints the session cookie.
+   */
+  sessionId: string
   /** Abort deadline in ms. */
   timeout: number
   /** Caller ownership check; defaults to owned. */
@@ -180,7 +186,7 @@ export async function runNostrConnectSignIn(
   publicKey: string,
   options: SignInTransactionOptions,
 ): Promise<SignInTransactionResult> {
-  const { timeout, isCurrent, onProgress, signal: external } = options
+  const { sessionId, timeout, isCurrent, onProgress, signal: external } = options
   const stillOwned = (): boolean => isCurrent?.() ?? true
 
   // One signal for the whole transaction. The deadline and external cancellation both abort it,
@@ -221,34 +227,34 @@ export async function runNostrConnectSignIn(
   }
 
   try {
-    onProgress?.("signing", "Signing authentication event...")
+    onProgress?.("signing", "Completing sign-in...")
 
-    // nip98Login is given the signal and is expected to settle on abort — it aborts its own
+    // consumeSession is given the signal and is expected to settle on abort — it aborts its own
     // fetch, and reports a post-header abort as ESTABLISHED so the session it created can be
     // discarded below. It is NOT raced against a bare abort promise: racing meant an abort
     // landing while the response body was being read won the race and returned cancelled,
     // skipping compensation for a session the server had already committed with its headers
     // (PR #69 review).
     //
-    // A grace race is still needed for liveness, because a login that ignores its signal would
-    // otherwise hold this transaction — and the mutex slot — forever. The grace period starts
-    // only once the abort has fired, so a login that settles promptly (including one reporting
-    // an established session) always wins and its session is always compensated.
-    const sessionResult: Awaited<ReturnType<typeof NostrAuthService.nip98Login>> =
-      await Promise.race([
-        NostrAuthService.nip98Login({
-          signWithMethod: "nostrConnect",
-          signal: controller.signal,
-        }),
-        abandonAfterGrace(controller.signal),
-      ])
+    // A grace race is still needed for liveness, because a request that ignores its signal
+    // would otherwise hold this transaction — and the mutex slot — forever. The grace period
+    // starts only once the abort has fired, so a call that settles promptly (including one
+    // reporting an established session) always wins and its session is always compensated.
+    //
+    // Since #70 this is a plain POST rather than a relay round-trip: the signing already
+    // happened server-side and was verified there, so all that remains is to exchange the
+    // approval for a cookie. The transaction's guarantees are unchanged.
+    const sessionResult = await Promise.race([
+      consumeSession(sessionId, controller.signal),
+      abandonAfterGrace(controller.signal),
+    ])
 
     // NOTE: deliberately no `if (signal.aborted) return` here. "The caller gave up" and "no
     // session exists" are different questions, and only the login can answer the second. An
     // aborted attempt whose login still established a session must fall through to the
     // ownership gate so that session is discarded (PR #69 review).
     if (!sessionResult.success) {
-      // A login that reports "superseded" was cancelled BEFORE it created a session, so there
+      // A consume that reports "superseded" was cancelled BEFORE it created a session, so there
       // is nothing to compensate. The transaction reports its OWN cause, so a deadline still
       // surfaces as "timeout" rather than being flattened into "superseded".
       if (sessionResult.errorType === "superseded" || controller.signal.aborted) {

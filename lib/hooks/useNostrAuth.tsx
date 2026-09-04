@@ -27,7 +27,6 @@ import NostrAuthService, {
   type ServerSessionResult,
   type EncryptedNsecData,
 } from "../nostr/NostrAuthService"
-import { type ConnectionResult } from "../nostr/NostrConnectService"
 import { runNostrConnectSignIn } from "../nostr/NostrConnectSignIn"
 import NostrProfileService, { type NostrProfile } from "../nostr/NostrProfileService"
 import CryptoUtils, { type EncryptedData } from "../storage/CryptoUtils"
@@ -35,7 +34,7 @@ import ProfileStorage, {
   type StoredProfile,
   type StoredBlinkAccount,
 } from "../storage/ProfileStorage"
-import { AUTH_VERSION_FULL, logAuth, logAuthWarn } from "../version"
+import { AUTH_VERSION_FULL, logAuth, logAuthError, logAuthWarn } from "../version"
 
 // ============= Helper Types =============
 
@@ -88,6 +87,12 @@ export interface NostrAuthState {
 }
 
 interface NostrConnectSignInOptions {
+  /**
+   * The server-held NIP-46 session that the signer approved. Consuming it is
+   * what mints the session cookie (issue #70); the browser no longer signs
+   * anything itself.
+   */
+  sessionId: string
   onProgress?: (stage: string, message?: string) => void
   timeout?: number
   /**
@@ -115,7 +120,7 @@ export interface NostrAuthContextValue extends NostrAuthState {
   signInWithExternalSigner: () => Promise<AuthActionResult>
   signInWithNostrConnect: (
     publicKey: string,
-    options?: NostrConnectSignInOptions,
+    options: NostrConnectSignInOptions,
   ) => Promise<AuthActionResult>
   signOut: () => Promise<void>
   refreshProfile: () => void
@@ -174,6 +179,12 @@ export function NostrAuthProvider({
 
   // Track if challenge flow is being handled to prevent duplicate processing
   const challengeFlowHandling = useRef<boolean>(false)
+  /**
+   * Late-bound signOut, so the mount effect (which runs before signOut is
+   * defined) can sign a nostrConnect user out when their server session is gone
+   * and there is no local signer left to re-establish it (issue #70).
+   */
+  const signOutRef = useRef<(() => Promise<void>) | null>(null)
 
   // Re-check extension availability after short delay (extensions may inject asynchronously)
   useEffect(() => {
@@ -720,68 +731,37 @@ export function NostrAuthProvider({
             return
           }
 
-          // For Nostr Connect, restore the relay session first before NIP-98
+          // Nostr Connect has no local signer to re-sign with (issue #70): the NIP-46
+          // conversation lived on the server for the duration of one sign-in and was torn
+          // down when it completed. So there is nothing to restore here — if the server
+          // session cookie is gone (expired, or cleared), the only honest move is to send
+          // the user back through the signer.
+          //
+          // The alternative would be keeping the browser-held bunker session alive purely
+          // to re-sign NIP-98 on startup, which is exactly the fragile transport this
+          // change removes.
           if (method === "nostrConnect") {
-            console.log("[useNostrAuth] Nostr Connect: Restoring relay session...")
             setTimeout(async () => {
               try {
-                // Dynamic import to avoid circular dependency
-                const NostrConnectServiceModule = (
-                  await import("../nostr/NostrConnectService")
-                ).default as {
-                  restoreSession: (opts?: {
-                    expectedPublicKey?: string
-                  }) => Promise<ConnectionResult>
-                }
+                const sessionCheck: ServerSessionResult =
+                  await NostrAuthService.verifyServerSession()
 
-                // Bind the restore to the user this session belongs to. Without it, a stale
-                // record for a DIFFERENT user (possible when a previous session write and its
-                // fallback removal both failed) would be restored here and authenticated as
-                // that other user (PR #66 review).
-                const restoreResult: ConnectionResult =
-                  await NostrConnectServiceModule.restoreSession({
-                    expectedPublicKey: publicKey,
-                  })
-
-                if (!restoreResult.success) {
-                  console.warn(
-                    "[useNostrAuth] Nostr Connect: Failed to restore session:",
-                    restoreResult.error,
-                  )
-                  console.log("[useNostrAuth] Nostr Connect: User needs to reconnect")
-                  // Don't clear auth - let user see they're "logged in" but need to reconnect
-                  // They can reconnect via the Nostr Connect modal
+                if (sessionCheck.hasSession && sessionCheck.pubkey === publicKey) {
+                  logAuth("useNostrAuth", "Nostr Connect: server session still valid")
+                  updateState({ hasServerSession: true })
+                  await syncBlinkAccountFromServer()
                   return
                 }
 
-                console.log("[useNostrAuth] ✓ Nostr Connect: Relay session restored")
-
-                // Now attempt NIP-98 login
-                console.log("[useNostrAuth] Nostr Connect: Starting NIP-98 login...")
-                const sessionResult: Nip98LoginResult =
-                  await NostrAuthService.nip98Login()
-                console.log(
-                  "[useNostrAuth] Nostr Connect: NIP-98 login result:",
-                  sessionResult,
+                logAuth(
+                  "useNostrAuth",
+                  "Nostr Connect: no server session; signing out to re-authenticate",
                 )
-
-                if (sessionResult.success) {
-                  console.log(
-                    "[useNostrAuth] ✓ Nostr Connect: Server session established",
-                  )
-                  updateState({ hasServerSession: true })
-
-                  // Sync data from server
-                  const syncResult = await syncBlinkAccountFromServer()
-                  console.log("[useNostrAuth] Nostr Connect: Sync result:", syncResult)
-                } else {
-                  console.warn(
-                    "[useNostrAuth] Nostr Connect: NIP-98 login failed:",
-                    sessionResult.error,
-                  )
-                }
+                // Clear local auth so the app does not render as signed in without a
+                // server session it cannot re-establish on its own.
+                await signOutRef.current?.()
               } catch (e: unknown) {
-                console.error("[useNostrAuth] Nostr Connect: Session restore error:", e)
+                logAuthError("useNostrAuth", "Nostr Connect: session check failed:", e)
               }
             }, 100)
             return
@@ -1402,6 +1382,9 @@ export function NostrAuthProvider({
     })
   }, [updateState])
 
+  // Late-bind for the mount effect; see signOutRef.
+  signOutRef.current = signOut
+
   /**
    * Refresh profile data
    */
@@ -1628,9 +1611,9 @@ export function NostrAuthProvider({
   const signInWithNostrConnect = useCallback(
     async (
       publicKey: string,
-      options: NostrConnectSignInOptions = {},
+      options: NostrConnectSignInOptions,
     ): Promise<AuthActionResult> => {
-      const { onProgress, timeout = 30000, isCurrent, signal } = options
+      const { sessionId, onProgress, timeout = 30000, isCurrent, signal } = options
 
       logAuth(
         "useNostrAuth",
@@ -1644,6 +1627,7 @@ export function NostrAuthProvider({
       // translates the result into provider state, so the concurrency and cancellation
       // invariants live in one tested place rather than being re-derived here (PR #66 review).
       const result = await runNostrConnectSignIn(publicKey, {
+        sessionId,
         timeout,
         isCurrent,
         signal,
@@ -1654,7 +1638,7 @@ export function NostrAuthProvider({
         if (result.errorType === "timeout") {
           return {
             success: false,
-            error: "Signing timed out. Make sure Amber is open and approve the request.",
+            error: "Sign-in timed out. Please try again.",
             errorType: "timeout",
           }
         }
