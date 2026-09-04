@@ -233,23 +233,144 @@ export async function getSession(id: string): Promise<Nip46SessionRecord | null>
   return record
 }
 
-async function writeExisting(record: Nip46SessionRecord): Promise<void> {
+// ---------- Atomic state transitions ----------
+
+/**
+ * Every state change is a CONDITIONAL transition executed inside Redis.
+ *
+ * The previous implementation used WATCH/MULTI on the shared singleton
+ * connection, which is not a compare-and-swap: WATCH state is connection-scoped,
+ * so two overlapping requests on the same client both read `approved`, the first
+ * EXEC clears the connection's watch, and the second EXEC then runs unguarded —
+ * both succeed and one approval mints two sessions (PR #71 review).
+ *
+ * A Lua script is atomic by construction: Redis runs it to completion on a
+ * single thread, so the read, the checks and the write cannot interleave with
+ * anything, on any connection. It also removes the read-then-write window that
+ * let a late worker resurrect a cancelled session.
+ *
+ * Returns a flat array: { outcome, recordJson? }.
+ */
+const TRANSITION_SCRIPT = `
+local raw = redis.call('GET', KEYS[1])
+if not raw then return {'notfound'} end
+
+local rec = cjson.decode(raw)
+
+-- Binding is checked first so a caller without the cookie cannot tell
+-- "wrong session" from "expired" or "already used".
+if ARGV[1] ~= '' and rec.bindingHash ~= ARGV[1] then return {'binding'} end
+if tonumber(rec.expiresAt) < tonumber(ARGV[4]) then return {'expired'} end
+
+local allowed = cjson.decode(ARGV[2])
+local ok = false
+for i = 1, #allowed do
+  if rec.status == allowed[i] then ok = true break end
+end
+if not ok then return {'status', rec.status} end
+
+if ARGV[5] == '1' and (rec.pubkey == nil or rec.pubkey == '') then
+  return {'nopubkey'}
+end
+
+rec.status = ARGV[3]
+local patch = cjson.decode(ARGV[6])
+for k, v in pairs(patch) do rec[k] = v end
+
+local ttl = tonumber(rec.expiresAt) - tonumber(ARGV[4])
+if ttl < 1 then ttl = 1 end
+redis.call('SET', KEYS[1], cjson.encode(rec), 'PX', ttl)
+
+return {'ok', cjson.encode(rec)}
+`
+
+type TransitionFailure = "notfound" | "binding" | "expired" | "status" | "nopubkey"
+
+interface TransitionOptions {
+  /** Statuses the session may currently be in. */
+  from: Nip46SessionStatus[]
+  to: Nip46SessionStatus
+  /** When set, the stored bindingHash must equal this. */
+  bindingHash?: string
+  /** Require a verified pubkey to be present (consumption). */
+  requirePubkey?: boolean
+  patch?: Partial<Nip46SessionRecord>
+}
+
+type TransitionResult =
+  | { ok: true; record: Nip46SessionRecord }
+  | { ok: false; reason: TransitionFailure; status?: Nip46SessionStatus }
+
+async function transition(
+  id: string,
+  options: TransitionOptions,
+): Promise<TransitionResult> {
   const redis = await getRedisClient()
   if (redis && redisConnected) {
     try {
-      const ttlMs = Math.max(1, record.expiresAt - Date.now())
-      await redis.set(REDIS_KEY_PREFIX + record.id, JSON.stringify(record), {
-        PX: ttlMs,
-      })
-      return
+      return await transitionRedis(redis, id, options)
     } catch (error: unknown) {
+      // Fails closed: on a Redis error we fall through to the per-process map,
+      // which will not hold a record written to Redis, so the transition is
+      // denied rather than double-applied.
       console.warn(
-        "NIP-46 session store Redis update failed; using in-memory:",
+        "NIP-46 session store Redis transition failed; using in-memory:",
         (error as Error).message,
       )
     }
   }
-  memoryStore.set(record.id, record)
+  return transitionInMemory(id, options)
+}
+
+async function transitionRedis(
+  redis: RedisClientType,
+  id: string,
+  options: TransitionOptions,
+): Promise<TransitionResult> {
+  const reply = (await redis.eval(TRANSITION_SCRIPT, {
+    keys: [REDIS_KEY_PREFIX + id],
+    arguments: [
+      options.bindingHash ?? "",
+      JSON.stringify(options.from),
+      options.to,
+      String(Date.now()),
+      options.requirePubkey ? "1" : "0",
+      JSON.stringify(options.patch ?? {}),
+    ],
+  })) as unknown as [string, string?]
+
+  const [outcome, payload] = reply
+  if (outcome === "ok" && payload) {
+    return { ok: true, record: JSON.parse(payload) as Nip46SessionRecord }
+  }
+  return {
+    ok: false,
+    reason: outcome as TransitionFailure,
+    status: payload as Nip46SessionStatus | undefined,
+  }
+}
+
+function transitionInMemory(id: string, options: TransitionOptions): TransitionResult {
+  const record = memoryStore.get(id)
+  if (!record) return { ok: false, reason: "notfound" }
+  if (options.bindingHash && record.bindingHash !== options.bindingHash) {
+    return { ok: false, reason: "binding" }
+  }
+  if (isExpired(record)) return { ok: false, reason: "expired" }
+  if (!options.from.includes(record.status)) {
+    return { ok: false, reason: "status", status: record.status }
+  }
+  if (options.requirePubkey && !record.pubkey) {
+    return { ok: false, reason: "nopubkey" }
+  }
+
+  const updated: Nip46SessionRecord = {
+    ...record,
+    ...options.patch,
+    status: options.to,
+  }
+  memoryStore.set(id, updated)
+  return { ok: true, record: updated }
 }
 
 /**
@@ -257,22 +378,25 @@ async function writeExisting(record: Nip46SessionRecord): Promise<void> {
  * worker can never resurrect a cancelled or already-consumed session.
  */
 export async function markApproved(id: string, pubkey: string): Promise<boolean> {
-  const record = await getSession(id)
-  if (!record || record.status !== "pending") return false
-  await writeExisting({ ...record, status: "approved", pubkey })
-  return true
+  const result = await transition(id, {
+    from: ["pending"],
+    to: "approved",
+    patch: { pubkey },
+  })
+  return result.ok
 }
 
+/** Terminal states stay terminal: only pending or approved can fail. */
 export async function markFailed(
   id: string,
   reason: Nip46FailureReason,
 ): Promise<boolean> {
-  const record = await getSession(id)
-  if (!record) return false
-  // Terminal states stay terminal.
-  if (record.status === "consumed" || record.status === "failed") return false
-  await writeExisting({ ...record, status: "failed", error: reason })
-  return true
+  const result = await transition(id, {
+    from: ["pending", "approved"],
+    to: "failed",
+    patch: { error: reason },
+  })
+  return result.ok
 }
 
 export async function deleteSession(id: string): Promise<void> {
@@ -292,92 +416,69 @@ export async function deleteSession(id: string): Promise<void> {
  * Atomically move an approved session to consumed and return its pubkey.
  *
  * This is the single point where an approval becomes a login, so it must be
- * exactly-once: the Redis path uses WATCH/MULTI so two concurrent consume calls
- * (double-clicked button, duplicated request) cannot both mint a cookie.
+ * exactly-once. The transition runs as one Lua script inside Redis, so two
+ * concurrent consumes (double-clicked button, duplicated request, two app
+ * instances) can never both succeed.
  */
 export async function consumeSession(
   id: string,
   presentedBindingSecret: string | undefined,
 ): Promise<ConsumeResult> {
-  const redis = await getRedisClient()
-  if (redis && redisConnected) {
-    try {
-      return await consumeSessionRedis(redis, id, presentedBindingSecret)
-    } catch (error: unknown) {
-      console.warn(
-        "NIP-46 session store Redis consume failed; using in-memory:",
-        (error as Error).message,
-      )
-    }
-  }
-  return consumeSessionInMemory(id, presentedBindingSecret)
-}
-
-function checkConsumable(
-  record: Nip46SessionRecord | null,
-  presentedBindingSecret: string | undefined,
-): string | null {
-  if (!record) return "Session not found or expired"
-  // Binding is checked before anything else so that a caller without the cookie
-  // cannot distinguish "wrong session", "expired" and "already used".
+  // The binding is compared in constant time HERE, in Node, because it is the
+  // secret that authorises the consume. The Lua script re-checks it inside the
+  // atomic step; that second compare is a plain equality on a SHA-256 digest,
+  // which is not a useful timing oracle.
   const presentedHash = presentedBindingSecret
     ? sha256Hex(presentedBindingSecret)
     : undefined
-  if (!bindingMatches(record.bindingHash, presentedHash)) {
-    return "Session not found or expired"
+
+  const existing = await getSession(id)
+  if (!existing || !bindingMatches(existing.bindingHash, presentedHash)) {
+    return { ok: false, error: "Session not found or expired" }
   }
-  if (isExpired(record)) return "Session expired"
-  if (record.status === "consumed") return "Session already used"
-  if (record.status !== "approved") return "Session is not approved"
-  if (!record.pubkey) return "Session has no verified pubkey"
-  return null
+
+  const result = await transition(id, {
+    from: ["approved"],
+    to: "consumed",
+    bindingHash: existing.bindingHash,
+    requirePubkey: true,
+  })
+
+  if (result.ok) {
+    return { ok: true, pubkey: result.record.pubkey }
+  }
+
+  return { ok: false, error: describeTransitionFailure(result) }
 }
 
-function consumeSessionInMemory(
-  id: string,
-  presentedBindingSecret: string | undefined,
-): ConsumeResult {
-  const record = memoryStore.get(id) ?? null
-  const error = checkConsumable(record, presentedBindingSecret)
-  if (error || !record) return { ok: false, error: error ?? "Session not found" }
-
-  memoryStore.set(id, { ...record, status: "consumed" })
-  return { ok: true, pubkey: record.pubkey }
-}
-
-async function consumeSessionRedis(
-  redis: RedisClientType,
-  id: string,
-  presentedBindingSecret: string | undefined,
-): Promise<ConsumeResult> {
-  const key = REDIS_KEY_PREFIX + id
-
-  await redis.watch(key)
-  const raw = await redis.get(key)
-  const record = raw ? (JSON.parse(raw) as Nip46SessionRecord) : null
-
-  const error = checkConsumable(record, presentedBindingSecret)
-  if (error || !record) {
-    await redis.unwatch()
-    return { ok: false, error: error ?? "Session not found" }
+function describeTransitionFailure(
+  result: Extract<TransitionResult, { ok: false }>,
+): string {
+  switch (result.reason) {
+    case "expired":
+      return "Session expired"
+    case "nopubkey":
+      return "Session has no verified pubkey"
+    case "status":
+      return result.status === "consumed"
+        ? "Session already used"
+        : "Session is not approved"
+    default:
+      // notfound / binding are deliberately indistinguishable.
+      return "Session not found or expired"
   }
-
-  const consumed: Nip46SessionRecord = { ...record, status: "consumed" }
-  const ttlMs = Math.max(1, record.expiresAt - Date.now())
-  const result = await redis
-    .multi()
-    .set(key, JSON.stringify(consumed), { PX: ttlMs })
-    .exec()
-
-  if (!result) {
-    // Watched key changed — another request consumed it first.
-    return { ok: false, error: "Session already used" }
-  }
-
-  return { ok: true, pubkey: record.pubkey }
 }
 
 /** Test-only: drop the in-memory contents between cases. */
 export function __resetSessionStoreForTests(): void {
   memoryStore.clear()
+}
+
+/** Test-only: close the Redis connection so a test process can exit. */
+export async function __closeSessionStoreRedisForTests(): Promise<void> {
+  const client = redisClient
+  redisClient = null
+  redisConnected = false
+  redisInitPromise = null
+  if (client) await client.quit().catch(() => undefined)
 }
