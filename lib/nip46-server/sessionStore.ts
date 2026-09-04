@@ -21,18 +21,20 @@
  * Backed by Redis when ENABLE_HYBRID_STORAGE is set — the same flag that gates
  * the rest of the Redis stack — and by a per-process Map otherwise.
  *
- * ONE BACKEND PER SESSION, CHOSEN ONCE AT CREATION. The backend is decided by
- * reachability at the moment the session is created, and never re-evaluated
- * for that session's life:
+ * ONE BACKEND PER SESSION, CHOSEN ONCE AT CREATION. The backend is decided when
+ * the session is created and never re-evaluated for that session's life:
  *
- *  - Redis configured and reachable  → Redis.
- *  - Redis configured but UNREACHABLE at creation (getRedisClient throws) → the
- *    in-process Map, so an outage does not take sign-in down. The record lives
- *    there for its whole short life; every read/transition/delete consults the
- *    Map FIRST, precisely so a later Redis recovery cannot orphan it.
- *  - A command FAILING on a reachable Redis → Nip46StorageError (retryable
- *    503). A data-integrity failure is never degraded to memory, and a session
- *    never straddles the two stores.
+ *  - Redis configured and reachable, write succeeds → Redis.
+ *  - Redis configured but the initial write does NOT land — unreachable
+ *    (getRedisClient throws) OR reachable but rejecting the write (OOM, cannot
+ *    persist to disk, readonly replica, ACL) → the in-process Map. Creation is
+ *    the ONE point where this degrade is safe: no backend is committed until a
+ *    write lands, so falling back cannot split an existing session. The record
+ *    then lives in the Map for its whole short life; every read/transition/
+ *    delete consults the Map FIRST, so a later Redis recovery cannot orphan it.
+ *  - A command failing on an ALREADY-committed Redis session (getSession,
+ *    transition, deleteSession) → Nip46StorageError (retryable 503). Degrading
+ *    there WOULD split a live session across two backends, so it fails closed.
  *
  * This is the one-backend-per-session invariant the store promised: the earlier
  * bug was re-choosing the backend from live connectivity on every operation,
@@ -40,6 +42,11 @@
  * created in memory during an outage vanished when Redis recovered, and a
  * Redis-backed session read during a drop looked expired while its relay worker
  * was still live (PR #71 review, then confirmed live on staging).
+ *
+ * A SEPARATE regression (fixed here): the create path used to fail closed on a
+ * readable-but-write-rejecting Redis, 503'ing sign-in even though poll/consume
+ * reads still worked. Because create is pre-commit, it now degrades like the
+ * unreachable case (reproduced locally with `maxmemory 1` + noeviction).
  */
 
 import crypto from "crypto"
@@ -191,20 +198,23 @@ export async function createSession(
     challenge: input.challenge,
   }
 
-  // Reachability is decided ONCE, at creation, and never re-evaluated for this session's life
-  // (PR #71 review). Two distinct Redis problems must not be conflated:
+  // The session's backend is chosen ONCE, here at creation, and never re-evaluated for its life
+  // (PR #71 review). Creation is the ONE point where degrading to memory is safe, because nothing
+  // is committed to a backend yet — the one-backend-per-session invariant is about a record that
+  // already lives somewhere, and there is no such record until this write lands. So EVERY way the
+  // initial persist can fail resolves the same way: put the record in the in-process Map and use
+  // that as its backend for its whole short life. Sign-in stays up whether Redis is unreachable,
+  // rejecting writes (OOM / MISCONF-can't-persist / READONLY replica), or ACL-denied.
   //
-  //  - CONFIGURED-BUT-UNREACHABLE (getRedisClient throws): an operational condition. Degrade to
-  //    the in-process Map, so a Redis outage does not take down sign-in on a single-instance
-  //    deployment. The record lives in memory for its full short life; the reads consult memory
-  //    first precisely so a later Redis recovery does not orphan it.
-  //  - A COMMAND FAILING on a reachable Redis: a data-integrity failure. Fail closed (503) —
-  //    the one-backend-per-session invariant means a session never straddles the two stores.
+  // This is the fix for the staging regression: a readable-but-write-rejecting Redis threw here
+  // and 503'd sign-in, even though reads (poll/consume) still worked. It is distinct from a write
+  // failure on an ALREADY-committed Redis session (getSession/transition/deleteSession), which
+  // still fails closed — degrading those WOULD split a live session across two backends.
   let redis: RedisClientType | null = null
   try {
     redis = await getRedisClient()
   } catch {
-    // Unreachable: degrade to memory below. Nothing is thrown.
+    // Configured-but-unreachable: degrade to memory below. Nothing is thrown.
     redis = null
   }
 
@@ -220,8 +230,13 @@ export async function createSession(
       })
       return record
     } catch (error: unknown) {
-      // A command failure on a live connection is a real failure — never degrade it to memory.
-      throw new Nip46StorageError(`could not persist session: ${asMessage(error)}`)
+      // A reachable Redis that rejects THIS write (OOM, can't-persist, readonly replica) must not
+      // take sign-in down: no backend is committed yet, so fall through to the Map. Reads consult
+      // memory first, so the record stays coherent for its whole life even if Redis later heals.
+      console.warn(
+        "[nip46] session store write failed; degrading this session to memory:",
+        asMessage(error),
+      )
     }
   }
 
