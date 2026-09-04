@@ -207,7 +207,11 @@ export async function createSession(
   if (redis && redisConnected) {
     try {
       await redis.set(REDIS_KEY_PREFIX + record.id, JSON.stringify(record), {
-        EX: ttlSeconds,
+        // The Redis TTL is a garbage-collection bound, not the expiry rule:
+        // `expiresAt` is the authority, and every read re-checks it. They are
+        // clamped apart because Redis rejects a non-positive EX outright, which
+        // would turn an already-expired record into a hard storage error.
+        EX: Math.max(1, Math.ceil(ttlSeconds)),
         NX: true,
       })
       return record
