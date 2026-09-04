@@ -5,6 +5,7 @@
  * sessionManager.ts for the live/persisted split.
  */
 
+export { Nip46CapacityError, Nip46RelayUnavailableError } from "./errors"
 export { getNip46Relays, DEFAULT_NIP46_RELAYS } from "./relays"
 export {
   Nip46Transport,
@@ -35,8 +36,6 @@ export {
   buildConsumeUrl,
   buildNostrConnectUri,
   getNip46SessionManager,
-  Nip46CapacityError,
-  Nip46RelayUnavailableError,
   Nip46SessionManager,
   RELAY_READY_TIMEOUT_MS,
   type CreatedSession,

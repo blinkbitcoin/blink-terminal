@@ -24,6 +24,7 @@
 import Nip98Verifier from "../nostr/Nip98Verifier"
 import { onShutdown } from "../shutdown"
 
+import { Nip46CapacityError, Nip46RelayUnavailableError } from "./errors"
 import { getNip46Relays } from "./relays"
 import {
   consumeSession,
@@ -97,9 +98,6 @@ export interface CreatedSession {
   expiresAt: number
   readyRelays: string[]
 }
-
-export class Nip46CapacityError extends Error {}
-export class Nip46RelayUnavailableError extends Error {}
 
 export interface SessionStatus {
   status: Nip46SessionRecord["status"]
@@ -447,4 +445,5 @@ function getManager(): Nip46SessionManager {
 }
 
 export { getManager as getNip46SessionManager, Nip46SessionManager }
+export { Nip46CapacityError, Nip46RelayUnavailableError }
 export { getSession, SESSION_TTL_SECONDS }
