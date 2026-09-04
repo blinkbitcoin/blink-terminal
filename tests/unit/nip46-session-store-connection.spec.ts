@@ -17,7 +17,8 @@
 process.env.ENABLE_HYBRID_STORAGE = "true"
 // The drop tests expect a fast failure while a dropped client reconnects; the shared client's
 // initial-connect deadline defaults to 5s, which would make each such assertion take that long.
-process.env.REDIS_CONNECT_DEADLINE_MS = "100"
+const DEADLINE_MS = 100
+process.env.REDIS_CONNECT_DEADLINE_MS = String(DEADLINE_MS)
 
 type Handler = (...args: unknown[]) => void
 const handlers: Record<string, Handler[]> = {}
@@ -157,8 +158,14 @@ describe("Redis configured but the connection is unavailable", () => {
 
     // A read during the drop must NOT silently consult the Map and report the session gone —
     // that 404'd a session whose relay worker was still live.
+    const startedAt = Date.now()
     await expect(getSession(id)).rejects.toBeInstanceOf(Nip46StorageError)
     expect(redisCommands.get).not.toHaveBeenCalled()
+
+    // ...and it must fail IMMEDIATELY, not hold the request for the connect deadline. node-redis
+    // reconnects in the background and a command issued in the gap would reject at once anyway,
+    // so waiting only delayed every rate-limited endpoint and every fail-closed 503 (#75 review).
+    expect(Date.now() - startedAt).toBeLessThan(DEADLINE_MS / 2)
   })
 
   it("the same session is readable again after the client recovers — never split", async () => {
@@ -199,8 +206,12 @@ describe("Redis configured but the connection is unavailable", () => {
     expect(createClientMock).toHaveBeenCalledTimes(1)
 
     emit("error", new Error("Socket closed unexpectedly"))
+    const startedAt = Date.now()
     await expect(getSession("whatever")).rejects.toBeInstanceOf(Nip46StorageError)
     await expect(getSession("whatever")).rejects.toBeInstanceOf(Nip46StorageError)
+
+    // Neither call waited out the deadline: repeated calls during a reconnect must stay cheap.
+    expect(Date.now() - startedAt).toBeLessThan(DEADLINE_MS / 2)
 
     // Still the one client — node-redis owns the reconnect; we do not race it.
     expect(createClientMock).toHaveBeenCalledTimes(1)

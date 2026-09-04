@@ -22,7 +22,21 @@
  *    covers the handshake). On expiry the client is disposed so it cannot reconnect later as an
  *    orphan, and the caller gets a rejection.
  *  - ESTABLISHED recovery is left to node-redis's default unbounded strategy. Once a client has
- *    reported ready, a later drop reconnects it in the background.
+ *    reported ready, a later drop reconnects it in the background and callers fail IMMEDIATELY
+ *    in the meantime — they never wait out the deadline. Waiting there would only add latency:
+ *    disableOfflineQueue means a command issued during the gap rejects at once anyway, so the
+ *    wait delayed every rate-limited endpoint and every fail-closed 503 for no gain
+ *    (review of #75). The deadline is for FIRST establishment only.
+ *
+ * Because nothing waits for `ready` any more, the helper that did so is gone — with it the
+ * listener it registered per timeout and never removed, which accumulated until Node emitted
+ * MaxListenersExceededWarning (review of #75). The leak is fixed by the code path not existing.
+ *
+ * A failed initial connect is remembered briefly (UNAVAILABLE_BACKOFF_MS). Without that memo,
+ * consumers that run in sequence within one request each rebuild a client and each wait the full
+ * deadline — the rate limiter, then the session store, so a single cold-start request paid the
+ * deadline twice (review of #75). The window is short so a recovered Redis is picked up on the
+ * next request rather than being masked.
  *
  * Commands issued while disconnected reject immediately (disableOfflineQueue) rather than
  * queueing until a possibly-never reconnection.
@@ -41,9 +55,16 @@ function initialConnectDeadlineMs(): number {
 
 const UNREACHABLE = "Redis is configured but unreachable"
 
+/**
+ * How long a failed initial connect is remembered. Consumers arriving inside this window fail
+ * immediately instead of each paying the deadline again. Short, so recovery is noticed promptly.
+ */
+const UNAVAILABLE_BACKOFF_MS = 1500
+
 let client: RedisClientType | null = null
 let ready = false
 let initPromise: Promise<RedisClientType> | null = null
+let unavailableUntil = 0
 
 function buildClient(): RedisClientType {
   const c = createClient({
@@ -75,8 +96,8 @@ function buildClient(): RedisClientType {
  * The shared client, or a rejection when Redis is configured but the initial connection cannot
  * be established within the deadline.
  *
- * - Not ready and a client exists that is reconnecting (isOpen) → wait for it to report ready;
- *   do NOT build a second client.
+ * - Not ready and a client exists that is reconnecting (isOpen) → fail IMMEDIATELY and let
+ *   node-redis reconnect in the background; do NOT wait and do NOT build a second client.
  * - A client exists but is permanently closed (!isOpen) → dispose and build a fresh one, so a
  *   budget-exhausted initial attempt can still recover on the next call.
  * - The INITIAL connect is the only bounded phase; recovery of an established connection is
@@ -86,16 +107,16 @@ async function connectInitial(): Promise<RedisClientType> {
   if (client && ready) return client
 
   if (client && client.isOpen) {
-    // Dropped after connecting: node-redis is already reconnecting. Wait for `ready` with the
-    // same deadline; do not build a second client.
-    await waitForReady(client, initialConnectDeadlineMs())
-    ready = true
-    return client
+    // Dropped after connecting: node-redis is already reconnecting on its own. Fail now rather
+    // than holding the request for the deadline — a command issued during the gap would reject
+    // immediately anyway (disableOfflineQueue), so waiting only added latency. The `ready` event
+    // handler restores readiness when the reconnect lands; no second client is built.
+    throw new Error(UNREACHABLE)
   }
 
   if (client) {
     // Permanently closed (an earlier bounded attempt gave up). Start clean.
-    await client.quit().catch(() => undefined)
+    client.disconnect()
     client = null
   }
 
@@ -111,9 +132,13 @@ async function connectInitial(): Promise<RedisClientType> {
   } catch (error: unknown) {
     client = null
     ready = false
+    // Remember the failure briefly so the next consumer in this request fails fast instead of
+    // paying the whole deadline over again.
+    unavailableUntil = Date.now() + UNAVAILABLE_BACKOFF_MS
     throw error instanceof Error ? error : new Error(UNREACHABLE)
   }
   ready = true
+  unavailableUntil = 0
   return next
 }
 
@@ -143,22 +168,6 @@ function withDeadline<T>(
   })
 }
 
-/** Await `ready` on a client that is already connected/reconnecting, with the same deadline. */
-function waitForReady(c: RedisClientType, ms: number): Promise<void> {
-  if (ready) return Promise.resolve()
-  return new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new Error(UNREACHABLE))
-    }, ms)
-    const onReady = (): void => {
-      clearTimeout(timer)
-      resolve()
-    }
-    c.once("ready", onReady)
-    // If it never reports ready in time, reject; the caller treats it as unavailable.
-  })
-}
-
 /**
  * The shared Redis client, or null when Redis is not configured at all (the only null case;
  * callers treat that as "use the in-process backend").
@@ -170,6 +179,9 @@ function waitForReady(c: RedisClientType, ms: number): Promise<void> {
 export async function getSharedRedisClient(): Promise<RedisClientType | null> {
   if (process.env.ENABLE_HYBRID_STORAGE !== "true") return null
   if (client && ready) return client
+  // A recent initial connect already timed out: fail now rather than rebuilding and waiting the
+  // deadline again for every consumer in the same request.
+  if (Date.now() < unavailableUntil) throw new Error(UNREACHABLE)
   if (!initPromise) initPromise = connectInitial()
   try {
     return await initPromise
@@ -183,11 +195,24 @@ export function sharedRedisReady(): boolean {
   return ready
 }
 
-/** Test-only: close the shared client and reset all state so a test process can exit. */
+/**
+ * Test-only: close the shared client and reset all state so a test process can exit.
+ *
+ * Uses disconnect(), not quit(): quit() waits for a graceful exchange with the server, which
+ * never completes while the client is mid-reconnect, so cleanup hung (review of #75). This also
+ * matches how a timed-out initial connect is disposed.
+ */
 export async function __closeSharedRedisForTests(): Promise<void> {
   const c = client
   client = null
   ready = false
   initPromise = null
-  if (c) await c.quit().catch(() => undefined)
+  unavailableUntil = 0
+  if (c) {
+    try {
+      c.disconnect()
+    } catch {
+      // Already closed; nothing to release.
+    }
+  }
 }
