@@ -40,10 +40,12 @@ import { Nip46StorageError } from "../../lib/nip46-server/errors"
 import {
   __resetSessionStoreForTests,
   __closeSessionStoreRedisForTests,
+  consumeSession,
   createSession,
   generateBindingSecret,
   generateSessionId,
   getSession,
+  markApproved,
   sha256Hex,
 } from "../../lib/nip46-server/sessionStore"
 
@@ -79,15 +81,45 @@ beforeEach(async () => {
 })
 
 describe("Redis configured but the connection is unavailable", () => {
-  it("initial connect failure raises a storage error and writes nothing to memory", async () => {
+  it("initial connect failure degrades to memory, and the session stays there for its whole life (PR #71 regression)", async () => {
     redisCommands.connect.mockRejectedValue(new Error("ECONNREFUSED"))
 
     const id = generateSessionId()
-    await expect(createSession(seedInput(id))).rejects.toBeInstanceOf(Nip46StorageError)
+    const created = await createSession(seedInput(id))
+    expect(created.id).toBe(id)
 
-    // Nothing was written behind Redis's back: once Redis is up and empty, the id is gone.
+    // The record is memory-resident. Crucially it must REMAIN readable after Redis recovers —
+    // the earlier bug re-chose the backend from live connectivity on every op, so a recovered
+    // Redis made the session vanish while its relay worker was still running (this is the
+    // regression seen live on staging).
     redisCommands.connect.mockImplementation(async () => undefined)
-    expect(await memoryHas(id)).toBe(false)
+    redisCommands.get.mockResolvedValue(null) // recovered Redis has nothing under this id
+    const read = await getSession(id)
+    expect(read?.id).toBe(id)
+    expect(read?.status).toBe("pending")
+  })
+
+  it("a memory-resident session remains single-use consume-able after Redis recovers", async () => {
+    redisCommands.connect.mockRejectedValue(new Error("ECONNREFUSED"))
+
+    const id = generateSessionId()
+    const secret = generateBindingSecret()
+    const input = {
+      id,
+      bindingHash: sha256Hex(secret),
+      expectedUrl: `https://pos.example/api/nostr-connect/sessions/${id}/consume`,
+      challenge: "challenge-value",
+    }
+    await createSession(input)
+    await markApproved(id, "user-pubkey")
+
+    // Redis is back, but the session lives in memory and must consume there — exactly once.
+    redisCommands.connect.mockImplementation(async () => undefined)
+    const first = await consumeSession(id, secret)
+    expect(first.ok).toBe(true)
+    const second = await consumeSession(id, secret)
+    expect(second.ok).toBe(false)
+    expect(redisCommands.eval).not.toHaveBeenCalled() // never touched Redis
   })
 
   it("a client that dropped after connecting fails closed rather than falling back", async () => {
@@ -122,21 +154,21 @@ describe("Redis configured but the connection is unavailable", () => {
     expect(read?.status).toBe("pending")
   })
 
-  it("does not build a second client per failed attempt", async () => {
-    redisCommands.connect
-      .mockRejectedValueOnce(new Error("ECONNREFUSED"))
-      .mockImplementation(async () => undefined)
-
-    const id = generateSessionId()
-    await expect(createSession(seedInput(id))).rejects.toBeInstanceOf(Nip46StorageError)
-    // The failed initial connect leaves no client to reconnect, so the next attempt creates
-    // one — exactly one — and after THAT succeeds, further calls reuse it.
+  it("does not build a second client while one is live or reconnecting", async () => {
+    redisCommands.connect.mockImplementation(async () => undefined)
     redisCommands.set.mockResolvedValue("OK")
-    await createSession(seedInput(generateSessionId()))
-    await createSession(seedInput(generateSessionId()))
 
-    // One client for the failed attempt, one for the successful one; the third call reused it.
-    expect(createClientMock).toHaveBeenCalledTimes(2)
+    await createSession(seedInput(generateSessionId()))
+    expect(createClientMock).toHaveBeenCalledTimes(1)
+
+    // The connection drops; while node-redis reconnects, calls fail closed and no second
+    // client is built. (A failed INITIAL connect leaves no live client, so that path does retry
+    // connect once per call — the invariant is only that a live/reconnecting client is never
+    // duplicated.)
+    emit("error", new Error("Socket closed unexpectedly"))
+    await expect(getSession("whatever")).rejects.toBeInstanceOf(Nip46StorageError)
+    await expect(getSession("whatever")).rejects.toBeInstanceOf(Nip46StorageError)
+    expect(createClientMock).toHaveBeenCalledTimes(1)
   })
 
   it("while a dropped client reconnects, no additional client is created", async () => {
