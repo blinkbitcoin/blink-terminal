@@ -3,14 +3,18 @@
  *
  * Session store behaviour when Redis is configured but a command fails.
  *
- * The store must use ONE backend per session. Falling back to the in-process
- * Map per command split a session across two stores: a failed SET wrote the
- * record to memory, and the next GET — against a Redis that had recovered —
- * missed and reported the session as expired. Polling and consume then 404'd a
- * session whose relay worker was still running (PR #71 review).
+ * The store uses ONE backend per session, chosen at creation. Two failure
+ * classes are handled differently, and the distinction is the whole point:
  *
- * A command failure now raises Nip46StorageError, which the routes turn into a
- * retryable 503, and nothing is written to the Map behind Redis's back.
+ *  - The INITIAL write (createSession) failing is PRE-COMMIT: no backend is
+ *    chosen yet, so it degrades to the in-process Map and the session stays
+ *    usable end-to-end. This is the staging-regression fix — a readable but
+ *    write-rejecting Redis (OOM / can't-persist / readonly replica) used to
+ *    503 sign-in outright.
+ *  - A command failing on an ALREADY-committed Redis session (get / transition
+ *    / consume) is POST-COMMIT: degrading it would split a live session across
+ *    two stores, so it raises Nip46StorageError → retryable 503, and nothing is
+ *    written to the Map behind Redis's back (PR #71 review).
  */
 
 process.env.ENABLE_HYBRID_STORAGE = "true"
@@ -64,16 +68,42 @@ beforeEach(() => {
 })
 
 describe("Redis command failures", () => {
-  it("createSession reports a storage error instead of writing to memory", async () => {
+  it("createSession degrades to memory when the initial write is rejected", async () => {
+    // A reachable Redis that refuses the write (OOM / can't-persist / readonly).
     redisCommands.set.mockRejectedValue(FAULT)
 
     const id = generateSessionId()
-    await expect(createSession(seedInput(id))).rejects.toBeInstanceOf(Nip46StorageError)
+    // Pre-commit: sign-in must NOT 503 here. The record lands in the Map.
+    const record = await createSession(seedInput(id))
+    expect(record.id).toBe(id)
+    expect(record.status).toBe("pending")
 
-    // The crucial part: nothing was written behind Redis's back, so a later
-    // read cannot disagree with a recovered Redis.
+    // And it must be usable through the memory backend for the rest of its life,
+    // WITHOUT ever touching Redis again — memory is consulted first. If a later
+    // read hit Redis it would 404 the session whose relay worker is still live.
     redisCommands.get.mockResolvedValue(null)
-    expect(await getSession(id)).toBeNull()
+    const read = await getSession(id)
+    expect(read?.id).toBe(id)
+    expect(redisCommands.get).not.toHaveBeenCalled()
+  })
+
+  it("a memory-degraded session transitions and consumes through memory", async () => {
+    // Every Redis command is broken; a session created under this condition must
+    // still go pending -> approved -> consumed entirely in memory.
+    redisCommands.set.mockRejectedValue(FAULT)
+    redisCommands.eval.mockRejectedValue(FAULT)
+    redisCommands.get.mockRejectedValue(FAULT)
+
+    const id = generateSessionId()
+    const secret = generateBindingSecret()
+    const input = { ...seedInput(id), bindingHash: sha256Hex(secret) }
+
+    await createSession(input)
+    expect(await markApproved(id, "a".repeat(64))).toBe(true)
+
+    const result = await consumeSession(id, secret)
+    expect(result.ok).toBe(true)
+    expect(result.pubkey).toBe("a".repeat(64))
   })
 
   it("getSession reports a storage error rather than a false 'expired'", async () => {
