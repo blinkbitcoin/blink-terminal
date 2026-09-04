@@ -20,8 +20,8 @@ import type { NextApiRequest, NextApiResponse } from "next"
 
 import { buildClearNip46BindingCookie } from "../../../../../lib/auth/cookies"
 import { getNip46SessionManager, getSession } from "../../../../../lib/nip46-server"
+import { isBoundCaller, getSessionId } from "../../../../../lib/nip46-server/request"
 import { withRateLimit, RATE_LIMIT_POLL } from "../../../../../lib/rate-limit"
-import { isBoundCaller, getSessionId } from "../_shared"
 
 const NOT_FOUND = { error: "Session not found or expired" }
 

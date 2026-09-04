@@ -8,6 +8,13 @@
 export { Nip46CapacityError, Nip46RelayUnavailableError } from "./errors"
 export { getNip46Relays, DEFAULT_NIP46_RELAYS } from "./relays"
 export {
+  getBindingSecret,
+  getClientIp,
+  getRequestOrigin,
+  getSessionId,
+  isBoundCaller,
+} from "./request"
+export {
   Nip46Transport,
   Nip46TransportError,
   NOSTR_CONNECT_KIND,

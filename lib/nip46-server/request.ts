@@ -1,13 +1,18 @@
 /**
- * Helpers shared by the NIP-46 session routes.
+ * Request helpers shared by the NIP-46 session routes.
  *
- * Not an API route itself — the leading underscore keeps Next from routing it.
+ * These live in lib/, not under pages/api. Next's Pages Router special-cases
+ * only _app, _document and _error — every other file under pages/api becomes a
+ * real route, so this module was being built and served as
+ * /api/nostr-connect/sessions/_shared. It exports no default handler, so a
+ * request to it would have thrown at runtime (PR #71 review).
  */
 
 import type { NextApiRequest } from "next"
 
-import { NIP46_COOKIE_NAME } from "../../../../lib/auth/cookies"
-import { bindingMatches, sha256Hex } from "../../../../lib/nip46-server/sessionStore"
+import { NIP46_COOKIE_NAME } from "../auth/cookies"
+
+import { bindingMatches, sha256Hex } from "./sessionStore"
 
 /**
  * Absolute origin of this request, used to derive the canonical NIP-98 `u`

@@ -24,10 +24,9 @@ import {
   Nip46CapacityError,
   Nip46RelayUnavailableError,
 } from "../../../../lib/nip46-server"
+import { getClientIp, getRequestOrigin } from "../../../../lib/nip46-server/request"
 import { sha256Hex } from "../../../../lib/nip46-server/sessionStore"
 import { withRateLimit, RATE_LIMIT_AUTH } from "../../../../lib/rate-limit"
-
-import { getClientIp, getRequestOrigin } from "./_shared"
 
 async function handler(req: NextApiRequest, res: NextApiResponse): Promise<void> {
   if (req.method !== "POST") {

@@ -21,8 +21,12 @@ import {
   buildSessionCookie,
 } from "../../../../../lib/auth/cookies"
 import { getNip46SessionManager, getSession } from "../../../../../lib/nip46-server"
+import {
+  getBindingSecret,
+  isBoundCaller,
+  getSessionId,
+} from "../../../../../lib/nip46-server/request"
 import { withRateLimit, RATE_LIMIT_AUTH } from "../../../../../lib/rate-limit"
-import { getBindingSecret, isBoundCaller, getSessionId } from "../_shared"
 
 const NOT_FOUND = { error: "Session not found or expired" }
 
