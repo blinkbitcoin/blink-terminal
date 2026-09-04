@@ -282,13 +282,48 @@ describe("Nip46Transport.waitForConnectAck", () => {
     transport.close()
   })
 
-  it("also accepts the legacy 'ack' result", async () => {
+  /**
+   * Our client pubkey is public — it is in the `#p` filter of the REQ we send to
+   * every relay — so any relay observer can NIP-44-encrypt a reply to it from a
+   * key of their own. If a bare `"ack"` pinned the signer, that observer would
+   * be handed `get_public_key` and the NIP-98 challenge, and the victim's
+   * browser would consume an approval for the ATTACKER's identity. Only the
+   * secret, which never leaves the URI, may pin.
+   */
+  it("ignores a bare 'ack' from a key that does not know the secret", async () => {
+    const { transport, relay } = await openTransport()
+    const waiting = transport.waitForConnectAck({ secret: "s3cret", timeoutMs: 40 })
+
+    const attacker = "f".repeat(64)
+    relay.emit({ id: "1", result: "ack" }, attacker)
+
+    await expect(waiting).rejects.toThrow("connect ack timed out")
+    expect(transport.pinnedSignerPubkey).toBeNull()
+    transport.close()
+  })
+
+  it("still pins the real signer when the secret arrives after an attacker's ack", async () => {
     const { transport, relay } = await openTransport()
     const waiting = transport.waitForConnectAck({ secret: "s3cret", timeoutMs: 1000 })
 
-    relay.emit({ id: "1", result: "ack" })
+    // The attacker races first and must lose.
+    relay.emit({ id: "1", result: "ack" }, "f".repeat(64))
+    relay.emit({ id: "2", result: "s3cret" })
 
     await expect(waiting).resolves.toEqual({ signerPubkey: SIGNER })
+    expect(transport.pinnedSignerPubkey).toBe(SIGNER)
+    transport.close()
+  })
+
+  it("ignores a near-miss secret", async () => {
+    const { transport, relay } = await openTransport()
+    const waiting = transport.waitForConnectAck({ secret: "s3cret", timeoutMs: 40 })
+
+    relay.emit({ id: "1", result: "s3cre" })
+    relay.emit({ id: "2", result: "s3cretX" })
+    relay.emit({ id: "3", result: "" })
+
+    await expect(waiting).rejects.toThrow("connect ack timed out")
     transport.close()
   })
 

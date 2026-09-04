@@ -26,6 +26,8 @@
  * is never persisted (see sessionStore.ts, which holds TTL-bound metadata only).
  */
 
+import { timingSafeEqual } from "crypto"
+
 import {
   finalizeEvent,
   generateSecretKey,
@@ -275,10 +277,20 @@ export class Nip46Transport {
   /**
    * Wait for the signer's connect acknowledgement for `secret`.
    *
-   * Per NIP-46 the signer answers a nostrconnect:// handshake with the secret
-   * echoed back; some signers answer with "ack" instead, so both are accepted.
-   * The acknowledging author is pinned as the signer for the rest of the
-   * session and every later response is required to come from it.
+   * Per NIP-46 the signer answers a nostrconnect:// handshake by echoing the
+   * secret from the URI. Possession of that secret is the ONLY thing that
+   * distinguishes the real signer here, so nothing else may pin.
+   *
+   * In particular a bare `"ack"` result is rejected. Our client pubkey is
+   * public — it is in the `#p` filter of the REQ we send to every relay — so
+   * any relay observer can NIP-44-encrypt a response to it from a key of their
+   * own. Accepting `"ack"` would let such an observer win this race, be pinned
+   * as the signer, and receive `get_public_key` and the NIP-98 challenge; the
+   * victim's browser would then consume an approval for the attacker's
+   * identity. The secret never leaves the URI, so requiring it closes that.
+   *
+   * The acknowledging author is pinned for the rest of the session and every
+   * later response is required to come from it.
    */
   async waitForConnectAck(options: {
     secret: string
@@ -299,7 +311,7 @@ export class Nip46Transport {
       })
 
       this.ackListener = (event: NostrEvent, payload: RpcPayload): void => {
-        if (payload.result !== options.secret && payload.result !== "ack") return
+        if (!secretMatches(options.secret, payload.result)) return
         this.pinSigner(event.pubkey)
         settled.settle(() => resolve({ signerPubkey: event.pubkey }))
       }
@@ -457,6 +469,20 @@ interface RpcPayload {
   id?: string
   result?: string
   error?: string
+}
+
+/**
+ * Constant-time comparison of the connect-ack result against the session
+ * secret. The secret is what authenticates the signer, so it is compared like
+ * one — an early-exit compare would leak it a byte at a time to an observer who
+ * can publish guesses to the same relay.
+ */
+function secretMatches(expected: string, presented: string | undefined): boolean {
+  if (typeof presented !== "string") return false
+  const a = Buffer.from(expected)
+  const b = Buffer.from(presented)
+  if (a.length !== b.length) return false
+  return timingSafeEqual(a, b)
 }
 
 function onAbort(signal: AbortSignal, handler: () => void): () => void {
