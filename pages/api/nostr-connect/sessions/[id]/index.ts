@@ -18,7 +18,6 @@
 
 import type { NextApiRequest, NextApiResponse } from "next"
 
-import { buildClearNip46BindingCookie } from "../../../../../lib/auth/cookies"
 import { getNip46SessionManager, getSession } from "../../../../../lib/nip46-server"
 import {
   isBoundCaller,
@@ -53,7 +52,14 @@ async function handler(req: NextApiRequest, res: NextApiResponse): Promise<void>
 
     if (req.method === "DELETE") {
       await manager.cancel(sessionId)
-      res.setHeader("Set-Cookie", buildClearNip46BindingCookie())
+      // Deliberately does NOT clear the binding cookie. Cancellation's job is releasing the
+      // relay sockets; the cookie's lifetime tracks the SESSION — set by POST, replaced by the
+      // next POST, expired by TTL. The client fires this DELETE without awaiting it and then
+      // creates a replacement session immediately, so this response can land AFTER the new
+      // POST has set the replacement's cookie. Clearing here validated against the OLD
+      // session's binding but wiped the NEW one, leaving it unbound and 404-ing on every
+      // poll (PR #71 review). A stale cookie is harmless: the next read 404s and the client
+      // starts fresh.
       res.status(200).json({ status: "cancelled" })
       return
     }

@@ -21,14 +21,20 @@
  * Backed by Redis when ENABLE_HYBRID_STORAGE is set — the same flag that gates
  * the rest of the Redis stack — and by a per-process Map otherwise.
  *
- * ONE BACKEND PER SESSION. The backend is chosen by whether a Redis client is
- * connected, never per command: when Redis is in use, a command failure raises
- * Nip46StorageError rather than quietly writing to the Map. Falling back
- * per-command split a session across two stores — a failed SET wrote the record
- * to memory, and the next GET (Redis healthy again) missed in Redis and
- * reported the session as expired, 404-ing a session whose relay worker was
- * still running (PR #71 review). A transient fault now surfaces as a retryable
- * 503 instead of silently losing the session.
+ * ONE BACKEND PER SESSION. The backend is chosen by CONFIGURATION, never by
+ * whether Redis happens to be reachable right now: with ENABLE_HYBRID_STORAGE
+ * set, Redis is the backend and nothing is ever written to the Map. Any Redis
+ * unavailability — a command failure, a failed initial connection, or a client
+ * that dropped after connecting — raises Nip46StorageError, which the routes
+ * turn into a retryable 503.
+ *
+ * Both halves matter. Falling back per-command split a session across two
+ * stores (a failed SET wrote to memory; the next GET against a recovered Redis
+ * missed and 404'd a session whose relay worker was still running). Falling
+ * back on connection state did the same one layer up: a session created in
+ * memory during an outage vanished when Redis recovered, and a Redis-backed
+ * session read during a drop looked expired (PR #71 review). Failing closed on
+ * both keeps every session on exactly one backend for its whole life.
  */
 
 import crypto from "crypto"
@@ -96,19 +102,41 @@ if (cleanupTimer.unref) cleanupTimer.unref()
 
 let redisClient: RedisClientType | null = null
 let redisConnected = false
-let redisInitPromise: Promise<RedisClientType | null> | null = null
+let redisInitPromise: Promise<RedisClientType> | null = null
 
 function redisEnabled(): boolean {
   return process.env.ENABLE_HYBRID_STORAGE === "true"
 }
 
+/**
+ * The single Redis client, created once and reused across connection attempts.
+ *
+ * Returns null ONLY when Redis is not configured — that is the one case in which the
+ * in-process Map is the session backend. When Redis IS configured but unavailable (the
+ * initial connection failed, or a connected client has since dropped), this throws
+ * Nip46StorageError rather than returning null. Returning null there silently switched every
+ * subsequent operation to the Map, which split sessions across backends exactly as the
+ * header forbids: a session created in memory during an outage vanished when Redis recovered,
+ * and a Redis-backed session read during a drop 404'd while its relay worker was still live
+ * (PR #71 review). Failing closed turns both into a retryable 503.
+ *
+ * One client, not one per attempt: a failed connect used to null the client and build a fresh
+ * one on the next call. node-redis reconnects on its own; the same instance is kept and its
+ * readiness re-checked, so a recovering Redis is picked up without a pile of half-built clients.
+ */
 async function getRedisClient(): Promise<RedisClientType | null> {
   if (!redisEnabled()) return null
   if (redisClient && redisConnected) return redisClient
-  if (redisInitPromise) return redisInitPromise
 
-  redisInitPromise = (async () => {
-    try {
+  // A client exists but is not ready: it dropped after connecting. node-redis is already
+  // reconnecting it; `ready` will flip the flag back. Do NOT fall back to memory and do NOT
+  // build a second client — fail closed until it recovers.
+  if (redisClient) {
+    throw new Nip46StorageError("Redis is configured but currently disconnected")
+  }
+
+  if (!redisInitPromise) {
+    redisInitPromise = (async (): Promise<RedisClientType> => {
       const client = createClient({
         socket: {
           host: process.env.REDIS_HOST || "localhost",
@@ -122,28 +150,40 @@ async function getRedisClient(): Promise<RedisClientType | null> {
         console.error("NIP-46 session store Redis error:", err.message)
         redisConnected = false
       })
-      client.on("connect", () => {
+      // `ready` (not `connect`): the socket can be open before the handshake completes,
+      // and a command sent in that gap fails. Readiness is what "connected" means here.
+      client.on("ready", () => {
         redisConnected = true
       })
+      client.on("end", () => {
+        redisConnected = false
+      })
 
-      await client.connect()
+      try {
+        await client.connect()
+      } catch (error: unknown) {
+        // The initial connection never came up, so there is nothing for node-redis to
+        // reconnect. Leave `redisClient` unset so the next call retries from scratch — but
+        // that retry is the ONLY thing that happens; nothing is written to memory meanwhile.
+        redisConnected = false
+        throw error
+      }
+
       redisClient = client
       redisConnected = true
       return client
-    } catch (error: unknown) {
-      console.warn(
-        "NIP-46 session store Redis connection failed; falling back to in-memory:",
-        (error as Error).message,
-      )
-      redisConnected = false
-      redisClient = null
-      return null
-    } finally {
+    })().finally(() => {
       redisInitPromise = null
-    }
-  })()
+    })
+  }
 
-  return redisInitPromise
+  try {
+    return await redisInitPromise
+  } catch (error: unknown) {
+    throw new Nip46StorageError(
+      `Redis is configured but unavailable: ${(error as Error).message}`,
+    )
+  }
 }
 
 // ---------- Helpers ----------
@@ -203,8 +243,9 @@ export async function createSession(
     challenge: input.challenge,
   }
 
+  // Non-null means connected; configured-but-unavailable throws, unconfigured is null.
   const redis = await getRedisClient()
-  if (redis && redisConnected) {
+  if (redis) {
     try {
       await redis.set(REDIS_KEY_PREFIX + record.id, JSON.stringify(record), {
         // The Redis TTL is a garbage-collection bound, not the expiry rule:
@@ -225,8 +266,9 @@ export async function createSession(
 }
 
 export async function getSession(id: string): Promise<Nip46SessionRecord | null> {
+  // Non-null means connected; configured-but-unavailable throws, unconfigured is null.
   const redis = await getRedisClient()
-  if (redis && redisConnected) {
+  if (redis) {
     try {
       const raw = await redis.get(REDIS_KEY_PREFIX + id)
       if (!raw) return null
@@ -318,8 +360,9 @@ async function transition(
   id: string,
   options: TransitionOptions,
 ): Promise<TransitionResult> {
+  // Non-null means connected; configured-but-unavailable throws, unconfigured is null.
   const redis = await getRedisClient()
-  if (redis && redisConnected) {
+  if (redis) {
     try {
       return await transitionRedis(redis, id, options)
     } catch (error: unknown) {
@@ -407,8 +450,9 @@ export async function markFailed(
 }
 
 export async function deleteSession(id: string): Promise<void> {
+  // Non-null means connected; configured-but-unavailable throws, unconfigured is null.
   const redis = await getRedisClient()
-  if (redis && redisConnected) {
+  if (redis) {
     try {
       await redis.del(REDIS_KEY_PREFIX + id)
     } catch (error: unknown) {

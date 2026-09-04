@@ -292,7 +292,7 @@ describe("GET /api/nostr-connect/sessions/:id", () => {
 })
 
 describe("DELETE /api/nostr-connect/sessions/:id", () => {
-  it("cancels the session and clears the binding cookie", async () => {
+  it("cancels the session WITHOUT touching the binding cookie", async () => {
     getSessionMock.mockResolvedValue(pendingRecord())
 
     const res = makeRes()
@@ -303,7 +303,74 @@ describe("DELETE /api/nostr-connect/sessions/:id", () => {
 
     expect(managerMock.cancel).toHaveBeenCalledWith(SESSION_ID)
     expect(res._status).toBe(200)
-    expect(res._headers["Set-Cookie"]).toContain("Max-Age=0")
+    // The cookie's lifetime tracks the session (set by POST, replaced by the next POST,
+    // expired by TTL). Cancellation must not clear it — see the race below.
+    expect(res._headers["Set-Cookie"]).toBeUndefined()
+  })
+
+  /**
+   * PR #71 review: the client fires DELETE for the old session without awaiting it, then
+   * immediately POSTs a replacement. The DELETE request leaves carrying the OLD binding (so
+   * it passes isBoundCaller), but its response can land AFTER the new POST has set the
+   * REPLACEMENT's cookie. An unconditional clear on that response validated against the old
+   * session and wiped the new one, leaving it unbound — every subsequent poll 404'd a
+   * session whose relay worker was live. The DELETE response must carry no cookie mutation.
+   */
+  it("a delayed DELETE resolving after a replacement POST does not unbind the new session", async () => {
+    // Old session A is bound to BINDING_SECRET.
+    getSessionMock.mockResolvedValue(pendingRecord())
+
+    // Start the DELETE for A, but hold its cancel so the response is delayed.
+    let releaseCancel: () => void = () => {}
+    managerMock.cancel.mockImplementation(
+      () => new Promise<void>((resolve) => (releaseCancel = resolve)),
+    )
+    const deleteRes = makeRes()
+    const deleteInFlight = statusRoute(
+      makeReq({ method: "DELETE", query: { id: SESSION_ID }, cookies: cookies() }),
+      deleteRes,
+    )
+
+    // Meanwhile the replacement POST completes and sets B's binding cookie.
+    const NEW_SECRET = "n".repeat(64)
+    managerMock.create.mockResolvedValue({
+      sessionId: "b1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+      uri: "nostrconnect://x?relay=wss%3A%2F%2Fr.example&secret=s",
+      bindingSecret: NEW_SECRET,
+      expiresAt: Date.now() + 300_000,
+    })
+    const postRes = makeRes()
+    await createRoute(
+      makeReq({ method: "POST", headers: { "x-forwarded-for": "1.2.3.4" } }),
+      postRes,
+    )
+    const newCookie = postRes._headers["Set-Cookie"] as string
+    expect(newCookie).toContain(`blinkpos-nip46=${NEW_SECRET}`)
+
+    // Now A's delayed DELETE response lands.
+    releaseCancel()
+    await deleteInFlight
+
+    // It must not carry a clear — B's cookie survives.
+    expect(deleteRes._status).toBe(200)
+    expect(deleteRes._headers["Set-Cookie"]).toBeUndefined()
+
+    // ...and B is still reachable with its own binding.
+    getSessionMock.mockResolvedValue({
+      ...pendingRecord(),
+      id: "b1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+      bindingHash: sha256Hex(NEW_SECRET),
+    })
+    const pollRes = makeRes()
+    await statusRoute(
+      makeReq({
+        method: "GET",
+        query: { id: "b1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6" },
+        cookies: cookies(NEW_SECRET),
+      }),
+      pollRes,
+    )
+    expect(pollRes._status).toBe(200)
   })
 
   it("refuses to cancel someone else's session", async () => {
