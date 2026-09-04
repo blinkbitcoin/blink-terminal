@@ -156,9 +156,29 @@ interface HealthCheckResult {
   redis: boolean
   postgres: boolean
   overall: boolean
+  /**
+   * Whether Redis accepted a WRITE, not just a PING.
+   *
+   * A Redis that is out of memory, cannot persist to disk (MISCONF), is a
+   * read-only replica, or is ACL-restricted answers PING perfectly while
+   * refusing every write. That state took NIP-46 sign-in down on staging while
+   * this endpoint still reported `redis: up`, so readiness is probed with an
+   * actual write. Meaningless (and left false) when `redis` is false.
+   */
+  redisWritable: boolean
+  /** The Redis error that failed the ping or the write probe, when one did. */
+  redisError?: string
 }
 
 type RedisClient = ReturnType<typeof createClient>
+
+/**
+ * Key written by the health check's write probe. Namespaced like the rest of
+ * this app's keys, and short-lived so repeated health checks cannot accumulate
+ * anything — the value is never read back.
+ */
+const HEALTH_PROBE_KEY = "blink-terminal:health:probe"
+const HEALTH_PROBE_TTL_SECONDS = 30
 
 class HybridStore {
   private redis: RedisClient | null
@@ -958,15 +978,38 @@ class HybridStore {
       redis: false,
       postgres: false,
       overall: false,
+      redisWritable: false,
     }
 
-    // Check Redis
+    // Check Redis: reachable (PING) AND accepting writes.
+    //
+    // PING alone is not a readiness signal. An out-of-memory, MISCONF
+    // (cannot-persist-to-disk), read-only-replica or ACL-restricted Redis
+    // answers PING while refusing every write — which is precisely how a
+    // multi-hour NIP-46 sign-in outage stayed invisible here. The probe key is
+    // namespaced and carries a short TTL, so it needs no cleanup and cannot
+    // accumulate.
     if (this.isRedisConnected) {
       try {
         await this.redis!.ping()
         health.redis = true
       } catch (error: unknown) {
+        health.redisError = error instanceof Error ? error.message : String(error)
         console.error("Redis health check failed:", error)
+      }
+
+      if (health.redis) {
+        try {
+          await this.redis!.set(HEALTH_PROBE_KEY, String(Date.now()), {
+            EX: HEALTH_PROBE_TTL_SECONDS,
+          })
+          health.redisWritable = true
+        } catch (error: unknown) {
+          // Reachable but refusing writes. The message names the real cause
+          // (e.g. "OOM command not allowed when used memory > 'maxmemory'").
+          health.redisError = error instanceof Error ? error.message : String(error)
+          console.error("Redis write probe failed:", error)
+        }
       }
     }
 

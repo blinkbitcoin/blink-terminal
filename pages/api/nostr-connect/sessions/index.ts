@@ -28,6 +28,7 @@ import {
   getClientIp,
   getRequestOrigin,
   respondToStorageError,
+  warnIfInsecureOrigin,
 } from "../../../../lib/nip46-server/request"
 import { sha256Hex } from "../../../../lib/nip46-server/sessionStore"
 import { withRateLimit, RATE_LIMIT_AUTH } from "../../../../lib/rate-limit"
@@ -40,11 +41,15 @@ async function handler(req: NextApiRequest, res: NextApiResponse): Promise<void>
   }
 
   const previousSecret = req.cookies[NIP46_COOKIE_NAME]
+  const origin = getRequestOrigin(req)
+  // A plain-HTTP non-localhost origin means the Secure binding cookie below is
+  // dropped by the browser and this sign-in cannot succeed. Say so once.
+  warnIfInsecureOrigin(origin)
 
   try {
     const created = await getNip46SessionManager().create({
       ip: getClientIp(req),
-      origin: getRequestOrigin(req),
+      origin,
       // Supersede this browser's previous attempt instead of stacking sockets.
       previousBindingHash: previousSecret ? sha256Hex(previousSecret) : undefined,
     })

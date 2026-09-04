@@ -20,6 +20,8 @@ const logger = baseLogger.child({ module: "health" })
 interface CheckResult {
   status: string
   enabled?: boolean
+  /** Redis only: whether a write probe succeeded, not just a PING. */
+  writable?: boolean
   error?: string
   storage?: string
   stats?: unknown
@@ -90,9 +92,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         const hybridStore = await getHybridStore()
         const storageHealth = await hybridStore.healthCheck()
 
+        // "up" requires Redis to accept a WRITE, not merely answer PING. A
+        // Redis that is out of memory, cannot persist to disk, or is a
+        // read-only replica pings fine while refusing writes; reporting that as
+        // "up" is what hid a multi-hour NIP-46 sign-in outage on staging.
+        const redisWriteRejected = storageHealth.redis && !storageHealth.redisWritable
         health.checks.redis = {
-          status: storageHealth.redis ? "up" : "down",
+          status: !storageHealth.redis ? "down" : redisWriteRejected ? "degraded" : "up",
           enabled: true,
+          writable: storageHealth.redisWritable,
+          error: storageHealth.redisError,
         }
 
         health.checks.postgres = {
@@ -104,8 +113,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         if (!storageHealth.postgres) {
           health.status = "unhealthy"
         }
-        // If Redis is down but PostgreSQL is up, service is degraded
-        else if (!storageHealth.redis) {
+        // Redis down, or reachable but refusing writes, degrades the service
+        // without failing it: sign-in and rate limiting fall back to in-process
+        // state, so the app still serves. Degraded stays HTTP 200 deliberately
+        // — a non-fatal condition must not restart-loop the container.
+        else if (!storageHealth.redis || redisWriteRejected) {
           health.status = "degraded"
         }
       } catch (error: unknown) {
