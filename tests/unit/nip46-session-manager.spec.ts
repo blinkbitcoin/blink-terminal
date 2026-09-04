@@ -29,6 +29,8 @@ interface TransportConfig {
   responses?: Record<string, string | Error>
   /** When set, sign_event waits on this before answering. */
   signGate?: Promise<void>
+  /** When set, open() waits on this — the barrier for concurrent-create tests. */
+  openGate?: Promise<void>
 }
 
 /**
@@ -47,6 +49,7 @@ class FakeTransport {
   ackError: Error | null = null
   responses: Record<string, string | Error>
   signGate: Promise<void> | null
+  openGate: Promise<void> | null
   requested: { method: string; params: string[] }[] = []
 
   constructor() {
@@ -55,10 +58,12 @@ class FakeTransport {
     this.ackError = config.ackError ?? null
     this.responses = config.responses ?? { ...HAPPY_PATH_RESPONSES }
     this.signGate = config.signGate ?? null
+    this.openGate = config.openGate ?? null
     transports.push(this)
   }
 
   async open(): Promise<{ readyRelays: string[] }> {
+    if (this.openGate) await this.openGate
     if (this.openError) throw this.openError
     return { readyRelays: this.readyRelays }
   }
@@ -198,6 +203,103 @@ describe("create", () => {
     await expect(
       manager.create({ ip: "2.2.2.2", origin: ORIGIN }),
     ).rejects.toBeInstanceOf(Nip46CapacityError)
+  })
+
+  /**
+   * Caps must bind on CONCURRENT creates, not just sequential ones.
+   *
+   * Relay setup takes up to RELAY_READY_TIMEOUT_MS, and the session only became
+   * visible in `live` afterwards. Every create in a burst therefore saw the same
+   * count and none of them blocked, so a burst could open unbounded relay
+   * sockets and blow through both caps (PR #71 review). These hold every create
+   * inside open() on one barrier, so they are all in flight simultaneously.
+   */
+  describe("concurrent creates", () => {
+    /** Release-on-demand barrier that all in-flight transports wait on. */
+    function barrier(): { release: () => void } {
+      let release!: () => void
+      nextTransportConfig = {
+        openGate: new Promise<void>((resolve) => {
+          release = resolve
+        }),
+      }
+      return { release }
+    }
+
+    it("enforces the per-IP cap against a simultaneous burst", async () => {
+      process.env.NIP46_MAX_SESSIONS_PER_IP = "2"
+      const gate = barrier()
+
+      // All three enter create() before any of them finishes opening.
+      const attempts = [
+        manager.create({ ip: "1.2.3.4", origin: ORIGIN }),
+        manager.create({ ip: "1.2.3.4", origin: ORIGIN }),
+        manager.create({ ip: "1.2.3.4", origin: ORIGIN }),
+      ]
+      const settled = attempts.map((p) => p.catch((error: unknown) => error))
+
+      // The third is rejected synchronously, before any relay work happens.
+      expect(transports).toHaveLength(2)
+
+      gate.release()
+      const results = await Promise.all(settled)
+
+      const rejected = results.filter((r) => r instanceof Nip46CapacityError)
+      expect(rejected).toHaveLength(1)
+      expect(results.filter((r) => !(r instanceof Error))).toHaveLength(2)
+      expect(manager.liveCount).toBe(2)
+      expect(manager.__reservedCount).toBe(0)
+    })
+
+    it("enforces the global cap against a simultaneous burst from many IPs", async () => {
+      process.env.NIP46_MAX_SESSIONS = "3"
+      const gate = barrier()
+
+      const attempts = Array.from({ length: 6 }, (_unused, i) =>
+        manager.create({ ip: `10.0.0.${i}`, origin: ORIGIN }),
+      )
+      const settled = attempts.map((p) => p.catch((error: unknown) => error))
+
+      expect(transports).toHaveLength(3)
+
+      gate.release()
+      const results = await Promise.all(settled)
+
+      expect(results.filter((r) => r instanceof Nip46CapacityError)).toHaveLength(3)
+      expect(manager.liveCount).toBe(3)
+      expect(manager.__reservedCount).toBe(0)
+    })
+
+    it("releases the reservation when relay setup fails, freeing the slot", async () => {
+      process.env.NIP46_MAX_SESSIONS_PER_IP = "1"
+      nextTransportConfig = { openError: new Error("all relays failed to connect") }
+
+      await expect(
+        manager.create({ ip: "1.2.3.4", origin: ORIGIN }),
+      ).rejects.toBeInstanceOf(Nip46RelayUnavailableError)
+
+      expect(manager.__reservedCount).toBe(0)
+      expect(manager.liveCount).toBe(0)
+
+      // The failed attempt must not have permanently consumed the client's slot.
+      stayPending()
+      await expect(
+        manager.create({ ip: "1.2.3.4", origin: ORIGIN }),
+      ).resolves.toBeDefined()
+    })
+
+    it("frees a slot again once a session finishes", async () => {
+      process.env.NIP46_MAX_SESSIONS_PER_IP = "1"
+
+      const first = await manager.create({ ip: "1.2.3.4", origin: ORIGIN })
+      await settleWorker()
+      // The happy path completes and tears down, releasing the slot.
+      expect(manager.isLive(first.sessionId)).toBe(false)
+
+      await expect(
+        manager.create({ ip: "1.2.3.4", origin: ORIGIN }),
+      ).resolves.toBeDefined()
+    })
   })
 
   it("supersedes the caller's previous session instead of stacking sockets", async () => {

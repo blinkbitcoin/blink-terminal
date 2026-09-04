@@ -112,6 +112,14 @@ class Nip46SessionManager {
   private readonly live = new Map<string, LiveSession>()
 
   /**
+   * Sessions that have taken a capacity slot but are not live yet (relay setup
+   * and persistence are still in flight). Counted alongside `live` so a burst of
+   * concurrent creates cannot all slip through the caps together.
+   */
+  private readonly reservedByIp = new Map<string, number>()
+  private reservedTotal = 0
+
+  /**
    * Create a session: mint the ephemeral key, get at least one relay listening,
    * and only then hand back the URI. The ordering is the whole point of #70 —
    * see transport.ts.
@@ -123,68 +131,97 @@ class Nip46SessionManager {
       this.cancelByBindingHash(options.previousBindingHash)
     }
 
-    this.enforceCaps(options.ip)
+    // Capacity is reserved SYNCHRONOUSLY, before the first await. Checking the
+    // caps and then inserting into `live` only after relay setup left a window
+    // of up to RELAY_READY_TIMEOUT_MS in which every concurrent create observed
+    // the same count, so a burst could open unbounded sockets and blow straight
+    // through both caps (PR #71 review). Node runs this synchronous prologue to
+    // completion before any other request resumes, so the reservation is the
+    // serialisation point.
+    this.reserve(options.ip)
 
-    const sessionId = generateSessionId()
-    const bindingSecret = generateBindingSecret()
-    const challenge = generateSessionChallenge()
-    const relays = options.relays ?? getNip46Relays()
-
-    const transport = new Nip46Transport({ relays, pool: options.pool })
-    const controller = new AbortController()
+    let reservationHeld = true
+    const releaseReservation = (): void => {
+      if (!reservationHeld) return
+      reservationHeld = false
+      this.releaseReservation(options.ip)
+    }
 
     try {
-      await transport.open({
-        timeoutMs: RELAY_READY_TIMEOUT_MS,
-        signal: controller.signal,
+      const sessionId = generateSessionId()
+      const bindingSecret = generateBindingSecret()
+      const challenge = generateSessionChallenge()
+      const relays = options.relays ?? getNip46Relays()
+
+      const transport = new Nip46Transport({ relays, pool: options.pool })
+      const controller = new AbortController()
+
+      try {
+        await transport.open({
+          timeoutMs: RELAY_READY_TIMEOUT_MS,
+          signal: controller.signal,
+        })
+      } catch (error: unknown) {
+        transport.close()
+        throw new Nip46RelayUnavailableError((error as Error).message)
+      }
+
+      const secret = generateSessionChallenge().slice(0, 32)
+      const expectedUrl = buildConsumeUrl(options.origin, sessionId)
+      const uri = buildNostrConnectUri({
+        clientPubkey: transport.clientPubkey,
+        relays,
+        secret,
+        appOrigin: options.origin,
       })
-    } catch (error: unknown) {
-      transport.close()
-      throw new Nip46RelayUnavailableError((error as Error).message)
-    }
 
-    const secret = generateSessionChallenge().slice(0, 32)
-    const expectedUrl = buildConsumeUrl(options.origin, sessionId)
-    const uri = buildNostrConnectUri({
-      clientPubkey: transport.clientPubkey,
-      relays,
-      secret,
-      appOrigin: options.origin,
-    })
+      let record
+      try {
+        record = await createSession({
+          id: sessionId,
+          bindingHash: sha256Hex(bindingSecret),
+          expectedUrl,
+          challenge,
+        })
+      } catch (error: unknown) {
+        // Nothing is live yet, so the socket would otherwise leak.
+        transport.close()
+        throw error
+      }
 
-    const record = await createSession({
-      id: sessionId,
-      bindingHash: sha256Hex(bindingSecret),
-      expectedUrl,
-      challenge,
-    })
+      const session: LiveSession = {
+        id: sessionId,
+        ip: options.ip,
+        bindingHash: record.bindingHash,
+        transport,
+        controller,
+        createdAt: record.createdAt,
+      }
+      // Convert the reservation into a live entry in one synchronous step, so
+      // the session is never counted twice or not at all.
+      this.live.set(sessionId, session)
+      releaseReservation()
 
-    const session: LiveSession = {
-      id: sessionId,
-      ip: options.ip,
-      bindingHash: record.bindingHash,
-      transport,
-      controller,
-      createdAt: record.createdAt,
-    }
-    this.live.set(sessionId, session)
+      // Detached: the browser polls for the outcome.
+      this.runWorker(session, {
+        secret,
+        challenge,
+        expectedUrl,
+        expiresAt: record.expiresAt,
+      }).catch((error: unknown) => {
+        console.error("[nip46] worker crashed:", (error as Error).message)
+      })
 
-    // Detached: the browser polls for the outcome.
-    this.runWorker(session, {
-      secret,
-      challenge,
-      expectedUrl,
-      expiresAt: record.expiresAt,
-    }).catch((error: unknown) => {
-      console.error("[nip46] worker crashed:", (error as Error).message)
-    })
-
-    return {
-      sessionId,
-      uri,
-      bindingSecret,
-      expiresAt: record.expiresAt,
-      readyRelays: transport.readyRelays,
+      return {
+        sessionId,
+        uri,
+        bindingSecret,
+        expiresAt: record.expiresAt,
+        readyRelays: transport.readyRelays,
+      }
+    } finally {
+      // No-op when the reservation already became a live session.
+      releaseReservation()
     }
   }
 
@@ -353,17 +390,35 @@ class Nip46SessionManager {
     }
   }
 
-  private enforceCaps(ip: string): void {
-    if (this.live.size >= maxSessionsGlobal()) {
-      throw new Nip46CapacityError("too many concurrent sign-in sessions")
-    }
-    let perIp = 0
+  /**
+   * Take a capacity slot, counting sessions that are live AND those still being
+   * set up. Throws without reserving when either cap is reached.
+   */
+  private reserve(ip: string): void {
+    let perIp = this.reservedByIp.get(ip) ?? 0
     for (const session of this.live.values()) {
       if (session.ip === ip) perIp += 1
+    }
+
+    if (this.live.size + this.reservedTotal >= maxSessionsGlobal()) {
+      throw new Nip46CapacityError("too many concurrent sign-in sessions")
     }
     if (perIp >= maxSessionsPerIp()) {
       throw new Nip46CapacityError("too many concurrent sign-in sessions for this client")
     }
+
+    this.reservedTotal += 1
+    this.reservedByIp.set(ip, (this.reservedByIp.get(ip) ?? 0) + 1)
+  }
+
+  private releaseReservation(ip: string): void {
+    this.reservedTotal = Math.max(0, this.reservedTotal - 1)
+    const remaining = (this.reservedByIp.get(ip) ?? 1) - 1
+    if (remaining > 0) {
+      this.reservedByIp.set(ip, remaining)
+      return
+    }
+    this.reservedByIp.delete(ip)
   }
 
   /** Abort the worker and release the sockets. Idempotent. */
@@ -393,6 +448,13 @@ class Nip46SessionManager {
   /** Test-only. */
   __resetForTests(): void {
     for (const id of [...this.live.keys()]) this.teardown(id)
+    this.reservedByIp.clear()
+    this.reservedTotal = 0
+  }
+
+  /** Test-only: capacity slots taken by in-flight creates. */
+  get __reservedCount(): number {
+    return this.reservedTotal
   }
 }
 
