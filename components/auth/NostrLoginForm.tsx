@@ -20,7 +20,6 @@ import { isPasswordAuthEnabled } from "../../lib/config/features"
 import { useNostrAuth } from "../../lib/hooks/useNostrAuth"
 import { useTheme } from "../../lib/hooks/useTheme"
 import NostrAuthService from "../../lib/nostr/NostrAuthService"
-import NostrConnectService from "../../lib/nostr/NostrConnectService"
 import { AUTH_VERSION_FULL, logAuth, logAuthError } from "../../lib/version"
 
 import NostrConnectModal from "./NostrConnectModal"
@@ -62,7 +61,6 @@ export default function NostrLoginForm() {
   // NIP-46 Nostr Connect state
   // Modal handles the full sign-in flow internally
   const [showNostrConnectModal, setShowNostrConnectModal] = useState<boolean>(false)
-  const [nostrConnectURI, setNostrConnectURI] = useState<string>("")
 
   // Ref to prevent multiple rapid sign-in attempts (refs don't trigger re-renders)
   const signingInRef = useRef<boolean>(false)
@@ -368,21 +366,14 @@ export default function NostrLoginForm() {
   }
 
   // NIP-46 Nostr Connect handlers
-  const handleNostrConnectSignIn = async () => {
+  //
+  // The nostrconnect:// URI is minted by the server (issue #70), which
+  // subscribes to the signer's reply BEFORE handing the URI back. The modal owns
+  // that request so it can show its own progress and error states.
+  const handleNostrConnectSignIn = () => {
     logAuth("NostrLoginForm", "Starting Nostr Connect flow")
     setLocalError(null)
-
-    try {
-      // Generate the nostrconnect:// URI
-      const uri = NostrConnectService.generateConnectionURI()
-      setNostrConnectURI(uri)
-      setShowNostrConnectModal(true)
-
-      logAuth("NostrLoginForm", "Generated URI, showing modal")
-    } catch (err: unknown) {
-      logAuthError("NostrLoginForm", "Failed to generate connection URI:", err)
-      setLocalError("Failed to start Nostr Connect: " + (err as Error).message)
-    }
+    setShowNostrConnectModal(true)
   }
 
   // Handle successful Nostr Connect sign-in
@@ -394,7 +385,6 @@ export default function NostrLoginForm() {
       pubkey?.substring(0, 16) + "...",
     )
     setShowNostrConnectModal(false)
-    setNostrConnectURI("")
     // Navigation will happen automatically via auth state change
   }, [])
 
@@ -402,7 +392,6 @@ export default function NostrLoginForm() {
   const handleNostrConnectClose = () => {
     logAuth("NostrLoginForm", "Closing Nostr Connect modal")
     setShowNostrConnectModal(false)
-    setNostrConnectURI("")
   }
 
   // v29: The modal now handles the full connection flow internally,
@@ -1356,7 +1345,6 @@ export default function NostrLoginForm() {
           {/* v32: Nostr Connect Modal - handles full sign-in flow with progress UI */}
           {showNostrConnectModal && (
             <NostrConnectModal
-              uri={nostrConnectURI}
               onSuccess={handleNostrConnectSuccess}
               onCancel={handleNostrConnectClose}
               signInWithNostrConnect={signInWithNostrConnect}

@@ -20,7 +20,22 @@ jobs:
     name: Unit Tests
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    
+
+    # The NIP-46 session store's exactly-once consume is enforced by a Lua CAS
+    # inside Redis. That guarantee cannot be exercised against the in-memory
+    # fallback (single-threaded, so the interleaving never occurs), so the
+    # concurrency suite needs a real server.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -39,6 +54,11 @@ jobs:
 
       - name: Run unit tests with coverage
         run: pnpm run test:unit:coverage
+        env:
+          # Opts the real-Redis concurrency suite in; it is skipped otherwise.
+          NIP46_REDIS_TEST: '1'
+          REDIS_HOST: localhost
+          REDIS_PORT: '6379' 
 
       - name: Generate test summary
         if: always()

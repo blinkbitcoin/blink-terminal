@@ -24,9 +24,20 @@ import { resourceFromAttributes } from "@opentelemetry/resources"
 import { NodeSDK } from "@opentelemetry/sdk-node"
 import { BatchSpanProcessor } from "@opentelemetry/sdk-trace-node"
 import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions"
+import WebSocket from "ws"
 
 const serviceName = process.env.TRACING_SERVICE_NAME || "bbt"
 const otlpEndpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT
+
+/**
+ * Node 20 has no global WebSocket, and nostr-tools' relay pool reaches for
+ * `globalThis.WebSocket`. The server-held NIP-46 sign-in sessions
+ * (lib/nip46-server) open relay sockets outside any request, so the polyfill
+ * has to be installed at process start rather than inside a route module.
+ */
+if (typeof globalThis.WebSocket === "undefined") {
+  Object.assign(globalThis, { WebSocket })
+}
 
 /**
  * Only initialize tracing when an OTLP collector endpoint is configured.

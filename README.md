@@ -59,7 +59,8 @@ A powerful Bitcoin Lightning terminal for Blink power users. Execute advanced op
 
 ### Authentication
 
-- **Nostr Authentication**: NIP-07 (browser extensions) and NIP-55 (external signers like Amber)
+- **Nostr Authentication**: NIP-07 (browser extensions), NIP-55 (external signers like Amber) and NIP-46 (Nostr Connect / remote signers)
+- **Server-held NIP-46 sessions**: the relay subscription for a Nostr Connect sign-in lives on the server, so opening the signer app (which backgrounds the browser tab) cannot lose the signer's one-shot response
 - **Cross-Device Sync**: Profile settings and credentials sync across devices when authenticated via Nostr
 - **Encrypted Storage**: Client-side encryption for sensitive credentials (API keys, NWC URIs)
 
@@ -233,11 +234,20 @@ DATABASE_URL=postgresql://blinkpos:password@localhost:5432/blinkpos
 
 ### Authentication
 
-| Endpoint                | Method | Description                     |
-| ----------------------- | ------ | ------------------------------- |
-| `POST /api/auth/login`  | POST   | Authenticate with Blink API key |
-| `POST /api/auth/logout` | POST   | Clear user session              |
-| `GET /api/auth/verify`  | GET    | Verify current session          |
+| Endpoint                                       | Method | Description                                     |
+| ---------------------------------------------- | ------ | ----------------------------------------------- |
+| `POST /api/auth/login`                         | POST   | Authenticate with Blink API key                 |
+| `POST /api/auth/logout`                        | POST   | Clear user session                              |
+| `GET /api/auth/verify`                         | GET    | Verify current session                          |
+| `POST /api/auth/nostr-login`                   | POST   | NIP-98 login (extension / generated keys)       |
+| `POST /api/nostr-connect/sessions`             | POST   | Start a NIP-46 sign-in; returns a ready URI     |
+| `GET /api/nostr-connect/sessions/:id`          | GET    | Poll session status (never mints a cookie)      |
+| `POST /api/nostr-connect/sessions/:id/consume` | POST   | Consume the approval and set the session cookie |
+| `DELETE /api/nostr-connect/sessions/:id`       | DELETE | Cancel a session and release its relay sockets  |
+
+The NIP-46 endpoints are bound to the browser that created the session by an
+HttpOnly `SameSite=Strict` cookie; the session id alone is not a login
+capability. See `lib/nip46-server/` for the transport and session model.
 
 ### Blink Integration
 

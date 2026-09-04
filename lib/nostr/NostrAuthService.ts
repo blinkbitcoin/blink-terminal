@@ -146,22 +146,35 @@ interface DebugChallengeInfo {
 // ============= NostrConnect service type (dynamic imports) =============
 
 /**
- * Minimal interface for the dynamically imported NostrConnect services.
- * The UnsignedEvent parameter includes an index signature for
- * compatibility with the imported .js services.
+ * Storage keys written by the removed browser-held NIP-46 implementation
+ * (issue #70). Nothing reads them any more; they are purged so a stale signer
+ * session cannot linger in a returning user's browser indefinitely.
  */
-interface NostrConnectServiceLike {
-  isConnected: () => boolean
-  signEvent: (
-    event: UnsignedEvent,
-    maxRetries?: number,
-    signal?: AbortSignal,
-  ) => Promise<{
-    success: boolean
-    event?: SignedEvent
-    error?: string
-    errorType?: string
-  }>
+const LEGACY_NIP46_KEYS = [
+  "blinkpos_nip46_session",
+  "blinkpos_nip46_clientkey",
+  "blinkpos_nip46_pending",
+] as const
+
+/**
+ * Drop the browser-held NIP-46 leftovers. Best-effort and idempotent: storage
+ * access can throw (private mode, disabled storage) and a failure here must
+ * never block sign-in.
+ */
+function purgeLegacyNip46Storage(): void {
+  if (typeof window === "undefined") return
+  for (const key of LEGACY_NIP46_KEYS) {
+    try {
+      window.localStorage?.removeItem(key)
+    } catch {
+      // ignore
+    }
+    try {
+      window.sessionStorage?.removeItem(key)
+    } catch {
+      // ignore
+    }
+  }
 }
 
 // Use localStorage for signer flow (persists across page reloads/redirects)
@@ -561,9 +574,11 @@ class NostrAuthService {
 
   /**
    * Sign in with Nostr Connect (NIP-46)
-   * Called after successful NIP-46 connection via NostrConnectService
    *
-   * @param publicKey - Public key from connected remote signer
+   * Called after the SERVER has verified the signer's kind-27235 signature and
+   * the browser has consumed the resulting session (issue #70).
+   *
+   * @param publicKey - Public key the server verified for this session
    * @returns {AuthResult}
    */
   static signInWithNostrConnect(publicKey: string): AuthResult {
@@ -574,6 +589,10 @@ class NostrAuthService {
       }
 
       const normalizedPublicKey = publicKey.toLowerCase()
+
+      // A successful server-side sign-in supersedes anything the old
+      // browser-held implementation may have left behind.
+      purgeLegacyNip46Storage()
 
       // Store auth data with nostrConnect method
       this.storeAuthData(normalizedPublicKey, "nostrConnect")
@@ -1104,42 +1123,16 @@ class NostrAuthService {
       }
       return this.signEventWithPrivateKey(event, privateKey)
     } else if (method === "nostrConnect") {
-      // Sign with remote signer via NIP-46
-      return this.signEventWithNostrConnect(event, signal)
+      // Since issue #70 the NIP-46 conversation lives on the server and exists
+      // only for the duration of one sign-in, so there is no browser-side signer
+      // to reach here. Sign-in goes through the server session endpoints
+      // (lib/nostr/NostrConnectClient); nothing else needs remote signing.
+      throw new Error(
+        "Nostr Connect signing is handled server-side. Please sign in again.",
+      )
     }
 
     throw new Error(`Unknown sign-in method: ${method}`)
-  }
-
-  /**
-   * Sign event using Nostr Connect (NIP-46)
-   *
-   * @param event
-   * @returns {Promise<SignedEvent>}
-   */
-  static async signEventWithNostrConnect(
-    event: UnsignedEvent,
-    signal?: AbortSignal,
-  ): Promise<SignedEvent> {
-    if (signal?.aborted) throw new Error("aborted")
-    const NostrConnectService: NostrConnectServiceLike = (
-      await import("./NostrConnectService")
-    ).default
-
-    if (!NostrConnectService.isConnected()) {
-      throw new Error("Nostr Connect session not active. Please reconnect.")
-    }
-
-    // Forward the signal into the relay round-trip so a cancelled caller cannot leave a
-    // signing request outstanding (PR #66 review).
-    const result = await NostrConnectService.signEvent(event, 3, signal)
-    if (signal?.aborted) throw new Error("aborted")
-
-    if (!result.success) {
-      throw new Error(result.error || "Failed to sign event via Nostr Connect")
-    }
-
-    return result.event!
   }
 
   /**
@@ -1365,6 +1358,7 @@ class NostrAuthService {
     localStorage.removeItem(SIGN_IN_STORAGE_KEY)
     // Clear session private key from memory
     this.clearSessionPrivateKey()
+    purgeLegacyNip46Storage()
     // Note: We don't clear ENCRYPTED_NSEC_KEY here - that's the user's account
     // They should use clearEncryptedNsec() explicitly if they want to delete their account
   }

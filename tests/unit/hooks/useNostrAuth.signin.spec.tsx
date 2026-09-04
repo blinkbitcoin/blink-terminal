@@ -9,8 +9,8 @@
  *
  * @jest-environment jsdom
  */
-import React from "react"
 import { render, screen, act } from "@testing-library/react"
+import React from "react"
 
 // ---- Boundary mocks. The provider touches storage, relays and the network on mount; none of
 // that is under test here, so each is stubbed at its module edge.
@@ -88,6 +88,7 @@ const runSignIn = (
 ).runNostrConnectSignIn
 
 const PUBKEY = "a".repeat(64)
+const SESSION_ID = "s".repeat(32)
 const PUBKEY_B = "c".repeat(64)
 
 /** Exposes the provider's auth state and the sign-in action to the test. */
@@ -140,13 +141,13 @@ describe("useNostrAuth.signInWithNostrConnect — transaction delegation (issue 
     const isCurrent = jest.fn(() => true)
 
     await act(async () => {
-      await signIn(PUBKEY, { isCurrent })
+      await signIn(PUBKEY, { sessionId: SESSION_ID, isCurrent })
       await new Promise<void>((r) => setTimeout(r, 0))
     })
 
     expect(runSignIn).toHaveBeenCalledWith(
       PUBKEY,
-      expect.objectContaining({ isCurrent, timeout: 30000 }),
+      expect.objectContaining({ isCurrent, timeout: 30000, sessionId: SESSION_ID }),
     )
   })
 
@@ -161,7 +162,7 @@ describe("useNostrAuth.signInWithNostrConnect — transaction delegation (issue 
     await renderProvider()
     let result: { success: boolean } | undefined
     await act(async () => {
-      result = await signIn(PUBKEY)
+      result = await signIn(PUBKEY, { sessionId: SESSION_ID })
       await new Promise<void>((r) => setTimeout(r, 0))
     })
 
@@ -185,7 +186,7 @@ describe("useNostrAuth.signInWithNostrConnect — transaction delegation (issue 
     await renderProvider()
     let result: { success: boolean; errorType?: string } | undefined
     await act(async () => {
-      result = await signIn(PUBKEY)
+      result = await signIn(PUBKEY, { sessionId: SESSION_ID })
       await new Promise<void>((r) => setTimeout(r, 0))
     })
 
@@ -211,7 +212,7 @@ describe("useNostrAuth.signInWithNostrConnect — transaction delegation (issue 
     await renderProvider()
     let result: { success: boolean; errorType?: string; error?: string } | undefined
     await act(async () => {
-      result = await signIn(PUBKEY)
+      result = await signIn(PUBKEY, { sessionId: SESSION_ID })
       await new Promise<void>((r) => setTimeout(r, 0))
     })
 
@@ -229,7 +230,7 @@ describe("useNostrAuth.signInWithNostrConnect — transaction delegation (issue 
     await renderProvider()
     let result: { errorType?: string } | undefined
     await act(async () => {
-      result = await signIn(PUBKEY)
+      result = await signIn(PUBKEY, { sessionId: SESSION_ID })
       await new Promise<void>((r) => setTimeout(r, 0))
     })
 
@@ -256,7 +257,7 @@ describe("useNostrAuth.signInWithNostrConnect — transaction delegation (issue 
 
     let owned = true
     await act(async () => {
-      const a = signIn(PUBKEY, { isCurrent: () => owned })
+      const a = signIn(PUBKEY, { sessionId: SESSION_ID, isCurrent: () => owned })
       await new Promise<void>((r) => setTimeout(r, 0))
       owned = false
       finishSync({

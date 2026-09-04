@@ -56,6 +56,15 @@ export const RATE_LIMIT_WRITE: RateLimitOptions = { max: 30 }
 /** Authenticated read endpoints (balance, wallets, transactions). */
 export const RATE_LIMIT_READ: RateLimitOptions = { max: 120 }
 
+/**
+ * Status-polling endpoints. The NIP-46 sign-in modal polls its session roughly
+ * every 1.5s for up to 5 minutes, which would blow through even the READ tier.
+ * Polling is a cheap Redis GET and is already bound by the session TTL and the
+ * concurrent-session caps, so it gets its own much higher tier rather than
+ * weakening the tier that guards session creation.
+ */
+export const RATE_LIMIT_POLL: RateLimitOptions = { max: 240 }
+
 const DEFAULT_WINDOW_MS = 60_000 // 1 minute
 const REDIS_KEY_PREFIX = "blink-terminal:ratelimit:"
 
