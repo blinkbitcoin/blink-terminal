@@ -26,6 +26,11 @@ services:
       JWT_SECRET: ${JWT_SECRET}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY}
       ENABLE_HYBRID_STORAGE: "true"
+      # Nostr Connect (NIP-46) sign-in. Relays default to lib/nip46-server/relays.ts;
+      # the caps bound how many relay sockets the server will hold open at once.
+      NIP46_RELAYS: ${NIP46_RELAYS:-}
+      NIP46_MAX_SESSIONS: ${NIP46_MAX_SESSIONS:-200}
+      NIP46_MAX_SESSIONS_PER_IP: ${NIP46_MAX_SESSIONS_PER_IP:-5}
       # Citrusrate exchange rate provider
       CITRUSRATE_API_KEY: ${CITRUSRATE_API_KEY}
       CITRUSRATE_BASE_URL: ${CITRUSRATE_BASE_URL:-https://citrusrate-be.onrender.com}
