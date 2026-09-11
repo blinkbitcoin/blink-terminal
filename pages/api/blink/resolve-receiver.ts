@@ -83,6 +83,10 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
     let receiver
     try {
+      // Callers (the validation gates) intentionally omit walletCurrency, so
+      // this resolves with the default-wallet custodial probe. The invoice
+      // endpoints pass "BTC" instead; the resulting cache-slot difference is
+      // harmless because custodial results are never cached.
       receiver = await resolveReceiver(username, {
         apiUrl,
         lnAddressDomain: LN_ADDRESS_DOMAIN,
