@@ -116,8 +116,14 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     // "lnaddress" receiver; for custodial users it returns "custodial".
     let receiver
     try {
-      // Pass walletCurrency through so this resolution uses the same cache
-      // key as /api/blink/resolve-receiver (the validation gate).
+      // Forward walletCurrency so the custodial 409 guard below probes the
+      // same wallet currency as /api/blink/public-invoice (which uses the BTC
+      // probe when the client sends "BTC"). Without this, a custodial account
+      // whose default wallet is not BTC would loop: public-invoice 404 (no
+      // BTC wallet) -> this endpoint 409 (default-wallet probe hits) -> no
+      // invoice. Cache slots intentionally differ per walletCurrency (the
+      // validation gates resolve without one, using the default-wallet
+      // probe); that is harmless because custodial results are never cached.
       receiver = await resolveReceiver(username, {
         apiUrl,
         lnAddressDomain: LN_ADDRESS_DOMAIN,
