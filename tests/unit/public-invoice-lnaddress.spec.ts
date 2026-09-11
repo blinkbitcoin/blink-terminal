@@ -220,4 +220,18 @@ describe("public-invoice-lnaddress", () => {
     expect(res._status).toBe(200)
     expect(mockResolveReceiver).toHaveBeenCalled()
   })
+
+  it("forwards walletCurrency to resolveReceiver (cache-key symmetry)", async () => {
+    const { req, res } = mockReqRes({
+      username: "sparkmerchant",
+      amount: 5000,
+      walletCurrency: "BTC",
+    })
+    await handler(req, res)
+    expect(res._status).toBe(200)
+    expect(mockResolveReceiver).toHaveBeenCalledWith(
+      "sparkmerchant",
+      expect.objectContaining({ walletCurrency: "BTC" }),
+    )
+  })
 })

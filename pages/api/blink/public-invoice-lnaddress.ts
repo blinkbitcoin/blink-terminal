@@ -49,10 +49,11 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 
   try {
-    const { username, amount, memo, environment } = req.body as {
+    const { username, amount, memo, walletCurrency, environment } = req.body as {
       username: string
       amount: string | number
       memo?: string
+      walletCurrency?: string
       environment?: EnvironmentName
     }
 
@@ -115,9 +116,12 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     // "lnaddress" receiver; for custodial users it returns "custodial".
     let receiver
     try {
+      // Pass walletCurrency through so this resolution uses the same cache
+      // key as /api/blink/resolve-receiver (the validation gate).
       receiver = await resolveReceiver(username, {
         apiUrl,
         lnAddressDomain: LN_ADDRESS_DOMAIN,
+        walletCurrency,
       })
     } catch (resolveError: unknown) {
       if (resolveError instanceof ReceiverNotFoundError) {

@@ -184,22 +184,67 @@ describe("resolveReceiver - not found", () => {
 })
 
 describe("resolveReceiver - caching", () => {
-  it("caches the resolved result per identifier+apiUrl", async () => {
+  it("never caches custodial results (migration safety)", async () => {
     mockGetWalletByUsername.mockResolvedValue({ id: "wallet-123", currency: "BTC" })
 
     await resolveReceiver("merchant", { apiUrl: "https://api.test" })
     await resolveReceiver("merchant", { apiUrl: "https://api.test" })
 
-    // Second call served from cache => only one custodial probe.
-    expect(mockGetWalletByUsername).toHaveBeenCalledTimes(1)
+    // Custodial status can change (custodial -> self-custodial migration), so
+    // every resolution re-probes instead of serving a stale "custodial".
+    expect(mockGetWalletByUsername).toHaveBeenCalledTimes(2)
   })
 
-  it("does not collide across different apiUrls", async () => {
+  it("re-resolves as lnaddress after a custodial -> self-custodial migration", async () => {
+    // Pre-migration: custodial wallet exists.
     mockGetWalletByUsername.mockResolvedValue({ id: "wallet-123", currency: "BTC" })
+    const before = await resolveReceiver("merchant", { apiUrl: "https://api.test" })
+    expect(before.type).toBe("custodial")
 
-    await resolveReceiver("merchant", { apiUrl: "https://api.a" })
-    await resolveReceiver("merchant", { apiUrl: "https://api.b" })
+    // Post-migration: custodial account closed, LN address now active.
+    mockGetWalletByUsername.mockRejectedValue(new Error("Account is inactive."))
+    mockFetchLnurlPayMetadata.mockResolvedValue(META)
+    const after = await resolveReceiver("merchant", { apiUrl: "https://api.test" })
 
-    expect(mockGetWalletByUsername).toHaveBeenCalledTimes(2)
+    expect(after.type).toBe("lnaddress")
+    expect(after).toMatchObject({ lightningAddress: "merchant@blink.sv" })
+  })
+
+  it("caches lnaddress results within the TTL", async () => {
+    mockGetWalletByUsername.mockRejectedValue(new Error("no wallet"))
+    mockFetchLnurlPayMetadata.mockResolvedValue(META)
+
+    await resolveReceiver("sparkmerchant", { apiUrl: "https://api.test" })
+    await resolveReceiver("sparkmerchant", { apiUrl: "https://api.test" })
+
+    // Second call served from cache => only one LNURL fetch.
+    expect(mockFetchLnurlPayMetadata).toHaveBeenCalledTimes(1)
+  })
+
+  it("expires cached lnaddress results after the TTL", async () => {
+    mockGetWalletByUsername.mockRejectedValue(new Error("no wallet"))
+    mockFetchLnurlPayMetadata.mockResolvedValue(META)
+
+    await resolveReceiver("sparkmerchant", { apiUrl: "https://api.test" })
+
+    // Advance time past the 15-minute TTL.
+    const nowSpy = jest.spyOn(Date, "now").mockReturnValue(Date.now() + 16 * 60 * 1000)
+    try {
+      await resolveReceiver("sparkmerchant", { apiUrl: "https://api.test" })
+    } finally {
+      nowSpy.mockRestore()
+    }
+
+    expect(mockFetchLnurlPayMetadata).toHaveBeenCalledTimes(2)
+  })
+
+  it("does not collide cached lnaddress results across different apiUrls", async () => {
+    mockGetWalletByUsername.mockRejectedValue(new Error("no wallet"))
+    mockFetchLnurlPayMetadata.mockResolvedValue(META)
+
+    await resolveReceiver("sparkmerchant", { apiUrl: "https://api.a" })
+    await resolveReceiver("sparkmerchant", { apiUrl: "https://api.b" })
+
+    expect(mockFetchLnurlPayMetadata).toHaveBeenCalledTimes(2)
   })
 })

@@ -1442,6 +1442,7 @@ const POS = forwardRef<POSRef, POSProps>(
                 username: activeBlinkAccount.username,
                 amount: finalTotalInSats,
                 memo: memo || `Payment to ${activeBlinkAccount.username}`,
+                walletCurrency: "BTC",
                 environment: getEnvironment(),
               }),
             })

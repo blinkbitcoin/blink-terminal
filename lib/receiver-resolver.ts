@@ -23,8 +23,13 @@
  *   and a full `username@domain`.
  * - If an explicit non-Blink domain is supplied, the custodial probe is skipped
  *   and the address is resolved purely as an external LNURL-pay address.
- * - Results are cached per (identifier, apiUrl) for the lifetime of the process
- *   (server-side module cache) to avoid repeated lookups within a session.
+ * - Caching (server-side module cache, per (identifier, walletCurrency, apiUrl)):
+ *   - CUSTODIAL results are NEVER cached. Custodial status is exactly what a
+ *     custodial -> self-custodial (Spark) migration flips, and a stale
+ *     "custodial" entry breaks the Public POS in a closed 404/409 loop between
+ *     the two invoice endpoints. The probe is a single cheap GraphQL call.
+ *   - LNADDRESS results are cached with a TTL, since LNURL-pay metadata
+ *     (callback, min/max sendable) changes rarely.
  *
  * Phase 1: production / `blink.sv` only. Staging is deferred.
  */
@@ -99,8 +104,22 @@ export class ReceiverNotFoundError extends Error {
 const DEFAULT_LN_ADDRESS_DOMAIN = "blink.sv"
 const DEFAULT_BLINK_DOMAINS = ["blink.sv"]
 
-// Module-level resolution cache. Key: `${identifier}::${apiUrl}`.
-const resolutionCache = new Map<string, ResolvedReceiver>()
+/**
+ * TTL for cached `lnaddress` resolutions. LNURL-pay metadata (callback,
+ * min/max sendable) changes rarely, so a short TTL bounds staleness while
+ * avoiding repeated `.well-known/lnurlp` fetches within a session.
+ */
+const LNADDRESS_CACHE_TTL_MS = 15 * 60 * 1000 // 15 minutes
+
+interface CacheEntry {
+  value: ResolvedReceiver
+  expiresAt: number
+}
+
+// Module-level resolution cache for `lnaddress` results only. Custodial
+// results are never cached (see module doc). Key:
+// `${identifier}:${walletCurrency}::${apiUrl}`.
+const resolutionCache = new Map<string, CacheEntry>()
 
 // =============================================================================
 // Helpers
@@ -168,7 +187,10 @@ export async function resolveReceiver(
   )
   const cached = resolutionCache.get(key)
   if (cached) {
-    return cached
+    if (cached.expiresAt > Date.now()) {
+      return cached.value
+    }
+    resolutionCache.delete(key)
   }
 
   const effectiveDomain = domain ?? lnAddressDomain
@@ -183,14 +205,15 @@ export async function resolveReceiver(
           : await BlinkAPI.getWalletByUsername(username, apiUrl)
 
       if (wallet?.id) {
-        const resolved: CustodialReceiver = {
+        // Deliberately NOT cached: a custodial -> self-custodial migration
+        // closes the custodial account, and a stale "custodial" entry would
+        // permanently misroute this merchant's Public POS payments.
+        return {
           type: "custodial",
           username,
           walletId: wallet.id,
           walletCurrency: wallet.currency,
         }
-        resolutionCache.set(key, resolved)
-        return resolved
       }
     } catch {
       // No custodial wallet (e.g. self-custodial Spark user, or unknown
@@ -213,7 +236,10 @@ export async function resolveReceiver(
       isBlinkDomain,
       metadata,
     }
-    resolutionCache.set(key, resolved)
+    resolutionCache.set(key, {
+      value: resolved,
+      expiresAt: Date.now() + LNADDRESS_CACHE_TTL_MS,
+    })
     return resolved
   } catch (lnurlErr) {
     console.warn(
