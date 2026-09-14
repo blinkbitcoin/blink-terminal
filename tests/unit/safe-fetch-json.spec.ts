@@ -58,7 +58,7 @@ import {
   safeFetchJsonResponse,
 } from "../../lib/server/safe-fetch-json"
 
-const expect = globalThis.expect as unknown as jest.Expect
+const expect = (globalThis as unknown as { expect: jest.Expect }).expect
 const jestIt = globalThis.it as unknown as jest.It
 
 const PUBLIC_ADDRESS: Address = { address: "8.8.8.8", family: 4 }

@@ -263,7 +263,7 @@ class BlinkAPI {
   convertToSatoshis(
     amount: number,
     currency: string,
-    exchangeRate: ExchangeRate,
+    exchangeRate: ExchangeRate | null,
     fractionDigits: number = 2,
   ): number {
     if (currency === "BTC") {

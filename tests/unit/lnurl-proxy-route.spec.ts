@@ -33,7 +33,7 @@ jest.mock("../../lib/server/safe-fetch-json", () => {
 import { SafeFetchError } from "../../lib/server/safe-fetch-json"
 import handler from "../../pages/api/lnurl-proxy"
 
-const expect = globalThis.expect as unknown as jest.Expect
+const expect = (globalThis as unknown as { expect: jest.Expect }).expect
 const jestIt = globalThis.it as unknown as jest.It
 
 const PAYMENT_REQUEST = `lnbc${"a".repeat(24)}`

@@ -295,7 +295,11 @@ describe("runNostrConnectSignIn (issue #67)", () => {
     const aAbort = new AbortController()
     const started = Date.now()
     // A has a LONG deadline; without external cancellation B would wait it out.
-    const a = runNostrConnectSignIn(PUBKEY, { timeout: 60_000, signal: aAbort.signal })
+    const a = runNostrConnectSignIn(PUBKEY, {
+      sessionId: SESSION_ID,
+      timeout: 60_000,
+      signal: aAbort.signal,
+    })
     const b = runNostrConnectSignIn(PUBKEY_B, { sessionId: SESSION_ID, timeout: 5000 })
     await new Promise((r) => setTimeout(r, 0))
 

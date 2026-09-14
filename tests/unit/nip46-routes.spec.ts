@@ -68,8 +68,20 @@ interface MockResponse extends NextApiResponse {
   _headers: Record<string, string | string[]>
 }
 
+// The concrete shape of the mock object literal, so `this._status` etc.
+// resolve inside its method bodies before the widening cast to MockResponse.
+interface MockResShape {
+  _status: number
+  _json: unknown
+  _headers: Record<string, string | string[]>
+  status(code: number): MockResShape
+  json(payload: unknown): MockResShape
+  setHeader(name: string, value: string | string[]): MockResShape
+  getHeader(name: string): string | string[] | undefined
+}
+
 function makeRes(): MockResponse {
-  const res = {
+  const res: MockResShape = {
     _status: 0,
     _json: undefined,
     _headers: {},
@@ -88,8 +100,8 @@ function makeRes(): MockResponse {
     getHeader(name: string) {
       return this._headers[name]
     },
-  } as unknown as MockResponse
-  return res
+  }
+  return res as unknown as MockResponse
 }
 
 function makeReq(overrides: Partial<NextApiRequest> = {}): NextApiRequest {

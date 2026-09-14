@@ -119,8 +119,8 @@ describe("Boltcard Crypto", () => {
       )
 
       expect(result).not.toBeNull()
-      expect(result.cardUid).toBe(TEST_VECTORS.uid)
-      expect(result.counter).toBe(counter)
+      expect(result!.cardUid).toBe(TEST_VECTORS.uid)
+      expect(result!.counter).toBe(counter)
     })
 
     it("should reject PICCData with wrong tag byte", () => {
