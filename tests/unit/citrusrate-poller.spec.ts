@@ -199,6 +199,61 @@ describe("startCitrusratePoller", () => {
     expect(streetWrites.some(([, rates]) => "GHS_STREET" in rates)).toBe(false)
   })
 
+  it("continues to street rates when the official snapshot fails", async () => {
+    process.env.CITRUSRATE_API_KEY = "test-key"
+    mockGetAllOfficialRates.mockRejectedValue(new Error("upstream 500"))
+
+    startCitrusratePoller()
+    await runFirstTick()
+
+    // Official write skipped, but all 13 street rates still cached
+    expect(
+      mockSetCachedRatesBulk.mock.calls.some(
+        ([provider]) => provider === "citrusrate_official",
+      ),
+    ).toBe(false)
+    const streetWrites = mockSetCachedRatesBulk.mock.calls.filter(
+      ([provider]) => provider === "citrusrate_street",
+    )
+    expect(streetWrites).toHaveLength(13)
+  })
+
+  it("keeps the same-key refresh gap within the cache TTL even at worst-case latency", async () => {
+    process.env.CITRUSRATE_API_KEY = "test-key"
+
+    // Every upstream call takes the full 10s client timeout worth of latency
+    // (bounded worst-case tick: 10s official + 13 x (10s + 0.5s) = 146.5s)
+    const slow = <T>(value: T): Promise<T> =>
+      new Promise((resolve) => setTimeout(() => resolve(value), 10_000))
+    mockGetAllOfficialRates.mockImplementation(() => slow(OFFICIAL_SNAPSHOT))
+    mockGetBlackMarketRate.mockImplementation((currency: string) =>
+      slow(streetRate(currency)),
+    )
+
+    const officialWriteTimes: number[] = []
+    let writtenTtl: number | undefined
+    mockSetCachedRatesBulk.mockImplementation(
+      async (provider: string, _rates: BulkRates, ttl?: number) => {
+        if (provider === "citrusrate_official") {
+          officialWriteTimes.push(jest.now())
+          writtenTtl = ttl
+        }
+      },
+    )
+
+    startCitrusratePoller()
+    // Two full worst-case ticks + the 60s completion-based gap between them
+    await jest.advanceTimersByTimeAsync(2 * 146_500 + 60_000 + 20_000)
+
+    expect(officialWriteTimes.length).toBeGreaterThanOrEqual(2)
+    expect(writtenTtl).toBe(300)
+    // Same-key write gap must stay within the TTL, or entries expire between
+    // ticks and clients fall back to inline upstream fetches
+    expect(officialWriteTimes[1] - officialWriteTimes[0]).toBeLessThanOrEqual(
+      (writtenTtl as number) * 1000,
+    )
+  })
+
   it("repeats the tick after the previous one settles (completion-based scheduling)", async () => {
     process.env.CITRUSRATE_API_KEY = "test-key"
     startCitrusratePoller()

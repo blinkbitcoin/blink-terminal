@@ -45,9 +45,14 @@ import {
 import { STREET_RATE_CURRENCIES } from "./index"
 
 const POLL_INTERVAL_MS: number = 60_000
-// Cache TTL must outlive the poll interval, otherwise entries expire before
-// the next tick lands and requests in the gap fall through to inline fetches
-const POLLER_CACHE_TTL_SECS: number = 120
+// Cache TTL is a stale-on-failure bound, not just "longer than the interval".
+// With completion-based scheduling the same-key refresh gap is
+// (tick duration + POLL_INTERVAL_MS), and a tick is bounded by the client
+// timeout (10s, see citrusrate.ts): 10s official + 13 x (10s street + 0.5s
+// spacing) = 146.5s, so the worst-case gap is 206.5s. 300s covers it with
+// margin. Healthy ticks refresh every ~67s; 300s staleness only occurs while
+// the upstream is failing, where stale-while-error is the right POS policy.
+const POLLER_CACHE_TTL_SECS: number = 300
 // Spread the 13 sequential black-market calls over the tick to avoid bursting
 const BLACKMARKET_CALL_SPACING_MS: number = 500
 

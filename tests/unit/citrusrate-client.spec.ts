@@ -78,6 +78,27 @@ describe("CitrusrateAPI rate validation", () => {
     jest.clearAllMocks()
   })
 
+  it("converts a valid black-market rate to satPriceInCurrency", async () => {
+    const api = apiWithKey()
+    mockFetch.mockResolvedValue(
+      okJson({
+        status: "success",
+        data: {
+          pair: "BTC/MZN",
+          rate: 5_951_836.43,
+          timestamp: "2026-09-14T00:00:00Z",
+          source: "estimated",
+        },
+      }),
+    )
+
+    const result = await api.getBlackMarketRate("mzn")
+    expect(result.satPriceInCurrency).toBeCloseTo((5_951_836.43 / 100_000_000) * 100, 10)
+    expect(result.currency).toBe("MZN")
+    expect(result.provider).toBe("citrusrate_street")
+    expect(result.source).toBe("estimated")
+  })
+
   it("converts a valid official rate to satPriceInCurrency", async () => {
     const api = apiWithKey()
     mockFetch.mockResolvedValue(
@@ -160,6 +181,39 @@ describe("CitrusrateAPI rate validation", () => {
     )
     expect(warn).toHaveBeenCalledTimes(4)
     warn.mockRestore()
+  })
+})
+
+describe("CitrusrateAPI timeout covers body parsing", () => {
+  beforeEach(() => {
+    jest.clearAllMocks()
+  })
+
+  it("rejects when the response body stalls (headers received, json() never resolves)", async () => {
+    const api = apiWithKey()
+    api.timeout = 50
+    mockFetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => new Promise(() => undefined), // never resolves
+    })
+
+    const started = Date.now()
+    await expect(api.getOfficialRate("NGN")).rejects.toThrow(/timed out/)
+    // Must reject near the configured 50ms deadline, not hang
+    expect(Date.now() - started).toBeLessThan(2000)
+  })
+
+  it("rejects when the error-body parse stalls too", async () => {
+    const api = apiWithKey()
+    api.timeout = 50
+    mockFetch.mockResolvedValue({
+      ok: false,
+      status: 500,
+      json: () => new Promise(() => undefined),
+    })
+
+    await expect(api.getOfficialRate("NGN")).rejects.toThrow(/timed out/)
   })
 })
 

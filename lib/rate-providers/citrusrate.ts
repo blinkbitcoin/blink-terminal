@@ -68,64 +68,74 @@ export class CitrusrateAPI {
     })
 
     const controller: AbortController = new AbortController()
-    const timeoutId: ReturnType<typeof setTimeout> = setTimeout(
-      () => controller.abort(),
-      this.timeout,
-    )
+
+    // The deadline must cover the ENTIRE lifecycle — fetch, status handling,
+    // AND body parsing. Aborting on timer expiry alone is not sufficient:
+    // once fetch() resolves with headers, response.json() has no deadline of
+    // its own, and a stalled/truncated body would hang the caller forever
+    // (for the poller: the tick never settles and no further tick is ever
+    // scheduled). Racing the deadline rejects the request even when the body
+    // stream never completes; the abort still fires for real-network cleanup.
+    let timeoutId: ReturnType<typeof setTimeout> | undefined
+    const deadline: Promise<never> = new Promise<never>((_resolve, reject) => {
+      timeoutId = setTimeout(() => {
+        controller.abort()
+        reject(new Error("Citrusrate API request timed out"))
+      }, this.timeout)
+    })
 
     try {
-      const response: Response = await fetch(url.toString(), {
-        method: "GET",
-        headers: {
-          "x-api-key": this.apiKey as string,
-          "Content-Type": "application/json",
-        },
-        signal: controller.signal,
-      })
-
+      return await Promise.race([this.doRequest(url, controller.signal), deadline])
+    } finally {
       clearTimeout(timeoutId)
-
-      if (!response.ok) {
-        const errorData: Record<string, unknown> = (await response
-          .json()
-          .catch(() => ({}))) as Record<string, unknown>
-
-        // Handle rate limiting
-        if (response.status === 429) {
-          const retryAfter: number = (errorData.retryAfter as number) || 60
-          const error = new Error(
-            `Rate limited. Retry after ${retryAfter} seconds.`,
-          ) as CitrusrateError
-          error.status = 429
-          error.retryAfter = retryAfter
-          throw error
-        }
-
-        throw new Error(
-          (errorData.message as string) || `Citrusrate API error: ${response.status}`,
-        )
-      }
-
-      const data: Record<string, unknown> = (await response.json()) as Record<
-        string,
-        unknown
-      >
-
-      if (data.status !== "success") {
-        throw new Error(
-          (data.message as string) || "Citrusrate API returned error status",
-        )
-      }
-
-      return data.data
-    } catch (error: unknown) {
-      clearTimeout(timeoutId)
-
-      if (error instanceof Error && error.name === "AbortError") {
-        throw new Error("Citrusrate API request timed out")
-      }
-      throw error
     }
+  }
+
+  /**
+   * Perform the HTTP request and validate the response envelope.
+   * Separated from request() so the timeout race wraps body parsing too.
+   */
+  private async doRequest(url: URL, signal: AbortSignal): Promise<unknown> {
+    const response: Response = await fetch(url.toString(), {
+      method: "GET",
+      headers: {
+        "x-api-key": this.apiKey as string,
+        "Content-Type": "application/json",
+      },
+      signal,
+    })
+
+    if (!response.ok) {
+      const errorData: Record<string, unknown> = (await response
+        .json()
+        .catch(() => ({}))) as Record<string, unknown>
+
+      // Handle rate limiting
+      if (response.status === 429) {
+        const retryAfter: number = (errorData.retryAfter as number) || 60
+        const error = new Error(
+          `Rate limited. Retry after ${retryAfter} seconds.`,
+        ) as CitrusrateError
+        error.status = 429
+        error.retryAfter = retryAfter
+        throw error
+      }
+
+      throw new Error(
+        (errorData.message as string) || `Citrusrate API error: ${response.status}`,
+      )
+    }
+
+    const data: Record<string, unknown> = (await response.json()) as Record<
+      string,
+      unknown
+    >
+
+    if (data.status !== "success") {
+      throw new Error((data.message as string) || "Citrusrate API returned error status")
+    }
+
+    return data.data
   }
 
   /**
