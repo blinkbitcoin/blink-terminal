@@ -31,7 +31,10 @@ services:
       NIP46_RELAYS: ${NIP46_RELAYS:-}
       NIP46_MAX_SESSIONS: ${NIP46_MAX_SESSIONS:-200}
       NIP46_MAX_SESSIONS_PER_IP: ${NIP46_MAX_SESSIONS_PER_IP:-5}
-      # Citrusrate exchange rate provider
+      # Citrusrate exchange rate provider. NOTE: the rate poller
+      # (lib/rate-providers/poller.ts) assumes a SINGLE app replica — its
+      # start-guard is process-local, so scaling this service would multiply
+      # upstream calls against the same API key.
       CITRUSRATE_API_KEY: ${CITRUSRATE_API_KEY}
       CITRUSRATE_BASE_URL: ${CITRUSRATE_BASE_URL:-https://api.citrusrate.com}
       # OpenTelemetry tracing

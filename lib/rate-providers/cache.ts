@@ -3,18 +3,22 @@
  *
  * Caches exchange rates in Redis with configurable TTL.
  * Citrusrate recommends 30-60 second caching.
+ *
+ * Uses the shared Redis lifecycle from lib/redis.ts (bounded initial connect,
+ * fail-fast during reconnect gaps) rather than a hand-rolled client — see that
+ * file for why. When hybrid storage is off or Redis is unavailable, every
+ * function here degrades to a no-op / cache miss and callers fall back to
+ * inline upstream fetches.
  */
 
-import { createClient, RedisClientType } from "redis"
+import { RedisClientType } from "redis"
+
+import { getSharedRedisClient } from "../redis"
 
 // Cache configuration
 const RATE_CACHE_TTL: number = 45 // seconds (between 30-60 recommended by Citrusrate)
 // All Redis keys use the "blink-terminal:" prefix to avoid collisions in shared Redis instances.
 const CACHE_KEY_PREFIX: string = "blink-terminal:rate:"
-
-// Redis client singleton
-let redisClient: RedisClientType | null = null
-let isConnected: boolean = false
 
 export interface CachedRate {
   [key: string]: unknown
@@ -22,37 +26,13 @@ export interface CachedRate {
 }
 
 /**
- * Get or create Redis client for rate caching
+ * Get the shared Redis client, or null when caching is unavailable
+ * (hybrid storage off, or Redis down — callers then behave as cache-miss).
  */
 async function getRedisClient(): Promise<RedisClientType | null> {
-  if (redisClient && isConnected) {
-    return redisClient
-  }
-
   try {
-    redisClient = createClient({
-      socket: {
-        host: process.env.REDIS_HOST || "localhost",
-        port: parseInt(process.env.REDIS_PORT || "6379"),
-      },
-      password: process.env.REDIS_PASSWORD || undefined,
-      database: parseInt(process.env.REDIS_DB || "0"),
-    }) as RedisClientType
-
-    redisClient.on("error", (err: Error) => {
-      console.error("Rate cache Redis error:", err.message)
-      isConnected = false
-    })
-
-    redisClient.on("connect", () => {
-      isConnected = true
-    })
-
-    await redisClient.connect()
-    return redisClient
-  } catch (error: unknown) {
-    console.warn("Rate cache Redis connection failed:", (error as Error).message)
-    isConnected = false
+    return await getSharedRedisClient()
+  } catch {
     return null
   }
 }

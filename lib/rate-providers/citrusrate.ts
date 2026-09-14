@@ -7,6 +7,20 @@
 
 const SATS_PER_BTC: number = 100_000_000
 
+/**
+ * Validate a raw upstream rate before it is converted or cached.
+ * The API contract says number, but a malformed payload (string, object,
+ * null) would otherwise produce NaN, which JSON.stringify serializes as null
+ * — and a null satPriceInCurrency would poison the shared cache for up to the
+ * full TTL and be returned to checkout math as a successful response.
+ */
+function toValidBtcRate(raw: unknown): number | null {
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) {
+    return null
+  }
+  return raw
+}
+
 export interface CitrusrateRateData {
   currency: string
   satPriceInCurrency: number
@@ -127,20 +141,21 @@ export class CitrusrateAPI {
       currency: currency.toUpperCase(),
     })) as Record<string, unknown>
 
-    if (!data.rate) {
-      throw new Error(`No black market rate available for ${currency}`)
+    const btcRate: number | null = toValidBtcRate(data.rate)
+    if (btcRate === null) {
+      throw new Error(`No valid black market rate available for ${currency}`)
     }
 
     // Convert BTC rate to satPriceInCurrency format (price of 1 sat in fiat minor units)
     // Citrusrate returns: rate = price of 1 BTC in fiat (e.g., 6,903,525 MZN)
     // We need: satPriceInCurrency = price of 1 sat in fiat cents/minor units
     // Formula: (btcRate / SATS_PER_BTC) * 100 = price of 1 sat in cents
-    const satPriceInCurrency: number = ((data.rate as number) / SATS_PER_BTC) * 100
+    const satPriceInCurrency: number = (btcRate / SATS_PER_BTC) * 100
 
     return {
       currency: currency.toUpperCase(),
       satPriceInCurrency,
-      btcRate: data.rate as number,
+      btcRate,
       timestamp: data.timestamp as string,
       source: (data.source as string) || "citrusrate_blackmarket",
       provider: "citrusrate_street",
@@ -158,16 +173,17 @@ export class CitrusrateAPI {
       currency: currency.toUpperCase(),
     })) as Record<string, unknown>
 
-    if (!data.rate) {
-      throw new Error(`No official rate available for ${currency}`)
+    const btcRate: number | null = toValidBtcRate(data.rate)
+    if (btcRate === null) {
+      throw new Error(`No valid official rate available for ${currency}`)
     }
 
-    const satPriceInCurrency: number = ((data.rate as number) / SATS_PER_BTC) * 100
+    const satPriceInCurrency: number = (btcRate / SATS_PER_BTC) * 100
 
     return {
       currency: currency.toUpperCase(),
       satPriceInCurrency,
-      btcRate: data.rate as number,
+      btcRate,
       timestamp: data.timestamp as string,
       source: "citrusrate_official",
       provider: "citrusrate",
@@ -189,11 +205,18 @@ export class CitrusrateAPI {
       throw new Error("No rates available from Citrusrate")
     }
 
-    // Convert all rates to satPriceInCurrency format
+    // Convert all rates to satPriceInCurrency format.
+    // Malformed entries are skipped, not propagated: one bad currency must not
+    // poison the 38-currency snapshot the poller bulk-writes to the cache.
     const convertedRates: Record<string, CitrusrateRateData> = {}
-    for (const [currency, btcRate] of Object.entries(
-      data.rates as Record<string, number>,
+    for (const [currency, rawRate] of Object.entries(
+      data.rates as Record<string, unknown>,
     )) {
+      const btcRate: number | null = toValidBtcRate(rawRate)
+      if (btcRate === null) {
+        console.warn(`Citrusrate /btc/all: skipping malformed rate for ${currency}`)
+        continue
+      }
       convertedRates[currency] = {
         currency,
         satPriceInCurrency: (btcRate / SATS_PER_BTC) * 100,

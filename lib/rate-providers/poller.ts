@@ -20,6 +20,19 @@
  * Started from instrumentation.node.ts (Node.js runtime only). Requires a
  * long-lived server process (self-hosted / docker-compose); on serverless the
  * inline per-request fetch in the exchange-rate route remains the fallback.
+ *
+ * KNOWN LIMITATION — single replica only. The started-flag is process-local,
+ * so every app replica would run its own poller against the same API key
+ * (N replicas ≈ N×14 calls/min; 5 replicas would exceed the 60/min
+ * black-market limit). The reference deployment (docker-compose.prod.yml)
+ * runs one app container. If blink-terminal ever scales out, gate the poller
+ * behind a Redis-backed leader lease before adding replicas.
+ *
+ * Scheduling: completion-based recursion (setTimeout scheduled only after a
+ * tick settles), NOT setInterval. A degraded upstream can stretch one tick to
+ * ~146s (official timeout + 13 × (street timeout + spacing)); interval-based
+ * scheduling would then launch overlapping ticks and multiply traffic exactly
+ * during an outage.
  */
 
 import { setCachedRatesBulk, CachedRate } from "./cache"
@@ -114,7 +127,9 @@ async function tick(): Promise<void> {
 
 /**
  * Start the background poller. Idempotent — safe to call more than once.
- * No-ops (with a log line) when CITRUSRATE_API_KEY is not configured.
+ * No-ops (with a log line) when CITRUSRATE_API_KEY is not configured or when
+ * hybrid storage is off (no shared Redis cache to warm — the exchange-rate
+ * route fetches inline in that mode).
  */
 export function startCitrusratePoller(): void {
   if (globalState.__citrusratePollerStarted) {
@@ -129,6 +144,14 @@ export function startCitrusratePoller(): void {
     return
   }
 
+  if (process.env.ENABLE_HYBRID_STORAGE !== "true") {
+    console.log(
+      "[citrusrate-poller] ENABLE_HYBRID_STORAGE is not true — poller disabled " +
+        "(no shared Redis cache; exchange-rate route will fetch inline)",
+    )
+    return
+  }
+
   globalState.__citrusratePollerStarted = true
 
   console.log(
@@ -138,15 +161,21 @@ export function startCitrusratePoller(): void {
       `${STREET_RATE_CURRENCIES.length} street currencies)`,
   )
 
-  // Warm the cache immediately, then keep it fresh on the fixed schedule
+  // Warm the cache immediately, then keep it fresh. The next tick is scheduled
+  // only AFTER the current one settles — a slow upstream stretches the gap
+  // instead of stacking concurrent ticks (see module header).
+  const scheduleNext = (): void => {
+    setTimeout(runTick, POLL_INTERVAL_MS)
+  }
   const runTick = (): void => {
-    tick().catch((error: unknown) =>
-      console.warn(
-        "[citrusrate-poller] tick failed:",
-        error instanceof Error ? error.message : error,
-      ),
-    )
+    tick()
+      .catch((error: unknown) =>
+        console.warn(
+          "[citrusrate-poller] tick failed:",
+          error instanceof Error ? error.message : error,
+        ),
+      )
+      .finally(scheduleNext)
   }
   runTick()
-  setInterval(runTick, POLL_INTERVAL_MS)
 }

@@ -11,6 +11,8 @@
  * - street rates are fetched per base and cached under the _STREET ids
  * - a failing street currency is skipped without stalling the rest of the tick
  * - the tick repeats on the poll interval
+ * - ticks never overlap: the next tick is scheduled only after the current
+ *   one settles, even when an upstream request hangs across the 60s boundary
  */
 
 type BulkRates = Record<string, Record<string, unknown>>
@@ -92,6 +94,7 @@ describe("startCitrusratePoller", () => {
     jest.clearAllMocks()
     delete globalState.__citrusratePollerStarted
     delete process.env.CITRUSRATE_API_KEY
+    process.env.ENABLE_HYBRID_STORAGE = "true"
 
     mockGetAllOfficialRates.mockResolvedValue(OFFICIAL_SNAPSHOT)
     mockGetBlackMarketRate.mockImplementation(async (currency: string) =>
@@ -101,6 +104,7 @@ describe("startCitrusratePoller", () => {
 
   afterEach(() => {
     jest.useRealTimers()
+    delete process.env.ENABLE_HYBRID_STORAGE
   })
 
   it("no-ops when CITRUSRATE_API_KEY is not set", async () => {
@@ -110,6 +114,18 @@ describe("startCitrusratePoller", () => {
     expect(mockGetAllOfficialRates).not.toHaveBeenCalled()
     expect(mockSetCachedRatesBulk).not.toHaveBeenCalled()
     // flag stays unset so a later call (e.g. after config fix) can start it
+    expect(globalState.__citrusratePollerStarted).toBeUndefined()
+  })
+
+  it("no-ops when hybrid storage is off even with a key (no shared cache to warm)", async () => {
+    process.env.CITRUSRATE_API_KEY = "test-key"
+    delete process.env.ENABLE_HYBRID_STORAGE
+
+    startCitrusratePoller()
+    await runFirstTick()
+
+    expect(mockGetAllOfficialRates).not.toHaveBeenCalled()
+    expect(mockSetCachedRatesBulk).not.toHaveBeenCalled()
     expect(globalState.__citrusratePollerStarted).toBeUndefined()
   })
 
@@ -183,7 +199,7 @@ describe("startCitrusratePoller", () => {
     expect(streetWrites.some(([, rates]) => "GHS_STREET" in rates)).toBe(false)
   })
 
-  it("repeats the tick on the poll interval", async () => {
+  it("repeats the tick after the previous one settles (completion-based scheduling)", async () => {
     process.env.CITRUSRATE_API_KEY = "test-key"
     startCitrusratePoller()
     await runFirstTick()
@@ -191,9 +207,37 @@ describe("startCitrusratePoller", () => {
     const callsAfterFirstTick = mockSetCachedRatesBulk.mock.calls.length
     expect(callsAfterFirstTick).toBeGreaterThan(0)
 
-    // Advance past one full 60s interval + the street-call spacing
-    await jest.advanceTimersByTimeAsync(60_000 + 13 * 500 + 100)
+    // The next tick is scheduled 60s after tick 1 COMPLETED (not started).
+    // Advance well past that: 60s interval + street-call spacing + slack.
+    await jest.advanceTimersByTimeAsync(60_000 + 13 * 500 + 1000)
     expect(mockSetCachedRatesBulk.mock.calls.length).toBeGreaterThan(callsAfterFirstTick)
+  })
+
+  it("never launches a second tick while an upstream request is still pending", async () => {
+    process.env.CITRUSRATE_API_KEY = "test-key"
+
+    // Degraded upstream: the /btc/all call hangs past the 60s boundary
+    let resolvePending: (value: typeof OFFICIAL_SNAPSHOT) => void = () => undefined
+    mockGetAllOfficialRates.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolvePending = resolve
+        }),
+    )
+
+    startCitrusratePoller()
+    // Advance across TWO interval boundaries while tick 1 is still in flight
+    await jest.advanceTimersByTimeAsync(130_000)
+
+    // No second tick: /btc/all called exactly once, street phase never reached
+    expect(mockGetAllOfficialRates).toHaveBeenCalledTimes(1)
+    expect(mockGetBlackMarketRate).not.toHaveBeenCalled()
+
+    // Upstream recovers: tick 1 completes and the next tick is scheduled
+    resolvePending(OFFICIAL_SNAPSHOT)
+    await jest.advanceTimersByTimeAsync(13 * 500 + 100) // finish tick 1 streets
+    await jest.advanceTimersByTimeAsync(60_000 + 100) // reach tick 2
+    expect(mockGetAllOfficialRates).toHaveBeenCalledTimes(2)
   })
 
   it("is idempotent — a second call does not start a second interval", async () => {
