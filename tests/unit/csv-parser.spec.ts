@@ -114,11 +114,11 @@ user@alby.com,500,SATS,Another payment`
 
       expect(result.success).toBe(true)
       expect(result.records).toHaveLength(2)
-      expect(result.records[0].normalized).toBe("hermann")
-      expect(result.records[0].type).toBe(RECIPIENT_TYPES.BLINK)
-      expect(result.records[0].amount).toBe(1000)
-      expect(result.records[0].currency).toBe("SATS")
-      expect(result.records[1].type).toBe(RECIPIENT_TYPES.LN_ADDRESS)
+      expect(result.records![0].normalized).toBe("hermann")
+      expect(result.records![0].type).toBe(RECIPIENT_TYPES.BLINK)
+      expect(result.records![0].amount).toBe(1000)
+      expect(result.records![0].currency).toBe("SATS")
+      expect(result.records![1].type).toBe(RECIPIENT_TYPES.LN_ADDRESS)
     })
 
     it("should handle CSV without optional columns", () => {
@@ -130,8 +130,8 @@ alice,500`
 
       expect(result.success).toBe(true)
       expect(result.records).toHaveLength(2)
-      expect(result.records[0].currency).toBe("SATS") // Default
-      expect(result.records[0].memo).toBe("") // Default
+      expect(result.records![0].currency).toBe("SATS") // Default
+      expect(result.records![0].memo).toBe("") // Default
     })
 
     it("should return error for missing required headers", () => {
@@ -184,7 +184,7 @@ alice,500`
       const result = parseCSV(csv)
 
       expect(result.success).toBe(false)
-      expect(result.errors.some((e: string) => e.includes("Missing recipient"))).toBe(
+      expect(result.errors!.some((e: string) => e.includes("Missing recipient"))).toBe(
         true,
       )
       expect(result.records).toHaveLength(1) // Only valid row
@@ -198,7 +198,7 @@ alice,500`
       const result = parseCSV(csv)
 
       expect(result.success).toBe(false)
-      expect(result.errors.some((e: string) => e.includes("Missing amount"))).toBe(true)
+      expect(result.errors!.some((e: string) => e.includes("Missing amount"))).toBe(true)
     })
 
     it("should validate invalid amount", () => {
@@ -209,7 +209,7 @@ alice,-100`
       const result = parseCSV(csv)
 
       expect(result.success).toBe(false)
-      expect(result.errors.some((e: string) => e.includes("Invalid amount"))).toBe(true)
+      expect(result.errors!.some((e: string) => e.includes("Invalid amount"))).toBe(true)
     })
 
     it("should validate currency", () => {
@@ -219,7 +219,9 @@ hermann,1000,EUR`
       const result = parseCSV(csv)
 
       expect(result.success).toBe(false)
-      expect(result.errors.some((e: string) => e.includes("Invalid currency"))).toBe(true)
+      expect(result.errors!.some((e: string) => e.includes("Invalid currency"))).toBe(
+        true,
+      )
     })
 
     it("should convert BTC to sats", () => {
@@ -229,7 +231,7 @@ hermann,0.001,BTC`
       const result = parseCSV(csv)
 
       expect(result.success).toBe(true)
-      expect(result.records[0].amountSats).toBe(100000) // 0.001 BTC = 100,000 sats
+      expect(result.records![0].amountSats).toBe(100000) // 0.001 BTC = 100,000 sats
     })
 
     it("should leave USD amount as null for later conversion", () => {
@@ -239,8 +241,8 @@ hermann,10,USD`
       const result = parseCSV(csv)
 
       expect(result.success).toBe(true)
-      expect(result.records[0].amountSats).toBeNull()
-      expect(result.records[0].amount).toBe(10)
+      expect(result.records![0].amountSats).toBeNull()
+      expect(result.records![0].amount).toBe(10)
     })
 
     it("should provide summary with type breakdown", () => {
@@ -251,10 +253,10 @@ lnurl1test,200,SATS,LNURL`
 
       const result = parseCSV(csv)
 
-      expect(result.summary.total).toBe(3)
-      expect(result.summary.byType[RECIPIENT_TYPES.BLINK]).toBe(1)
-      expect(result.summary.byType[RECIPIENT_TYPES.LN_ADDRESS]).toBe(1)
-      expect(result.summary.byType[RECIPIENT_TYPES.LNURL]).toBe(1)
+      expect(result.summary!.total).toBe(3)
+      expect(result.summary!.byType[RECIPIENT_TYPES.BLINK]).toBe(1)
+      expect(result.summary!.byType[RECIPIENT_TYPES.LN_ADDRESS]).toBe(1)
+      expect(result.summary!.byType[RECIPIENT_TYPES.LNURL]).toBe(1)
     })
 
     it("should handle Windows line endings", () => {
@@ -295,7 +297,8 @@ hermann,1000`
     })
 
     it("should fail for non-string content", () => {
-      const result = quickValidate(null)
+      // Deliberately invalid input: quickValidate must reject it at runtime
+      const result = quickValidate(null as unknown as string)
 
       expect(result.valid).toBe(false)
     })
@@ -356,7 +359,7 @@ hermann,1000`
       const result = parseCSV(template)
 
       expect(result.success).toBe(true)
-      expect(result.records.length).toBeGreaterThan(0)
+      expect(result.records!.length).toBeGreaterThan(0)
     })
   })
 })

@@ -24,7 +24,7 @@ import { resourceFromAttributes } from "@opentelemetry/resources"
 import { NodeSDK } from "@opentelemetry/sdk-node"
 import { BatchSpanProcessor } from "@opentelemetry/sdk-trace-node"
 import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions"
-import WebSocket from "ws"
+import { WebSocket as WsWebSocket } from "ws"
 
 const serviceName = process.env.TRACING_SERVICE_NAME || "bbt"
 const otlpEndpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT
@@ -36,7 +36,7 @@ const otlpEndpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT
  * has to be installed at process start rather than inside a route module.
  */
 if (typeof globalThis.WebSocket === "undefined") {
-  Object.assign(globalThis, { WebSocket })
+  Object.assign(globalThis, { WebSocket: WsWebSocket })
 }
 
 /**
