@@ -5,6 +5,8 @@
  * Docs: https://citrusrate.com/llm.txt
  */
 
+import { getCitrusrateFractionDigits } from "./index"
+
 const SATS_PER_BTC: number = 100_000_000
 
 /**
@@ -19,6 +21,19 @@ function toValidBtcRate(raw: unknown): number | null {
     return null
   }
   return raw
+}
+
+/**
+ * Convert a fiat-per-BTC rate to the price of 1 sat in MINOR units.
+ *
+ * Consumers (POS, Voucher, MultiVoucher) scale entered amounts by
+ * 10^fractionDigits before dividing by satPriceInCurrency, so the conversion
+ * must use the currency's actual denomination: x100 for 2-decimal currencies
+ * (cents), x1 for zero-decimal (VUV, RWF, UGX, XAF, XOF), x1000 for
+ * 3-decimal (LYD, TND). A fixed x100 would misprice invoices by 100x/10x.
+ */
+function toSatPriceInMinorUnits(btcRate: number, fractionDigits: number): number {
+  return (btcRate / SATS_PER_BTC) * 10 ** fractionDigits
 }
 
 export interface CitrusrateRateData {
@@ -156,11 +171,11 @@ export class CitrusrateAPI {
       throw new Error(`No valid black market rate available for ${currency}`)
     }
 
-    // Convert BTC rate to satPriceInCurrency format (price of 1 sat in fiat minor units)
-    // Citrusrate returns: rate = price of 1 BTC in fiat (e.g., 6,903,525 MZN)
-    // We need: satPriceInCurrency = price of 1 sat in fiat cents/minor units
-    // Formula: (btcRate / SATS_PER_BTC) * 100 = price of 1 sat in cents
-    const satPriceInCurrency: number = (btcRate / SATS_PER_BTC) * 100
+    // Convert to satPriceInCurrency (price of 1 sat in fiat MINOR units)
+    const satPriceInCurrency: number = toSatPriceInMinorUnits(
+      btcRate,
+      getCitrusrateFractionDigits(currency),
+    )
 
     return {
       currency: currency.toUpperCase(),
@@ -188,7 +203,10 @@ export class CitrusrateAPI {
       throw new Error(`No valid official rate available for ${currency}`)
     }
 
-    const satPriceInCurrency: number = (btcRate / SATS_PER_BTC) * 100
+    const satPriceInCurrency: number = toSatPriceInMinorUnits(
+      btcRate,
+      getCitrusrateFractionDigits(currency),
+    )
 
     return {
       currency: currency.toUpperCase(),
@@ -229,7 +247,10 @@ export class CitrusrateAPI {
       }
       convertedRates[currency] = {
         currency,
-        satPriceInCurrency: (btcRate / SATS_PER_BTC) * 100,
+        satPriceInCurrency: toSatPriceInMinorUnits(
+          btcRate,
+          getCitrusrateFractionDigits(currency),
+        ),
         btcRate,
         timestamp: data.timestamp as string,
         source: "citrusrate_official",

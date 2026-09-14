@@ -30,9 +30,13 @@
  *
  * Scheduling: completion-based recursion (setTimeout scheduled only after a
  * tick settles), NOT setInterval. A degraded upstream can stretch one tick to
- * ~146s (official timeout + 13 × (street timeout + spacing)); interval-based
+ * ~146.5s (official timeout + 13 × (street timeout + spacing)); interval-based
  * scheduling would then launch overlapping ticks and multiply traffic exactly
- * during an outage.
+ * during an outage. The bounded tick duration assumes Citrusrate HTTP calls
+ * are the only slow dependency — it excludes Redis command latency: a
+ * connected-but-silent Redis could still stall a tick mid-write (an existing
+ * limitation of the cache read path too; a bounded cache-operation timeout is
+ * a possible follow-up).
  */
 
 import { setCachedRatesBulk, CachedRate } from "./cache"

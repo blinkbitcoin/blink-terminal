@@ -4,12 +4,18 @@
  * CitrusrateAPI client guards (PR #81 review follow-up).
  *
  * The poller bulk-publishes whatever these methods return into the shared
- * cache for up to 120s, and the exchange-rate route returns cache hits with
+ * cache for up to 300s, and the exchange-rate route returns cache hits with
  * success: true — so malformed upstream payloads must be rejected BEFORE
  * conversion/caching, not trusted after a cast. A string/object rate would
  * otherwise become NaN, serialize as null, and reach checkout math.
+ *
+ * Conversions must use each currency's real fractionDigits (minor units per
+ * sat): consumers scale amounts by 10^fractionDigits before dividing, so a
+ * fixed x100 would misprice zero-decimal (VUV/RWF/UGX/XAF/XOF) and
+ * 3-decimal (LYD/TND) invoices by 100x/10x.
  */
 
+import { getCurrencyById } from "../../lib/currency-utils"
 import { CitrusrateAPI, CitrusrateError } from "../../lib/rate-providers/citrusrate"
 
 const mockFetch = jest.fn()
@@ -93,10 +99,77 @@ describe("CitrusrateAPI rate validation", () => {
     )
 
     const result = await api.getBlackMarketRate("mzn")
+    // MZN is 2-decimal: minor units (centavos) per sat
     expect(result.satPriceInCurrency).toBeCloseTo((5_951_836.43 / 100_000_000) * 100, 10)
     expect(result.currency).toBe("MZN")
     expect(result.provider).toBe("citrusrate_street")
     expect(result.source).toBe("estimated")
+  })
+
+  it("converts a zero-decimal currency (VUV) without the cents multiplier", async () => {
+    const api = apiWithKey()
+    mockFetch.mockResolvedValue(
+      okJson({
+        status: "success",
+        data: { pair: "BTC/VUV", rate: 9_002_353.74, timestamp: "2026-09-14T00:00:00Z" },
+      }),
+    )
+
+    const result = await api.getOfficialRate("VUV")
+    // VUV has 0 fraction digits: price per sat in whole vatu (x1, not x100)
+    expect(result.satPriceInCurrency).toBeCloseTo(9_002_353.74 / 100_000_000, 12)
+  })
+
+  it("converts a three-decimal currency (LYD) with the x1000 multiplier", async () => {
+    const api = apiWithKey()
+    mockFetch.mockResolvedValue(
+      okJson({
+        status: "success",
+        data: { pair: "BTC/LYD", rate: 555_000, timestamp: "2026-09-14T00:00:00Z" },
+      }),
+    )
+
+    const result = await api.getOfficialRate("LYD")
+    // LYD has 3 fraction digits: price per sat in dirhams
+    expect(result.satPriceInCurrency).toBeCloseTo((555_000 / 100_000_000) * 1000, 10)
+  })
+
+  it("converts a zero-decimal street rate (RWF) without the cents multiplier", async () => {
+    const api = apiWithKey()
+    mockFetch.mockResolvedValue(
+      okJson({
+        status: "success",
+        data: {
+          pair: "BTC/RWF",
+          rate: 115_361_018.9,
+          timestamp: "2026-09-14T00:00:00Z",
+          source: "estimated",
+        },
+      }),
+    )
+
+    const result = await api.getBlackMarketRate("RWF")
+    expect(result.satPriceInCurrency).toBeCloseTo(115_361_018.9 / 100_000_000, 10)
+  })
+
+  it("route-to-checkout contract: a 1,000 VUV sale yields ~11,108 sats (PR #81 review example)", async () => {
+    const api = apiWithKey()
+    mockFetch.mockResolvedValue(
+      okJson({
+        status: "success",
+        data: { pair: "BTC/VUV", rate: 9_002_353.74, timestamp: "2026-09-14T00:00:00Z" },
+      }),
+    )
+
+    const rate = await api.getOfficialRate("VUV")
+
+    // Mirror POS.tsx convertToSatoshis: minor units / per-sat minor price
+    const currencyInfo = getCurrencyById("VUV", [])
+    expect(currencyInfo?.fractionDigits).toBe(0)
+    const amountInMinorUnits = 1000 * 10 ** (currencyInfo?.fractionDigits ?? 2)
+    const satsAmount = Math.round(amountInMinorUnits / rate.satPriceInCurrency)
+
+    expect(satsAmount).toBe(11_108)
   })
 
   it("converts a valid official rate to satPriceInCurrency", async () => {
@@ -175,9 +248,14 @@ describe("CitrusrateAPI rate validation", () => {
     const result = await api.getAllOfficialRates()
 
     expect(Object.keys(result.rates).sort()).toEqual(["NGN", "VUV"])
+    // NGN is 2-decimal (x100), VUV is zero-decimal (x1) — per-currency denominations
     expect(result.rates.NGN.satPriceInCurrency).toBeCloseTo(
       (103_011_056.22 / 100_000_000) * 100,
       10,
+    )
+    expect(result.rates.VUV.satPriceInCurrency).toBeCloseTo(
+      9_002_353.74 / 100_000_000,
+      12,
     )
     expect(warn).toHaveBeenCalledTimes(4)
     warn.mockRestore()

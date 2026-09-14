@@ -272,6 +272,31 @@ export function getStreetRateCurrency(currencyId: string): StreetRateCurrency | 
 }
 
 /**
+ * Get the fraction digits for any Citrusrate-backed currency variant.
+ *
+ * Accepts a plain base id ("VUV"), an alt id ("UGX_CITRUS"), or a street id
+ * ("RWF_STREET") and resolves the denomination metadata needed to convert a
+ * BTC rate into minor units per sat (consumers like POS.tsx scale amounts by
+ * 10^fractionDigits before dividing by satPriceInCurrency). fractionDigits is
+ * a property of the BASE currency, so street/alt variants share their base's
+ * value. Defaults to 2 for unknown ids.
+ */
+export function getCitrusrateFractionDigits(currencyId: string): number {
+  const baseId: string = getBaseCurrency(currencyId)
+
+  const exclusive = CITRUSRATE_EXCLUSIVE_CURRENCIES.find((c) => c.id === baseId)
+  if (exclusive) return exclusive.fractionDigits
+
+  const alt = CITRUSRATE_ALT_CURRENCIES.find((c) => c.baseId === baseId)
+  if (alt) return alt.fractionDigits
+
+  const street = STREET_RATE_CURRENCIES.find((c) => c.baseId === baseId)
+  if (street) return street.fractionDigits
+
+  return 2
+}
+
+/**
  * Get all configured street rate currencies
  */
 export function getAllStreetRateCurrencies(): StreetRateCurrency[] {
