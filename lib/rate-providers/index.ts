@@ -52,8 +52,7 @@ export const RATE_PROVIDERS: Record<string, RateProvider> = {
     id: "citrusrate_street",
     name: "Citrusrate (Street)",
     description: "Black market / street exchange rates from Citrusrate",
-    // Specific currencies this provider handles
-    currencies: ["MZN_STREET"],
+    // Currency mapping is driven by STREET_RATE_CURRENCIES below
     rateType: "blackmarket",
   },
   citrusrate_official: {
@@ -68,9 +67,52 @@ export const RATE_PROVIDERS: Record<string, RateProvider> = {
 
 /**
  * Street rate currency configurations
- * Maps virtual currency IDs (e.g., MZN_STREET) to their base currencies and metadata
+ * Maps virtual currency IDs (e.g., MZN_STREET) to their base currencies and metadata.
+ * Covers all 13 currencies supported by Citrusrate's black-market endpoint
+ * (GET /v1/btc/blackmarket?currency=X) — verified live Sept 2026.
+ * NOTE: keep in sync with STREET_RATE_CURRENCIES in lib/currency-utils.ts
  */
 export const STREET_RATE_CURRENCIES: StreetRateCurrency[] = [
+  {
+    id: "EGP_STREET",
+    baseId: "EGP",
+    displayId: "EGP (street)",
+    symbol: "E£",
+    name: "Egyptian Pound (street rate)",
+    flag: "🇪🇬",
+    fractionDigits: 2,
+    rateProvider: "citrusrate_street",
+  },
+  {
+    id: "ETB_STREET",
+    baseId: "ETB",
+    displayId: "ETB (street)",
+    symbol: "Br",
+    name: "Ethiopian Birr (street rate)",
+    flag: "🇪🇹",
+    fractionDigits: 2,
+    rateProvider: "citrusrate_street",
+  },
+  {
+    id: "GHS_STREET",
+    baseId: "GHS",
+    displayId: "GHS (street)",
+    symbol: "₵",
+    name: "Ghanaian Cedi (street rate)",
+    flag: "🇬🇭",
+    fractionDigits: 2,
+    rateProvider: "citrusrate_street",
+  },
+  {
+    id: "MWK_STREET",
+    baseId: "MWK",
+    displayId: "MWK (street)",
+    symbol: "MK",
+    name: "Malawian Kwacha (street rate)",
+    flag: "🇲🇼",
+    fractionDigits: 2,
+    rateProvider: "citrusrate_street",
+  },
   {
     id: "MZN_STREET",
     baseId: "MZN",
@@ -81,7 +123,86 @@ export const STREET_RATE_CURRENCIES: StreetRateCurrency[] = [
     fractionDigits: 2,
     rateProvider: "citrusrate_street",
   },
-  // More street rate currencies can be added when Citrusrate expands support
+  {
+    id: "NAD_STREET",
+    baseId: "NAD",
+    displayId: "NAD (street)",
+    symbol: "$",
+    name: "Namibian Dollar (street rate)",
+    flag: "🇳🇦",
+    fractionDigits: 2,
+    rateProvider: "citrusrate_street",
+  },
+  {
+    id: "RWF_STREET",
+    baseId: "RWF",
+    displayId: "RWF (street)",
+    symbol: "RF",
+    name: "Rwandan Franc (street rate)",
+    flag: "🇷🇼",
+    fractionDigits: 0,
+    rateProvider: "citrusrate_street",
+  },
+  {
+    id: "TZS_STREET",
+    baseId: "TZS",
+    displayId: "TZS (street)",
+    symbol: "TSh",
+    name: "Tanzanian Shilling (street rate)",
+    flag: "🇹🇿",
+    fractionDigits: 2,
+    rateProvider: "citrusrate_street",
+  },
+  {
+    id: "UGX_STREET",
+    baseId: "UGX",
+    displayId: "UGX (street)",
+    symbol: "USh",
+    name: "Ugandan Shilling (street rate)",
+    flag: "🇺🇬",
+    fractionDigits: 0,
+    rateProvider: "citrusrate_street",
+  },
+  {
+    id: "XAF_STREET",
+    baseId: "XAF",
+    displayId: "XAF (street)",
+    symbol: "FCFA",
+    name: "CFA Franc BEAC (street rate)",
+    flag: "🇨🇲",
+    fractionDigits: 0,
+    rateProvider: "citrusrate_street",
+  },
+  {
+    id: "XOF_STREET",
+    baseId: "XOF",
+    displayId: "XOF (street)",
+    symbol: "CFA",
+    name: "CFA Franc BCEAO (street rate)",
+    flag: "🇸🇳",
+    fractionDigits: 0,
+    rateProvider: "citrusrate_street",
+  },
+  {
+    id: "ZAR_STREET",
+    baseId: "ZAR",
+    displayId: "ZAR (street)",
+    symbol: "R",
+    name: "South African Rand (street rate)",
+    flag: "🇿🇦",
+    fractionDigits: 2,
+    rateProvider: "citrusrate_street",
+  },
+  {
+    id: "ZMW_STREET",
+    baseId: "ZMW",
+    displayId: "ZMW (street)",
+    symbol: "ZK",
+    name: "Zambian Kwacha (street rate)",
+    flag: "🇿🇲",
+    fractionDigits: 2,
+    rateProvider: "citrusrate_street",
+  },
 ]
 
 /**
@@ -148,6 +269,31 @@ export function getStreetRateCurrency(currencyId: string): StreetRateCurrency | 
   return (
     STREET_RATE_CURRENCIES.find((c: StreetRateCurrency) => c.id === currencyId) || null
   )
+}
+
+/**
+ * Get the fraction digits for any Citrusrate-backed currency variant.
+ *
+ * Accepts a plain base id ("VUV"), an alt id ("UGX_CITRUS"), or a street id
+ * ("RWF_STREET") and resolves the denomination metadata needed to convert a
+ * BTC rate into minor units per sat (consumers like POS.tsx scale amounts by
+ * 10^fractionDigits before dividing by satPriceInCurrency). fractionDigits is
+ * a property of the BASE currency, so street/alt variants share their base's
+ * value. Defaults to 2 for unknown ids.
+ */
+export function getCitrusrateFractionDigits(currencyId: string): number {
+  const baseId: string = getBaseCurrency(currencyId)
+
+  const exclusive = CITRUSRATE_EXCLUSIVE_CURRENCIES.find((c) => c.id === baseId)
+  if (exclusive) return exclusive.fractionDigits
+
+  const alt = CITRUSRATE_ALT_CURRENCIES.find((c) => c.baseId === baseId)
+  if (alt) return alt.fractionDigits
+
+  const street = STREET_RATE_CURRENCIES.find((c) => c.baseId === baseId)
+  if (street) return street.fractionDigits
+
+  return 2
 }
 
 /**

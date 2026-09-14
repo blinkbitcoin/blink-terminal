@@ -70,6 +70,19 @@ if (otlpEndpoint) {
 }
 
 /**
+ * Start the Citrusrate rate poller: pulls official + street rates from
+ * Citrusrate on a fixed 60s schedule into the shared Redis cache, so client
+ * requests to /api/rates/exchange-rate fan out from cache rather than each
+ * triggering an upstream call. No-ops when CITRUSRATE_API_KEY is unset.
+ */
+import("./lib/rate-providers/poller")
+  .then(({ startCitrusratePoller }) => startCitrusratePoller())
+  .catch((err: unknown) =>
+    // eslint-disable-next-line no-console
+    console.warn("[citrusrate-poller] failed to start:", err),
+  )
+
+/**
  * Export the SDK instance so lib/shutdown.ts can call sdk.shutdown()
  * during graceful shutdown. May be undefined when tracing is disabled.
  */

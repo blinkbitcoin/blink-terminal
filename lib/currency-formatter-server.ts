@@ -62,7 +62,7 @@ const CURRENCY_SYMBOLS: Record<string, string> = {
   "MYR": "RM",
   "BTC": "sats",
   "BTC-BIP177": "₿",
-  // Citrusrate African currencies (24 exclusive)
+  // Citrusrate exclusive currencies (21: 20 African + VUV)
   "AOA": "Kz", // Angolan Kwanza
   "BIF": "FBu", // Burundian Franc
   "BWP": "P", // Botswana Pula
@@ -77,16 +77,13 @@ const CURRENCY_SYMBOLS: Record<string, string> = {
   "LSL": "L", // Lesotho Loti
   "LYD": "ل.د", // Libyan Dinar
   "MGA": "Ar", // Malagasy Ariary
-  "MRO": "UM", // Mauritanian Ouguiya (old code)
   "RWF": "RF", // Rwandan Franc
   "SCR": "SR", // Seychellois Rupee
   "SDG": "ج.س", // Sudanese Pound
-  "SLL": "Le", // Sierra Leonean Leone
   "SOS": "S", // Somali Shilling
-  "STD": "Db", // São Tomé and Príncipe Dobra (old code)
   "SZL": "E", // Swazi Lilangeni
   "TND": "د.ت", // Tunisian Dinar
-  "ZWD": "Z$", // Zimbabwean Dollar (old code)
+  "VUV": "VT", // Vanuatu Vatu
 }
 
 // Currencies with 0 decimal places
@@ -110,13 +107,14 @@ const ZERO_DECIMAL_CURRENCIES: string[] = [
   "IDR",
   "IRR",
   "IQD",
-  // Citrusrate African zero-decimal currencies
+  // Citrusrate exclusive zero-decimal currencies
   "BIF", // Burundian Franc
   "DJF", // Djiboutian Franc
   "GNF", // Guinean Franc
   "KMF", // Comorian Franc
   "MGA", // Malagasy Ariary
   "RWF", // Rwandan Franc
+  "VUV", // Vanuatu Vatu
 ]
 
 /**
