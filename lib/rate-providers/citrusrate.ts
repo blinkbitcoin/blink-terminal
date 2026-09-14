@@ -1,8 +1,8 @@
 /**
  * Citrusrate API Client
  *
- * Fetches black market / street exchange rates from Citrusrate API.
- * https://documenter.getpostman.com/view/27524206/2sBXVigpTG
+ * Fetches official and black market / street exchange rates from Citrusrate API.
+ * Docs: https://citrusrate.com/llm.txt
  */
 
 const SATS_PER_BTC: number = 100_000_000
@@ -33,7 +33,7 @@ export class CitrusrateAPI {
 
   constructor() {
     this.apiKey = process.env.CITRUSRATE_API_KEY
-    this.baseUrl = process.env.CITRUSRATE_BASE_URL || "https://citrusrate-be.onrender.com"
+    this.baseUrl = process.env.CITRUSRATE_BASE_URL || "https://api.citrusrate.com"
     this.timeout = 10000 // 10 second timeout as recommended
   }
 
@@ -44,6 +44,10 @@ export class CitrusrateAPI {
    * @returns API response data
    */
   async request(endpoint: string, params: Record<string, string> = {}): Promise<unknown> {
+    if (!this.apiKey) {
+      throw new Error("Citrusrate API key not configured (CITRUSRATE_API_KEY is not set)")
+    }
+
     const url: URL = new URL(`${this.baseUrl}${endpoint}`)
     Object.entries(params).forEach(([key, value]: [string, string]) => {
       url.searchParams.append(key, value)

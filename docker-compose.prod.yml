@@ -33,7 +33,7 @@ services:
       NIP46_MAX_SESSIONS_PER_IP: ${NIP46_MAX_SESSIONS_PER_IP:-5}
       # Citrusrate exchange rate provider
       CITRUSRATE_API_KEY: ${CITRUSRATE_API_KEY}
-      CITRUSRATE_BASE_URL: ${CITRUSRATE_BASE_URL:-https://citrusrate-be.onrender.com}
+      CITRUSRATE_BASE_URL: ${CITRUSRATE_BASE_URL:-https://api.citrusrate.com}
       # OpenTelemetry tracing
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4318}
       TRACING_SERVICE_NAME: ${TRACING_SERVICE_NAME:-bbt-pos}

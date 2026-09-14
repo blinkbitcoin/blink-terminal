@@ -178,4 +178,37 @@ export async function clearAllCachedRates(): Promise<void> {
   }
 }
 
+/**
+ * Cache multiple rates at once (used by the Citrusrate poller)
+ * @param provider - Provider ID
+ * @param rates - Map of currency code to rate data
+ * @param ttl - TTL in seconds (optional, defaults to RATE_CACHE_TTL)
+ */
+export async function setCachedRatesBulk(
+  provider: string,
+  rates: Record<string, CachedRate>,
+  ttl: number = RATE_CACHE_TTL,
+): Promise<void> {
+  try {
+    const redis: RedisClientType | null = await getRedisClient()
+    if (!redis) {
+      return
+    }
+
+    const cachedAt: string = new Date().toISOString()
+    const pipeline = redis.multi()
+    for (const [currency, rate] of Object.entries(rates)) {
+      const cacheKey: string = getCacheKey(provider, currency)
+      pipeline.setEx(cacheKey, ttl, JSON.stringify({ ...rate, cachedAt }))
+    }
+    await pipeline.exec()
+
+    console.log(
+      `Rate cache bulk write: ${provider} (${Object.keys(rates).length} currencies, TTL: ${ttl}s)`,
+    )
+  } catch (error: unknown) {
+    console.warn("Rate cache bulk set error:", (error as Error).message)
+  }
+}
+
 export { RATE_CACHE_TTL }
