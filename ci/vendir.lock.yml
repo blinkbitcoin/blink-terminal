@@ -8,8 +8,9 @@ directories:
   path: ../.github/workflows/vendor
 - contents:
   - git:
-      commitTitle: 'chore: register blink-terminal in src_repos (#23)...'
-      sha: 2055dbe92df1048a2e77d8ac26480cba5d41aa0b
+      commitTitle: 'fix(ci): preserve compatible chart pipeline and remove invalid
+        Git get parameter'
+      sha: 5f1d0ac4501ef9443aafb537bd663a09796e8082
     path: .
   path: vendor
 kind: LockConfig
