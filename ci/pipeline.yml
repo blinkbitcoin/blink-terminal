@@ -1,3 +1,4 @@
+#@ load("@ytt:overlay", "overlay")
 #@ load("@ytt:data", "data")
 
 #@ load("vendor/pipeline-fragments.lib.yml",
@@ -73,3 +74,17 @@ resources:
 resource_types:
 - #@ gcr_resource_type()
 - #@ slack_resource_type()
+
+#! Keep the pinned shared template unchanged while using supported Git get params.
+#@overlay/match by=lambda _, left, right: "jobs" in left, expects=1
+---
+jobs:
+#@overlay/match by="name", expects=1
+- name: bump-image-in-chart
+  plan:
+  #@overlay/match by=lambda _, left, right: "in_parallel" in left, expects=1
+  - in_parallel:
+    #@overlay/match by=overlay.subset({"get": "charts-repo"}), expects=1
+    - params:
+        #@overlay/remove
+        skip_download:
