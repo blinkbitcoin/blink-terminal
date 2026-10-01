@@ -26,7 +26,7 @@ const EXPECTED_OVERRIDES: Record<string, string> = {
   "protobufjs": ">=8.4.1",
   "lodash@<4.18.0": ">=4.18.0",
   "ws@>=8.0.0 <8.21.0": ">=8.21.0",
-  "@grpc/grpc-js@>=1.14.0 <1.14.4": ">=1.14.4",
+  "@grpc/grpc-js@>=1.14.0 <1.14.5": ">=1.14.5",
   "sharp@<0.35.0": ">=0.35.3",
   "postcss@<8.5.18": ">=8.5.18",
   "nanoid@<3.3.18": "^3.3.18",
