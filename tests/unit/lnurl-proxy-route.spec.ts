@@ -22,7 +22,13 @@ jest.mock("../../lib/logger", () => ({
 }))
 
 jest.mock("../../lib/server/safe-fetch-json", () => {
-  class SafeFetchError extends Error {}
+  class SafeFetchError extends Error {
+    code: string
+    constructor(message: string, code: string) {
+      super(message)
+      this.code = code
+    }
+  }
   return {
     SafeFetchError,
     safeFetchJson: (url: string) => mockSafeFetchJson(url),
@@ -292,7 +298,9 @@ describe("POST /api/lnurl-proxy", () => {
   )
 
   it("maps expected fetch failures to a client error", async () => {
-    mockSafeFetchJsonResponse.mockRejectedValueOnce(new SafeFetchError("unavailable"))
+    mockSafeFetchJsonResponse.mockRejectedValueOnce(
+      new SafeFetchError("unavailable", "NETWORK"),
+    )
 
     const result = await post({ lnurl: SERVICE_URL, paymentRequest: PAYMENT_REQUEST })
     expect(result.status).toBe(400)
@@ -301,7 +309,7 @@ describe("POST /api/lnurl-proxy", () => {
 
   it("maps callback fetch failures to a client error", async () => {
     mockSafeFetchJsonResponse.mockResolvedValueOnce(serviceResponse(withdrawParams()))
-    mockSafeFetchJson.mockRejectedValueOnce(new SafeFetchError("unavailable"))
+    mockSafeFetchJson.mockRejectedValueOnce(new SafeFetchError("unavailable", "NETWORK"))
 
     const result = await post({ lnurl: SERVICE_URL, paymentRequest: PAYMENT_REQUEST })
     expect(result.status).toBe(400)

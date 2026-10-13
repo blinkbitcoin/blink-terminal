@@ -13,7 +13,13 @@ jest.mock("nostr-tools", () => ({
 
 const mockSafeFetchJson = jest.fn()
 jest.mock("../../lib/server/safe-fetch-json", () => {
-  class SafeFetchError extends Error {}
+  class SafeFetchError extends Error {
+    code: string
+    constructor(message: string, code: string) {
+      super(message)
+      this.code = code
+    }
+  }
   return {
     SafeFetchError,
     safeFetchJson: (...args: unknown[]) => mockSafeFetchJson(...args),
@@ -38,9 +44,18 @@ describe("fetchJsonWithRetry", () => {
     })
   })
 
+  it("retries on the NETWORK code regardless of message text", async () => {
+    mockSafeFetchJson
+      .mockRejectedValueOnce(new SafeFetchError("socket hang up", "NETWORK"))
+      .mockResolvedValueOnce({ ok: 1 })
+
+    await expect(fetchJsonWithRetry("https://blink.sv/x", 2)).resolves.toEqual({ ok: 1 })
+    expect(mockSafeFetchJson).toHaveBeenCalledTimes(2)
+  })
+
   it("retries a transient transport failure then succeeds", async () => {
     mockSafeFetchJson
-      .mockRejectedValueOnce(new SafeFetchError("upstream request failed"))
+      .mockRejectedValueOnce(new SafeFetchError("upstream request failed", "NETWORK"))
       .mockResolvedValueOnce({ ok: 1 })
 
     await expect(fetchJsonWithRetry("https://blink.sv/x", 2)).resolves.toEqual({ ok: 1 })
@@ -48,7 +63,9 @@ describe("fetchJsonWithRetry", () => {
   })
 
   it("throws after exhausting all retries", async () => {
-    mockSafeFetchJson.mockRejectedValue(new SafeFetchError("upstream request timed out"))
+    mockSafeFetchJson.mockRejectedValue(
+      new SafeFetchError("upstream request timed out", "TIMEOUT"),
+    )
 
     await expect(fetchJsonWithRetry("https://blink.sv/x", 2)).rejects.toThrow(
       "upstream request timed out",
@@ -57,11 +74,14 @@ describe("fetchJsonWithRetry", () => {
   })
 
   it.each([
-    "hostname does not resolve to a public address",
-    "only https URLs are allowed",
-    "upstream returned HTTP 404",
-  ])("does not retry policy/HTTP rejections (%s)", async (message) => {
-    mockSafeFetchJson.mockRejectedValue(new SafeFetchError(message))
+    ["hostname does not resolve to a public address", "BLOCKED_ADDRESS"],
+    ["only https URLs are allowed", "NOT_HTTPS"],
+    ["upstream returned HTTP 404", "HTTP_STATUS"],
+    ["upstream request deadline exceeded", "DEADLINE"],
+    // Retry decisions use the code, not the message text.
+    ["upstream request failed", "INVALID_JSON"],
+  ] as const)("does not retry %s (%s)", async (message, code) => {
+    mockSafeFetchJson.mockRejectedValue(new SafeFetchError(message, code))
 
     await expect(fetchJsonWithRetry("https://blink.sv/x", 2)).rejects.toThrow(message)
     expect(mockSafeFetchJson).toHaveBeenCalledTimes(1)
@@ -81,7 +101,10 @@ describe("getInvoiceFromLightningAddress (SSRF)", () => {
         metadata: "[]",
       })
       .mockRejectedValueOnce(
-        new SafeFetchError("hostname does not resolve to a public address"),
+        new SafeFetchError(
+          "hostname does not resolve to a public address",
+          "BLOCKED_ADDRESS",
+        ),
       )
 
     await expect(getInvoiceFromLightningAddress("a@evil.example", 10)).rejects.toThrow(

@@ -8,7 +8,11 @@
 import { nip19 } from "nostr-tools"
 import type { DecodedResult } from "nostr-tools/lib/types/nip19"
 
-import { SafeFetchError, safeFetchJson } from "./server/safe-fetch-json"
+import {
+  SafeFetchError,
+  type SafeFetchErrorCode,
+  safeFetchJson,
+} from "./server/safe-fetch-json"
 
 // =============================================================================
 // Types
@@ -106,10 +110,7 @@ const LNURL_MAX_BODY_BYTES = 256 * 1024
 
 // Transport-level failures worth retrying. Policy rejections (non-https,
 // private/internal address, oversized body, bad JSON, HTTP status) are not.
-const RETRYABLE_MESSAGES = new Set([
-  "upstream request failed",
-  "upstream request timed out",
-])
+const RETRYABLE_CODES: ReadonlySet<SafeFetchErrorCode> = new Set(["NETWORK", "TIMEOUT"])
 
 /**
  * GET a JSON document from a user- or third-party-supplied URL (Lightning address
@@ -138,8 +139,7 @@ export async function fetchJsonWithRetry(
       return await safeFetchJson(url, { maxBodyBytes: LNURL_MAX_BODY_BYTES })
     } catch (err) {
       lastError = err
-      const retryable =
-        err instanceof SafeFetchError && RETRYABLE_MESSAGES.has(err.message)
+      const retryable = err instanceof SafeFetchError && RETRYABLE_CODES.has(err.code)
       if (!retryable || attempt === retries) break
 
       await new Promise((resolve) =>
