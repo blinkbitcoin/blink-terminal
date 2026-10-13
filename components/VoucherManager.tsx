@@ -120,11 +120,21 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
     const pollingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
     const qrRef = useRef<HTMLDivElement>(null)
 
+    // Vouchers are scoped to (and authorized by) the voucher wallet's API key.
+    const voucherApiKey = voucherWallet?.apiKey
+
     // Fetch vouchers
     const fetchVouchers = useCallback(async () => {
+      if (!voucherApiKey) {
+        setVouchers([])
+        setLoading(false)
+        return
+      }
       try {
         setError("")
-        const response = await fetch("/api/voucher/list")
+        const response = await fetch("/api/voucher/list", {
+          headers: { "x-voucher-api-key": voucherApiKey },
+        })
         const data = await response.json()
 
         if (data.success) {
@@ -141,7 +151,7 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
       } finally {
         setLoading(false)
       }
-    }, [])
+    }, [voucherApiKey])
 
     // Expose methods for keyboard navigation
     useImperativeHandle(ref, () => ({
@@ -159,13 +169,16 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
 
     // Cancel voucher
     const cancelVoucher = async (voucherId: string) => {
-      if (!voucherId) return
+      if (!voucherId || !voucherApiKey) return
 
       setCancelling(true)
       try {
         const response = await fetch("/api/voucher/cancel", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            "x-voucher-api-key": voucherApiKey,
+          },
           body: JSON.stringify({ chargeId: voucherId }),
         })
 

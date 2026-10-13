@@ -1,6 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
 import { withRateLimit, RATE_LIMIT_READ } from "../../../lib/rate-limit"
+import { apiKeyMatches, getVoucherApiKey } from "../../../lib/voucher-auth"
 import voucherStore from "../../../lib/voucher-store"
 
 /** Shape of a voucher record from the store */
@@ -19,38 +20,42 @@ interface VoucherRecord {
   status: string
   walletCurrency?: string
   usdAmountCents?: number | null
+  apiKey?: string | null
 }
 
 /**
- * API endpoint to list all vouchers
+ * API endpoint to list the caller's vouchers
  *
  * GET /api/voucher/list
- * Returns all vouchers with status information (ACTIVE, CLAIMED, CANCELLED, EXPIRED)
+ * Header: x-voucher-api-key: <voucher wallet API key>
+ * Returns only vouchers created with that API key, with status information
+ * (ACTIVE, CLAIMED, CANCELLED, EXPIRED). Voucher ids are LNURL-withdraw
+ * redemption secrets, so they are never returned to anyone but the owner.
  *
  * Query params:
  * - status: Filter by status (optional): 'ACTIVE', 'CLAIMED', 'CANCELLED', 'EXPIRED', 'all'
  *   Default: returns all vouchers
  */
 async function handler(req: NextApiRequest, res: NextApiResponse) {
-  // Add CORS headers for compatibility
-  res.setHeader("Access-Control-Allow-Origin", "*")
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS")
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type")
-
-  if (req.method === "OPTIONS") {
-    return res.status(200).end()
-  }
+  res.setHeader("Cache-Control", "no-store")
 
   if (req.method !== "GET") {
     return res.status(405).json({ error: "Method not allowed" })
+  }
+
+  const apiKey = getVoucherApiKey(req)
+  if (!apiKey) {
+    return res.status(401).json({ error: "Voucher wallet API key required" })
   }
 
   try {
     const { status: filterStatus } = req.query as { status?: string }
     const now = Date.now()
 
-    // Get all vouchers with status from the store (async)
-    const allVouchers = await voucherStore.getAllVouchers()
+    // Only the caller's vouchers (those funded by the presented API key)
+    const allVouchers = (await voucherStore.getAllVouchers()).filter(
+      (voucher: VoucherRecord) => apiKeyMatches(voucher.apiKey, apiKey),
+    )
 
     // Format vouchers for response
     let vouchers = allVouchers.map((voucher: VoucherRecord) => {

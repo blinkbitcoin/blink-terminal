@@ -1,7 +1,8 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
-import BlinkAPI from "../../../lib/blink-api"
+import BlinkAPI, { PaymentRejectedError } from "../../../lib/blink-api"
 import { getApiUrlForEnvironment, type EnvironmentName } from "../../../lib/config/api"
+import { verifyForwardInvoice } from "../../../lib/payout-guard"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
 import voucherStore from "../../../lib/voucher-store"
 
@@ -35,7 +36,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   const startTime = Date.now()
 
   try {
-    const { k1, pr } = req.query as { k1: string; pr: string }
+    const k1 = typeof req.query.k1 === "string" ? req.query.k1 : undefined
+    const pr = typeof req.query.pr === "string" ? req.query.pr : undefined
 
     console.log("🔔 LNURL-withdraw callback received:", {
       k1: k1 ? k1.substring(0, 8) + "..." : "missing",
@@ -93,6 +95,30 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       return res.status(200).json({
         status: "ERROR",
         reason: "Invalid Lightning invoice format",
+      })
+    }
+
+    // The invoice must be for exactly the voucher's face value (sats fixed at
+    // issuance, also for USD vouchers), carry an amount, and not be expired.
+    // Checked BEFORE claiming so a rejected invoice never touches the voucher.
+    const invoiceCheck = verifyForwardInvoice({
+      invoice: pr,
+      expectedSats: voucher.amount,
+    })
+    if (!invoiceCheck.ok) {
+      console.error("❌ Invoice rejected for voucher:", {
+        chargeId: chargeId.substring(0, 8) + "...",
+        reason: invoiceCheck.error,
+      })
+      return res.status(200).json({
+        status: "ERROR",
+        reason: invoiceCheck.error.includes("expired")
+          ? "Invoice has expired"
+          : invoiceCheck.error.includes("no amount")
+            ? "Invoice must specify an amount"
+            : invoiceCheck.error.includes("decode")
+              ? "Invalid Lightning invoice"
+              : `Invoice amount does not match voucher (${voucher.amount} sats)`,
       })
     }
 
@@ -180,8 +206,12 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
           console.log("⏳ Payment is pending:", paymentResult)
           // For PENDING, we still return OK as the payment is in progress
           // The voucher remains claimed
+        } else if (paymentResult.status === "FAILURE") {
+          // Definite failure reported by the API: nothing was sent.
+          throw new PaymentRejectedError(`Payment failed with status: FAILURE`)
         } else {
-          throw new Error(`Payment failed with status: ${paymentResult.status}`)
+          // Unknown status: outcome uncertain, keep the voucher claimed.
+          throw new Error(`Payment returned unexpected status: ${paymentResult.status}`)
         }
       }
 
@@ -197,13 +227,22 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       // Return LNURL success response
       return res.status(200).send('{"status":"OK"}')
     } catch (paymentError: unknown) {
-      // Payment failed - unclaim the voucher so it can be retried
       const paymentMessage =
         paymentError instanceof Error ? paymentError.message : "Unknown error"
-      console.error("❌ Payment failed, unclaiming voucher:", paymentMessage)
 
-      // Unclaim the voucher using proper method
-      await voucherStore.unclaimVoucher(chargeId)
+      if (paymentError instanceof PaymentRejectedError) {
+        // The API rejected the payment (nothing sent) — release the voucher so
+        // the holder can retry. Safe: the invoice amount is pinned to face value.
+        console.error("❌ Payment rejected, unclaiming voucher:", paymentMessage)
+        await voucherStore.unclaimVoucher(chargeId)
+      } else {
+        // Transport error / unknown outcome: the payment may have gone out.
+        // Keep the voucher claimed to rule out a double payout.
+        console.error(
+          "❌ Payment outcome unknown, voucher stays claimed:",
+          paymentMessage,
+        )
+      }
 
       throw paymentError
     }

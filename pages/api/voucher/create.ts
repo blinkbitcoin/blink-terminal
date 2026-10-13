@@ -2,6 +2,7 @@ import type { NextApiRequest, NextApiResponse } from "next"
 
 import type { EnvironmentName } from "../../../lib/config/api"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
+import { apiKeyOwnsWallet } from "../../../lib/voucher-auth"
 import { isValidExpiryId, DEFAULT_EXPIRY_ID } from "../../../lib/voucher-expiry"
 import voucherStore from "../../../lib/voucher-store"
 
@@ -36,7 +37,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       commissionPercent,
       displayAmount,
       displayCurrency,
-      environment = "production",
+      environment: requestedEnvironment,
       walletCurrency = "BTC",
       usdAmount,
     } = req.body as {
@@ -47,13 +48,22 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       commissionPercent?: number
       displayAmount?: string
       displayCurrency?: string
-      environment?: EnvironmentName
+      environment?: unknown
       walletCurrency?: string
       usdAmount?: number | string
     }
 
+    const environment: EnvironmentName =
+      requestedEnvironment === "staging" ? "staging" : "production"
+
     // Validate required fields
-    if (!amount || !apiKey || !walletId) {
+    if (
+      !amount ||
+      !apiKey ||
+      !walletId ||
+      typeof apiKey !== "string" ||
+      typeof walletId !== "string"
+    ) {
       console.error("❌ Missing required fields for voucher creation")
       return res.status(400).json({
         error: "Missing required fields: amount, apiKey, walletId",
@@ -86,6 +96,15 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
           error: "USD vouchers require a positive usdAmount (in cents)",
         })
       }
+    }
+
+    // The API key must own the wallet the voucher is drawn from. Otherwise
+    // anyone could create vouchers against (and exhaust the unclaimed-voucher
+    // quota of) a wallet id they don't control.
+    if (!(await apiKeyOwnsWallet(apiKey, walletId, environment))) {
+      return res.status(403).json({
+        error: "API key is not valid for this wallet",
+      })
     }
 
     // Validate expiryId if provided

@@ -108,6 +108,21 @@ const getApiUrlFromConfig = (): string => {
   }
 }
 
+/**
+ * The Blink API answered a payment mutation with `errors` — the payment was
+ * rejected and not executed (e.g. insufficient balance, invalid invoice).
+ * Distinct from transport / unknown-outcome failures, which stay plain Errors.
+ */
+class PaymentRejectedError extends Error {
+  readonly code: string | undefined
+
+  constructor(message: string, code?: string) {
+    super(message)
+    this.name = "PaymentRejectedError"
+    this.code = code
+  }
+}
+
 // =============================================================================
 // BlinkAPI Class
 // =============================================================================
@@ -610,7 +625,8 @@ class BlinkAPI {
     const data = await this.query(query, variables)
 
     if (data.lnInvoicePaymentSend?.errors?.length > 0) {
-      throw new Error(data.lnInvoicePaymentSend.errors[0].message)
+      const [error] = data.lnInvoicePaymentSend.errors
+      throw new PaymentRejectedError(error.message, error.code)
     }
 
     return data.lnInvoicePaymentSend
@@ -1018,7 +1034,7 @@ class BlinkAPI {
 }
 
 export default BlinkAPI
-export { BlinkAPI }
+export { BlinkAPI, PaymentRejectedError }
 export type {
   GraphQLResponse,
   ExchangeRate,
