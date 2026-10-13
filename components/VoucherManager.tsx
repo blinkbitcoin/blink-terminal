@@ -9,6 +9,7 @@ import {
 } from "react"
 import QRCode from "react-qr-code"
 
+import { getEnvironment } from "../lib/config/api"
 import { isVoucherPdfEnabled } from "../lib/config/features"
 import {
   formatDisplayAmount as formatCurrency,
@@ -60,6 +61,21 @@ interface VoucherData {
   lnurl?: string
 }
 
+const EMPTY_STATS: VoucherStats = {
+  total: 0,
+  active: 0,
+  claimed: 0,
+  cancelled: 0,
+  expired: 0,
+  expiringSoon: 0,
+}
+
+/** The voucher-wallet key a request belongs to; replaced on every key change. */
+interface KeyContext {
+  apiKey: string | undefined
+  controller: AbortController
+}
+
 interface VoucherManagerProps {
   voucherWallet: VoucherWallet | null
   displayCurrency: string
@@ -101,14 +117,7 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
     ref,
   ) => {
     const [vouchers, setVouchers] = useState<VoucherData[]>([])
-    const [stats, setStats] = useState<VoucherStats>({
-      total: 0,
-      active: 0,
-      claimed: 0,
-      cancelled: 0,
-      expired: 0,
-      expiringSoon: 0,
-    })
+    const [stats, setStats] = useState<VoucherStats>(EMPTY_STATS)
     const [loading, setLoading] = useState<boolean>(true)
     const [error, setError] = useState<string>("")
     const [selectedVoucher, setSelectedVoucher] = useState<VoucherData | null>(null)
@@ -120,12 +129,52 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
     const pollingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
     const qrRef = useRef<HTMLDivElement>(null)
 
-    // Fetch vouchers
+    // Vouchers are scoped to (and authorized by) the voucher wallet's API key.
+    const voucherApiKey = voucherWallet?.apiKey
+
+    // Every request runs inside the key context it started in. A key change
+    // aborts the old context; anything that resolves afterwards for the old
+    // context must not touch state (voucher ids are redemption secrets).
+    const keyContextRef = useRef<KeyContext>({
+      apiKey: undefined,
+      controller: new AbortController(),
+    })
+    const listAbortRef = useRef<AbortController | null>(null)
+
+    const isCurrent = (ctx: KeyContext): boolean =>
+      keyContextRef.current === ctx && !ctx.controller.signal.aborted
+
+    // Fetch vouchers. Stable: always uses the CURRENT key context, so a
+    // callback from an older render can never send (or accept data for) an
+    // old key.
     const fetchVouchers = useCallback(async () => {
+      const ctx = keyContextRef.current
+      if (!ctx.apiKey) {
+        setVouchers([])
+        setLoading(false)
+        return
+      }
+
+      // One list request at a time, also aborted when the key context ends.
+      listAbortRef.current?.abort()
+      const controller = new AbortController()
+      listAbortRef.current = controller
+      ctx.controller.signal.addEventListener("abort", () => controller.abort(), {
+        once: true,
+      })
+      const isStale = () => controller.signal.aborted || !isCurrent(ctx)
+
       try {
         setError("")
-        const response = await fetch("/api/voucher/list")
+        const response = await fetch(
+          `/api/voucher/list?environment=${encodeURIComponent(getEnvironment())}`,
+          {
+            headers: { "x-voucher-api-key": ctx.apiKey },
+            signal: controller.signal,
+          },
+        )
         const data = await response.json()
+        if (isStale()) return
 
         if (data.success) {
           setVouchers(data.vouchers)
@@ -136,12 +185,28 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
           setError(data.error || "Failed to load vouchers")
         }
       } catch (err: unknown) {
+        if (isStale()) return
         console.error("Error fetching vouchers:", err)
         setError("Failed to load vouchers")
       } finally {
-        setLoading(false)
+        if (!isStale()) setLoading(false)
       }
     }, [])
+
+    // Key change: end the old context, clear wallet-scoped state, load anew.
+    useEffect(() => {
+      keyContextRef.current.controller.abort()
+      keyContextRef.current = { apiKey: voucherApiKey, controller: new AbortController() }
+      setVouchers([])
+      setStats(EMPTY_STATS)
+      setSelectedVoucher(null)
+      setCancelling(false)
+      setError("")
+      setLoading(Boolean(voucherApiKey))
+      fetchVouchers()
+    }, [voucherApiKey, fetchVouchers])
+
+    useEffect(() => () => keyContextRef.current.controller.abort(), [])
 
     // Expose methods for keyboard navigation
     useImperativeHandle(ref, () => ({
@@ -157,32 +222,39 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
       handleCommissionDialogKey: () => {},
     }))
 
-    // Cancel voucher
+    // Cancel voucher (bound to the key context it started in)
     const cancelVoucher = async (voucherId: string) => {
-      if (!voucherId) return
+      const ctx = keyContextRef.current
+      if (!voucherId || !ctx.apiKey) return
 
       setCancelling(true)
       try {
         const response = await fetch("/api/voucher/cancel", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            "x-voucher-api-key": ctx.apiKey,
+          },
           body: JSON.stringify({ chargeId: voucherId }),
+          signal: ctx.controller.signal,
         })
 
         const data = await response.json()
+        if (!isCurrent(ctx)) return
 
         if (data.success) {
-          // Refresh vouchers list
-          await fetchVouchers()
           setSelectedVoucher(null)
+          // Refresh through the stable fetcher (current key only)
+          await fetchVouchers()
         } else {
           setError(data.error || "Failed to cancel voucher")
         }
       } catch (err: unknown) {
+        if (!isCurrent(ctx)) return
         console.error("Error cancelling voucher:", err)
         setError("Failed to cancel voucher")
       } finally {
-        setCancelling(false)
+        if (isCurrent(ctx)) setCancelling(false)
       }
     }
 
@@ -382,10 +454,8 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
       }
     }
 
-    // Initial fetch and polling
+    // Polling (the initial fetch happens in the key-change effect)
     useEffect(() => {
-      fetchVouchers()
-
       // Poll every 10 seconds for updates (skipping ticks while hidden)
       pollingIntervalRef.current = setInterval(() => {
         if (document.visibilityState === "hidden") return

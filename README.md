@@ -263,15 +263,30 @@ capability. See `lib/nip46-server/` for the transport and session model.
 
 ### Vouchers
 
-| Endpoint                                   | Method | Description                            |
-| ------------------------------------------ | ------ | -------------------------------------- |
-| `POST /api/voucher/create`                 | POST   | Create new voucher                     |
-| `GET /api/voucher/list`                    | GET    | List all vouchers with filtering       |
-| `GET /api/voucher/status/:chargeId`        | GET    | Check voucher status                   |
-| `POST /api/voucher/cancel`                 | POST   | Cancel an unclaimed voucher            |
-| `POST /api/voucher/pdf`                    | POST   | Generate voucher PDF (single or batch) |
-| `GET /api/voucher/lnurl/:chargeId/:amount` | GET    | LNURL-withdraw endpoint                |
-| `POST /api/voucher/callback`               | POST   | LNURL callback for redemption          |
+| Endpoint                                   | Method | Description                                                                   |
+| ------------------------------------------ | ------ | ----------------------------------------------------------------------------- |
+| `POST /api/voucher/create`                 | POST   | Create a voucher. Body `apiKey` must currently own `walletId` and match `walletCurrency` |
+| `GET /api/voucher/list`                    | GET    | List the caller's vouchers. Requires `x-voucher-api-key`; `?environment=`, `?status=` |
+| `GET /api/voucher/status/:chargeId`        | GET    | Check voucher status (capability URL: the chargeId is the secret)             |
+| `POST /api/voucher/cancel`                 | POST   | Cancel an unclaimed voucher. Requires `x-voucher-api-key`                     |
+| `POST /api/voucher/pdf`                    | POST   | Disabled (returns 503)                                                        |
+| `GET /api/voucher/lnurl/:chargeId/:amount` | GET    | LNURL-withdraw endpoint (LUD-03)                                              |
+| `GET /api/voucher/callback`                | GET    | LNURL-withdraw callback; pays only an invoice for exactly the face value      |
+
+Voucher management (`list`, `cancel`, `create`) is authorized by **current wallet
+ownership**: the presented Blink API key is checked live against Blink and must own
+the voucher's wallet in the voucher's environment. A revoked key stops working
+immediately; a replacement key for the same wallet can manage older vouchers.
+`list` and `cancel` are same-origin only (no CORS). Voucher ids are LNURL `k1`
+redemption secrets and are only returned to the current owner. If Blink can't be
+reached to check ownership, these routes answer `503` (retry) rather than an auth error.
+`list` returns at most 500 vouchers (newest first, `truncated: true` when capped);
+`stats` always cover all of the owner's vouchers.
+
+**Rotated / revoked funding key:** a voucher pays out with the API key it was created
+with. If that key is revoked, redemption fails with "This voucher's wallet is no
+longer available" and the voucher stays active; the owner can cancel it with the
+replacement key and reissue.
 
 ### Batch Payments
 

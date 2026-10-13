@@ -2,6 +2,11 @@ import type { NextApiRequest, NextApiResponse } from "next"
 
 import type { EnvironmentName } from "../../../lib/config/api"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
+import {
+  getOwnedWallets,
+  OWNERSHIP_UNAVAILABLE,
+  toEnvironment,
+} from "../../../lib/voucher-auth"
 import { isValidExpiryId, DEFAULT_EXPIRY_ID } from "../../../lib/voucher-expiry"
 import voucherStore from "../../../lib/voucher-store"
 
@@ -36,7 +41,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       commissionPercent,
       displayAmount,
       displayCurrency,
-      environment = "production",
+      environment: requestedEnvironment,
       walletCurrency = "BTC",
       usdAmount,
     } = req.body as {
@@ -47,13 +52,21 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       commissionPercent?: number
       displayAmount?: string
       displayCurrency?: string
-      environment?: EnvironmentName
+      environment?: unknown
       walletCurrency?: string
       usdAmount?: number | string
     }
 
+    const environment: EnvironmentName = toEnvironment(requestedEnvironment)
+
     // Validate required fields
-    if (!amount || !apiKey || !walletId) {
+    if (
+      !amount ||
+      !apiKey ||
+      !walletId ||
+      typeof apiKey !== "string" ||
+      typeof walletId !== "string"
+    ) {
       console.error("❌ Missing required fields for voucher creation")
       return res.status(400).json({
         error: "Missing required fields: amount, apiKey, walletId",
@@ -88,6 +101,30 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       }
     }
 
+    // The API key must currently own the wallet the voucher is drawn from
+    // (checked live, no cache). Otherwise anyone could create vouchers against
+    // (and exhaust the unclaimed-voucher quota of) a wallet id they don't control.
+    const ownership = await getOwnedWallets(apiKey, environment)
+    if (!ownership.ok && ownership.reason === "unavailable") {
+      return res.status(OWNERSHIP_UNAVAILABLE.status).json(OWNERSHIP_UNAVAILABLE.body)
+    }
+    const actualWalletCurrency = ownership.ok
+      ? ownership.wallets.get(walletId)
+      : undefined
+    if (!actualWalletCurrency) {
+      return res.status(403).json({
+        error: "API key is not valid for this wallet",
+      })
+    }
+
+    // The stored currency (memo, USD fields, listing) must match the wallet
+    // that actually pays out.
+    if (actualWalletCurrency !== walletCurrency) {
+      return res.status(400).json({
+        error: "walletCurrency does not match the wallet",
+      })
+    }
+
     // Validate expiryId if provided
     const validExpiryId =
       expiryId && isValidExpiryId(expiryId) ? expiryId : DEFAULT_EXPIRY_ID
@@ -99,8 +136,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       displayAmount: displayAmount || undefined,
       displayCurrency: displayCurrency || undefined,
       environment: environment,
-      walletCurrency: walletCurrency,
-      usdAmount: walletCurrency === "USD" ? parseInt(String(usdAmount)) : undefined,
+      walletCurrency: actualWalletCurrency,
+      usdAmount: actualWalletCurrency === "USD" ? parseInt(String(usdAmount)) : undefined,
     })
 
     console.log("✅ Voucher created successfully:", {

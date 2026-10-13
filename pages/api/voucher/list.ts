@@ -1,7 +1,13 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
 import { withRateLimit, RATE_LIMIT_READ } from "../../../lib/rate-limit"
-import voucherStore from "../../../lib/voucher-store"
+import {
+  getOwnedWallets,
+  getVoucherApiKey,
+  OWNERSHIP_UNAVAILABLE,
+  toEnvironment,
+} from "../../../lib/voucher-auth"
+import voucherStore, { OWNER_LIST_LIMIT } from "../../../lib/voucher-store"
 
 /** Shape of a voucher record from the store */
 interface VoucherRecord {
@@ -22,35 +28,51 @@ interface VoucherRecord {
 }
 
 /**
- * API endpoint to list all vouchers
+ * API endpoint to list the caller's vouchers
  *
  * GET /api/voucher/list
- * Returns all vouchers with status information (ACTIVE, CLAIMED, CANCELLED, EXPIRED)
+ * Header: x-voucher-api-key: <voucher wallet API key>
+ * Returns the vouchers drawn from wallets the key's account currently owns
+ * (checked live against Blink), with status information (ACTIVE, CLAIMED,
+ * CANCELLED, EXPIRED). Voucher ids are LNURL-withdraw redemption secrets, so
+ * they are never returned to anyone but the current owner. Same-origin only.
  *
  * Query params:
+ * - environment: 'production' (default) or 'staging'
  * - status: Filter by status (optional): 'ACTIVE', 'CLAIMED', 'CANCELLED', 'EXPIRED', 'all'
  *   Default: returns all vouchers
  */
 async function handler(req: NextApiRequest, res: NextApiResponse) {
-  // Add CORS headers for compatibility
-  res.setHeader("Access-Control-Allow-Origin", "*")
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS")
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type")
-
-  if (req.method === "OPTIONS") {
-    return res.status(200).end()
-  }
+  res.setHeader("Cache-Control", "no-store")
 
   if (req.method !== "GET") {
     return res.status(405).json({ error: "Method not allowed" })
   }
 
+  const apiKey = getVoucherApiKey(req)
+  if (!apiKey) {
+    return res.status(401).json({ error: "Voucher wallet API key required" })
+  }
+
+  const environment = toEnvironment(req.query.environment)
+  const ownership = await getOwnedWallets(apiKey, environment)
+  if (!ownership.ok) {
+    return ownership.reason === "invalid"
+      ? res.status(401).json({ error: "Voucher wallet API key is not valid" })
+      : res.status(OWNERSHIP_UNAVAILABLE.status).json(OWNERSHIP_UNAVAILABLE.body)
+  }
+  const ownedWallets = ownership.wallets
+
   try {
-    const { status: filterStatus } = req.query as { status?: string }
+    const filterStatus =
+      typeof req.query.status === "string" ? req.query.status : undefined
     const now = Date.now()
 
-    // Get all vouchers with status from the store (async)
-    const allVouchers = await voucherStore.getAllVouchers()
+    // Only vouchers drawn from wallets the caller currently owns
+    const allVouchers: VoucherRecord[] = await voucherStore.getVouchersByWalletIds(
+      [...ownedWallets.keys()],
+      environment,
+    )
 
     // Format vouchers for response
     let vouchers = allVouchers.map((voucher: VoucherRecord) => {
@@ -91,25 +113,18 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       }
     }
 
-    // Calculate summary stats
-    const stats = {
-      total: allVouchers.length,
-      active: allVouchers.filter((v: VoucherRecord) => v.status === "ACTIVE").length,
-      claimed: allVouchers.filter((v: VoucherRecord) => v.status === "CLAIMED").length,
-      cancelled: allVouchers.filter((v: VoucherRecord) => v.status === "CANCELLED")
-        .length,
-      expired: allVouchers.filter((v: VoucherRecord) => v.status === "EXPIRED").length,
-      // Count vouchers expiring within 24 hours
-      expiringSoon: allVouchers.filter(
-        (v: VoucherRecord) =>
-          v.status === "ACTIVE" && v.expiresAt && v.expiresAt - now < 24 * 60 * 60 * 1000,
-      ).length,
-    }
+    // Stats cover all of the caller's vouchers, not just the capped list
+    const stats = await voucherStore.getVoucherStatsByWalletIds(
+      [...ownedWallets.keys()],
+      environment,
+    )
 
     return res.status(200).json({
       success: true,
       vouchers: vouchers,
       count: vouchers.length,
+      // The listing is capped (newest first); stats are not.
+      truncated: allVouchers.length >= OWNER_LIST_LIMIT,
       stats: stats,
     })
   } catch (error: unknown) {
