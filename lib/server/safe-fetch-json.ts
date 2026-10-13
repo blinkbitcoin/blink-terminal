@@ -3,11 +3,35 @@ import https from "node:https"
 import { isIP, type LookupFunction } from "node:net"
 
 const MAX_REDIRECTS = 3
-const MAX_BODY_BYTES = 16 * 1024
+const DEFAULT_MAX_BODY_BYTES = 16 * 1024
 const TIMEOUT_MS = 5_000
 const DEADLINE_MS = 15_000
 
-export class SafeFetchError extends Error {}
+/**
+ * Stable failure categories. Callers branch on `code`, never on `message`
+ * (messages are human-readable and may change).
+ */
+export type SafeFetchErrorCode =
+  | "INVALID_URL"
+  | "NOT_HTTPS"
+  | "BLOCKED_ADDRESS"
+  | "REDIRECT"
+  | "HTTP_STATUS"
+  | "TOO_LARGE"
+  | "INVALID_JSON"
+  | "TIMEOUT"
+  | "DEADLINE"
+  | "NETWORK"
+
+export class SafeFetchError extends Error {
+  readonly code: SafeFetchErrorCode
+
+  constructor(message: string, code: SafeFetchErrorCode) {
+    super(message)
+    this.name = "SafeFetchError"
+    this.code = code
+  }
+}
 
 const BLOCKED_V4: Array<[number, number]> = [
   [0x00000000, 0xff000000], // 0.0.0.0/8      "this" network
@@ -86,7 +110,10 @@ const resolveAllowedAddresses = async (hostname: string): Promise<ResolvedAddres
   )
 
   if (allowed.length === 0) {
-    throw new SafeFetchError("hostname does not resolve to a public address")
+    throw new SafeFetchError(
+      "hostname does not resolve to a public address",
+      "BLOCKED_ADDRESS",
+    )
   }
 
   return allowed
@@ -100,7 +127,10 @@ const pinnedLookup =
       : addresses
 
     if (matching.length === 0) {
-      callback(new SafeFetchError("no address matches the requested family"), "")
+      callback(
+        new SafeFetchError("no address matches the requested family", "BLOCKED_ADDRESS"),
+        "",
+      )
       return
     }
 
@@ -116,13 +146,15 @@ const requestJsonOnce = async ({
   url,
   redirectsLeft,
   signal,
+  maxBodyBytes,
 }: {
   url: URL
   redirectsLeft: number
   signal: AbortSignal
+  maxBodyBytes: number
 }): Promise<{ data: unknown } | { redirect: URL }> => {
   if (url.protocol !== "https:") {
-    throw new SafeFetchError("only https URLs are allowed")
+    throw new SafeFetchError("only https URLs are allowed", "NOT_HTTPS")
   }
 
   const hostname = url.hostname.replace(/^\[|\]$/g, "")
@@ -146,27 +178,27 @@ const requestJsonOnce = async ({
         if ([301, 302, 303, 307, 308].includes(status)) {
           res.resume()
           if (redirectsLeft <= 0) {
-            reject(new SafeFetchError("too many redirects"))
+            reject(new SafeFetchError("too many redirects", "REDIRECT"))
             return
           }
 
           const location = res.headers.location
           if (!location) {
-            reject(new SafeFetchError("redirect without a location"))
+            reject(new SafeFetchError("redirect without a location", "REDIRECT"))
             return
           }
 
           try {
             resolve({ redirect: new URL(location, url) })
           } catch {
-            reject(new SafeFetchError("invalid redirect target"))
+            reject(new SafeFetchError("invalid redirect target", "REDIRECT"))
           }
           return
         }
 
         if (status < 200 || status >= 300) {
           res.resume()
-          reject(new SafeFetchError(`upstream returned HTTP ${status}`))
+          reject(new SafeFetchError(`upstream returned HTTP ${status}`, "HTTP_STATUS"))
           return
         }
 
@@ -178,9 +210,9 @@ const requestJsonOnce = async ({
           if (stopped) return
 
           size += chunk.length
-          if (size > MAX_BODY_BYTES) {
+          if (size > maxBodyBytes) {
             stopped = true
-            req.destroy(new SafeFetchError("response too large"))
+            req.destroy(new SafeFetchError("response too large", "TOO_LARGE"))
             return
           }
           chunks.push(Uint8Array.from(chunk))
@@ -191,14 +223,16 @@ const requestJsonOnce = async ({
           try {
             resolve({ data: JSON.parse(Buffer.concat(chunks).toString("utf8")) })
           } catch {
-            reject(new SafeFetchError("invalid JSON from upstream"))
+            reject(new SafeFetchError("invalid JSON from upstream", "INVALID_JSON"))
           }
         })
         res.on("error", reject)
       },
     )
 
-    req.on("timeout", () => req.destroy(new SafeFetchError("upstream request timed out")))
+    req.on("timeout", () =>
+      req.destroy(new SafeFetchError("upstream request timed out", "TIMEOUT")),
+    )
     req.on("error", reject)
     req.end()
   })
@@ -210,17 +244,20 @@ const fetchWithRedirects = async ({
   url,
   redirectsLeft,
   signal,
+  maxBodyBytes,
 }: {
   url: URL
   redirectsLeft: number
   signal: AbortSignal
+  maxBodyBytes: number
 }): Promise<SafeFetchJsonResponse> => {
-  const result = await requestJsonOnce({ url, redirectsLeft, signal })
+  const result = await requestJsonOnce({ url, redirectsLeft, signal, maxBodyBytes })
   if ("data" in result) return { data: result.data, url: url.toString() }
   return fetchWithRedirects({
     url: result.redirect,
     redirectsLeft: redirectsLeft - 1,
     signal,
+    maxBodyBytes,
   })
 }
 
@@ -233,7 +270,7 @@ const withRequestDeadline = ({
 }): Promise<SafeFetchJsonResponse> =>
   new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
-      reject(new SafeFetchError("upstream request deadline exceeded"))
+      reject(new SafeFetchError("upstream request deadline exceeded", "DEADLINE"))
       controller.abort()
     }, DEADLINE_MS)
     operation().then(
@@ -248,14 +285,20 @@ const withRequestDeadline = ({
     )
   })
 
+export type SafeFetchJsonOptions = {
+  /** Response body cap in bytes (default 16 KiB). */
+  maxBodyBytes?: number
+}
+
 export const safeFetchJsonResponse = async (
   input: string,
+  { maxBodyBytes = DEFAULT_MAX_BODY_BYTES }: SafeFetchJsonOptions = {},
 ): Promise<SafeFetchJsonResponse> => {
   let url: URL
   try {
     url = new URL(input)
   } catch {
-    throw new SafeFetchError("invalid URL")
+    throw new SafeFetchError("invalid URL", "INVALID_URL")
   }
 
   const controller = new AbortController()
@@ -268,13 +311,16 @@ export const safeFetchJsonResponse = async (
           url,
           redirectsLeft: MAX_REDIRECTS,
           signal: controller.signal,
+          maxBodyBytes,
         }),
     })
   } catch (error) {
     if (error instanceof SafeFetchError) throw error
-    throw new SafeFetchError("upstream request failed")
+    throw new SafeFetchError("upstream request failed", "NETWORK")
   }
 }
 
-export const safeFetchJson = async (input: string): Promise<unknown> =>
-  (await safeFetchJsonResponse(input)).data
+export const safeFetchJson = async (
+  input: string,
+  options?: SafeFetchJsonOptions,
+): Promise<unknown> => (await safeFetchJsonResponse(input, options)).data

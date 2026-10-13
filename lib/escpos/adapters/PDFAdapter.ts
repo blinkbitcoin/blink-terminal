@@ -16,7 +16,13 @@
  * - Shared via native share API
  */
 
+import { isVoucherPdfEnabled } from "../../config/features"
+
 import { BaseAdapter, AdapterStatus } from "./BaseAdapter"
+
+/** Shown when the PDF fallback is the only option but voucher PDF is disabled. */
+export const PDF_FALLBACK_DISABLED_MESSAGE =
+  "No thermal printer connected. Connect the Blink companion app or a USB printer to print."
 
 interface PDFAdapterOptions {
   format?: string
@@ -92,6 +98,8 @@ class PDFAdapter extends BaseAdapter {
    * @returns {Promise<boolean>}
    */
   async isAvailable(): Promise<boolean> {
+    // Server-side voucher PDF generation is disabled: never offer this adapter.
+    if (!isVoucherPdfEnabled()) return false
     // Available in any browser environment
     return typeof window !== "undefined"
   }
@@ -124,6 +132,15 @@ class PDFAdapter extends BaseAdapter {
    * @returns {Promise<boolean>}
    */
   async print(data: Uint8Array, options: PDFPrintOptions = {}): Promise<boolean> {
+    // Reached as ConnectionManager.getBestAdapter()'s last-resort fallback when
+    // no real printer is available. Fail clearly (thrown so PrintService
+    // surfaces the message) without calling the disabled PDF route.
+    if (!isVoucherPdfEnabled()) {
+      const error = new Error(PDF_FALLBACK_DISABLED_MESSAGE)
+      this._setError(error)
+      throw error
+    }
+
     const voucher = options.voucher
 
     if (!voucher) {

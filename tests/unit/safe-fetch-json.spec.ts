@@ -408,4 +408,52 @@ describe("safeFetchJson", () => {
       "upstream request failed",
     )
   })
+
+  it("tags every failure with a stable code", async () => {
+    const codeOf = async (promise: Promise<unknown>) => {
+      try {
+        await promise
+      } catch (error) {
+        return (error as SafeFetchError).code
+      }
+      return "resolved"
+    }
+
+    expect(await codeOf(safeFetchJson("not a url"))).toBe("INVALID_URL")
+    expect(await codeOf(safeFetchJson("http://service.example/"))).toBe("NOT_HTTPS")
+    expect(await codeOf(safeFetchJson("https://127.0.0.1/"))).toBe("BLOCKED_ADDRESS")
+
+    queueResponse({ status: 503, chunks: [] })
+    expect(await codeOf(safeFetchJson("https://service.example/"))).toBe("HTTP_STATUS")
+
+    queueResponse({ chunks: [Buffer.from("not-json")] })
+    expect(await codeOf(safeFetchJson("https://service.example/"))).toBe("INVALID_JSON")
+
+    queueResponse({ chunks: [Buffer.alloc(16 * 1024 + 1)] })
+    expect(await codeOf(safeFetchJson("https://service.example/"))).toBe("TOO_LARGE")
+
+    queueResponse({ status: 302, headers: {}, chunks: [] })
+    expect(await codeOf(safeFetchJson("https://service.example/"))).toBe("REDIRECT")
+
+    mockRequest.mockImplementationOnce(() => {
+      const request = new FakeRequest()
+      queueMicrotask(() => request.emit("timeout"))
+      return request
+    })
+    expect(await codeOf(safeFetchJson("https://service.example/"))).toBe("TIMEOUT")
+
+    mockRequest.mockImplementationOnce(() => {
+      const request = new FakeRequest()
+      queueMicrotask(() => request.emit("error", new Error("ECONNRESET")))
+      return request
+    })
+    expect(await codeOf(safeFetchJson("https://service.example/"))).toBe("NETWORK")
+  })
+
+  it("honours a larger maxBodyBytes", async () => {
+    queueResponse({ chunks: [Buffer.from(`{"pad":"${"x".repeat(20 * 1024)}"}`)] })
+    await expect(
+      safeFetchJson("https://service.example/", { maxBodyBytes: 64 * 1024 }),
+    ).resolves.toEqual({ pad: "x".repeat(20 * 1024) })
+  })
 })

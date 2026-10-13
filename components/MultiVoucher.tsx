@@ -12,6 +12,7 @@ import QRCode from "react-qr-code"
 
 import { unlockAudioContext, playSound } from "../lib/audio-utils"
 import { getEnvironment } from "../lib/config/api"
+import { isVoucherPdfEnabled } from "../lib/config/features"
 import {
   formatDisplayAmount as formatCurrency,
   getCurrencyById,
@@ -1103,9 +1104,9 @@ const MultiVoucher = forwardRef<MultiVoucherHandle, MultiVoucherProps>(
         if (currentStep === "amount") {
           handleOkPress()
         } else if (currentStep === "config") {
-          generateVouchers()
+          if (isVoucherPdfEnabled()) generateVouchers()
         } else if (currentStep === "preview") {
-          downloadPdf()
+          if (isVoucherPdfEnabled()) downloadPdf()
         }
       },
       hasValidAmount: (): boolean => isValidAmount(),
@@ -1416,9 +1417,16 @@ const MultiVoucher = forwardRef<MultiVoucherHandle, MultiVoucherProps>(
 
         {/* Action Buttons */}
         <div className="px-4 pb-4 space-y-3">
+          {/* Batch vouchers are only usable via the (disabled) PDF route. */}
+          {!isVoucherPdfEnabled() && (
+            <div className="bg-amber-100 dark:bg-amber-900 border border-amber-400 dark:border-amber-700 text-amber-800 dark:text-amber-200 px-3 py-2 rounded text-sm">
+              Batch voucher printing is temporarily unavailable.
+            </div>
+          )}
           <button
             onClick={generateVouchers}
-            className="w-full h-14 bg-purple-600 dark:bg-purple-500 hover:bg-purple-700 dark:hover:bg-purple-600 text-white rounded-lg text-lg font-semibold transition-colors shadow-md flex items-center justify-center gap-2"
+            disabled={!isVoucherPdfEnabled()}
+            className="w-full h-14 bg-purple-600 dark:bg-purple-500 hover:bg-purple-700 dark:hover:bg-purple-600 disabled:bg-gray-400 dark:disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg text-lg font-semibold transition-colors shadow-md flex items-center justify-center gap-2"
           >
             <svg
               className="w-5 h-5"
@@ -1525,7 +1533,7 @@ const MultiVoucher = forwardRef<MultiVoucherHandle, MultiVoucherProps>(
             {/* Print button - green outline (main action) */}
             <button
               onClick={printVouchers}
-              disabled={printing || downloadingPdf}
+              disabled={!isVoucherPdfEnabled() || printing || downloadingPdf}
               className="h-14 bg-white dark:bg-black border-2 border-green-600 dark:border-green-500 hover:border-green-700 dark:hover:border-green-400 hover:bg-green-50 dark:hover:bg-green-900 text-green-600 dark:text-green-400 disabled:border-gray-400 disabled:text-gray-400 disabled:cursor-not-allowed rounded-lg text-lg font-normal transition-colors shadow-md flex items-center justify-center gap-2"
             >
               {printing ? (
@@ -1556,7 +1564,7 @@ const MultiVoucher = forwardRef<MultiVoucherHandle, MultiVoucherProps>(
             {/* Download PDF button - orange/yellow outline */}
             <button
               onClick={downloadPdf}
-              disabled={downloadingPdf || printing}
+              disabled={!isVoucherPdfEnabled() || downloadingPdf || printing}
               className="h-14 bg-white dark:bg-black border-2 border-orange-500 dark:border-orange-500 hover:border-orange-600 dark:hover:border-orange-400 hover:bg-orange-50 dark:hover:bg-orange-900 text-orange-500 dark:text-orange-400 disabled:border-gray-400 disabled:text-gray-400 disabled:cursor-not-allowed rounded-lg text-lg font-normal transition-colors shadow-md flex items-center justify-center gap-2"
             >
               {downloadingPdf ? (

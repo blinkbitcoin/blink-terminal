@@ -8,6 +8,12 @@
 import { nip19 } from "nostr-tools"
 import type { DecodedResult } from "nostr-tools/lib/types/nip19"
 
+import {
+  SafeFetchError,
+  type SafeFetchErrorCode,
+  safeFetchJson,
+} from "./server/safe-fetch-json"
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -93,69 +99,56 @@ interface LnurlCallbackResponse {
 }
 
 // =============================================================================
-// Resilient fetch
+// Resilient, SSRF-safe fetch
 // =============================================================================
 
-const DEFAULT_FETCH_TIMEOUT_MS = 4000
 const DEFAULT_FETCH_RETRIES = 2 // total attempts = retries + 1
 const RETRY_BACKOFF_MS = 300
+// LNURL-pay metadata may embed a base64 image (LUD-06), so allow more than the
+// safeFetchJson default.
+const LNURL_MAX_BODY_BYTES = 256 * 1024
+
+// Transport-level failures worth retrying. Policy rejections (non-https,
+// private/internal address, oversized body, bad JSON, HTTP status) are not.
+const RETRYABLE_CODES: ReadonlySet<SafeFetchErrorCode> = new Set(["NETWORK", "TIMEOUT"])
 
 /**
- * fetch() with a per-attempt timeout and retry-with-backoff.
+ * GET a JSON document from a user- or third-party-supplied URL (Lightning address
+ * domain, LNURL callback, LUD-21 verify URL) with retry-with-backoff.
  *
- * Server-side calls to the Blink LNURL host (blink.sv / lnurl.blink.sv) via
- * Node's undici fetch intermittently fail with "fetch failed" (transient
- * connection/keep-alive races), even though the host is healthy. A single blip
- * must not surface to the user as "address not found", so we retry transient
- * failures. Each attempt uses a fresh connection (Connection: close) to avoid
- * reusing a half-broken pooled socket.
+ * All requests go through safeFetchJson: https only, DNS-pinned, private /
+ * link-local / loopback addresses refused, redirects re-checked. Never call
+ * raw fetch() on user- or third-party-supplied URLs (SSRF).
+ *
+ * Server-side calls to the Blink LNURL host (blink.sv / lnurl.blink.sv)
+ * intermittently fail with transient connection errors even though the host is
+ * healthy; a single blip must not surface as "address not found", so transient
+ * failures are retried.
  *
  * @param url - URL to fetch
- * @param init - fetch init (headers are merged with `Connection: close`)
  * @param retries - number of retries after the first attempt
- * @param timeoutMs - per-attempt timeout in milliseconds
  */
-export async function fetchWithRetry(
+export async function fetchJsonWithRetry(
   url: string,
-  init: RequestInit = {},
   retries: number = DEFAULT_FETCH_RETRIES,
-  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
-): Promise<Response> {
+): Promise<unknown> {
   let lastError: unknown
 
   for (let attempt = 0; attempt <= retries; attempt++) {
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), timeoutMs)
-
     try {
-      const response = await fetch(url, {
-        ...init,
-        signal: controller.signal,
-        headers: {
-          // Avoid reusing a stale pooled keep-alive socket on retries.
-          Connection: "close",
-          ...(init.headers || {}),
-        },
-      })
-      clearTimeout(timer)
-      return response
+      return await safeFetchJson(url, { maxBodyBytes: LNURL_MAX_BODY_BYTES })
     } catch (err) {
-      clearTimeout(timer)
       lastError = err
+      const retryable = err instanceof SafeFetchError && RETRYABLE_CODES.has(err.code)
+      if (!retryable || attempt === retries) break
 
-      // Last attempt: give up.
-      if (attempt === retries) break
-
-      // Backoff before retrying (linear).
       await new Promise((resolve) =>
         setTimeout(resolve, RETRY_BACKOFF_MS * (attempt + 1)),
       )
     }
   }
 
-  throw lastError instanceof Error
-    ? lastError
-    : new Error(`fetch failed for ${url}: ${String(lastError)}`)
+  throw lastError instanceof Error ? lastError : new Error("LNURL request failed")
 }
 
 // =============================================================================
@@ -282,17 +275,7 @@ export function validateNpubCashAddress(address: string): NpubCashValidationResu
 export async function fetchLnurlPayMetadata(
   lnurlEndpoint: string,
 ): Promise<LnurlPayMetadata> {
-  const response: Response = await fetchWithRetry(lnurlEndpoint, {
-    headers: {
-      Accept: "application/json",
-    },
-  })
-
-  if (!response.ok) {
-    throw new Error(`LNURL endpoint returned ${response.status}: ${response.statusText}`)
-  }
-
-  const data: LnurlPayResponse = await response.json()
+  const data = (await fetchJsonWithRetry(lnurlEndpoint)) as LnurlPayResponse
 
   // Validate it's a pay request
   if (data.tag !== "payRequest") {
@@ -339,17 +322,7 @@ export async function requestInvoiceFromCallback(
     url.searchParams.set("comment", comment)
   }
 
-  const response: Response = await fetchWithRetry(url.toString(), {
-    headers: {
-      Accept: "application/json",
-    },
-  })
-
-  if (!response.ok) {
-    throw new Error(`LNURL callback returned ${response.status}: ${response.statusText}`)
-  }
-
-  const data: LnurlCallbackResponse = await response.json()
+  const data = (await fetchJsonWithRetry(url.toString())) as LnurlCallbackResponse
 
   if (data.status === "ERROR") {
     throw new Error(`LNURL error: ${data.reason || "Unknown error"}`)
@@ -452,23 +425,13 @@ export interface LnurlVerifyResult {
  * @returns Parsed verify result
  */
 export async function verifyLnurlPayment(verifyUrl: string): Promise<LnurlVerifyResult> {
-  const response: Response = await fetchWithRetry(verifyUrl, {
-    headers: {
-      Accept: "application/json",
-    },
-  })
-
-  if (!response.ok) {
-    throw new Error(`LNURL verify returned ${response.status}: ${response.statusText}`)
-  }
-
-  const data: {
+  const data = (await fetchJsonWithRetry(verifyUrl)) as {
     status?: string
     reason?: string
     settled?: boolean
     preimage?: string | null
     pr?: string
-  } = await response.json()
+  }
 
   if (data.status === "ERROR") {
     throw new Error(`LNURL verify error: ${data.reason || "Unknown error"}`)

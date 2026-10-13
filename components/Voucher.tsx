@@ -12,6 +12,7 @@ import QRCode from "react-qr-code"
 
 import { unlockAudioContext, playSound } from "../lib/audio-utils"
 import { getEnvironment } from "../lib/config/api"
+import { isVoucherPdfEnabled } from "../lib/config/features"
 import {
   formatDisplayAmount as formatCurrency,
   getCurrencyById,
@@ -2006,40 +2007,42 @@ const Voucher = forwardRef<VoucherHandle, VoucherProps>(
                     </button>
                   )}
 
-                  {/* Download PDF Button */}
-                  <button
-                    onClick={generatePdf}
-                    disabled={generatingPdf}
-                    className={`w-full px-4 py-3 border-2 border-purple-600 text-purple-600 dark:text-purple-400 dark:border-purple-400 rounded-lg hover:bg-purple-50 dark:hover:bg-purple-900/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 ${
-                      printFormat === "a4" || printFormat === "letter"
-                        ? "bg-purple-600 text-white hover:bg-purple-700 border-purple-600"
-                        : ""
-                    }`}
-                  >
-                    {generatingPdf ? (
-                      <>
-                        <div className="animate-spin w-4 h-4 border-2 border-current border-t-transparent rounded-full"></div>
-                        Generating...
-                      </>
-                    ) : (
-                      <>
-                        <svg
-                          className="w-5 h-5"
-                          fill="none"
-                          stroke="currentColor"
-                          viewBox="0 0 24 24"
-                        >
-                          <path
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            strokeWidth="2"
-                            d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
-                          />
-                        </svg>
-                        Download PDF
-                      </>
-                    )}
-                  </button>
+                  {/* Download PDF Button (server-side voucher PDF disabled) */}
+                  {isVoucherPdfEnabled() && (
+                    <button
+                      onClick={generatePdf}
+                      disabled={generatingPdf}
+                      className={`w-full px-4 py-3 border-2 border-purple-600 text-purple-600 dark:text-purple-400 dark:border-purple-400 rounded-lg hover:bg-purple-50 dark:hover:bg-purple-900/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 ${
+                        printFormat === "a4" || printFormat === "letter"
+                          ? "bg-purple-600 text-white hover:bg-purple-700 border-purple-600"
+                          : ""
+                      }`}
+                    >
+                      {generatingPdf ? (
+                        <>
+                          <div className="animate-spin w-4 h-4 border-2 border-current border-t-transparent rounded-full"></div>
+                          Generating...
+                        </>
+                      ) : (
+                        <>
+                          <svg
+                            className="w-5 h-5"
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                          >
+                            <path
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              strokeWidth="2"
+                              d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
+                            />
+                          </svg>
+                          Download PDF
+                        </>
+                      )}
+                    </button>
+                  )}
 
                   {/* Browser Print Button - Fallback for desktop */}
                   <button

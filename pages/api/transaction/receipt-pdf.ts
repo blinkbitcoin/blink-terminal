@@ -144,16 +144,12 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       generatedAt,
     })
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : "Unknown error"
     const stack = error instanceof Error ? error.stack : undefined
     console.error("❌ Transaction receipt PDF generation error:", error)
     console.error("❌ Stack trace:", stack)
 
-    return res.status(500).json({
-      error: "Failed to generate receipt PDF",
-      message,
-      stack: process.env.NODE_ENV === "development" ? stack : undefined,
-    })
+    // Never echo renderer errors to the caller (they can carry fetched content).
+    return res.status(500).json({ error: "Failed to generate receipt PDF" })
   }
 }
 

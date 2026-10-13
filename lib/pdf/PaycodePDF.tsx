@@ -1,6 +1,8 @@
 import { Document, Page, Text, View, Image, StyleSheet } from "@react-pdf/renderer"
 import React from "react"
 
+import { safeImageSrc } from "./safe-image-src"
+
 // --- Type Definitions ---
 
 interface PaperFormat {
@@ -135,7 +137,9 @@ export const PaycodeDocument: React.FC<PaycodeDocumentProps> = ({ paycode }) => 
 
           {/* QR Code (Bitcoin logo already baked into qrDataUrl) */}
           <View style={styles.qrSection}>
-            <Image style={styles.qrCode} src={qrDataUrl} />
+            {safeImageSrc(qrDataUrl) && (
+              <Image style={styles.qrCode} src={safeImageSrc(qrDataUrl)} />
+            )}
           </View>
 
           {/* Instructions — plain, no colored box */}
