@@ -137,6 +137,44 @@ describe("VoucherManager", () => {
     expect(screen.getByText("CCCCCCCC")).toBeTruthy()
   })
 
+  it("a cancel that completes after a key switch never restores the old key's vouchers", async () => {
+    let releaseCancel: (value: Response) => void = () => {}
+    let cancelSignal: AbortSignal | undefined
+    const listKeys: string[] = []
+    fetchMock.mockImplementation((url: string, init: RequestInit) => {
+      const key = (init.headers as Record<string, string>)["x-voucher-api-key"]
+      if (url.startsWith("/api/voucher/cancel")) {
+        cancelSignal = init.signal as AbortSignal
+        // Held back; resolves only when the test releases it (ignores abort,
+        // like a response that was already in flight).
+        return new Promise<Response>((resolve) => {
+          releaseCancel = resolve
+        })
+      }
+      listKeys.push(key)
+      return ok(listBody([key === "blink_a" ? "a1".repeat(16) : "b1".repeat(16)]))
+    })
+
+    const { rerender } = render(<VoucherManager {...props({ apiKey: "blink_a" })} />)
+    fireEvent.click(await screen.findByText("A1A1A1A1"))
+    fireEvent.click(await screen.findByText("Cancel Voucher"))
+    await waitFor(() => expect(cancelSignal).toBeDefined())
+
+    rerender(<VoucherManager {...props({ apiKey: "blink_b" })} />)
+    await screen.findByText("B1B1B1B1")
+    expect(cancelSignal?.aborted).toBe(true)
+
+    // Key A's cancel response arrives late.
+    await act(async () => {
+      releaseCancel({ json: () => Promise.resolve({ success: true }) } as Response)
+    })
+
+    expect(screen.queryByText("A1A1A1A1")).toBeNull()
+    expect(screen.getByText("B1B1B1B1")).toBeTruthy()
+    // No list request with key A after the switch.
+    expect(listKeys).toEqual(["blink_a", "blink_b"])
+  })
+
   it("clears the list when the key is removed", async () => {
     fetchMock.mockImplementation(() => ok(listBody(["e".repeat(32)])))
 

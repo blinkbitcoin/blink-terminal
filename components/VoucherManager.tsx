@@ -70,6 +70,12 @@ const EMPTY_STATS: VoucherStats = {
   expiringSoon: 0,
 }
 
+/** The voucher-wallet key a request belongs to; replaced on every key change. */
+interface KeyContext {
+  apiKey: string | undefined
+  controller: AbortController
+}
+
 interface VoucherManagerProps {
   voucherWallet: VoucherWallet | null
   displayCurrency: string
@@ -126,43 +132,44 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
     // Vouchers are scoped to (and authorized by) the voucher wallet's API key.
     const voucherApiKey = voucherWallet?.apiKey
 
-    // Requests for a previous key must never land in the current view.
+    // Every request runs inside the key context it started in. A key change
+    // aborts the old context; anything that resolves afterwards for the old
+    // context must not touch state (voucher ids are redemption secrets).
+    const keyContextRef = useRef<KeyContext>({
+      apiKey: undefined,
+      controller: new AbortController(),
+    })
     const listAbortRef = useRef<AbortController | null>(null)
-    const keyGenerationRef = useRef<number>(0)
 
-    useEffect(() => {
-      keyGenerationRef.current += 1
-      listAbortRef.current?.abort()
-      listAbortRef.current = null
-      setVouchers([])
-      setStats(EMPTY_STATS)
-      setSelectedVoucher(null)
-      setError("")
-      setLoading(Boolean(voucherApiKey))
-    }, [voucherApiKey])
+    const isCurrent = (ctx: KeyContext): boolean =>
+      keyContextRef.current === ctx && !ctx.controller.signal.aborted
 
-    useEffect(() => () => listAbortRef.current?.abort(), [])
-
-    // Fetch vouchers
+    // Fetch vouchers. Stable: always uses the CURRENT key context, so a
+    // callback from an older render can never send (or accept data for) an
+    // old key.
     const fetchVouchers = useCallback(async () => {
-      if (!voucherApiKey) {
+      const ctx = keyContextRef.current
+      if (!ctx.apiKey) {
         setVouchers([])
         setLoading(false)
         return
       }
-      const generation = keyGenerationRef.current
+
+      // One list request at a time, also aborted when the key context ends.
       listAbortRef.current?.abort()
       const controller = new AbortController()
       listAbortRef.current = controller
-      const isStale = () =>
-        controller.signal.aborted || generation !== keyGenerationRef.current
+      ctx.controller.signal.addEventListener("abort", () => controller.abort(), {
+        once: true,
+      })
+      const isStale = () => controller.signal.aborted || !isCurrent(ctx)
 
       try {
         setError("")
         const response = await fetch(
           `/api/voucher/list?environment=${encodeURIComponent(getEnvironment())}`,
           {
-            headers: { "x-voucher-api-key": voucherApiKey },
+            headers: { "x-voucher-api-key": ctx.apiKey },
             signal: controller.signal,
           },
         )
@@ -184,7 +191,22 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
       } finally {
         if (!isStale()) setLoading(false)
       }
-    }, [voucherApiKey])
+    }, [])
+
+    // Key change: end the old context, clear wallet-scoped state, load anew.
+    useEffect(() => {
+      keyContextRef.current.controller.abort()
+      keyContextRef.current = { apiKey: voucherApiKey, controller: new AbortController() }
+      setVouchers([])
+      setStats(EMPTY_STATS)
+      setSelectedVoucher(null)
+      setCancelling(false)
+      setError("")
+      setLoading(Boolean(voucherApiKey))
+      fetchVouchers()
+    }, [voucherApiKey, fetchVouchers])
+
+    useEffect(() => () => keyContextRef.current.controller.abort(), [])
 
     // Expose methods for keyboard navigation
     useImperativeHandle(ref, () => ({
@@ -200,9 +222,10 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
       handleCommissionDialogKey: () => {},
     }))
 
-    // Cancel voucher
+    // Cancel voucher (bound to the key context it started in)
     const cancelVoucher = async (voucherId: string) => {
-      if (!voucherId || !voucherApiKey) return
+      const ctx = keyContextRef.current
+      if (!voucherId || !ctx.apiKey) return
 
       setCancelling(true)
       try {
@@ -210,25 +233,28 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "x-voucher-api-key": voucherApiKey,
+            "x-voucher-api-key": ctx.apiKey,
           },
           body: JSON.stringify({ chargeId: voucherId }),
+          signal: ctx.controller.signal,
         })
 
         const data = await response.json()
+        if (!isCurrent(ctx)) return
 
         if (data.success) {
-          // Refresh vouchers list
-          await fetchVouchers()
           setSelectedVoucher(null)
+          // Refresh through the stable fetcher (current key only)
+          await fetchVouchers()
         } else {
           setError(data.error || "Failed to cancel voucher")
         }
       } catch (err: unknown) {
+        if (!isCurrent(ctx)) return
         console.error("Error cancelling voucher:", err)
         setError("Failed to cancel voucher")
       } finally {
-        setCancelling(false)
+        if (isCurrent(ctx)) setCancelling(false)
       }
     }
 
@@ -428,10 +454,8 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
       }
     }
 
-    // Initial fetch and polling
+    // Polling (the initial fetch happens in the key-change effect)
     useEffect(() => {
-      fetchVouchers()
-
       // Poll every 10 seconds for updates (skipping ticks while hidden)
       pollingIntervalRef.current = setInterval(() => {
         if (document.visibilityState === "hidden") return
