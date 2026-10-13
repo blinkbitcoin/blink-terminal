@@ -285,6 +285,7 @@ class VoucherStore {
   _rowToVoucher(
     row: VoucherRow | null,
     decryptedApiKey: string | null = null,
+    decrypt: boolean = true,
   ): Voucher | null {
     if (!row) return null
 
@@ -297,7 +298,9 @@ class VoucherStore {
       expiresAt: parseInt(row.expires_at, 10),
       expiryId: row.expiry_id,
       cancelledAt: row.cancelled_at ? parseInt(row.cancelled_at, 10) : null,
-      apiKey: decryptedApiKey || AuthManager.decryptApiKey(row.api_key_encrypted),
+      apiKey:
+        decryptedApiKey ||
+        (decrypt ? AuthManager.decryptApiKey(row.api_key_encrypted) : null),
       walletId: row.wallet_id,
       commissionPercent: parseFloat(row.commission_percent) || 0,
       displayAmount: row.display_amount,
@@ -471,6 +474,43 @@ class VoucherStore {
     } catch (err: unknown) {
       console.error("[VoucherStore] cancelVoucher error:", (err as Error).message)
       return false
+    }
+  }
+
+  /**
+   * Get the vouchers drawn from any of `walletIds` in `environment`
+   * (owner-scoped listing). Stored API keys are NOT decrypted.
+   * @param walletIds - Wallet ids the caller currently owns
+   * @param environment - 'production' or 'staging'
+   * @returns Array of voucher objects with status (apiKey always null)
+   */
+  async getVouchersByWalletIds(
+    walletIds: string[],
+    environment: string,
+  ): Promise<Voucher[]> {
+    if (walletIds.length === 0) return []
+    try {
+      await this.lazyCleanup()
+
+      const result: QueryResult<VoucherRow> = await query(
+        `SELECT * FROM vouchers
+         WHERE wallet_id = ANY($1)
+           AND COALESCE(environment, 'production') = $2
+         ORDER BY created_at DESC`,
+        [walletIds, environment],
+      )
+
+      return result.rows.map((row: VoucherRow) => {
+        const voucher: Voucher = this._rowToVoucher(row, null, false) as Voucher
+        voucher.status = getVoucherStatus(voucher)
+        return voucher
+      })
+    } catch (err: unknown) {
+      console.error(
+        "[VoucherStore] getVouchersByWalletIds error:",
+        (err as Error).message,
+      )
+      throw err
     }
   }
 

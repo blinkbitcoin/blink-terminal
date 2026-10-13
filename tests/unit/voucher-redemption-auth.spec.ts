@@ -6,8 +6,10 @@
  *   face value, checked before the voucher is claimed;
  * - the voucher is released for retry only when the payment was definitely
  *   not sent;
- * - list / cancel are scoped to the voucher wallet API key that created the
- *   voucher; create requires that key to own the wallet.
+ * - list / cancel / create authorize by CURRENT wallet ownership, checked live
+ *   against Blink (no cache): a revoked key stops working at once, a
+ *   replacement key for the same wallet keeps working;
+ * - create stores the wallet currency confirmed by Blink.
  */
 
 import { encode as encodeInvoice, sign as signInvoice } from "bolt11"
@@ -16,6 +18,7 @@ const mockStore = {
   getVoucher: jest.fn(),
   getVoucherWithStatus: jest.fn(),
   getAllVouchers: jest.fn(),
+  getVouchersByWalletIds: jest.fn(),
   claimVoucher: jest.fn(),
   unclaimVoucher: jest.fn(),
   cancelVoucher: jest.fn(),
@@ -49,15 +52,15 @@ jest.mock("../../lib/blink-api", () => {
       this.code = code
     }
   }
-  const BlinkAPI = jest.fn().mockImplementation(() => ({
+  const BlinkAPI = jest.fn().mockImplementation((apiKey: string, apiUrl: string) => ({
     payLnInvoice: (...args: unknown[]) => mockPayLnInvoice(...args),
-    getWalletInfo: (...args: unknown[]) => mockGetWalletInfo(...args),
+    getWalletInfo: () => mockGetWalletInfo(apiKey, apiUrl),
   }))
   return { __esModule: true, default: BlinkAPI, BlinkAPI, PaymentRejectedError }
 })
 
 import { PaymentRejectedError } from "../../lib/blink-api"
-import { clearOwnershipCache, VOUCHER_API_KEY_HEADER } from "../../lib/voucher-auth"
+import { VOUCHER_API_KEY_HEADER } from "../../lib/voucher-auth"
 import callbackHandler from "../../pages/api/voucher/callback"
 import cancelHandler from "../../pages/api/voucher/cancel"
 import createHandler from "../../pages/api/voucher/create"
@@ -141,7 +144,6 @@ const redeem = (pr: string) =>
 
 beforeEach(() => {
   jest.clearAllMocks()
-  clearOwnershipCache()
   jest.spyOn(console, "log").mockImplementation(() => {})
   jest.spyOn(console, "error").mockImplementation(() => {})
   mockStore.getVoucher.mockResolvedValue(voucher())
@@ -241,53 +243,104 @@ describe("voucher callback: release only when nothing was sent", () => {
   })
 })
 
-describe("voucher list is scoped to the caller's API key", () => {
-  beforeEach(() => {
-    mockStore.getAllVouchers.mockResolvedValue([
-      voucher({ id: "1".repeat(32) }),
-      voucher({ id: "2".repeat(32), apiKey: OTHER_KEY }),
-      voucher({ id: "3".repeat(32), apiKey: null }),
-    ])
+// Blink's view of each key: walletId -> currency per environment. Missing
+// key => Blink rejects it (revoked / invalid).
+const PROD = "https://api.blink.sv/graphql"
+const STAGING = "https://api.staging.blink.sv/graphql"
+let blinkAccounts: Record<
+  string,
+  Record<string, Array<{ id: string; walletCurrency: string }>>
+>
+
+const setBlinkAccounts = (accounts: typeof blinkAccounts) => {
+  blinkAccounts = accounts
+  mockGetWalletInfo.mockImplementation(async (apiKey: string, apiUrl: string) => {
+    const wallets = blinkAccounts[apiKey]?.[apiUrl]
+    if (!wallets) throw new Error("Invalid API key")
+    return wallets
   })
+}
 
-  it("requires the API key header", async () => {
-    const res = await call(listHandler as Handler, { method: "GET" })
-    expect(res.statusCode).toBe(401)
-    expect(mockStore.getAllVouchers).not.toHaveBeenCalled()
-  })
+const BTC_WALLET = { id: "wallet-1", walletCurrency: "BTC" }
+const USD_WALLET = { id: "wallet-usd", walletCurrency: "USD" }
 
-  it("ignores a key passed in the query string", async () => {
-    const res = await call(listHandler as Handler, {
-      method: "GET",
-      query: { apiKey: OWNER_KEY },
-    })
-    expect(res.statusCode).toBe(401)
-  })
-
-  it("returns only the caller's vouchers and stats", async () => {
-    const res = await call(listHandler as Handler, {
-      method: "GET",
-      headers: { [VOUCHER_API_KEY_HEADER]: OWNER_KEY },
-    })
-
-    const body = res.body as { vouchers: Array<{ id: string }>; stats: { total: number } }
-    expect(res.statusCode).toBe(200)
-    expect(body.vouchers.map((v) => v.id)).toEqual(["1".repeat(32)])
-    expect(body.stats.total).toBe(1)
-    expect(JSON.stringify(body)).not.toContain(OWNER_KEY)
-    expect(res.headers["access-control-allow-origin"]).toBeUndefined()
-  })
-
-  it("returns nothing for an unknown key", async () => {
-    const res = await call(listHandler as Handler, {
-      method: "GET",
-      headers: { [VOUCHER_API_KEY_HEADER]: "blink_stranger" },
-    })
-    expect((res.body as { vouchers: unknown[] }).vouchers).toEqual([])
+beforeEach(() => {
+  setBlinkAccounts({
+    [OWNER_KEY]: {
+      [PROD]: [BTC_WALLET, USD_WALLET],
+      [STAGING]: [{ id: "wallet-stg", walletCurrency: "BTC" }],
+    },
+    // A rotated replacement key for the same account
+    blink_new_owner_key: { [PROD]: [BTC_WALLET, USD_WALLET] },
+    [OTHER_KEY]: { [PROD]: [{ id: "wallet-9", walletCurrency: "BTC" }] },
   })
 })
 
-describe("voucher cancel requires ownership", () => {
+describe("voucher list: current wallet owner only", () => {
+  const list = (headers: Record<string, string>, query: Record<string, unknown> = {}) =>
+    call(listHandler as Handler, { method: "GET", headers, query })
+
+  beforeEach(() => {
+    mockStore.getVouchersByWalletIds.mockResolvedValue([voucher({ id: "1".repeat(32) })])
+  })
+
+  it("requires the API key header", async () => {
+    expect((await list({})).statusCode).toBe(401)
+    expect(mockGetWalletInfo).not.toHaveBeenCalled()
+    expect(mockStore.getVouchersByWalletIds).not.toHaveBeenCalled()
+  })
+
+  it("ignores a key passed in the query string", async () => {
+    expect((await list({}, { apiKey: OWNER_KEY })).statusCode).toBe(401)
+  })
+
+  it("rejects a revoked / invalid key", async () => {
+    const res = await list({ [VOUCHER_API_KEY_HEADER]: "blink_revoked_key" })
+    expect(res.statusCode).toBe(401)
+    expect(mockStore.getVouchersByWalletIds).not.toHaveBeenCalled()
+  })
+
+  it("queries only the wallets the key currently owns, per environment", async () => {
+    const res = await list({ [VOUCHER_API_KEY_HEADER]: OWNER_KEY })
+
+    expect(res.statusCode).toBe(200)
+    expect(mockStore.getVouchersByWalletIds).toHaveBeenCalledWith(
+      ["wallet-1", "wallet-usd"],
+      "production",
+    )
+    const body = res.body as { vouchers: Array<{ id: string }>; stats: { total: number } }
+    expect(body.vouchers.map((v) => v.id)).toEqual(["1".repeat(32)])
+    expect(body.stats.total).toBe(1)
+    expect(res.headers["access-control-allow-origin"]).toBeUndefined()
+    expect(res.headers["cache-control"]).toBe("no-store")
+  })
+
+  it("scopes to the requested environment (staging)", async () => {
+    await list({ [VOUCHER_API_KEY_HEADER]: OWNER_KEY }, { environment: "staging" })
+    expect(mockGetWalletInfo).toHaveBeenCalledWith(OWNER_KEY, STAGING)
+    expect(mockStore.getVouchersByWalletIds).toHaveBeenCalledWith(
+      ["wallet-stg"],
+      "staging",
+    )
+  })
+
+  it("a replacement key for the same wallets sees the same vouchers", async () => {
+    await list({ [VOUCHER_API_KEY_HEADER]: "blink_new_owner_key" })
+    expect(mockStore.getVouchersByWalletIds).toHaveBeenCalledWith(
+      ["wallet-1", "wallet-usd"],
+      "production",
+    )
+  })
+
+  it("re-checks with Blink on every request (no cache)", async () => {
+    await list({ [VOUCHER_API_KEY_HEADER]: OWNER_KEY })
+    delete blinkAccounts[OWNER_KEY] // key revoked
+    expect((await list({ [VOUCHER_API_KEY_HEADER]: OWNER_KEY })).statusCode).toBe(401)
+    expect(mockGetWalletInfo).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe("voucher cancel: current wallet owner only", () => {
   const cancel = (headers: Record<string, string>) =>
     call(cancelHandler as Handler, {
       method: "POST",
@@ -295,58 +348,122 @@ describe("voucher cancel requires ownership", () => {
       body: { chargeId: "a".repeat(32) },
     })
 
+  beforeEach(() => {
+    mockStore.getVoucherWithStatus.mockResolvedValue(voucher())
+    mockStore.cancelVoucher.mockResolvedValue(true)
+  })
+
   it("requires the API key header", async () => {
     expect((await cancel({})).statusCode).toBe(401)
     expect(mockStore.cancelVoucher).not.toHaveBeenCalled()
   })
 
-  it("answers 404 for someone else's voucher and does not cancel it", async () => {
-    mockStore.getVoucherWithStatus.mockResolvedValueOnce(voucher())
-    const res = await cancel({ [VOUCHER_API_KEY_HEADER]: OTHER_KEY })
+  it.each([
+    ["a key for another account", OTHER_KEY],
+    ["the creating key after revocation", "blink_revoked_key"],
+  ])("answers 404 for %s and does not cancel", async (_name, key) => {
+    const res = await cancel({ [VOUCHER_API_KEY_HEADER]: key })
     expect(res.statusCode).toBe(404)
     expect(mockStore.cancelVoucher).not.toHaveBeenCalled()
   })
 
-  it("cancels the owner's voucher", async () => {
-    mockStore.getVoucherWithStatus.mockResolvedValueOnce(voucher())
-    mockStore.cancelVoucher.mockResolvedValueOnce(true)
-    const res = await cancel({ [VOUCHER_API_KEY_HEADER]: OWNER_KEY })
+  it.each([
+    ["the creating key", OWNER_KEY],
+    ["a replacement key for the same wallet", "blink_new_owner_key"],
+  ])("cancels with %s", async (_name, key) => {
+    const res = await cancel({ [VOUCHER_API_KEY_HEADER]: key })
     expect(res.statusCode).toBe(200)
     expect(mockStore.cancelVoucher).toHaveBeenCalledWith("a".repeat(32))
   })
+
+  it("checks ownership in the voucher's own environment", async () => {
+    mockStore.getVoucherWithStatus.mockResolvedValueOnce(
+      voucher({ walletId: "wallet-stg", environment: "staging" }),
+    )
+    const res = await cancel({ [VOUCHER_API_KEY_HEADER]: OWNER_KEY })
+    expect(mockGetWalletInfo).toHaveBeenCalledWith(OWNER_KEY, STAGING)
+    expect(res.statusCode).toBe(200)
+  })
 })
 
-describe("voucher create requires the API key to own the wallet", () => {
-  const create = () =>
+describe("voucher create: live ownership + confirmed wallet currency", () => {
+  const create = (body: Record<string, unknown> = {}) =>
     call(createHandler as Handler, {
       method: "POST",
-      body: { amount: 500, apiKey: OWNER_KEY, walletId: "wallet-1" },
+      body: { amount: 500, apiKey: OWNER_KEY, walletId: "wallet-1", ...body },
     })
 
+  beforeEach(() => {
+    mockStore.createVoucher.mockImplementation(async (amount, _key, walletId, opts) => ({
+      ...voucher({ amount, walletId }),
+      walletCurrency: opts.walletCurrency,
+      usdAmountCents: opts.usdAmount ?? null,
+      expiryId: "24h",
+      commissionPercent: 0,
+    }))
+  })
+
   it("rejects a key that does not own the wallet", async () => {
-    mockGetWalletInfo.mockResolvedValueOnce([{ id: "someone-elses-wallet" }])
-    const res = await create()
+    const res = await create({ apiKey: OTHER_KEY })
     expect(res.statusCode).toBe(403)
     expect(mockStore.createVoucher).not.toHaveBeenCalled()
   })
 
-  it("fails closed when the Blink API errors", async () => {
-    mockGetWalletInfo.mockRejectedValueOnce(new Error("Invalid API key"))
-    expect((await create()).statusCode).toBe(403)
+  it("fails closed when Blink rejects the key", async () => {
+    expect((await create({ apiKey: "blink_revoked_key" })).statusCode).toBe(403)
     expect(mockStore.createVoucher).not.toHaveBeenCalled()
   })
 
-  it("creates when the key owns the wallet, and caches the check for batches", async () => {
-    mockGetWalletInfo.mockResolvedValue([{ id: "wallet-1", walletCurrency: "BTC" }])
-    mockStore.createVoucher.mockResolvedValue({
-      ...voucher(),
-      expiryId: "24h",
-      commissionPercent: 0,
-    })
+  it("re-checks with Blink on every create (no revocation window)", async () => {
+    expect((await create()).statusCode).toBe(200)
+    expect((await create()).statusCode).toBe(200)
+    expect(mockGetWalletInfo).toHaveBeenCalledTimes(2)
 
-    expect((await create()).statusCode).toBe(200)
-    expect((await create()).statusCode).toBe(200)
+    delete blinkAccounts[OWNER_KEY] // key revoked mid-batch
+    expect((await create()).statusCode).toBe(403)
     expect(mockStore.createVoucher).toHaveBeenCalledTimes(2)
-    expect(mockGetWalletInfo).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    ["BTC requested for a USD wallet", { walletId: "wallet-usd", walletCurrency: "BTC" }],
+    [
+      "USD requested for a BTC wallet",
+      { walletId: "wallet-1", walletCurrency: "USD", usdAmount: 100 },
+    ],
+  ])("rejects %s", async (_name, body) => {
+    const res = await create(body)
+    expect(res.statusCode).toBe(400)
+    expect(res.body).toEqual({ error: "walletCurrency does not match the wallet" })
+    expect(mockStore.createVoucher).not.toHaveBeenCalled()
+  })
+
+  it("stores a matching USD voucher with its cents amount", async () => {
+    const res = await create({
+      walletId: "wallet-usd",
+      walletCurrency: "USD",
+      usdAmount: 100,
+    })
+    expect(res.statusCode).toBe(200)
+    expect(mockStore.createVoucher).toHaveBeenCalledWith(
+      500,
+      OWNER_KEY,
+      "wallet-usd",
+      expect.objectContaining({ walletCurrency: "USD", usdAmount: 100 }),
+    )
+  })
+
+  it("ignores a stray usdAmount on a BTC voucher", async () => {
+    await create({ walletCurrency: "BTC", usdAmount: 100 })
+    expect(mockStore.createVoucher).toHaveBeenCalledWith(
+      500,
+      OWNER_KEY,
+      "wallet-1",
+      expect.objectContaining({ walletCurrency: "BTC", usdAmount: undefined }),
+    )
+  })
+
+  it("normalizes an unknown environment to production", async () => {
+    await create({ environment: "http://evil.example" })
+    expect(mockGetWalletInfo).toHaveBeenCalledWith(OWNER_KEY, PROD)
   })
 })

@@ -1,7 +1,11 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
 import { withRateLimit, RATE_LIMIT_READ } from "../../../lib/rate-limit"
-import { apiKeyMatches, getVoucherApiKey } from "../../../lib/voucher-auth"
+import {
+  getOwnedWallets,
+  getVoucherApiKey,
+  toEnvironment,
+} from "../../../lib/voucher-auth"
 import voucherStore from "../../../lib/voucher-store"
 
 /** Shape of a voucher record from the store */
@@ -20,7 +24,6 @@ interface VoucherRecord {
   status: string
   walletCurrency?: string
   usdAmountCents?: number | null
-  apiKey?: string | null
 }
 
 /**
@@ -28,11 +31,13 @@ interface VoucherRecord {
  *
  * GET /api/voucher/list
  * Header: x-voucher-api-key: <voucher wallet API key>
- * Returns only vouchers created with that API key, with status information
- * (ACTIVE, CLAIMED, CANCELLED, EXPIRED). Voucher ids are LNURL-withdraw
- * redemption secrets, so they are never returned to anyone but the owner.
+ * Returns the vouchers drawn from wallets the key's account currently owns
+ * (checked live against Blink), with status information (ACTIVE, CLAIMED,
+ * CANCELLED, EXPIRED). Voucher ids are LNURL-withdraw redemption secrets, so
+ * they are never returned to anyone but the current owner. Same-origin only.
  *
  * Query params:
+ * - environment: 'production' (default) or 'staging'
  * - status: Filter by status (optional): 'ACTIVE', 'CLAIMED', 'CANCELLED', 'EXPIRED', 'all'
  *   Default: returns all vouchers
  */
@@ -48,13 +53,21 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     return res.status(401).json({ error: "Voucher wallet API key required" })
   }
 
+  const environment = toEnvironment(req.query.environment)
+  const ownedWallets = await getOwnedWallets(apiKey, environment)
+  if (!ownedWallets) {
+    return res.status(401).json({ error: "Voucher wallet API key is not valid" })
+  }
+
   try {
-    const { status: filterStatus } = req.query as { status?: string }
+    const filterStatus =
+      typeof req.query.status === "string" ? req.query.status : undefined
     const now = Date.now()
 
-    // Only the caller's vouchers (those funded by the presented API key)
-    const allVouchers = (await voucherStore.getAllVouchers()).filter(
-      (voucher: VoucherRecord) => apiKeyMatches(voucher.apiKey, apiKey),
+    // Only vouchers drawn from wallets the caller currently owns
+    const allVouchers: VoucherRecord[] = await voucherStore.getVouchersByWalletIds(
+      [...ownedWallets.keys()],
+      environment,
     )
 
     // Format vouchers for response

@@ -1,14 +1,19 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
-import { apiKeyMatches, getVoucherApiKey } from "../../../lib/voucher-auth"
+import {
+  getOwnedWallets,
+  getVoucherApiKey,
+  toEnvironment,
+} from "../../../lib/voucher-auth"
 import voucherStore from "../../../lib/voucher-store"
 
 /**
  * API endpoint to cancel a voucher
  *
  * POST /api/voucher/cancel
- * Header: x-voucher-api-key: <voucher wallet API key that created the voucher>
+ * Header: x-voucher-api-key: <API key whose account currently owns the
+ *         voucher's wallet (checked live against Blink)>
  * Body: { chargeId: string }
  *
  * Returns:
@@ -41,8 +46,12 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     // Get voucher with status to check current state (async)
     const voucher = await voucherStore.getVoucherWithStatus(chargeId)
 
-    // Same response for "doesn't exist" and "not yours" (no existence oracle)
-    if (!voucher || !apiKeyMatches(voucher.apiKey, apiKey)) {
+    // Ownership is checked live in the voucher's own environment. Same
+    // response for "doesn't exist", "not yours" and "key not valid" (no oracle).
+    const ownedWallets = voucher
+      ? await getOwnedWallets(apiKey, toEnvironment(voucher.environment))
+      : null
+    if (!voucher || !ownedWallets?.has(voucher.walletId)) {
       return res.status(404).json({
         error: "Voucher not found",
       })

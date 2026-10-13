@@ -2,7 +2,7 @@ import type { NextApiRequest, NextApiResponse } from "next"
 
 import type { EnvironmentName } from "../../../lib/config/api"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
-import { apiKeyOwnsWallet } from "../../../lib/voucher-auth"
+import { getOwnedWallets, toEnvironment } from "../../../lib/voucher-auth"
 import { isValidExpiryId, DEFAULT_EXPIRY_ID } from "../../../lib/voucher-expiry"
 import voucherStore from "../../../lib/voucher-store"
 
@@ -53,8 +53,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       usdAmount?: number | string
     }
 
-    const environment: EnvironmentName =
-      requestedEnvironment === "staging" ? "staging" : "production"
+    const environment: EnvironmentName = toEnvironment(requestedEnvironment)
 
     // Validate required fields
     if (
@@ -98,12 +97,22 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       }
     }
 
-    // The API key must own the wallet the voucher is drawn from. Otherwise
-    // anyone could create vouchers against (and exhaust the unclaimed-voucher
-    // quota of) a wallet id they don't control.
-    if (!(await apiKeyOwnsWallet(apiKey, walletId, environment))) {
+    // The API key must currently own the wallet the voucher is drawn from
+    // (checked live, no cache). Otherwise anyone could create vouchers against
+    // (and exhaust the unclaimed-voucher quota of) a wallet id they don't control.
+    const ownedWallets = await getOwnedWallets(apiKey, environment)
+    const actualWalletCurrency = ownedWallets?.get(walletId)
+    if (!actualWalletCurrency) {
       return res.status(403).json({
         error: "API key is not valid for this wallet",
+      })
+    }
+
+    // The stored currency (memo, USD fields, listing) must match the wallet
+    // that actually pays out.
+    if (actualWalletCurrency !== walletCurrency) {
+      return res.status(400).json({
+        error: "walletCurrency does not match the wallet",
       })
     }
 
@@ -118,8 +127,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       displayAmount: displayAmount || undefined,
       displayCurrency: displayCurrency || undefined,
       environment: environment,
-      walletCurrency: walletCurrency,
-      usdAmount: walletCurrency === "USD" ? parseInt(String(usdAmount)) : undefined,
+      walletCurrency: actualWalletCurrency,
+      usdAmount: actualWalletCurrency === "USD" ? parseInt(String(usdAmount)) : undefined,
     })
 
     console.log("✅ Voucher created successfully:", {

@@ -1,16 +1,15 @@
 /**
  * Voucher ownership (server-side).
  *
- * A voucher is owned by the voucher-wallet Blink API key that funded it: the
- * key is sent on create and stored (encrypted) with the voucher. Management
- * routes (list, cancel) require the caller to present that same key; create
- * requires the key to actually own the wallet it is drawn from.
+ * Authorization rule for every voucher management route: the presented Blink
+ * API key, checked live against Blink, must currently own the voucher's wallet
+ * (in the voucher's environment). Consequences:
+ * - a revoked / rotated key stops working immediately (no cache);
+ * - a replacement key that owns the same wallet can manage older vouchers.
  *
  * The voucher's id (chargeId) doubles as the LNURL-withdraw `k1` redemption
- * secret, so it must never be returned to anyone but the owner.
+ * secret, so it must never be returned to anyone but the current owner.
  */
-
-import crypto from "crypto"
 
 import type { NextApiRequest } from "next"
 
@@ -32,56 +31,33 @@ export function getVoucherApiKey(req: NextApiRequest): string | null {
   return trimmed
 }
 
-const digest = (value: string): Buffer =>
-  crypto.createHash("sha256").update(value).digest()
-
-/** Constant-time comparison of a presented key against a voucher's stored key. */
-export function apiKeyMatches(
-  stored: string | null | undefined,
-  presented: string | null | undefined,
-): boolean {
-  if (!stored || !presented) return false
-  return crypto.timingSafeEqual(digest(stored), digest(presented))
+/** Normalize an untrusted environment value. */
+export function toEnvironment(value: unknown): EnvironmentName {
+  return value === "staging" ? "staging" : "production"
 }
 
-// Positive results only, short TTL: batch creation calls create N times in a row.
-const OWNERSHIP_CACHE_TTL_MS = 5 * 60 * 1000
-const OWNERSHIP_CACHE_MAX = 1000
-const ownershipCache = new Map<string, number>()
-
-const ownershipCacheKey = (apiKey: string, walletId: string, env: string): string =>
-  crypto.createHash("sha256").update(`${env}\0${walletId}\0${apiKey}`).digest("hex")
-
 /**
- * True if `apiKey` is a valid Blink API key whose account owns `walletId`.
- * Fails closed (false) on any API error.
+ * The wallets the API key's account currently owns, as walletId → walletCurrency
+ * ("BTC" | "USD"), fetched live from Blink. `null` if the key is invalid or the
+ * lookup fails (callers must fail closed).
  */
-export async function apiKeyOwnsWallet(
+export async function getOwnedWallets(
   apiKey: string,
-  walletId: string,
   environment: EnvironmentName,
-): Promise<boolean> {
-  const key = ownershipCacheKey(apiKey, walletId, environment)
-  const cachedUntil = ownershipCache.get(key)
-  if (cachedUntil && cachedUntil > Date.now()) return true
-
+): Promise<Map<string, string> | null> {
   try {
     const wallets = await new BlinkAPI(
       apiKey,
       getApiUrlForEnvironment(environment),
     ).getWalletInfo()
-    const owns = wallets.some((wallet: { id: string }) => wallet.id === walletId)
-    if (owns) {
-      if (ownershipCache.size >= OWNERSHIP_CACHE_MAX) ownershipCache.clear()
-      ownershipCache.set(key, Date.now() + OWNERSHIP_CACHE_TTL_MS)
-    }
-    return owns
+    if (!Array.isArray(wallets)) return null
+    return new Map(
+      wallets.map((wallet: { id: string; walletCurrency: string }) => [
+        wallet.id,
+        wallet.walletCurrency,
+      ]),
+    )
   } catch {
-    return false
+    return null
   }
-}
-
-/** Test helper. */
-export function clearOwnershipCache(): void {
-  ownershipCache.clear()
 }
