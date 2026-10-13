@@ -11,9 +11,11 @@ jest.mock("../../lib/blink-api", () => {
       return mockGetWalletInfo()
     }
   }
-  return { __esModule: true, default: BlinkAPI, BlinkAPI }
+  class BlinkAuthError extends Error {}
+  return { __esModule: true, default: BlinkAPI, BlinkAPI, BlinkAuthError }
 })
 
+import { BlinkAuthError } from "../../lib/blink-api"
 import {
   getOwnedWallets,
   getVoucherApiKey,
@@ -64,23 +66,41 @@ describe("getOwnedWallets", () => {
       { id: "w2", walletCurrency: "USD" },
     ])
 
-    const wallets = await getOwnedWallets("blink_key", "staging")
+    const result = await getOwnedWallets("blink_key", "staging")
 
-    expect(wallets).toEqual(
-      new Map([
+    expect(result).toEqual({
+      ok: true,
+      wallets: new Map([
         ["w1", "BTC"],
         ["w2", "USD"],
       ]),
-    )
+    })
     expect(mockBlinkApiCtor).toHaveBeenCalledWith(
       "blink_key",
       "https://api.staging.blink.sv/graphql",
     )
   })
 
-  it("fails closed (null) when Blink rejects the key or errors", async () => {
-    mockGetWalletInfo.mockRejectedValueOnce(new Error("Invalid API key"))
-    await expect(getOwnedWallets("blink_key", "production")).resolves.toBeNull()
+  it("reports a key Blink refuses as invalid", async () => {
+    mockGetWalletInfo.mockRejectedValueOnce(new BlinkAuthError("rejected (401)"))
+    await expect(getOwnedWallets("blink_key", "production")).resolves.toEqual({
+      ok: false,
+      reason: "invalid",
+    })
+  })
+
+  it.each([
+    [
+      "a transport/5xx error",
+      () => mockGetWalletInfo.mockRejectedValueOnce(new Error("502")),
+    ],
+    ["a malformed response", () => mockGetWalletInfo.mockResolvedValueOnce(null)],
+  ])("reports %s as unavailable", async (_name, arrange) => {
+    arrange()
+    await expect(getOwnedWallets("blink_key", "production")).resolves.toEqual({
+      ok: false,
+      reason: "unavailable",
+    })
   })
 
   it("does not cache: every call hits Blink", async () => {

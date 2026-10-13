@@ -1,6 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
-import BlinkAPI, { PaymentRejectedError } from "../../../lib/blink-api"
+import BlinkAPI, { BlinkAuthError, PaymentRejectedError } from "../../../lib/blink-api"
 import { getApiUrlForEnvironment, type EnvironmentName } from "../../../lib/config/api"
 import { verifyForwardInvoice } from "../../../lib/payout-guard"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
@@ -230,10 +230,15 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       const paymentMessage =
         paymentError instanceof Error ? paymentError.message : "Unknown error"
 
-      if (paymentError instanceof PaymentRejectedError) {
-        // The API rejected the payment (nothing sent) — release the voucher so
-        // the holder can retry. Safe: the invoice amount is pinned to face value.
-        console.error("❌ Payment rejected, unclaiming voucher:", paymentMessage)
+      if (
+        paymentError instanceof PaymentRejectedError ||
+        paymentError instanceof BlinkAuthError
+      ) {
+        // The API rejected the payment, or refused the voucher's stored key
+        // (revoked / rotated) before executing anything: nothing was sent.
+        // Release the voucher so it can be retried or cancelled/reissued by
+        // the owner. Safe: the invoice amount is pinned to face value.
+        console.error("❌ Payment not executed, unclaiming voucher:", paymentMessage)
         await voucherStore.unclaimVoucher(chargeId)
       } else {
         // Transport error / unknown outcome: the payment may have gone out.
@@ -252,7 +257,9 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     console.error(`❌ Voucher callback error after ${elapsed}ms:`, message)
 
     let errorMessage = "Failed to process voucher withdrawal"
-    if (message.includes("balance") || message.includes("INSUFFICIENT")) {
+    if (error instanceof BlinkAuthError) {
+      errorMessage = "This voucher's wallet is no longer available - contact the issuer"
+    } else if (message.includes("balance") || message.includes("INSUFFICIENT")) {
       errorMessage = "Insufficient balance in voucher wallet"
     } else if (message.includes("expired")) {
       errorMessage = "Invoice has expired"

@@ -4,7 +4,7 @@
  * Tests the Blink API client class.
  */
 
-import BlinkAPI, { PaymentRejectedError } from "../../lib/blink-api"
+import BlinkAPI, { BlinkAuthError, PaymentRejectedError } from "../../lib/blink-api"
 
 describe("BlinkAPI", () => {
   let api: InstanceType<typeof BlinkAPI>
@@ -233,6 +233,61 @@ describe("BlinkAPI", () => {
       const result = await api.createLnUsdInvoice("usd-wallet-id", 500, "USD payment")
 
       expect(result).toEqual(mockInvoice)
+    })
+  })
+
+  describe("auth failures -> BlinkAuthError", () => {
+    const respond = (status: number, body: unknown, contentType = "application/json") => {
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: status >= 200 && status < 300,
+        status,
+        json: jest.fn().mockResolvedValue(body),
+        text: jest.fn().mockResolvedValue(String(body)),
+        headers: { get: () => contentType },
+      })
+    }
+
+    it.each([401, 403])("HTTP %i (invalid / revoked key)", async (status) => {
+      respond(status, "<html>401 Authorization Required</html>", "text/html")
+      await expect(api.query("query { me { id } }")).rejects.toBeInstanceOf(
+        BlinkAuthError,
+      )
+    })
+
+    it('GraphQL "Not authorized" (no key / insufficient scope)', async () => {
+      respond(200, { data: { me: null }, errors: [{ message: "Not authorized" }] })
+      await expect(api.query("query { me { id } }")).rejects.toBeInstanceOf(
+        BlinkAuthError,
+      )
+    })
+
+    it("GraphQL extensions.code UNAUTHENTICATED", async () => {
+      respond(200, {
+        errors: [{ message: "nope", extensions: { code: "UNAUTHENTICATED" } }],
+      })
+      await expect(api.query("query { me { id } }")).rejects.toBeInstanceOf(
+        BlinkAuthError,
+      )
+    })
+
+    it("a 401 on the payment mutation means nothing was executed", async () => {
+      respond(401, "<html>401</html>", "text/html")
+      await expect(api.payLnInvoice("wallet-id", "lnbc...")).rejects.toBeInstanceOf(
+        BlinkAuthError,
+      )
+    })
+
+    it.each([
+      ["HTTP 500", () => respond(500, "Server Error", "text/html")],
+      [
+        "an ordinary GraphQL error",
+        () => respond(200, { errors: [{ message: "Invalid wallet" }] }),
+      ],
+    ])("%s stays a plain Error", async (_name, arrange) => {
+      arrange()
+      const error = await api.query("query { me { id } }").catch((e: unknown) => e)
+      expect(error).toBeInstanceOf(Error)
+      expect(error).not.toBeInstanceOf(BlinkAuthError)
     })
   })
 

@@ -19,6 +19,7 @@ const mockStore = {
   getVoucherWithStatus: jest.fn(),
   getAllVouchers: jest.fn(),
   getVouchersByWalletIds: jest.fn(),
+  getVoucherStatsByWalletIds: jest.fn(),
   claimVoucher: jest.fn(),
   unclaimVoucher: jest.fn(),
   cancelVoucher: jest.fn(),
@@ -52,14 +53,21 @@ jest.mock("../../lib/blink-api", () => {
       this.code = code
     }
   }
+  class BlinkAuthError extends Error {}
   const BlinkAPI = jest.fn().mockImplementation((apiKey: string, apiUrl: string) => ({
     payLnInvoice: (...args: unknown[]) => mockPayLnInvoice(...args),
     getWalletInfo: () => mockGetWalletInfo(apiKey, apiUrl),
   }))
-  return { __esModule: true, default: BlinkAPI, BlinkAPI, PaymentRejectedError }
+  return {
+    __esModule: true,
+    default: BlinkAPI,
+    BlinkAPI,
+    BlinkAuthError,
+    PaymentRejectedError,
+  }
 })
 
-import { PaymentRejectedError } from "../../lib/blink-api"
+import { BlinkAuthError, PaymentRejectedError } from "../../lib/blink-api"
 import { VOUCHER_API_KEY_HEADER } from "../../lib/voucher-auth"
 import callbackHandler from "../../pages/api/voucher/callback"
 import cancelHandler from "../../pages/api/voucher/cancel"
@@ -213,6 +221,19 @@ describe("voucher callback: release only when nothing was sent", () => {
     expect(mockStore.unclaimVoucher).toHaveBeenCalledTimes(1)
   })
 
+  it("unclaims with a clear reason when the voucher's funding key was revoked", async () => {
+    mockPayLnInvoice.mockRejectedValueOnce(
+      new BlinkAuthError("Blink API rejected the API key (401)"),
+    )
+    const res = await redeem(invoice({ sats: 500 }))
+
+    expect(res.body).toEqual({
+      status: "ERROR",
+      reason: "This voucher's wallet is no longer available - contact the issuer",
+    })
+    expect(mockStore.unclaimVoucher).toHaveBeenCalledTimes(1)
+  })
+
   it("unclaims on a FAILURE status", async () => {
     mockPayLnInvoice.mockResolvedValueOnce({ status: "FAILURE" })
     await redeem(invoice({ sats: 500 }))
@@ -247,6 +268,7 @@ describe("voucher callback: release only when nothing was sent", () => {
 // key => Blink rejects it (revoked / invalid).
 const PROD = "https://api.blink.sv/graphql"
 const STAGING = "https://api.staging.blink.sv/graphql"
+let blinkDown = false
 let blinkAccounts: Record<
   string,
   Record<string, Array<{ id: string; walletCurrency: string }>>
@@ -255,8 +277,9 @@ let blinkAccounts: Record<
 const setBlinkAccounts = (accounts: typeof blinkAccounts) => {
   blinkAccounts = accounts
   mockGetWalletInfo.mockImplementation(async (apiKey: string, apiUrl: string) => {
+    if (blinkDown) throw new Error("Blink API returned non-JSON response (502)")
     const wallets = blinkAccounts[apiKey]?.[apiUrl]
-    if (!wallets) throw new Error("Invalid API key")
+    if (!wallets) throw new BlinkAuthError("Blink API rejected the API key (401)")
     return wallets
   })
 }
@@ -265,6 +288,7 @@ const BTC_WALLET = { id: "wallet-1", walletCurrency: "BTC" }
 const USD_WALLET = { id: "wallet-usd", walletCurrency: "USD" }
 
 beforeEach(() => {
+  blinkDown = false
   setBlinkAccounts({
     [OWNER_KEY]: {
       [PROD]: [BTC_WALLET, USD_WALLET],
@@ -282,6 +306,14 @@ describe("voucher list: current wallet owner only", () => {
 
   beforeEach(() => {
     mockStore.getVouchersByWalletIds.mockResolvedValue([voucher({ id: "1".repeat(32) })])
+    mockStore.getVoucherStatsByWalletIds.mockResolvedValue({
+      total: 7,
+      active: 1,
+      claimed: 3,
+      cancelled: 1,
+      expired: 2,
+      expiringSoon: 0,
+    })
   })
 
   it("requires the API key header", async () => {
@@ -310,9 +342,22 @@ describe("voucher list: current wallet owner only", () => {
     )
     const body = res.body as { vouchers: Array<{ id: string }>; stats: { total: number } }
     expect(body.vouchers.map((v) => v.id)).toEqual(["1".repeat(32)])
-    expect(body.stats.total).toBe(1)
+    // Stats come from the uncapped store aggregate, not the listed page
+    expect(body.stats.total).toBe(7)
+    expect(mockStore.getVoucherStatsByWalletIds).toHaveBeenCalledWith(
+      ["wallet-1", "wallet-usd"],
+      "production",
+    )
+    expect((res.body as { truncated: boolean }).truncated).toBe(false)
     expect(res.headers["access-control-allow-origin"]).toBeUndefined()
     expect(res.headers["cache-control"]).toBe("no-store")
+  })
+
+  it("answers 503 (not 401) when Blink is unavailable", async () => {
+    blinkDown = true
+    const res = await list({ [VOUCHER_API_KEY_HEADER]: OWNER_KEY })
+    expect(res.statusCode).toBe(503)
+    expect(mockStore.getVouchersByWalletIds).not.toHaveBeenCalled()
   })
 
   it("scopes to the requested environment (staging)", async () => {
@@ -376,6 +421,33 @@ describe("voucher cancel: current wallet owner only", () => {
     expect(mockStore.cancelVoucher).toHaveBeenCalledWith("a".repeat(32))
   })
 
+  it("answers 503 when Blink is unavailable and does not cancel", async () => {
+    blinkDown = true
+    const res = await cancel({ [VOUCHER_API_KEY_HEADER]: OWNER_KEY })
+    expect(res.statusCode).toBe(503)
+    expect(mockStore.cancelVoucher).not.toHaveBeenCalled()
+  })
+
+  it("answers 409 when a redemption wins the race against the cancel", async () => {
+    mockStore.getVoucherWithStatus
+      .mockResolvedValueOnce(voucher())
+      .mockResolvedValueOnce(voucher({ claimed: true, status: "CLAIMED" }))
+    mockStore.cancelVoucher.mockResolvedValueOnce(false)
+
+    const res = await cancel({ [VOUCHER_API_KEY_HEADER]: OWNER_KEY })
+
+    expect(res.statusCode).toBe(409)
+    expect(res.body).toEqual({
+      error: "Voucher is no longer active (claimed)",
+      status: "CLAIMED",
+    })
+  })
+
+  it("still answers 500 when the cancel update fails for another reason", async () => {
+    mockStore.cancelVoucher.mockResolvedValueOnce(false)
+    expect((await cancel({ [VOUCHER_API_KEY_HEADER]: OWNER_KEY })).statusCode).toBe(500)
+  })
+
   it("checks ownership in the voucher's own environment", async () => {
     mockStore.getVoucherWithStatus.mockResolvedValueOnce(
       voucher({ walletId: "wallet-stg", environment: "staging" }),
@@ -411,6 +483,12 @@ describe("voucher create: live ownership + confirmed wallet currency", () => {
 
   it("fails closed when Blink rejects the key", async () => {
     expect((await create({ apiKey: "blink_revoked_key" })).statusCode).toBe(403)
+    expect(mockStore.createVoucher).not.toHaveBeenCalled()
+  })
+
+  it("answers 503 (not 403) when Blink is unavailable", async () => {
+    blinkDown = true
+    expect((await create()).statusCode).toBe(503)
     expect(mockStore.createVoucher).not.toHaveBeenCalled()
   })
 

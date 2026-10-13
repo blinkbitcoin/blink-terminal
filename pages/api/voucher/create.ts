@@ -2,7 +2,11 @@ import type { NextApiRequest, NextApiResponse } from "next"
 
 import type { EnvironmentName } from "../../../lib/config/api"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
-import { getOwnedWallets, toEnvironment } from "../../../lib/voucher-auth"
+import {
+  getOwnedWallets,
+  OWNERSHIP_UNAVAILABLE,
+  toEnvironment,
+} from "../../../lib/voucher-auth"
 import { isValidExpiryId, DEFAULT_EXPIRY_ID } from "../../../lib/voucher-expiry"
 import voucherStore from "../../../lib/voucher-store"
 
@@ -100,8 +104,13 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     // The API key must currently own the wallet the voucher is drawn from
     // (checked live, no cache). Otherwise anyone could create vouchers against
     // (and exhaust the unclaimed-voucher quota of) a wallet id they don't control.
-    const ownedWallets = await getOwnedWallets(apiKey, environment)
-    const actualWalletCurrency = ownedWallets?.get(walletId)
+    const ownership = await getOwnedWallets(apiKey, environment)
+    if (!ownership.ok && ownership.reason === "unavailable") {
+      return res.status(OWNERSHIP_UNAVAILABLE.status).json(OWNERSHIP_UNAVAILABLE.body)
+    }
+    const actualWalletCurrency = ownership.ok
+      ? ownership.wallets.get(walletId)
+      : undefined
     if (!actualWalletCurrency) {
       return res.status(403).json({
         error: "API key is not valid for this wallet",

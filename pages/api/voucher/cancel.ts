@@ -4,6 +4,7 @@ import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
 import {
   getOwnedWallets,
   getVoucherApiKey,
+  OWNERSHIP_UNAVAILABLE,
   toEnvironment,
 } from "../../../lib/voucher-auth"
 import voucherStore from "../../../lib/voucher-store"
@@ -48,10 +49,13 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
     // Ownership is checked live in the voucher's own environment. Same
     // response for "doesn't exist", "not yours" and "key not valid" (no oracle).
-    const ownedWallets = voucher
+    const ownership = voucher
       ? await getOwnedWallets(apiKey, toEnvironment(voucher.environment))
       : null
-    if (!voucher || !ownedWallets?.has(voucher.walletId)) {
+    if (ownership && !ownership.ok && ownership.reason === "unavailable") {
+      return res.status(OWNERSHIP_UNAVAILABLE.status).json(OWNERSHIP_UNAVAILABLE.body)
+    }
+    if (!voucher || !ownership?.ok || !ownership.wallets.has(voucher.walletId)) {
       return res.status(404).json({
         error: "Voucher not found",
       })
@@ -71,10 +75,18 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       })
     }
 
-    // Cancel the voucher (async)
+    // Cancel the voucher (async). The update is guarded (ACTIVE and not
+    // claimed), so a redemption that wins the race leaves it untouched.
     const success = await voucherStore.cancelVoucher(chargeId)
 
     if (!success) {
+      const current = await voucherStore.getVoucherWithStatus(chargeId)
+      if (current && current.status !== "ACTIVE") {
+        return res.status(409).json({
+          error: `Voucher is no longer active (${current.status.toLowerCase()})`,
+          status: current.status,
+        })
+      }
       return res.status(500).json({
         error: "Failed to cancel voucher",
       })

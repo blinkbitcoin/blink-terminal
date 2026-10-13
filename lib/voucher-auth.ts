@@ -13,7 +13,7 @@
 
 import type { NextApiRequest } from "next"
 
-import { BlinkAPI } from "./blink-api"
+import { BlinkAPI, BlinkAuthError } from "./blink-api"
 import { getApiUrlForEnvironment, type EnvironmentName } from "./config/api"
 
 /** Request header carrying the voucher wallet's API key. */
@@ -36,28 +36,46 @@ export function toEnvironment(value: unknown): EnvironmentName {
   return value === "staging" ? "staging" : "production"
 }
 
+/** Outcome of a live ownership lookup. Callers must fail closed on `ok: false`. */
+export type OwnedWalletsResult =
+  | { ok: true; wallets: Map<string, string> }
+  | { ok: false; reason: "invalid" | "unavailable" }
+
 /**
  * The wallets the API key's account currently owns, as walletId → walletCurrency
- * ("BTC" | "USD"), fetched live from Blink. `null` if the key is invalid or the
- * lookup fails (callers must fail closed).
+ * ("BTC" | "USD"), fetched live from Blink.
+ * - `invalid`: Blink refused the key (revoked / wrong / insufficient scope).
+ * - `unavailable`: ownership could not be checked (network, 5xx, bad response).
  */
 export async function getOwnedWallets(
   apiKey: string,
   environment: EnvironmentName,
-): Promise<Map<string, string> | null> {
+): Promise<OwnedWalletsResult> {
   try {
     const wallets = await new BlinkAPI(
       apiKey,
       getApiUrlForEnvironment(environment),
     ).getWalletInfo()
-    if (!Array.isArray(wallets)) return null
-    return new Map(
-      wallets.map((wallet: { id: string; walletCurrency: string }) => [
-        wallet.id,
-        wallet.walletCurrency,
-      ]),
-    )
-  } catch {
-    return null
+    if (!Array.isArray(wallets)) return { ok: false, reason: "unavailable" }
+    return {
+      ok: true,
+      wallets: new Map(
+        wallets.map((wallet: { id: string; walletCurrency: string }) => [
+          wallet.id,
+          wallet.walletCurrency,
+        ]),
+      ),
+    }
+  } catch (error: unknown) {
+    return {
+      ok: false,
+      reason: error instanceof BlinkAuthError ? "invalid" : "unavailable",
+    }
   }
 }
+
+/** Response for an ownership lookup that could not be completed. */
+export const OWNERSHIP_UNAVAILABLE = {
+  status: 503,
+  body: { error: "Could not verify the voucher wallet right now, please retry" },
+} as const

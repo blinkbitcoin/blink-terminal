@@ -123,6 +123,29 @@ class PaymentRejectedError extends Error {
   }
 }
 
+/**
+ * Blink refused the API key (invalid / revoked / missing or insufficient
+ * scope): HTTP 401/403, or a GraphQL "Not authorized" / UNAUTHENTICATED error.
+ * The operation was not executed.
+ */
+class BlinkAuthError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "BlinkAuthError"
+  }
+}
+
+const AUTH_ERROR_CODES = new Set(["UNAUTHENTICATED", "NOT_AUTHORIZED", "FORBIDDEN"])
+
+const isAuthGraphQLError = (error: { message?: unknown; [key: string]: unknown }) => {
+  const code = (error.extensions as { code?: unknown } | undefined)?.code
+  return (
+    (typeof code === "string" && AUTH_ERROR_CODES.has(code)) ||
+    (typeof error.message === "string" &&
+      /^(not authorized|unauthorized|unauthenticated)\b/i.test(error.message))
+  )
+}
+
 // =============================================================================
 // BlinkAPI Class
 // =============================================================================
@@ -172,6 +195,10 @@ class BlinkAPI {
 
         span.setAttribute("http.status_code", response.status)
 
+        if (response.status === 401 || response.status === 403) {
+          throw new BlinkAuthError(`Blink API rejected the API key (${response.status})`)
+        }
+
         // Check if response is OK before parsing JSON
         if (!response.ok) {
           const contentType = response.headers.get("content-type")
@@ -198,6 +225,9 @@ class BlinkAPI {
         const data: GraphQLResponse = await response.json()
 
         if (data.errors) {
+          if (data.errors.some(isAuthGraphQLError)) {
+            throw new BlinkAuthError(data.errors[0]?.message || "Not authorized")
+          }
           throw new Error(data.errors[0]?.message || "GraphQL error")
         }
 
@@ -1034,7 +1064,7 @@ class BlinkAPI {
 }
 
 export default BlinkAPI
-export { BlinkAPI, PaymentRejectedError }
+export { BlinkAPI, BlinkAuthError, PaymentRejectedError }
 export type {
   GraphQLResponse,
   ExchangeRate,
