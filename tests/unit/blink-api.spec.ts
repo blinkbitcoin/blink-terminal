@@ -4,7 +4,7 @@
  * Tests the Blink API client class.
  */
 
-import BlinkAPI from "../../lib/blink-api"
+import BlinkAPI, { PaymentRejectedError } from "../../lib/blink-api"
 
 describe("BlinkAPI", () => {
   let api: InstanceType<typeof BlinkAPI>
@@ -296,6 +296,47 @@ describe("BlinkAPI", () => {
       const [, options] = (global.fetch as jest.Mock).mock.calls[0]
       const body = JSON.parse(options.body)
       expect(body.variables.input.memo).toBeUndefined()
+    })
+
+    it("throws PaymentRejectedError (with code) when the mutation returns errors", async () => {
+      global.fetch = jest.fn().mockResolvedValue({
+        ok: true,
+        json: jest.fn().mockResolvedValue({
+          data: {
+            lnInvoicePaymentSend: {
+              status: "FAILURE",
+              errors: [
+                {
+                  message: "Insufficient balance",
+                  code: "INSUFFICIENT_BALANCE",
+                  path: [],
+                },
+              ],
+            },
+          },
+        }),
+        headers: { get: () => "application/json" },
+      })
+
+      const error = await api
+        .payLnInvoice("wallet-id", "lnbc...")
+        .catch((e: unknown) => e)
+
+      expect(error).toBeInstanceOf(PaymentRejectedError)
+      expect(error).toBeInstanceOf(Error)
+      expect((error as PaymentRejectedError).message).toBe("Insufficient balance")
+      expect((error as PaymentRejectedError).code).toBe("INSUFFICIENT_BALANCE")
+    })
+
+    it("keeps transport failures as plain Errors (outcome unknown)", async () => {
+      global.fetch = jest.fn().mockRejectedValue(new TypeError("fetch failed"))
+
+      const error = await api
+        .payLnInvoice("wallet-id", "lnbc...")
+        .catch((e: unknown) => e)
+
+      expect(error).toBeInstanceOf(Error)
+      expect(error).not.toBeInstanceOf(PaymentRejectedError)
     })
   })
 
