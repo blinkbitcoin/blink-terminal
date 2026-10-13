@@ -89,6 +89,9 @@ interface VoucherRow {
   [key: string]: unknown
 }
 
+/** Max vouchers returned by the owner-scoped listing (newest first). */
+const OWNER_LIST_LIMIT = 500
+
 // Database connection pool (delegates to shared pool)
 function getPool() {
   return getSharedPool()
@@ -482,11 +485,13 @@ class VoucherStore {
    * (owner-scoped listing). Stored API keys are NOT decrypted.
    * @param walletIds - Wallet ids the caller currently owns
    * @param environment - 'production' or 'staging'
+   * @param limit - Max rows, newest first (default/max OWNER_LIST_LIMIT)
    * @returns Array of voucher objects with status (apiKey always null)
    */
   async getVouchersByWalletIds(
     walletIds: string[],
     environment: string,
+    limit: number = OWNER_LIST_LIMIT,
   ): Promise<Voucher[]> {
     if (walletIds.length === 0) return []
     try {
@@ -494,10 +499,11 @@ class VoucherStore {
 
       const result: QueryResult<VoucherRow> = await query(
         `SELECT * FROM vouchers
-         WHERE wallet_id = ANY($1)
-           AND COALESCE(environment, 'production') = $2
-         ORDER BY created_at DESC`,
-        [walletIds, environment],
+         WHERE COALESCE(environment, 'production') = $2
+           AND wallet_id = ANY($1)
+         ORDER BY created_at DESC
+         LIMIT $3`,
+        [walletIds, environment, Math.min(Math.max(1, limit), OWNER_LIST_LIMIT)],
       )
 
       return result.rows.map((row: VoucherRow) => {
@@ -511,6 +517,58 @@ class VoucherStore {
         (err as Error).message,
       )
       throw err
+    }
+  }
+
+  /**
+   * Status counts over ALL vouchers drawn from `walletIds` in `environment`
+   * (not capped like the listing). Mirrors getVoucherStatus():
+   * claimed > cancelled > expired > active.
+   */
+  async getVoucherStatsByWalletIds(
+    walletIds: string[],
+    environment: string,
+  ): Promise<VoucherStats> {
+    const empty: VoucherStats = {
+      total: 0,
+      active: 0,
+      claimed: 0,
+      cancelled: 0,
+      expired: 0,
+      expiringSoon: 0,
+    }
+    if (walletIds.length === 0) return empty
+
+    const now = Date.now()
+    const result = await query(
+      `SELECT
+         COUNT(*) AS total,
+         COUNT(*) FILTER (WHERE claimed) AS claimed,
+         COUNT(*) FILTER (WHERE NOT claimed AND cancelled_at IS NOT NULL) AS cancelled,
+         COUNT(*) FILTER (
+           WHERE NOT claimed AND cancelled_at IS NULL AND expires_at < $3
+         ) AS expired,
+         COUNT(*) FILTER (
+           WHERE NOT claimed AND cancelled_at IS NULL AND expires_at >= $3
+         ) AS active,
+         COUNT(*) FILTER (
+           WHERE NOT claimed AND cancelled_at IS NULL
+             AND expires_at >= $3 AND expires_at < $4
+         ) AS expiring_soon
+       FROM vouchers
+       WHERE COALESCE(environment, 'production') = $2
+         AND wallet_id = ANY($1)`,
+      [walletIds, environment, now, now + 24 * 60 * 60 * 1000],
+    )
+    const row = (result.rows[0] ?? {}) as Record<string, unknown>
+    const n = (value: unknown): number => parseInt(String(value ?? 0), 10) || 0
+    return {
+      total: n(row.total),
+      active: n(row.active),
+      claimed: n(row.claimed),
+      cancelled: n(row.cancelled),
+      expired: n(row.expired),
+      expiringSoon: n(row.expiring_soon),
     }
   }
 
@@ -609,6 +667,6 @@ class VoucherStore {
 // Export singleton instance
 const voucherStore: VoucherStore = new VoucherStore()
 export default voucherStore
-export { VoucherStore }
+export { VoucherStore, OWNER_LIST_LIMIT }
 
 export type { Voucher, CreateVoucherOptions, VoucherStats, VoucherRow }

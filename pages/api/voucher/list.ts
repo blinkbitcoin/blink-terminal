@@ -4,9 +4,10 @@ import { withRateLimit, RATE_LIMIT_READ } from "../../../lib/rate-limit"
 import {
   getOwnedWallets,
   getVoucherApiKey,
+  OWNERSHIP_UNAVAILABLE,
   toEnvironment,
 } from "../../../lib/voucher-auth"
-import voucherStore from "../../../lib/voucher-store"
+import voucherStore, { OWNER_LIST_LIMIT } from "../../../lib/voucher-store"
 
 /** Shape of a voucher record from the store */
 interface VoucherRecord {
@@ -54,10 +55,13 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 
   const environment = toEnvironment(req.query.environment)
-  const ownedWallets = await getOwnedWallets(apiKey, environment)
-  if (!ownedWallets) {
-    return res.status(401).json({ error: "Voucher wallet API key is not valid" })
+  const ownership = await getOwnedWallets(apiKey, environment)
+  if (!ownership.ok) {
+    return ownership.reason === "invalid"
+      ? res.status(401).json({ error: "Voucher wallet API key is not valid" })
+      : res.status(OWNERSHIP_UNAVAILABLE.status).json(OWNERSHIP_UNAVAILABLE.body)
   }
+  const ownedWallets = ownership.wallets
 
   try {
     const filterStatus =
@@ -109,25 +113,18 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       }
     }
 
-    // Calculate summary stats
-    const stats = {
-      total: allVouchers.length,
-      active: allVouchers.filter((v: VoucherRecord) => v.status === "ACTIVE").length,
-      claimed: allVouchers.filter((v: VoucherRecord) => v.status === "CLAIMED").length,
-      cancelled: allVouchers.filter((v: VoucherRecord) => v.status === "CANCELLED")
-        .length,
-      expired: allVouchers.filter((v: VoucherRecord) => v.status === "EXPIRED").length,
-      // Count vouchers expiring within 24 hours
-      expiringSoon: allVouchers.filter(
-        (v: VoucherRecord) =>
-          v.status === "ACTIVE" && v.expiresAt && v.expiresAt - now < 24 * 60 * 60 * 1000,
-      ).length,
-    }
+    // Stats cover all of the caller's vouchers, not just the capped list
+    const stats = await voucherStore.getVoucherStatsByWalletIds(
+      [...ownedWallets.keys()],
+      environment,
+    )
 
     return res.status(200).json({
       success: true,
       vouchers: vouchers,
       count: vouchers.length,
+      // The listing is capped (newest first); stats are not.
+      truncated: allVouchers.length >= OWNER_LIST_LIMIT,
       stats: stats,
     })
   } catch (error: unknown) {
