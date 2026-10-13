@@ -278,7 +278,15 @@ ownership**: the presented Blink API key is checked live against Blink and must 
 the voucher's wallet in the voucher's environment. A revoked key stops working
 immediately; a replacement key for the same wallet can manage older vouchers.
 `list` and `cancel` are same-origin only (no CORS). Voucher ids are LNURL `k1`
-redemption secrets and are only returned to the current owner.
+redemption secrets and are only returned to the current owner. If Blink can't be
+reached to check ownership, these routes answer `503` (retry) rather than an auth error.
+`list` returns at most 500 vouchers (newest first, `truncated: true` when capped);
+`stats` always cover all of the owner's vouchers.
+
+**Rotated / revoked funding key:** a voucher pays out with the API key it was created
+with. If that key is revoked, redemption fails with "This voucher's wallet is no
+longer available" and the voucher stays active; the owner can cancel it with the
+replacement key and reissue.
 
 ### Batch Payments
 
