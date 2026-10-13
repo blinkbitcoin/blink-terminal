@@ -8,6 +8,7 @@
  */
 
 import { getApiUrl } from "../config/api"
+import { fetchJsonWithRetry } from "../lnurl"
 
 import { RECIPIENT_TYPES, type ParsedRecipient } from "./csv-parser"
 
@@ -357,22 +358,12 @@ export async function executeLnurlPayment({
     const callbackUrl = new URL(lnurlData.callback)
     callbackUrl.searchParams.set("amount", amountMsats.toString())
 
-    const invoiceResponse = await fetch(callbackUrl.toString(), {
-      method: "GET",
-      headers: { Accept: "application/json" },
-    })
-
-    if (!invoiceResponse.ok) {
-      return {
-        success: false,
-        error: {
-          code: PAYMENT_ERROR_CODES.PAYMENT_FAILED,
-          message: `LNURL callback returned ${invoiceResponse.status}`,
-        },
-      }
-    }
-
-    const invoiceData: LnurlCallbackResponse = await invoiceResponse.json()
+    // SSRF-safe: the callback URL comes from a
+    // third-party LNURL server, so it must never reach internal targets.
+    const invoiceData = (await fetchJsonWithRetry(
+      callbackUrl.toString(),
+      0,
+    )) as LnurlCallbackResponse
 
     if (invoiceData.status === "ERROR") {
       return {

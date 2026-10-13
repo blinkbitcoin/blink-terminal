@@ -3,7 +3,7 @@ import https from "node:https"
 import { isIP, type LookupFunction } from "node:net"
 
 const MAX_REDIRECTS = 3
-const MAX_BODY_BYTES = 16 * 1024
+const DEFAULT_MAX_BODY_BYTES = 16 * 1024
 const TIMEOUT_MS = 5_000
 const DEADLINE_MS = 15_000
 
@@ -116,10 +116,12 @@ const requestJsonOnce = async ({
   url,
   redirectsLeft,
   signal,
+  maxBodyBytes,
 }: {
   url: URL
   redirectsLeft: number
   signal: AbortSignal
+  maxBodyBytes: number
 }): Promise<{ data: unknown } | { redirect: URL }> => {
   if (url.protocol !== "https:") {
     throw new SafeFetchError("only https URLs are allowed")
@@ -178,7 +180,7 @@ const requestJsonOnce = async ({
           if (stopped) return
 
           size += chunk.length
-          if (size > MAX_BODY_BYTES) {
+          if (size > maxBodyBytes) {
             stopped = true
             req.destroy(new SafeFetchError("response too large"))
             return
@@ -210,17 +212,20 @@ const fetchWithRedirects = async ({
   url,
   redirectsLeft,
   signal,
+  maxBodyBytes,
 }: {
   url: URL
   redirectsLeft: number
   signal: AbortSignal
+  maxBodyBytes: number
 }): Promise<SafeFetchJsonResponse> => {
-  const result = await requestJsonOnce({ url, redirectsLeft, signal })
+  const result = await requestJsonOnce({ url, redirectsLeft, signal, maxBodyBytes })
   if ("data" in result) return { data: result.data, url: url.toString() }
   return fetchWithRedirects({
     url: result.redirect,
     redirectsLeft: redirectsLeft - 1,
     signal,
+    maxBodyBytes,
   })
 }
 
@@ -248,8 +253,14 @@ const withRequestDeadline = ({
     )
   })
 
+export type SafeFetchJsonOptions = {
+  /** Response body cap in bytes (default 16 KiB). */
+  maxBodyBytes?: number
+}
+
 export const safeFetchJsonResponse = async (
   input: string,
+  { maxBodyBytes = DEFAULT_MAX_BODY_BYTES }: SafeFetchJsonOptions = {},
 ): Promise<SafeFetchJsonResponse> => {
   let url: URL
   try {
@@ -268,6 +279,7 @@ export const safeFetchJsonResponse = async (
           url,
           redirectsLeft: MAX_REDIRECTS,
           signal: controller.signal,
+          maxBodyBytes,
         }),
     })
   } catch (error) {
@@ -276,5 +288,7 @@ export const safeFetchJsonResponse = async (
   }
 }
 
-export const safeFetchJson = async (input: string): Promise<unknown> =>
-  (await safeFetchJsonResponse(input)).data
+export const safeFetchJson = async (
+  input: string,
+  options?: SafeFetchJsonOptions,
+): Promise<unknown> => (await safeFetchJsonResponse(input, options)).data

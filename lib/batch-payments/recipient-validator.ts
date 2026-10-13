@@ -8,6 +8,7 @@
  */
 
 import { getApiUrl, getAllValidDomains } from "../config/api"
+import { fetchJsonWithRetry } from "../lnurl"
 
 import { RECIPIENT_TYPES, type ParsedRecipient } from "./csv-parser"
 
@@ -277,23 +278,8 @@ export async function validateLnAddress(
   const lnurlpUrl = `https://${domain}/.well-known/lnurlp/${user}`
 
   try {
-    const response = await fetch(lnurlpUrl, {
-      method: "GET",
-      headers: { Accept: "application/json" },
-    })
-
-    if (!response.ok) {
-      return {
-        recipient,
-        valid: false,
-        error: {
-          code: ERROR_CODES.LNURL_UNREACHABLE,
-          message: `Could not reach ${domain} (HTTP ${response.status})`,
-        },
-      }
-    }
-
-    const data: LnurlPayResponse = await response.json()
+    // SSRF-safe: refuses internal/private targets.
+    const data = (await fetchJsonWithRetry(lnurlpUrl, 0)) as LnurlPayResponse
 
     // Check for LNURL error response
     if (data.status === "ERROR") {
@@ -400,23 +386,8 @@ export async function validateLnurl(
   }
 
   try {
-    const response = await fetch(url, {
-      method: "GET",
-      headers: { Accept: "application/json" },
-    })
-
-    if (!response.ok) {
-      return {
-        recipient,
-        valid: false,
-        error: {
-          code: ERROR_CODES.LNURL_UNREACHABLE,
-          message: `LNURL endpoint returned HTTP ${response.status}`,
-        },
-      }
-    }
-
-    const data: LnurlPayResponse = await response.json()
+    // SSRF-safe: refuses internal/private targets.
+    const data = (await fetchJsonWithRetry(url, 0)) as LnurlPayResponse
 
     // Check for error response
     if (data.status === "ERROR") {

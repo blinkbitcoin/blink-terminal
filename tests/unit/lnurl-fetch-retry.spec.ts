@@ -1,9 +1,8 @@
 /**
- * Tests for fetchWithRetry in lib/lnurl.ts
+ * Tests for fetchJsonWithRetry in lib/lnurl.ts
  *
- * Server-side LNURL fetches to blink.sv / lnurl.blink.sv intermittently fail
- * with "fetch failed" under Node's undici. fetchWithRetry retries transient
- * failures so a single blip does not surface as "address not found".
+ * All LNURL fetches go through safeFetchJson (SSRF guard). Transient transport failures are retried so a single blip does
+ * not surface as "address not found"; policy rejections are not retried.
  */
 
 // nostr-tools (pulled in transitively by lib/lnurl.ts) ships ESM that jest's
@@ -12,65 +11,86 @@ jest.mock("nostr-tools", () => ({
   nip19: { decode: () => ({ type: "npub", data: "x" }) },
 }))
 
-import { fetchWithRetry } from "../../lib/lnurl"
+const mockSafeFetchJson = jest.fn()
+jest.mock("../../lib/server/safe-fetch-json", () => {
+  class SafeFetchError extends Error {}
+  return {
+    SafeFetchError,
+    safeFetchJson: (...args: unknown[]) => mockSafeFetchJson(...args),
+  }
+})
 
-const okResponse = () => ({ ok: true, status: 200 }) as unknown as Response
+import { fetchJsonWithRetry, getInvoiceFromLightningAddress } from "../../lib/lnurl"
+import { SafeFetchError } from "../../lib/server/safe-fetch-json"
 
 beforeEach(() => {
   jest.clearAllMocks()
 })
 
-describe("fetchWithRetry", () => {
-  it("returns the response on first success", async () => {
-    const fetchMock = jest.fn(async () => okResponse())
-    global.fetch = fetchMock as unknown as typeof fetch
+describe("fetchJsonWithRetry", () => {
+  it("returns the parsed JSON on first success via safeFetchJson", async () => {
+    mockSafeFetchJson.mockResolvedValueOnce({ ok: 1 })
 
-    const res = await fetchWithRetry("https://blink.sv/x", {}, 2, 1000)
-
-    expect(res.status).toBe(200)
-    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await expect(fetchJsonWithRetry("https://blink.sv/x", 2)).resolves.toEqual({ ok: 1 })
+    expect(mockSafeFetchJson).toHaveBeenCalledTimes(1)
+    expect(mockSafeFetchJson).toHaveBeenCalledWith("https://blink.sv/x", {
+      maxBodyBytes: 256 * 1024,
+    })
   })
 
-  it("retries on transient failure then succeeds", async () => {
-    const fetchMock = jest
-      .fn()
-      .mockRejectedValueOnce(new Error("fetch failed"))
-      .mockResolvedValueOnce(okResponse())
-    global.fetch = fetchMock as unknown as typeof fetch
+  it("retries a transient transport failure then succeeds", async () => {
+    mockSafeFetchJson
+      .mockRejectedValueOnce(new SafeFetchError("upstream request failed"))
+      .mockResolvedValueOnce({ ok: 1 })
 
-    const res = await fetchWithRetry("https://blink.sv/x", {}, 2, 1000)
-
-    expect(res.status).toBe(200)
-    expect(fetchMock).toHaveBeenCalledTimes(2)
+    await expect(fetchJsonWithRetry("https://blink.sv/x", 2)).resolves.toEqual({ ok: 1 })
+    expect(mockSafeFetchJson).toHaveBeenCalledTimes(2)
   })
 
   it("throws after exhausting all retries", async () => {
-    const fetchMock = jest.fn().mockRejectedValue(new Error("fetch failed"))
-    global.fetch = fetchMock as unknown as typeof fetch
+    mockSafeFetchJson.mockRejectedValue(new SafeFetchError("upstream request timed out"))
 
-    await expect(fetchWithRetry("https://blink.sv/x", {}, 2, 1000)).rejects.toThrow(
-      "fetch failed",
+    await expect(fetchJsonWithRetry("https://blink.sv/x", 2)).rejects.toThrow(
+      "upstream request timed out",
     )
-    // initial attempt + 2 retries = 3
-    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(mockSafeFetchJson).toHaveBeenCalledTimes(3)
   })
 
-  it("sends Connection: close and merges caller headers", async () => {
-    const fetchMock = jest.fn(async (_url: string, _init?: RequestInit) => okResponse())
-    global.fetch = fetchMock as unknown as typeof fetch
+  it.each([
+    "hostname does not resolve to a public address",
+    "only https URLs are allowed",
+    "upstream returned HTTP 404",
+  ])("does not retry policy/HTTP rejections (%s)", async (message) => {
+    mockSafeFetchJson.mockRejectedValue(new SafeFetchError(message))
 
-    await fetchWithRetry(
-      "https://blink.sv/x",
-      { headers: { Accept: "application/json" } },
-      0,
-      1000,
+    await expect(fetchJsonWithRetry("https://blink.sv/x", 2)).rejects.toThrow(message)
+    expect(mockSafeFetchJson).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe("getInvoiceFromLightningAddress (SSRF)", () => {
+  it("never fetches the LNURL callback with raw fetch", async () => {
+    const rawFetch = jest.fn()
+    global.fetch = rawFetch as unknown as typeof fetch
+    mockSafeFetchJson
+      .mockResolvedValueOnce({
+        tag: "payRequest",
+        callback: "https://10.0.0.5:8080/internal",
+        minSendable: 1000,
+        maxSendable: 1_000_000,
+        metadata: "[]",
+      })
+      .mockRejectedValueOnce(
+        new SafeFetchError("hostname does not resolve to a public address"),
+      )
+
+    await expect(getInvoiceFromLightningAddress("a@evil.example", 10)).rejects.toThrow(
+      "hostname does not resolve to a public address",
     )
-
-    const init = fetchMock.mock.calls[0][1] as RequestInit
-    expect(init.headers).toMatchObject({
-      Connection: "close",
-      Accept: "application/json",
-    })
-    expect(init.signal).toBeDefined()
+    expect(rawFetch).not.toHaveBeenCalled()
+    expect(mockSafeFetchJson.mock.calls[0][0]).toBe(
+      "https://evil.example/.well-known/lnurlp/a",
+    )
+    expect(mockSafeFetchJson.mock.calls[1][0]).toContain("https://10.0.0.5:8080/")
   })
 })

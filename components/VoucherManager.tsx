@@ -9,6 +9,7 @@ import {
 } from "react"
 import QRCode from "react-qr-code"
 
+import { isVoucherPdfEnabled } from "../lib/config/features"
 import {
   formatDisplayAmount as formatCurrency,
   isBitcoinCurrency,
@@ -722,8 +723,8 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
 
               {/* Action Buttons */}
               <div className="space-y-2 mt-4">
-                {/* Reissue Button - for active vouchers */}
-                {canReissue && (
+                {/* Reissue Button - for active vouchers (needs the disabled voucher PDF route) */}
+                {canReissue && isVoucherPdfEnabled() && (
                   <button
                     onClick={() => reissueVoucher(selectedVoucher)}
                     disabled={reissuing}

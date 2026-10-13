@@ -2,6 +2,7 @@ import { renderToBuffer } from "@react-pdf/renderer"
 import type { NextApiRequest, NextApiResponse } from "next"
 import React from "react"
 
+import { isSafeImageDataUrl } from "../../../lib/pdf/safe-image-src"
 import { withRateLimit, RATE_LIMIT_PUBLIC } from "../../../lib/rate-limit"
 
 // Dynamic import to avoid issues with font registration at module load time
@@ -92,7 +93,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     // renderer's <Image src=...>, which will FETCH remote/file URLs. Only accept
     // inline base64 image data URLs so an attacker cannot coerce server-side
     // requests to arbitrary hosts.
-    if (!/^data:image\/(png|jpe?g|webp);base64,[A-Za-z0-9+/]+={0,2}$/.test(qrDataUrl)) {
+    if (!isSafeImageDataUrl(qrDataUrl)) {
       return res.status(400).json({
         error: "Invalid qrDataUrl",
         hint: "qrDataUrl must be an inline data:image/(png|jpeg|webp);base64,... URL",
@@ -135,16 +136,12 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       hasFixedAmount: !!(amount && amount > 0),
     })
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : "Unknown error"
     const stack = error instanceof Error ? error.stack : undefined
     console.error("❌ Paycode PDF generation error:", error)
     console.error("❌ Stack trace:", stack)
 
-    return res.status(500).json({
-      error: "Failed to generate Paycode PDF",
-      message,
-      stack: process.env.NODE_ENV === "development" ? stack : undefined,
-    })
+    // Never echo renderer errors to the caller (they can carry fetched content).
+    return res.status(500).json({ error: "Failed to generate Paycode PDF" })
   }
 }
 
