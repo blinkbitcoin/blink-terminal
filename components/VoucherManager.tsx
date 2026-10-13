@@ -9,6 +9,7 @@ import {
 } from "react"
 import QRCode from "react-qr-code"
 
+import { getEnvironment } from "../lib/config/api"
 import { isVoucherPdfEnabled } from "../lib/config/features"
 import {
   formatDisplayAmount as formatCurrency,
@@ -60,6 +61,15 @@ interface VoucherData {
   lnurl?: string
 }
 
+const EMPTY_STATS: VoucherStats = {
+  total: 0,
+  active: 0,
+  claimed: 0,
+  cancelled: 0,
+  expired: 0,
+  expiringSoon: 0,
+}
+
 interface VoucherManagerProps {
   voucherWallet: VoucherWallet | null
   displayCurrency: string
@@ -101,14 +111,7 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
     ref,
   ) => {
     const [vouchers, setVouchers] = useState<VoucherData[]>([])
-    const [stats, setStats] = useState<VoucherStats>({
-      total: 0,
-      active: 0,
-      claimed: 0,
-      cancelled: 0,
-      expired: 0,
-      expiringSoon: 0,
-    })
+    const [stats, setStats] = useState<VoucherStats>(EMPTY_STATS)
     const [loading, setLoading] = useState<boolean>(true)
     const [error, setError] = useState<string>("")
     const [selectedVoucher, setSelectedVoucher] = useState<VoucherData | null>(null)
@@ -123,6 +126,23 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
     // Vouchers are scoped to (and authorized by) the voucher wallet's API key.
     const voucherApiKey = voucherWallet?.apiKey
 
+    // Requests for a previous key must never land in the current view.
+    const listAbortRef = useRef<AbortController | null>(null)
+    const keyGenerationRef = useRef<number>(0)
+
+    useEffect(() => {
+      keyGenerationRef.current += 1
+      listAbortRef.current?.abort()
+      listAbortRef.current = null
+      setVouchers([])
+      setStats(EMPTY_STATS)
+      setSelectedVoucher(null)
+      setError("")
+      setLoading(Boolean(voucherApiKey))
+    }, [voucherApiKey])
+
+    useEffect(() => () => listAbortRef.current?.abort(), [])
+
     // Fetch vouchers
     const fetchVouchers = useCallback(async () => {
       if (!voucherApiKey) {
@@ -130,12 +150,24 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
         setLoading(false)
         return
       }
+      const generation = keyGenerationRef.current
+      listAbortRef.current?.abort()
+      const controller = new AbortController()
+      listAbortRef.current = controller
+      const isStale = () =>
+        controller.signal.aborted || generation !== keyGenerationRef.current
+
       try {
         setError("")
-        const response = await fetch("/api/voucher/list", {
-          headers: { "x-voucher-api-key": voucherApiKey },
-        })
+        const response = await fetch(
+          `/api/voucher/list?environment=${encodeURIComponent(getEnvironment())}`,
+          {
+            headers: { "x-voucher-api-key": voucherApiKey },
+            signal: controller.signal,
+          },
+        )
         const data = await response.json()
+        if (isStale()) return
 
         if (data.success) {
           setVouchers(data.vouchers)
@@ -146,10 +178,11 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
           setError(data.error || "Failed to load vouchers")
         }
       } catch (err: unknown) {
+        if (isStale()) return
         console.error("Error fetching vouchers:", err)
         setError("Failed to load vouchers")
       } finally {
-        setLoading(false)
+        if (!isStale()) setLoading(false)
       }
     }, [voucherApiKey])
 
