@@ -1,7 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
-import AuthManager from "../../../../lib/auth"
 import * as boltcard from "../../../../lib/boltcard"
+import { requireOwnedCard } from "../../../../lib/boltcard/owner-auth"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../../lib/rate-limit"
 
 /**
@@ -22,34 +22,6 @@ import { withRateLimit, RATE_LIMIT_WRITE } from "../../../../lib/rate-limit"
  * - Only returns keys for cards owned by the authenticated user
  */
 
-/**
- * Verify request has valid NIP-98 session
- */
-function verifySession(req: NextApiRequest): {
-  valid: boolean
-  pubkey?: string
-  error?: string
-} {
-  const token = req.cookies?.["auth-token"]
-
-  if (!token) {
-    return { valid: false, error: "Authentication required - no session token" }
-  }
-
-  const session = AuthManager.verifySession(token)
-
-  if (!session) {
-    return { valid: false, error: "Invalid or expired session" }
-  }
-
-  if (!session.username?.startsWith("nostr:")) {
-    return { valid: false, error: "Not a Nostr session" }
-  }
-
-  const pubkey = session.username.replace("nostr:", "")
-  return { valid: true, pubkey }
-}
-
 async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "GET") {
     return res.status(405).json({ error: "Method not allowed" })
@@ -62,35 +34,10 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 
   try {
-    // Verify session authentication
-    const verification = verifySession(req)
-
-    if (!verification.valid) {
-      return res.status(401).json({
-        error: "Authentication required",
-        message: verification.error,
-      })
-    }
-
-    const userPubkey = verification.pubkey as string
-
-    // Get the card
-    const card = await boltcard.store.getCard(cardId)
-
-    if (!card) {
-      return res.status(404).json({ error: "Card not found" })
-    }
-
-    // Verify ownership
-    if (card.ownerPubkey !== userPubkey) {
-      console.warn(
-        `[WipeKeys] Unauthorized access attempt: user ${userPubkey.substring(0, 8)}... tried to access card owned by ${card.ownerPubkey.substring(0, 8)}...`,
-      )
-      return res.status(403).json({
-        error: "Access denied",
-        message: "You do not own this card",
-      })
-    }
+    // Owner session required; another owner's card answers 404
+    const owned = await requireOwnedCard(req, res, cardId)
+    if (!owned) return
+    const { card, pubkey: userPubkey } = owned
 
     // Get IssuerKey for the owner
     const issuerKey = await boltcard.store.getIssuerKey(userPubkey)

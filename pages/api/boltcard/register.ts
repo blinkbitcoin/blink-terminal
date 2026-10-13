@@ -3,9 +3,14 @@ import type { NextApiRequest, NextApiResponse } from "next"
 import * as boltcardCrypto from "../../../lib/boltcard/crypto"
 import * as lnurlp from "../../../lib/boltcard/lnurlp"
 import * as lnurlw from "../../../lib/boltcard/lnurlw"
+import { requireSessionPubkey } from "../../../lib/boltcard/owner-auth"
 import boltcardStore from "../../../lib/boltcard/store"
-import type { EnvironmentName } from "../../../lib/config/api"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
+import {
+  getOwnedWallets,
+  OWNERSHIP_UNAVAILABLE,
+  toEnvironment,
+} from "../../../lib/wallet-ownership"
 
 /**
  * API endpoint to register a new Boltcard
@@ -27,9 +32,9 @@ import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
  * POST /api/boltcard/register
  * Body: {
  *   cardUid?: string,       // Card UID (14 hex chars) - OPTIONAL for deeplink flow
- *   ownerPubkey: string,    // Owner's Nostr pubkey
- *   walletId: string,       // Blink wallet ID
- *   apiKey: string,         // Blink API key
+ *   ownerPubkey?: string,   // Optional; must equal the session pubkey if sent
+ *   walletId: string,       // Blink wallet ID (must match walletCurrency)
+ *   apiKey: string,         // Blink API key that currently owns walletId
  *   name?: string,          // User-friendly card name
  *   walletCurrency?: string,// 'BTC' or 'USD' (default: 'BTC')
  *   maxTxAmount?: number,   // Per-transaction limit (sats/cents)
@@ -37,6 +42,10 @@ import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
  *   initialBalance?: number,// Initial balance (sats/cents)
  *   environment?: string    // 'production' or 'staging'
  * }
+ *
+ * Requires the owner's Nostr session (auth-token cookie); the card's owner is
+ * always the session pubkey. Card keys are only ever returned to that session
+ * (direct flow) or via the single-use, expiring keys link (deeplink flow).
  */
 
 async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -44,10 +53,14 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     return res.status(405).json({ error: "Method not allowed" })
   }
 
+  // The owner is the authenticated Nostr session, never a request field.
+  const ownerPubkey = requireSessionPubkey(req, res)
+  if (!ownerPubkey) return
+
   try {
     const {
       cardUid,
-      ownerPubkey,
+      ownerPubkey: requestedOwnerPubkey,
       walletId,
       apiKey,
       name,
@@ -55,8 +68,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       maxTxAmount,
       dailyLimit,
       initialBalance = 0,
-      environment = "production",
-    } = req.body as {
+      environment: requestedEnvironment,
+    } = (req.body ?? {}) as {
       cardUid?: string
       ownerPubkey?: string
       walletId?: string
@@ -66,13 +79,26 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       maxTxAmount?: string | number
       dailyLimit?: string | number
       initialBalance?: string | number
-      environment?: EnvironmentName
+      environment?: unknown
+    }
+    const environment = toEnvironment(requestedEnvironment)
+
+    if (
+      requestedOwnerPubkey !== undefined &&
+      String(requestedOwnerPubkey).toLowerCase() !== ownerPubkey
+    ) {
+      return res.status(403).json({ error: "ownerPubkey does not match the session" })
     }
 
     // Validate required fields
-    if (!ownerPubkey || !walletId || !apiKey) {
+    if (
+      !walletId ||
+      !apiKey ||
+      typeof walletId !== "string" ||
+      typeof apiKey !== "string"
+    ) {
       return res.status(400).json({
-        error: "Missing required fields: ownerPubkey, walletId, apiKey",
+        error: "Missing required fields: walletId, apiKey",
       })
     }
 
@@ -81,6 +107,22 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       return res.status(400).json({
         error: "walletCurrency must be BTC or USD",
       })
+    }
+
+    // The API key (which the card will spend with) must currently own the
+    // wallet, and the wallet must be of the card's currency. Checked live.
+    const ownership = await getOwnedWallets(apiKey, environment)
+    if (!ownership.ok) {
+      return ownership.reason === "invalid"
+        ? res.status(403).json({ error: "API key is not valid for this wallet" })
+        : res.status(OWNERSHIP_UNAVAILABLE.status).json(OWNERSHIP_UNAVAILABLE.body)
+    }
+    const actualWalletCurrency = ownership.wallets.get(walletId)
+    if (!actualWalletCurrency) {
+      return res.status(403).json({ error: "API key is not valid for this wallet" })
+    }
+    if (actualWalletCurrency !== walletCurrency) {
+      return res.status(400).json({ error: "walletCurrency does not match the wallet" })
     }
 
     const serverUrl = getServerUrl(req)
@@ -111,14 +153,11 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       const keysRequestUrl = `${serverUrl}/api/boltcard/keys/${pending.id}`
       const deeplink = boltcardCrypto.generateProgramDeeplink(keysRequestUrl)
 
+      // The registration id / keys URL is a single-use capability: don't log it.
       console.log("Boltcard pending registration created:", {
-        registrationId: pending.id,
         name: pending.name,
         walletCurrency: pending.walletCurrency,
         environment,
-        keysRequestUrl,
-        deeplink,
-        deeplinkLength: deeplink.length,
       })
 
       return res.status(200).json({

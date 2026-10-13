@@ -2,6 +2,7 @@ import type { NextApiRequest, NextApiResponse } from "next"
 
 import BlinkAPI from "../../../lib/blink-api"
 import * as boltcard from "../../../lib/boltcard"
+import { requireOwnedCard } from "../../../lib/boltcard/owner-auth"
 import { getApiUrlForEnvironment, type EnvironmentName } from "../../../lib/config/api"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
 
@@ -21,6 +22,10 @@ import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
  * - description: string - Optional description for the transaction
  *
  * Response includes a 'warning' field if card balance exceeds wallet balance (soft limit).
+ *
+ * Requires the card owner's Nostr session; another owner's card answers 404.
+ * The over-allocation stays a soft limit on purpose: card spends are paid
+ * from the owner's own wallet, so only the owner can raise their own cap.
  */
 
 async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -44,16 +49,14 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     }
 
     // Validate required fields
-    if (!cardId) {
+    if (!cardId || typeof cardId !== "string") {
       return res.status(400).json({ error: "Missing cardId" })
     }
 
-    // Get the card with API key for Blink API calls
-    const card = await boltcard.store.getCard(cardId, true) // includeKeys=true
-
-    if (!card) {
-      return res.status(404).json({ error: "Card not found" })
-    }
+    // Owner only (card loaded with its API key for the Blink balance check)
+    const owned = await requireOwnedCard(req, res, cardId, { includeKeys: true })
+    if (!owned) return
+    const { card } = owned
 
     // Check card status
     if (card.status === "wiped") {
