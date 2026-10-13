@@ -2,6 +2,7 @@
 
 // Get git commit hash at build time
 const { execSync } = require("child_process")
+const path = require("path")
 let gitCommit = "dev"
 try {
   gitCommit = execSync("git rev-parse --short HEAD").toString().trim()
@@ -138,7 +139,7 @@ const nextConfig = {
       },
     ]
   },
-  webpack: (config, { isServer, dev }) => {
+  webpack: (config, { isServer, dev, webpack }) => {
     if (!isServer) {
       config.resolve.fallback = {
         ...config.resolve.fallback,
@@ -146,6 +147,17 @@ const nextConfig = {
         net: false,
         tls: false,
       }
+
+      // lib/lnurl.ts is isomorphic. On the server it must use the SSRF-safe
+      // node:https fetcher; in the browser (no SSRF risk, no node: modules)
+      // swap in a window.fetch implementation with the same API. Server
+      // builds always get the real guard.
+      config.plugins.push(
+        new webpack.NormalModuleReplacementPlugin(
+          /[\\/]server[\\/]safe-fetch-json$/,
+          path.resolve(__dirname, "lib/server/safe-fetch-json.browser.ts"),
+        ),
+      )
     }
 
     // Handle WebSocket modules properly
