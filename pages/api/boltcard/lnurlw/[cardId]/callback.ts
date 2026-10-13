@@ -6,6 +6,7 @@ import {
   getApiUrlForEnvironment,
   type EnvironmentName,
 } from "../../../../../lib/config/api"
+import { isBoltcardSpendEnabled } from "../../../../../lib/config/features"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../../../lib/rate-limit"
 
 /**
@@ -20,6 +21,13 @@ import { withRateLimit, RATE_LIMIT_WRITE } from "../../../../../lib/rate-limit"
  * - pr: BOLT11 invoice to pay
  */
 async function handler(req: NextApiRequest, res: NextApiResponse) {
+  if (!isBoltcardSpendEnabled()) {
+    return res.status(503).json({
+      status: "ERROR",
+      reason: "Bolt Card payments are temporarily unavailable",
+    })
+  }
+
   if (req.method !== "POST" && req.method !== "GET") {
     return res.status(405).json({ status: "ERROR", reason: "Method not allowed" })
   }

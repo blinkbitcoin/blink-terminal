@@ -55,3 +55,17 @@ export function isPasswordAuthEnabled(): boolean {
 export function isVoucherPdfEnabled(): boolean {
   return false
 }
+
+/**
+ * Whether Bolt Card spending (LNURL-withdraw) and the unauthenticated Bolt
+ * Card top-up webhook are available.
+ *
+ * Hard-disabled: the withdraw callback did not bind payment to a verified
+ * card tap, and `/api/boltcard/webhook` credited balances on an unverified
+ * `PAID` claim. Top-ups still settle via the verified polling path and the
+ * signed Blink webhook. Deliberately not env-toggleable — re-enabling needs
+ * the tap-bound single-use k1 and webhook authentication first.
+ */
+export function isBoltcardSpendEnabled(): boolean {
+  return false
+}

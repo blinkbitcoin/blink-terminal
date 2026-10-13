@@ -3,6 +3,7 @@ import type { NextApiRequest, NextApiResponse } from "next"
 import BlinkAPI from "../../../../lib/blink-api"
 import * as boltcard from "../../../../lib/boltcard"
 import { getApiUrlForEnvironment, type EnvironmentName } from "../../../../lib/config/api"
+import { isBoltcardSpendEnabled } from "../../../../lib/config/features"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../../lib/rate-limit"
 
 /**
@@ -29,6 +30,13 @@ import { withRateLimit, RATE_LIMIT_WRITE } from "../../../../lib/rate-limit"
  * - pr: BOLT11 invoice to pay
  */
 async function handler(req: NextApiRequest, res: NextApiResponse) {
+  if (!isBoltcardSpendEnabled()) {
+    return res.status(503).json({
+      status: "ERROR",
+      reason: "Bolt Card payments are temporarily unavailable",
+    })
+  }
+
   const { cardId } = req.query
 
   if (!cardId) {

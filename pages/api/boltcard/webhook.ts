@@ -1,6 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
 import * as boltcard from "../../../lib/boltcard"
+import { isBoltcardSpendEnabled } from "../../../lib/config/features"
 
 /**
  * Webhook endpoint for Boltcard payment notifications
@@ -19,6 +20,13 @@ import * as boltcard from "../../../lib/boltcard"
  * }
  */
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  if (!isBoltcardSpendEnabled()) {
+    return res.status(503).json({
+      status: "ERROR",
+      reason: "Bolt Card payments are temporarily unavailable",
+    })
+  }
+
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" })
   }
