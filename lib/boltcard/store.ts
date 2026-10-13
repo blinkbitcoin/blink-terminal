@@ -467,7 +467,9 @@ class BoltcardStore {
         ],
       )
 
-      console.log(`[BoltcardStore] Created pending registration: ${id}`)
+      console.log(
+        `[BoltcardStore] Created pending registration for ${ownerPubkey.substring(0, 8)}...`,
+      )
 
       const row: DbRow = result.rows[0]
       return {
@@ -564,6 +566,44 @@ class BoltcardStore {
       throw new Error("Registration has expired")
     }
 
+    // Atomically claim the registration: the keys link is single-use, so two
+    // concurrent requests can never both mint a card (and keys) from it.
+    const claimedAt: number = Date.now()
+    const claim: QueryResult<DbRow> = await query(
+      `UPDATE boltcard_pending_registrations
+       SET status = $2, completed_at = $3
+       WHERE id = $1 AND status = $4 AND expires_at > $3
+       RETURNING id`,
+      [registrationId, PendingStatus.COMPLETED, claimedAt, PendingStatus.PENDING],
+    )
+    if ((claim.rowCount ?? 0) === 0) {
+      throw new Error("Registration is not pending")
+    }
+
+    try {
+      return await this._completeClaimedRegistration(
+        registrationId,
+        registration,
+        cardUid,
+      )
+    } catch (err: unknown) {
+      // Nothing was minted: release the claim so the owner can retry
+      // (e.g. after tapping the wrong card).
+      await query(
+        `UPDATE boltcard_pending_registrations
+         SET status = $2, completed_at = NULL
+         WHERE id = $1 AND card_id IS NULL AND status = $3`,
+        [registrationId, PendingStatus.PENDING, PendingStatus.COMPLETED],
+      ).catch(() => undefined)
+      throw err
+    }
+  }
+
+  async _completeClaimedRegistration(
+    registrationId: string,
+    registration: PendingRegistrationRecord,
+    cardUid: string,
+  ): Promise<BoltcardData | null> {
     // Check if card UID already exists
     const existingCard: BoltcardData | null = await this.getCardByUid(cardUid)
     if (existingCard) {
@@ -636,7 +676,7 @@ class BoltcardStore {
     )
 
     console.log(
-      `[BoltcardStore] Completed registration ${registrationId} -> card ${card.id} (auto-activated)`,
+      `[BoltcardStore] Completed registration -> card ${card.id} (auto-activated)`,
     )
 
     // Return card with keys for programming
@@ -1460,6 +1500,53 @@ class BoltcardStore {
     }
   }
 
+  /**
+   * Record that a reset of this card was just tap-verified (SUN/CMAC).
+   */
+  async markResetVerified(cardId: string): Promise<boolean> {
+    try {
+      const result: QueryResult<DbRow> = await query(
+        `UPDATE boltcards SET reset_verified_at = $2
+         WHERE id = $1 AND status != 'WIPED'
+         RETURNING id`,
+        [cardId, Date.now()],
+      )
+      return (result.rowCount ?? 0) > 0
+    } catch (err: unknown) {
+      console.error("[BoltcardStore] markResetVerified error:", (err as Error).message)
+      return false
+    }
+  }
+
+  /**
+   * Mark the card WIPED only if a reset was tap-verified within `windowMs`.
+   * Atomic; consumes the verification.
+   */
+  async wipeCardAfterVerifiedReset(cardId: string, windowMs: number): Promise<boolean> {
+    try {
+      const now: number = Date.now()
+      const result: QueryResult<DbRow> = await query(
+        `UPDATE boltcards
+         SET status = 'WIPED', disabled_at = $2, reset_verified_at = NULL
+         WHERE id = $1 AND status != 'WIPED'
+           AND reset_verified_at IS NOT NULL AND reset_verified_at > $3
+         RETURNING id`,
+        [cardId, now, now - windowMs],
+      )
+      if ((result.rowCount ?? 0) > 0) {
+        console.log(`[BoltcardStore] Wiped card after verified reset: ${cardId}`)
+        return true
+      }
+      return false
+    } catch (err: unknown) {
+      console.error(
+        "[BoltcardStore] wipeCardAfterVerifiedReset error:",
+        (err as Error).message,
+      )
+      return false
+    }
+  }
+
   // ==========================================================================
   // PENDING TOP-UP MANAGEMENT (for LNURL-pay)
   // ==========================================================================
@@ -1735,4 +1822,4 @@ class BoltcardStore {
 // Export singleton instance and constants
 const boltcardStore: BoltcardStore = new BoltcardStore()
 export default boltcardStore
-export { CardStatus, TxType, PendingStatus }
+export { BoltcardStore, CardStatus, TxType, PendingStatus }

@@ -128,6 +128,9 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     // Update counter for replay protection
     await boltcardStore.updateLastCounter(cardId, verifyResult.counter ?? 0)
 
+    // Allow /confirm to mark the card wiped for a short window
+    await boltcardStore.markResetVerified(cardId)
+
     console.log(
       `[ResetAPI] Card ${cardId} verified for reset. Counter: ${verifyResult.counter}`,
     )
