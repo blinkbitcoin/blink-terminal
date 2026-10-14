@@ -37,6 +37,11 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     const pendingTopUps = (await boltcard.lnurlp.getAllPendingTopUps()).filter(
       (topUp: { cardId: string }) => cardIds.has(topUp.cardId),
     )
+    // Claimed top-ups whose transfer/credit outcome is unresolved (kept
+    // claims are invisible to the pending queries above)
+    const needingReview = (await boltcard.store.getTopUpsNeedingReview()).filter(
+      (topUp) => cardIds.has(topUp.cardId),
+    )
 
     res.status(200).json({
       success: true,
@@ -52,6 +57,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
         totalUsdBalanceCents: sum("USD"),
         pendingRegistrations: pendingRegistrations.length,
         pendingTopUps: pendingTopUps.length,
+        topUpsNeedingReview: needingReview.length,
       },
       timestamp: Date.now(),
     })

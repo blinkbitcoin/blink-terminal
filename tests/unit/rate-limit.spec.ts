@@ -138,21 +138,51 @@ describe("lib/rate-limit", () => {
       expect(resB._status).toBe(200)
     })
 
-    it("should extract IP from x-forwarded-for header (first value)", async () => {
+    it("keys x-forwarded-for on the rightmost hop (the one our proxy appended)", async () => {
       const inner = jest.fn((_req, res) => res.status(200).json({ ok: true }))
       const handler = withRateLimit(inner, { max: 1 }, "test-route")
 
-      const req = mockReq({
-        headers: { "x-forwarded-for": "10.0.0.1, 10.0.0.2, 10.0.0.3" },
-      } as Partial<NextApiRequest>)
-
       const res1 = mockRes()
-      await handler(req, res1)
+      await handler(
+        mockReq({
+          headers: { "x-forwarded-for": "10.0.0.1, 10.0.0.2, 10.0.0.3" },
+        } as Partial<NextApiRequest>),
+        res1,
+      )
       expect(res1._status).toBe(200)
 
-      // Should be limited now for 10.0.0.1
+      // A spoofed, changing leftmost value does not reset the limit
       const res2 = mockRes()
-      await handler(req, res2)
+      await handler(
+        mockReq({
+          headers: { "x-forwarded-for": "9.9.9.9, 10.0.0.3" },
+        } as Partial<NextApiRequest>),
+        res2,
+      )
+      expect(res2._status).toBe(429)
+    })
+
+    it("prefers x-real-ip over a client-supplied x-forwarded-for", async () => {
+      const inner = jest.fn((_req, res) => res.status(200).json({ ok: true }))
+      const handler = withRateLimit(inner, { max: 1 }, "test-route")
+
+      const res1 = mockRes()
+      await handler(
+        mockReq({
+          headers: { "x-real-ip": "203.0.113.7", "x-forwarded-for": "1.1.1.1" },
+        } as Partial<NextApiRequest>),
+        res1,
+      )
+      expect(res1._status).toBe(200)
+
+      // Rotating x-forwarded-for doesn't help: still the same x-real-ip
+      const res2 = mockRes()
+      await handler(
+        mockReq({
+          headers: { "x-real-ip": "203.0.113.7", "x-forwarded-for": "2.2.2.2" },
+        } as Partial<NextApiRequest>),
+        res2,
+      )
       expect(res2._status).toBe(429)
     })
 

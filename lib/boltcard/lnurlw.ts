@@ -23,6 +23,7 @@ import { bech32 } from "bech32"
 
 import BlinkAPI from "../blink-api"
 import type { EnvironmentName } from "../config/api"
+import { decodeInvoice } from "../invoice-decoder"
 
 import * as boltcardCrypto from "./crypto"
 import boltcardStore, { CardStatus, TxType } from "./store"
@@ -77,6 +78,8 @@ interface VerifyResult {
 interface DeductResult {
   success: boolean
   balance?: number
+  /** The daily window (next reset) the deduction belongs to. */
+  dailyResetAt?: number | null
   error?: string
 }
 
@@ -84,6 +87,10 @@ interface PayInvoiceResult {
   success: boolean
   paymentHash?: string
   error?: string
+  /** For failures: true if the payment definitely was not sent. */
+  definite?: boolean
+  /** Payment status as reported by the wallet ("PENDING" while in flight). */
+  status?: string
 }
 
 type PayInvoiceFn = (
@@ -289,9 +296,6 @@ async function handleWithdrawRequest(
     }
   }
 
-  // Update counter for replay protection
-  await boltcardStore.updateLastCounter(cardId, verifyResult.counter as number)
-
   // Check balance
   if (card.balance <= 0) {
     return {
@@ -348,6 +352,21 @@ async function handleWithdrawRequest(
   const maxWithdrawableMsats = maxWithdrawableSats * 1000
   const minWithdrawableMsats = 1000 // Minimum 1 sat
 
+  if (maxWithdrawableMsats < minWithdrawableMsats) {
+    return { status: "ERROR", reason: "Card has no balance" }
+  }
+
+  // Advance the replay counter AND create a single-use, tap-bound session in
+  // one atomic write. A replayed / concurrent tap gets no session (no k1).
+  const k1 = await boltcardStore.startWithdrawSession(
+    cardId,
+    verifyResult.counter as number,
+    maxWithdrawableMsats,
+  )
+  if (!k1) {
+    return { status: "ERROR", reason: "Card tap already used - tap again" }
+  }
+
   console.log(
     `[LNURLW] Card ${cardId} tap verified. Max withdrawable: ${maxWithdrawable} ${unit} (${maxWithdrawableSats} sats)`,
   )
@@ -356,7 +375,7 @@ async function handleWithdrawRequest(
   return {
     tag: "withdrawRequest",
     callback: callbackUrl,
-    k1: cardId, // Use cardId as k1 for simplicity (identifies the withdrawal session)
+    k1, // Random, single-use, bound to this tap (never the cardId)
     defaultDescription: `Boltcard payment (${card.name || "Card"})`,
     minWithdrawable: minWithdrawableMsats,
     maxWithdrawable: maxWithdrawableMsats,
@@ -374,16 +393,53 @@ async function handleWithdrawRequest(
  * Process LNURL-withdraw callback (invoice submission)
  * Pays the invoice from the card's Blink wallet
  *
- * @param cardId - Card ID (from k1 parameter)
+ * @param cardId - Card ID (from the URL path)
+ * @param k1 - Single-use session from the verified tap (required)
  * @param invoice - BOLT11 invoice to pay
  * @param payInvoice - Function to pay invoice (amount, invoice, apiKey, environment, walletCurrency) -> { success, paymentHash, error }
  * @returns Result { status, paymentHash? }
  */
 async function handleWithdrawCallback(
   cardId: string,
+  k1: string | undefined,
   invoice: string,
-  payInvoice: PayInvoiceFn,
+  payInvoice: PayInvoiceFn = payCardInvoice,
 ): Promise<WithdrawCallbackResult> {
+  // The tap-bound session is the only authorizer. Required, single-use.
+  if (!k1) {
+    return { status: "ERROR", reason: "Missing k1 - tap the card again" }
+  }
+
+  // Decode invoice to get amount (no side effects yet). A non-whole-sat
+  // amount would deduct less than Blink pays, so refuse it before consuming
+  // the tap. An over-max invoice is also refused before consume, so the
+  // wallet can retry smaller on the same k1.
+  const invoiceAmount = parseInvoiceAmount(invoice)
+  if (!invoiceAmount || invoiceAmount.sats <= 0 || invoiceAmount.msats % 1000 !== 0) {
+    return {
+      status: "ERROR",
+      reason: "Invoice amount must be a whole number of sats",
+    }
+  }
+  const invoiceHash = extractPaymentHash(invoice)
+  if (!invoiceHash) {
+    return { status: "ERROR", reason: "Invoice has no payment hash" }
+  }
+
+  const maxMsats = await boltcardStore.peekWithdrawSession(k1, cardId)
+  if (maxMsats === null) {
+    return { status: "ERROR", reason: "Invalid or expired k1 - tap the card again" }
+  }
+  if (invoiceAmount.msats > maxMsats) {
+    return {
+      status: "ERROR",
+      reason: "Invoice amount exceeds the amount allowed for this tap",
+    }
+  }
+  if ((await boltcardStore.consumeWithdrawSession(k1, cardId)) === null) {
+    return { status: "ERROR", reason: "Invalid or expired k1 - tap the card again" }
+  }
+
   // Get card with keys
   const card = (await boltcardStore.getCard(cardId, true)) as BoltcardCard | null
 
@@ -398,15 +454,6 @@ async function handleWithdrawCallback(
     return {
       status: "ERROR",
       reason: `Card is ${card.status.toLowerCase()}`,
-    }
-  }
-
-  // Decode invoice to get amount
-  const invoiceAmount = parseInvoiceAmount(invoice)
-  if (!invoiceAmount || invoiceAmount.sats <= 0) {
-    return {
-      status: "ERROR",
-      reason: "Invalid invoice amount",
     }
   }
 
@@ -430,16 +477,35 @@ async function handleWithdrawCallback(
     amount = invoiceAmount.sats
   }
 
-  // Try to deduct from card balance (atomic operation with limit checks)
-  const deductResult = (await boltcardStore.incrementDailySpent(
+  // Claim the hash and deduct in one transaction. A taken hash (in flight or
+  // already spent) cannot debit the card again. A database error throws:
+  // the claim may have committed, so this is not a decline.
+  const deductResult = await boltcardStore.claimAndDeductWithdrawal(
+    invoiceHash,
     cardId,
     amount,
-  )) as DeductResult
-
-  if (!deductResult.success) {
+  )
+  if (deductResult.status === "spent") {
     return {
       status: "ERROR",
-      reason: deductResult.error || "Failed to process payment",
+      reason: "This invoice was already used",
+    }
+  }
+  if (deductResult.status === "declined") {
+    return {
+      status: "ERROR",
+      reason: "Payment declined (balance or spending limits)",
+    }
+  }
+
+  // Leave CLAIMED before Blink can send. UNKNOWN is not auto-restored, so a
+  // tap during the payment call cannot give the balance back and still pay.
+  // False means the claim was already resolved: do not pay.
+  const attempt = deductResult.attempt
+  if (!(await boltcardStore.beginWithdrawalSend(invoiceHash, attempt))) {
+    return {
+      status: "ERROR",
+      reason: "This invoice was already used",
     }
   }
 
@@ -453,10 +519,28 @@ async function handleWithdrawCallback(
   )
 
   if (!payResult.success) {
-    // Rollback: restore balance
-    await boltcardStore.rollbackSpend(cardId, amount)
-
-    console.log(`[LNURLW] Payment failed for card ${cardId}, rolled back ${amount}`)
+    if (payResult.definite) {
+      // Nothing was sent. Resolve and restore in one statement. If that
+      // write's result is lost, it throws — do not restore again. A retry
+      // of reconciliation restores the still-open claim at most once.
+      await boltcardStore.resolvePendingWithdrawalFailed(invoiceHash, attempt)
+      console.log(`[LNURLW] Payment failed for card ${cardId}, rolled back ${amount}`)
+    } else {
+      // Outcome unknown: the payment may have gone out. Keep the deduction
+      // and mark the claim UNKNOWN before returning, so reconciliation will
+      // not treat it as never sent.
+      await boltcardStore.finalizeWithdrawal(invoiceHash, "UNKNOWN", attempt)
+      await boltcardStore.recordTransaction(cardId, {
+        type: TxType.WITHDRAW,
+        amount: amount,
+        balanceAfter: deductResult.balance,
+        paymentHash: invoiceHash,
+        description: "Card payment - outcome unknown, pending review",
+      })
+      console.error(
+        `[LNURLW] Payment outcome unknown for card ${cardId}; deduction of ${amount} kept for review`,
+      )
+    }
 
     return {
       status: "ERROR",
@@ -464,14 +548,28 @@ async function handleWithdrawCallback(
     }
   }
 
-  // Record the transaction
+  // The claim row is the spent-hash record. It must reach its final state
+  // before we report OK, or a second tap of this invoice could deduct again.
+  const inFlight = payResult.status === "PENDING"
+  await boltcardStore.finalizeWithdrawal(
+    invoiceHash,
+    inFlight ? "PENDING" : "SUCCESS",
+    attempt,
+  )
   await boltcardStore.recordTransaction(cardId, {
     type: TxType.WITHDRAW,
     amount: amount,
-    balanceAfter: deductResult.balance as number,
-    paymentHash: payResult.paymentHash,
-    description: "Card payment",
+    balanceAfter: deductResult.balance,
+    paymentHash: invoiceHash,
+    description: inFlight
+      ? "Card payment - in flight, pending reconciliation"
+      : "Card payment",
   })
+  if (inFlight) {
+    console.warn(
+      `[LNURLW] Card ${cardId} payment ${invoiceHash} is PENDING - queued for reconciliation`,
+    )
+  }
 
   console.log(
     `[LNURLW] Card ${cardId} payment successful: ${amount} ${card.walletCurrency === "USD" ? "cents" : "sats"}`,
@@ -481,6 +579,72 @@ async function handleWithdrawCallback(
     status: "OK",
     paymentHash: payResult.paymentHash,
   }
+}
+
+// ============================================================================
+// Paying the invoice from the card's wallet
+// ============================================================================
+
+/**
+ * Pay `invoice` from the card owner's wallet of the card's currency.
+ * SUCCESS and PENDING count as paid (the payment is executed / in flight).
+ * A rejected payment (mutation errors, FAILURE status, key refused, no such
+ * wallet) is a definite failure; a transport error is an unknown outcome.
+ */
+async function payCardInvoice(
+  _amountSats: number,
+  invoice: string,
+  apiKey: string,
+  environment: EnvironmentName,
+  walletCurrency: string = "BTC",
+): Promise<PayInvoiceResult> {
+  const { getApiUrlForEnvironment } = await import("../config/api")
+  const { PaymentRejectedError, BlinkAuthError } = await import("../blink-api")
+  const blinkAPI = new BlinkAPI(apiKey, getApiUrlForEnvironment(environment))
+
+  let walletId: string | undefined
+  try {
+    const wallets = await blinkAPI.getWalletInfo()
+    walletId = wallets.find(
+      (w: { walletCurrency: string; id: string }) => w.walletCurrency === walletCurrency,
+    )?.id
+  } catch (error: unknown) {
+    // Nothing has been sent yet
+    return { success: false, definite: true, error: (error as Error).message }
+  }
+  if (!walletId) {
+    return { success: false, definite: true, error: `No ${walletCurrency} wallet found` }
+  }
+
+  try {
+    const result = await blinkAPI.payLnInvoice(walletId, invoice, "Boltcard payment")
+    if (result.status === "SUCCESS" || result.status === "PENDING") {
+      return {
+        success: true,
+        status: result.status,
+        paymentHash: extractPaymentHash(invoice) ?? undefined,
+      }
+    }
+    if (result.status === "FAILURE") {
+      return { success: false, definite: true, error: "Payment failed" }
+    }
+    return {
+      success: false,
+      definite: false,
+      error: `Payment status: ${String(result.status)}`,
+    }
+  } catch (error: unknown) {
+    const definite =
+      error instanceof PaymentRejectedError || error instanceof BlinkAuthError
+    return { success: false, definite, error: (error as Error).message }
+  }
+}
+
+function extractPaymentHash(invoice: string): string | null {
+  const decoded = decodeInvoice(invoice)
+  return decoded.success && decoded.data.paymentHash
+    ? String(decoded.data.paymentHash)
+    : null
 }
 
 // ============================================================================
@@ -551,6 +715,119 @@ function parseInvoiceAmount(invoice: string): InvoiceAmount | null {
 }
 
 // ============================================================================
+// Reconciliation of in-flight / unknown-outcome withdrawals
+// ============================================================================
+
+/**
+ * Reconcile pending withdrawals by payment hash: PAID -> resolved SUCCESS;
+ * EXPIRED (terminal send failure) -> deduction restored and resolved FAILED;
+ * RESTORE_FAILED + UNSEEN (no transaction) -> restored immediately.
+ * CLAIMED + UNSEEN is an abandoned claim: restored only by a compare-and-set
+ * that still sees CLAIMED and a stamp older than the grace. A row handed to
+ * pay (UNKNOWN) is not restored. An in-flight SEND stays for the next pass.
+ *
+ * Triggered from the balance check (the owner's tap) and available for ops.
+ * A global scheduler is blink-wip#1619.
+ */
+/** A CLAIMED row younger than this is a payment attempt still in flight. */
+const CLAIMED_UNSEEN_GRACE_MS = 2 * 60 * 1000
+
+async function reconcilePendingWithdrawals(cardId?: string): Promise<{
+  checked: number
+  resolved: number
+  restored: number
+}> {
+  const pending = await boltcardStore.getPendingWithdrawals(cardId)
+  let resolved = 0
+  let restored = 0
+
+  for (const item of pending) {
+    try {
+      const card = (await boltcardStore.getCard(item.cardId, true)) as BoltcardCard | null
+      if (!card || card.status === CardStatus.WIPED) {
+        // Card gone: nothing to restore, close it out (one-shot resolve)
+        if (
+          await boltcardStore.resolvePendingWithdrawal(
+            item.paymentHash,
+            "FAILED",
+            item.attempt,
+          )
+        ) {
+          resolved++
+        }
+        continue
+      }
+
+      // The invoice was paid from the wallet of the card's currency
+      const { getApiUrlForEnvironment } = await import("../config/api")
+      const { checkInvoiceStatus } = await import("./lnurlp")
+      const status = await checkInvoiceStatus(
+        item.paymentHash,
+        card.apiKey as string,
+        getApiUrlForEnvironment(card.environment as EnvironmentName),
+        card.walletId,
+        "SEND",
+      )
+
+      if (status === "PAID") {
+        if (
+          await boltcardStore.resolvePendingWithdrawal(
+            item.paymentHash,
+            "SUCCESS",
+            item.attempt,
+          )
+        )
+          resolved++
+      } else if (status === "EXPIRED") {
+        // Terminal failure (send path): resolve AND restore the deduction in
+        // one statement — at most once, and never resolved without restoring.
+        if (
+          await boltcardStore.resolvePendingWithdrawalFailed(
+            item.paymentHash,
+            item.attempt,
+          )
+        ) {
+          resolved++
+          restored++
+        }
+      } else if (status === "UNSEEN" && item.kind === "RESTORE_FAILED") {
+        // Definite rejection whose restore was queued. The payment was never sent.
+        if (
+          await boltcardStore.resolvePendingWithdrawalFailed(
+            item.paymentHash,
+            item.attempt,
+          )
+        ) {
+          resolved++
+          restored++
+        }
+      } else if (status === "UNSEEN" && item.kind === "CLAIMED") {
+        // Abandoned only if the row is still CLAIMED and older than the grace
+        // at the moment of the write. A concurrent beginWithdrawalSend wins
+        // the row and this matches nothing.
+        if (
+          await boltcardStore.resolvePendingWithdrawalFailed(
+            item.paymentHash,
+            item.attempt,
+            Date.now() - CLAIMED_UNSEEN_GRACE_MS,
+          )
+        ) {
+          resolved++
+          restored++
+        }
+      }
+      // PENDING (a send exists and is in flight) or ERROR: next pass
+    } catch (err: unknown) {
+      console.error(
+        `[LNURLW] Reconciliation failed for withdrawal ${item.paymentHash.substring(0, 16)}...: ${(err as Error).message}`,
+      )
+    }
+  }
+
+  return { checked: pending.length, resolved, restored }
+}
+
+// ============================================================================
 // Balance Check
 // ============================================================================
 
@@ -590,6 +867,8 @@ export {
   generateCardLnurl,
   handleWithdrawRequest,
   handleWithdrawCallback,
+  payCardInvoice,
+  reconcilePendingWithdrawals,
   parseInvoiceAmount,
   getCardBalance,
 }
