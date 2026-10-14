@@ -501,6 +501,15 @@ async function handleWithdrawCallback(
         balanceAfter: deductResult.balance as number,
         description: "Card payment - outcome unknown, pending review",
       })
+      const unknownHash = payResult.paymentHash ?? extractPaymentHash(invoice)
+      if (unknownHash) {
+        await boltcardStore.recordPendingWithdrawal(
+          unknownHash,
+          cardId,
+          amount,
+          deductResult.balance as number,
+        )
+      }
       console.error(
         `[LNURLW] Payment outcome unknown for card ${cardId}; deduction of ${amount} kept for review`,
       )
@@ -525,8 +534,16 @@ async function handleWithdrawCallback(
         : "Card payment",
   })
   if (payResult.status === "PENDING") {
+    // The pending-withdrawal row IS the reconciliation state; it must persist
+    // before we report OK, otherwise nothing would ever reconcile it.
+    await boltcardStore.recordPendingWithdrawal(
+      payResult.paymentHash as string,
+      cardId,
+      amount,
+      deductResult.balance as number,
+    )
     console.warn(
-      `[LNURLW] Card ${cardId} payment ${payResult.paymentHash} is PENDING - flagged for reconciliation`,
+      `[LNURLW] Card ${cardId} payment ${payResult.paymentHash} is PENDING - queued for reconciliation`,
     )
   }
 
@@ -674,6 +691,67 @@ function parseInvoiceAmount(invoice: string): InvoiceAmount | null {
 }
 
 // ============================================================================
+// Reconciliation of in-flight / unknown-outcome withdrawals
+// ============================================================================
+
+/**
+ * Reconcile pending withdrawals by payment hash: PAID -> resolved SUCCESS;
+ * EXPIRED/FAILED (terminal) -> deduction restored and resolved FAILED;
+ * still PENDING -> left for the next pass. Returns per-row outcomes.
+ *
+ * Triggered from the balance check (the owner's tap) and available for ops.
+ * A global scheduler is blink-wip#1619.
+ */
+async function reconcilePendingWithdrawals(cardId?: string): Promise<{
+  checked: number
+  resolved: number
+  restored: number
+}> {
+  const pending = await boltcardStore.getPendingWithdrawals(cardId)
+  let resolved = 0
+  let restored = 0
+
+  for (const item of pending) {
+    try {
+      const card = (await boltcardStore.getCard(item.cardId, true)) as BoltcardCard | null
+      if (!card || card.status === CardStatus.WIPED) {
+        // Card gone: nothing to restore, close it out
+        await boltcardStore.resolvePendingWithdrawal(item.paymentHash, "FAILED")
+        resolved++
+        continue
+      }
+
+      // The invoice was paid from the wallet of the card's currency
+      const { getApiUrlForEnvironment } = await import("../config/api")
+      const { checkInvoiceStatus } = await import("./lnurlp")
+      const status = await checkInvoiceStatus(
+        item.paymentHash,
+        card.apiKey as string,
+        getApiUrlForEnvironment(card.environment as EnvironmentName),
+        card.walletId,
+      )
+
+      if (status === "PAID") {
+        await boltcardStore.resolvePendingWithdrawal(item.paymentHash, "SUCCESS")
+        resolved++
+      } else if (status === "EXPIRED") {
+        // Terminal failure: the payee was never paid - restore the deduction
+        if (await boltcardStore.rollbackSpend(item.cardId, item.amount)) restored++
+        await boltcardStore.resolvePendingWithdrawal(item.paymentHash, "FAILED")
+        resolved++
+      }
+      // PENDING / ERROR: leave for the next pass
+    } catch (err: unknown) {
+      console.error(
+        `[LNURLW] Reconciliation failed for withdrawal ${item.paymentHash.substring(0, 16)}...: ${(err as Error).message}`,
+      )
+    }
+  }
+
+  return { checked: pending.length, resolved, restored }
+}
+
+// ============================================================================
 // Balance Check
 // ============================================================================
 
@@ -714,6 +792,7 @@ export {
   handleWithdrawRequest,
   handleWithdrawCallback,
   payCardInvoice,
+  reconcilePendingWithdrawals,
   parseInvoiceAmount,
   getCardBalance,
 }

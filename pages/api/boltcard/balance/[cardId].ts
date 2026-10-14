@@ -140,6 +140,16 @@ async function handleBalanceGet(
       })
     }
 
+    // Reconcile this card's in-flight / unknown-outcome withdrawals
+    try {
+      await boltcard.lnurlw.reconcilePendingWithdrawals(cardId)
+    } catch (reconcileError: unknown) {
+      console.error(
+        `[BALANCE] Withdrawal reconciliation failed for card ${cardId}:`,
+        reconcileError,
+      )
+    }
+
     // Check and process any pending top-ups before returning balance
     // This detects paid invoices that weren't processed via webhook
     let pendingTopUpsResult = { processed: 0, total: 0, errors: 0 }

@@ -1665,6 +1665,72 @@ class BoltcardStore {
   }
 
   // ==========================================================================
+  // PENDING WITHDRAWALS (in-flight / unknown-outcome card payments)
+  // ==========================================================================
+
+  /**
+   * Record a withdrawal whose payment is not yet final (PENDING or unknown
+   * outcome), keyed by payment hash. Idempotent. Throws on database errors —
+   * callers must not report success unless this persists.
+   */
+  async recordPendingWithdrawal(
+    paymentHash: string,
+    cardId: string,
+    amount: number,
+    balanceAfter: number,
+  ): Promise<void> {
+    await query(
+      `INSERT INTO boltcard_pending_withdrawals
+         (payment_hash, card_id, amount, balance_after, created_at)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (payment_hash) DO NOTHING`,
+      [paymentHash, cardId, Math.floor(amount), Math.floor(balanceAfter), Date.now()],
+    )
+  }
+
+  /**
+   * Unresolved pending withdrawals (optionally for one card): in-flight or
+   * unknown-outcome payments awaiting reconciliation.
+   */
+  async getPendingWithdrawals(
+    cardId?: string,
+  ): Promise<
+    Array<{ paymentHash: string; cardId: string; amount: number; createdAt: number }>
+  > {
+    const result: QueryResult<DbRow> = await query(
+      `SELECT payment_hash, card_id, amount, created_at
+       FROM boltcard_pending_withdrawals
+       WHERE resolved_at IS NULL AND ($1::text IS NULL OR card_id = $1)
+       ORDER BY created_at ASC`,
+      [cardId ?? null],
+    )
+    return result.rows.map((row: DbRow) => ({
+      paymentHash: row.payment_hash as string,
+      cardId: row.card_id as string,
+      amount: parseInt(String(row.amount), 10),
+      createdAt: parseInt(String(row.created_at), 10),
+    }))
+  }
+
+  /**
+   * Resolve a pending withdrawal (SUCCESS, or FAILED after the deduction was
+   * restored). Unknown outcome keeps it unresolved.
+   */
+  async resolvePendingWithdrawal(
+    paymentHash: string,
+    outcome: "SUCCESS" | "FAILED",
+  ): Promise<boolean> {
+    const result: QueryResult<DbRow> = await query(
+      `UPDATE boltcard_pending_withdrawals
+       SET resolved_at = $2, outcome = $3
+       WHERE payment_hash = $1 AND resolved_at IS NULL
+       RETURNING payment_hash`,
+      [paymentHash, Date.now(), outcome],
+    )
+    return (result.rowCount ?? 0) > 0
+  }
+
+  // ==========================================================================
   // PENDING TOP-UP MANAGEMENT (for LNURL-pay)
   // ==========================================================================
 
@@ -1751,6 +1817,48 @@ class BoltcardStore {
   }
 
   /**
+   * Flag a claimed top-up as needing (manual) review, with a reason. Review
+   * rows are excluded from cleanup and stay queryable until resolved.
+   */
+  async setTopUpReviewReason(paymentHash: string, reason: string): Promise<void> {
+    await query(
+      `UPDATE boltcard_pending_topups
+       SET needs_review = TRUE, review_reason = $2
+       WHERE payment_hash = $1`,
+      [paymentHash, reason],
+    )
+  }
+
+  /** Clear the review flag after an operator resolved the situation. */
+  async clearTopUpReview(paymentHash: string): Promise<boolean> {
+    const result: QueryResult<DbRow> = await query(
+      `UPDATE boltcard_pending_topups
+       SET needs_review = FALSE, review_reason = NULL
+       WHERE payment_hash = $1 AND needs_review
+       RETURNING payment_hash`,
+      [paymentHash],
+    )
+    return (result.rowCount ?? 0) > 0
+  }
+
+  /** Claimed top-ups awaiting manual review. */
+  async getTopUpsNeedingReview(): Promise<
+    Array<{ paymentHash: string; cardId: string; reason: string | null }>
+  > {
+    const result: QueryResult<DbRow> = await query(
+      `SELECT payment_hash, card_id, review_reason
+       FROM boltcard_pending_topups
+       WHERE processed = TRUE AND needs_review
+       ORDER BY processed_at ASC`,
+    )
+    return result.rows.map((row: DbRow) => ({
+      paymentHash: row.payment_hash as string,
+      cardId: row.card_id as string,
+      reason: row.review_reason as string | null,
+    }))
+  }
+
+  /**
    * Release a top-up claim (markTopUpProcessed) when nothing was credited or
    * transferred, so it can be processed again later.
    */
@@ -1758,7 +1866,7 @@ class BoltcardStore {
     try {
       const result: QueryResult<DbRow> = await query(
         `UPDATE boltcard_pending_topups
-         SET processed = FALSE, processed_at = NULL
+         SET processed = FALSE, processed_at = NULL, needs_review = FALSE, review_reason = NULL
          WHERE payment_hash = $1 AND processed = TRUE
          RETURNING payment_hash`,
         [paymentHash],
@@ -1880,7 +1988,7 @@ class BoltcardStore {
          UPDATE boltcards
          SET balance = balance + $2
          WHERE id = $1 AND status = 'ACTIVE'
-         RETURNING balance
+         RETURNING id, balance
        )
        INSERT INTO boltcard_transactions
          (card_id, tx_type, amount, balance_after, payment_hash, description, created_at)

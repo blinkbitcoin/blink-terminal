@@ -405,3 +405,53 @@ describe("topUpCard: atomic credit + audit, definite vs ambiguous failure", () =
     await expect(store().topUpCard("c1", 1000, "h")).rejects.toThrow("connection reset")
   })
 })
+
+describe("review states (pending withdrawals, top-up flags)", () => {
+  it("recordPendingWithdrawal is idempotent on the payment hash", async () => {
+    mockPoolQuery.mockResolvedValue({ rowCount: 0, rows: [] })
+    await store().recordPendingWithdrawal("h", "c1", 1000, 4000)
+    const [sql, params] = mockPoolQuery.mock.calls[0]
+    expect(String(sql)).toMatch(/ON CONFLICT \(payment_hash\) DO NOTHING/)
+    expect(params).toEqual(["h", "c1", 1000, 4000, expect.any(Number)])
+  })
+
+  it("getPendingWithdrawals filters unresolved rows, optionally per card", async () => {
+    mockPoolQuery.mockResolvedValue({ rows: [] })
+    await store().getPendingWithdrawals("c1")
+    const [sql, params] = mockPoolQuery.mock.calls[0]
+    expect(String(sql)).toMatch(/WHERE resolved_at IS NULL/)
+    expect(params).toEqual(["c1"])
+    await store().getPendingWithdrawals()
+    expect(mockPoolQuery.mock.calls[1][1]).toEqual([null])
+  })
+
+  it("resolvePendingWithdrawal is one-shot", async () => {
+    mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{}] })
+    await expect(store().resolvePendingWithdrawal("h", "SUCCESS")).resolves.toBe(true)
+    const [sql] = mockPoolQuery.mock.calls[0]
+    expect(String(sql)).toMatch(/WHERE payment_hash = \$1 AND resolved_at IS NULL/)
+  })
+
+  it("setTopUpReviewReason / getTopUpsNeedingReview / clearTopUpReview", async () => {
+    mockPoolQuery.mockResolvedValue({ rowCount: 1, rows: [] })
+    await store().setTopUpReviewReason("h", "why")
+    expect(mockPoolQuery.mock.calls[0][1]).toEqual(["h", "why"])
+
+    mockPoolQuery.mockResolvedValueOnce({ rows: [] })
+    await store().getTopUpsNeedingReview()
+    expect(String(mockPoolQuery.mock.calls[1][0])).toMatch(
+      /WHERE processed = TRUE AND needs_review/,
+    )
+
+    await store().clearTopUpReview("h")
+    expect(String(mockPoolQuery.mock.calls[2][0])).toMatch(/SET needs_review = FALSE/)
+  })
+
+  it("unmarkTopUpProcessed clears the review flag too", async () => {
+    mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [] })
+    await store().unmarkTopUpProcessed("h")
+    expect(String(mockPoolQuery.mock.calls[0][0])).toMatch(
+      /needs_review = FALSE, review_reason = NULL/,
+    )
+  })
+})

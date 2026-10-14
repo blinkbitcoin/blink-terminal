@@ -534,6 +534,9 @@ async function processTopUpPayment(paymentHash: string): Promise<ProcessTopUpRes
   }
   pendingTopUpsCache.delete(paymentHash)
   const release = () => boltcardStore.unmarkTopUpProcessed(paymentHash)
+  /** Keep the claim, flag it for review (queryable, excluded from cleanup). */
+  const review = (reason: string) =>
+    boltcardStore.setTopUpReviewReason(paymentHash, reason).catch(() => undefined)
 
   let creditAmount = amountSats
   let creditUnit = "sats"
@@ -559,6 +562,7 @@ async function processTopUpPayment(paymentHash: string): Promise<ProcessTopUpRes
       console.error(
         `[LNURLP] USD transfer outcome unknown for top-up ${paymentHash.substring(0, 16)}... - manual review needed: ${(err as Error).message}`,
       )
+      await review(`USD transfer outcome unknown: ${(err as Error).message}`)
       return {
         success: false,
         error: "USD transfer outcome unknown - manual review needed",
@@ -579,6 +583,7 @@ async function processTopUpPayment(paymentHash: string): Promise<ProcessTopUpRes
       console.error(
         `[LNURLP] Transfer status ${transferStatus} for top-up ${paymentHash.substring(0, 16)}... - manual review needed`,
       )
+      await review(`USD transfer status ${transferStatus}`)
       return {
         success: false,
         error: `USD transfer ${transferStatus.toLowerCase()} - manual review needed`,
@@ -595,6 +600,7 @@ async function processTopUpPayment(paymentHash: string): Promise<ProcessTopUpRes
       console.error(
         `[LNURLP] Rate lookup failed after USD transfer for top-up ${paymentHash.substring(0, 16)}... - manual review needed: ${(err as Error).message}`,
       )
+      await review(`Rate lookup failed after transfer: ${(err as Error).message}`)
       return {
         success: false,
         error: "Rate lookup failed after transfer - manual review needed",
@@ -619,6 +625,7 @@ async function processTopUpPayment(paymentHash: string): Promise<ProcessTopUpRes
     console.error(
       `[LNURLP] Top-up credit outcome unknown for ${paymentHash.substring(0, 16)}... - manual review needed: ${(err as Error).message}`,
     )
+    await review(`Credit outcome unknown: ${(err as Error).message}`)
     return { success: false, error: "Credit outcome unknown - manual review needed" }
   }
 

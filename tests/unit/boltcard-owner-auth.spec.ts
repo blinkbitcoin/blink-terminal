@@ -171,6 +171,7 @@ beforeEach(() => {
   mockVerifyCardTap.mockReset()
   consoleLog.mockClear()
   mockStore.getCard = jest.fn(async (id: string) => (id === card().id ? card() : null))
+  mockStore.getTopUpsNeedingReview = jest.fn().mockResolvedValue([])
 })
 
 describe("getSessionPubkey", () => {
