@@ -57,15 +57,14 @@ export function isVoucherPdfEnabled(): boolean {
 }
 
 /**
- * Whether Bolt Card spending (LNURL-withdraw) and the unauthenticated Bolt
- * Card top-up webhook are available.
+ * Whether Bolt Card spending (LNURL-withdraw tap + callback) is enabled.
  *
- * Hard-disabled: the withdraw callback did not bind payment to a verified
- * card tap, and `/api/boltcard/webhook` credited balances on an unverified
- * `PAID` claim. Top-ups still settle via the verified polling path and the
- * signed Blink webhook. Deliberately not env-toggleable — re-enabling needs
- * the tap-bound single-use k1 and webhook authentication first.
+ * Server-only (`BOLTCARD_SPEND_ENABLED`, read at request time). Off unless the
+ * value is exactly "true". Only turn it on once the tap-bound single-use k1
+ * (migration 024) is deployed and a real card has been tested end to end.
+ * The retired top-up webhook (`/api/boltcard/webhook`) is not affected — it
+ * stays 410.
  */
 export function isBoltcardSpendEnabled(): boolean {
-  return false
+  return process.env.BOLTCARD_SPEND_ENABLED === "true"
 }

@@ -1,9 +1,9 @@
 /** @jest-environment node */
 
 /**
- * Bolt Card spending (LNURL-withdraw) and the unauthenticated top-up webhook
- * are hard-disabled. Every method must get 503 before any card / ledger code
- * runs.
+ * Bolt Card spending (LNURL-withdraw) is off unless BOLTCARD_SPEND_ENABLED is
+ * exactly "true": every method must get 503 before any card / ledger code
+ * runs. The former unauthenticated top-up webhook is retired (410) regardless.
  */
 
 const mockBoltcardCall = jest.fn()
@@ -62,8 +62,36 @@ describe("Bolt Card spend kill switch", () => {
     global.fetch = rawFetch as unknown as typeof fetch
   })
 
-  it("is off", () => {
-    expect(isBoltcardSpendEnabled()).toBe(false)
+  const original = process.env.BOLTCARD_SPEND_ENABLED
+  afterEach(() => {
+    if (original === undefined) delete process.env.BOLTCARD_SPEND_ENABLED
+    else process.env.BOLTCARD_SPEND_ENABLED = original
+  })
+
+  it.each([undefined, "", "false", "1", "TRUE", "yes"])(
+    "is off for BOLTCARD_SPEND_ENABLED=%p",
+    (value) => {
+      if (value === undefined) delete process.env.BOLTCARD_SPEND_ENABLED
+      else process.env.BOLTCARD_SPEND_ENABLED = value
+      expect(isBoltcardSpendEnabled()).toBe(false)
+    },
+  )
+
+  it('is on only for BOLTCARD_SPEND_ENABLED="true"', () => {
+    process.env.BOLTCARD_SPEND_ENABLED = "true"
+    expect(isBoltcardSpendEnabled()).toBe(true)
+  })
+
+  it("the retired top-up webhook is 410 even with spending enabled", async () => {
+    process.env.BOLTCARD_SPEND_ENABLED = "true"
+    const res = await call(webhookHandler as Handler, {
+      method: "POST",
+      query: {},
+      body: { paymentHash: "ab", status: "PAID" },
+      headers: {},
+    })
+    expect(res.statusCode).toBe(410)
+    expect(mockBoltcardCall).not.toHaveBeenCalled()
   })
 
   it.each([
@@ -83,16 +111,10 @@ describe("Bolt Card spend kill switch", () => {
       { cardId: "c1" },
       { k1: "c1", pr: "lnbc1" },
     ],
-    [
-      "webhook PAID claim",
-      webhookHandler,
-      "POST",
-      {},
-      { paymentHash: "ab", status: "PAID" },
-    ],
   ])(
-    "%s returns 503 without touching card code",
+    "%s returns 503 (flag unset) without touching card code",
     async (_name, handler, method, query, body) => {
+      delete process.env.BOLTCARD_SPEND_ENABLED
       const res = await call(handler as Handler, { method, query, body, headers: {} })
 
       expect(res.statusCode).toBe(503)
