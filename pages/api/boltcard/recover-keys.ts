@@ -1,7 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
-import AuthManager from "../../../lib/auth"
 import * as boltcard from "../../../lib/boltcard"
+import { requireSessionPubkey } from "../../../lib/boltcard/owner-auth"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
 
 /**
@@ -27,51 +27,15 @@ import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
  * - Only works if user has previously programmed a card (IssuerKey exists)
  */
 
-/**
- * Verify request has valid NIP-98 session
- */
-function verifySession(req: NextApiRequest): {
-  valid: boolean
-  pubkey?: string
-  error?: string
-} {
-  const token = req.cookies?.["auth-token"]
-
-  if (!token) {
-    return { valid: false, error: "Authentication required - no session token" }
-  }
-
-  const session = AuthManager.verifySession(token)
-
-  if (!session) {
-    return { valid: false, error: "Invalid or expired session" }
-  }
-
-  if (!session.username?.startsWith("nostr:")) {
-    return { valid: false, error: "Not a Nostr session" }
-  }
-
-  const pubkey = session.username.replace("nostr:", "")
-  return { valid: true, pubkey }
-}
-
 async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed. Use POST." })
   }
 
   try {
-    // Verify session authentication
-    const verification = verifySession(req)
-
-    if (!verification.valid) {
-      return res.status(401).json({
-        error: "Authentication required",
-        message: verification.error,
-      })
-    }
-
-    const userPubkey = verification.pubkey as string
+    // Owner session required
+    const userPubkey = requireSessionPubkey(req, res)
+    if (!userPubkey) return
     const { uid, version = 1 } = req.body as { uid?: string; version?: number }
 
     // Validate UID format

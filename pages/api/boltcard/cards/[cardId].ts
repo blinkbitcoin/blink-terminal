@@ -1,6 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
 import * as boltcard from "../../../../lib/boltcard"
+import { requireOwnedCard } from "../../../../lib/boltcard/owner-auth"
 import { withRateLimit, RATE_LIMIT_READ } from "../../../../lib/rate-limit"
 
 /**
@@ -16,13 +17,27 @@ import { withRateLimit, RATE_LIMIT_READ } from "../../../../lib/rate-limit"
  * - Wipe/disable card
  *
  * POST /api/boltcard/cards/[cardId]
- * - Actions: activate, disable, enable, topup
+ * - Actions: activate, disable, enable, adjust, resetDaily
+ *
+ * All methods require the owner's Nostr session; another owner's card
+ * answers 404.
  */
 async function handler(req: NextApiRequest, res: NextApiResponse) {
   const cardId = req.query.cardId as string | undefined
 
-  if (!cardId) {
+  if (!cardId || typeof cardId !== "string") {
     return res.status(400).json({ error: "Missing cardId" })
+  }
+
+  if (!["GET", "PUT", "DELETE", "POST"].includes(req.method ?? "")) {
+    return res.status(405).json({ error: "Method not allowed" })
+  }
+
+  try {
+    if (!(await requireOwnedCard(req, res, cardId))) return
+  } catch (error: unknown) {
+    console.error("❌ Card ownership check error:", error)
+    return res.status(500).json({ error: "Failed to load card" })
   }
 
   switch (req.method) {

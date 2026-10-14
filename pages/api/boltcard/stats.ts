@@ -1,6 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
 import * as boltcard from "../../../lib/boltcard"
+import { requireSessionPubkey } from "../../../lib/boltcard/owner-auth"
 import { withRateLimit, RATE_LIMIT_READ } from "../../../lib/rate-limit"
 
 /**
@@ -8,23 +9,48 @@ import { withRateLimit, RATE_LIMIT_READ } from "../../../lib/rate-limit"
  *
  * GET /api/boltcard/stats
  *
- * Returns aggregate statistics about all boltcards
+ * Returns statistics about the authenticated owner's cards only (Nostr
+ * session required). Aggregates across other owners are never exposed.
  */
 async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "GET") {
     return res.status(405).json({ error: "Method not allowed" })
   }
 
-  try {
-    const stats = await boltcard.store.getStats()
+  const ownerPubkey = requireSessionPubkey(req, res)
+  if (!ownerPubkey) return
 
-    // Get pending top-ups count
-    const pendingTopUps = await boltcard.lnurlp.getAllPendingTopUps()
+  try {
+    const [cards, pendingRegistrations] = await Promise.all([
+      boltcard.store.getCardsByOwner(ownerPubkey),
+      boltcard.store.getPendingRegistrationsByOwner(ownerPubkey),
+    ])
+
+    const count = (predicate: (card: (typeof cards)[number]) => boolean) =>
+      cards.filter(predicate).length
+    const sum = (currency: string) =>
+      cards
+        .filter((card) => card.walletCurrency === currency && card.status !== "WIPED")
+        .reduce((total, card) => total + (card.balance || 0), 0)
+
+    const cardIds = new Set(cards.map((card) => card.id))
+    const pendingTopUps = (await boltcard.lnurlp.getAllPendingTopUps()).filter(
+      (topUp: { cardId: string }) => cardIds.has(topUp.cardId),
+    )
 
     res.status(200).json({
       success: true,
       stats: {
-        ...stats,
+        total: cards.length,
+        pending: count((card) => card.status === "PENDING"),
+        active: count((card) => card.status === "ACTIVE"),
+        disabled: count((card) => card.status === "DISABLED"),
+        wiped: count((card) => card.status === "WIPED"),
+        btcCards: count((card) => card.walletCurrency === "BTC"),
+        usdCards: count((card) => card.walletCurrency === "USD"),
+        totalBtcBalanceSats: sum("BTC"),
+        totalUsdBalanceCents: sum("USD"),
+        pendingRegistrations: pendingRegistrations.length,
         pendingTopUps: pendingTopUps.length,
       },
       timestamp: Date.now(),

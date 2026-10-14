@@ -236,6 +236,16 @@ const PendingStatus = {
 // Default registration expiry (15 minutes)
 const REGISTRATION_EXPIRY_MS: number = 15 * 60 * 1000
 
+/** Thrown when a newly minted / reprogrammed card could not be activated. */
+const CARD_ACTIVATION_FAILED = "Failed to activate card"
+
+/**
+ * Owner pubkeys are stored and looked up lowercase (hex), matching the Nostr
+ * session; migration 023 normalizes legacy rows.
+ */
+const normalizeOwnerPubkey = (pubkey: string): string =>
+  typeof pubkey === "string" ? pubkey.toLowerCase() : pubkey
+
 // ==========================================================================
 // Database connection pool (delegates to shared pool)
 // ==========================================================================
@@ -340,8 +350,9 @@ class BoltcardStore {
    * Get or create IssuerKey for a user
    * Each user has exactly one IssuerKey used to derive all their card keys
    */
-  async getOrCreateIssuerKey(ownerPubkey: string): Promise<string> {
-    if (!/^[0-9a-fA-F]{64}$/.test(ownerPubkey)) {
+  async getOrCreateIssuerKey(rawOwnerPubkey: string): Promise<string> {
+    const ownerPubkey: string = normalizeOwnerPubkey(rawOwnerPubkey)
+    if (!/^[0-9a-f]{64}$/.test(ownerPubkey)) {
       throw new Error("Invalid owner pubkey format")
     }
 
@@ -400,7 +411,8 @@ class BoltcardStore {
   /**
    * Get IssuerKey for a user (returns null if not found)
    */
-  async getIssuerKey(ownerPubkey: string): Promise<string | null> {
+  async getIssuerKey(rawOwnerPubkey: string): Promise<string | null> {
+    const ownerPubkey: string = normalizeOwnerPubkey(rawOwnerPubkey)
     try {
       const result: QueryResult<DbRow> = await query(
         `SELECT issuer_key_encrypted FROM boltcard_issuer_keys WHERE owner_pubkey = $1`,
@@ -430,7 +442,8 @@ class BoltcardStore {
     data: PendingRegistrationData,
     options: PendingRegistrationOptions = {},
   ): Promise<PendingRegistrationRecord> {
-    const { ownerPubkey, walletId, apiKey } = data
+    const { walletId, apiKey } = data
+    const ownerPubkey: string = normalizeOwnerPubkey(data.ownerPubkey)
 
     if (!ownerPubkey || !walletId || !apiKey) {
       throw new Error("Missing required fields: ownerPubkey, walletId, apiKey")
@@ -467,7 +480,9 @@ class BoltcardStore {
         ],
       )
 
-      console.log(`[BoltcardStore] Created pending registration: ${id}`)
+      console.log(
+        `[BoltcardStore] Created pending registration for ${ownerPubkey.substring(0, 8)}...`,
+      )
 
       const row: DbRow = result.rows[0]
       return {
@@ -564,6 +579,52 @@ class BoltcardStore {
       throw new Error("Registration has expired")
     }
 
+    // Atomically claim the registration: the keys link is single-use, so two
+    // concurrent requests can never both mint a card (and keys) from it.
+    const claimedAt: number = Date.now()
+    const claim: QueryResult<DbRow> = await query(
+      `UPDATE boltcard_pending_registrations
+       SET status = $2, completed_at = $3
+       WHERE id = $1 AND status = $4 AND expires_at > $3
+       RETURNING id`,
+      [registrationId, PendingStatus.COMPLETED, claimedAt, PendingStatus.PENDING],
+    )
+    if ((claim.rowCount ?? 0) === 0) {
+      throw new Error("Registration is not pending")
+    }
+
+    // Set just before the first write (delete / reprogram / create). Until
+    // then a failure provably minted nothing and the claim may be released.
+    const progress = { mutated: false }
+    try {
+      return await this._completeClaimedRegistration(
+        registrationId,
+        registration,
+        cardUid,
+        progress,
+      )
+    } catch (err: unknown) {
+      if (!progress.mutated) {
+        // Nothing was written: release the claim so the owner can retry
+        // (e.g. after tapping a card that belongs to someone else).
+        await query(
+          `UPDATE boltcard_pending_registrations
+           SET status = $2, completed_at = NULL
+           WHERE id = $1 AND card_id IS NULL AND status = $3`,
+          [registrationId, PendingStatus.PENDING, PendingStatus.COMPLETED],
+        ).catch(() => undefined)
+      }
+      // Otherwise the link stays consumed: a card may exist already.
+      throw err
+    }
+  }
+
+  async _completeClaimedRegistration(
+    registrationId: string,
+    registration: PendingRegistrationRecord,
+    cardUid: string,
+    progress: { mutated: boolean } = { mutated: false },
+  ): Promise<BoltcardData | null> {
     // Check if card UID already exists
     const existingCard: BoltcardData | null = await this.getCardByUid(cardUid)
     if (existingCard) {
@@ -572,6 +633,7 @@ class BoltcardStore {
         console.log(
           `[BoltcardStore] Deleting WIPED card ${existingCard.id} to allow fresh registration`,
         )
+        progress.mutated = true
         await query(`DELETE FROM boltcard_transactions WHERE card_id = $1`, [
           existingCard.id,
         ])
@@ -580,13 +642,23 @@ class BoltcardStore {
         ])
         await query(`DELETE FROM boltcards WHERE id = $1`, [existingCard.id])
         // Fall through to create new card below
-      } else if (existingCard.ownerPubkey === registration.ownerPubkey) {
+      } else if (
+        normalizeOwnerPubkey(existingCard.ownerPubkey) ===
+        normalizeOwnerPubkey(registration.ownerPubkey)
+      ) {
         // Same owner, active card - this is a re-program, increment version
+        progress.mutated = true
         const updated: BoltcardData | null = await this.reprogramCard(
           existingCard.id,
           cardUid,
         )
         if (updated) {
+          // reprogramCard resets the card to PENDING: re-activate (the NFC
+          // Programmer app has no confirmation callback) before handing out
+          // keys, and fail if that didn't persist.
+          if (!(await this.activateCard(existingCard.id))) {
+            throw new Error(CARD_ACTIVATION_FAILED)
+          }
           // Mark registration as completed
           await query(
             `UPDATE boltcard_pending_registrations 
@@ -602,6 +674,7 @@ class BoltcardStore {
     }
 
     // Create the card
+    progress.mutated = true
     const card: BoltcardData | null = await this.createCard(
       {
         cardUid,
@@ -623,9 +696,13 @@ class BoltcardStore {
       throw new Error("Failed to create card")
     }
 
-    // Auto-activate the card since NFC Programmer app doesn't have a confirmation callback
-    // If programming fails, user can delete and re-register the card
-    await this.activateCard(card.id)
+    // Auto-activate the card since NFC Programmer app doesn't have a confirmation callback.
+    // If activation didn't persist, fail WITHOUT returning keys. The card row
+    // exists, so the link stays consumed; the owner recovers by starting a new
+    // registration and tapping the same card (same-owner reprogram path).
+    if (!(await this.activateCard(card.id))) {
+      throw new Error(CARD_ACTIVATION_FAILED)
+    }
 
     // Mark registration as completed
     await query(
@@ -636,7 +713,7 @@ class BoltcardStore {
     )
 
     console.log(
-      `[BoltcardStore] Completed registration ${registrationId} -> card ${card.id} (auto-activated)`,
+      `[BoltcardStore] Completed registration -> card ${card.id} (auto-activated)`,
     )
 
     // Return card with keys for programming
@@ -669,8 +746,9 @@ class BoltcardStore {
    * Get pending registrations for an owner
    */
   async getPendingRegistrationsByOwner(
-    ownerPubkey: string,
+    rawOwnerPubkey: string,
   ): Promise<PendingRegistrationSummary[]> {
+    const ownerPubkey: string = normalizeOwnerPubkey(rawOwnerPubkey)
     try {
       await this.lazyCleanup()
 
@@ -764,7 +842,8 @@ class BoltcardStore {
     cardData: CardCreateData,
     options: CardCreateOptions = {},
   ): Promise<BoltcardData | null> {
-    const { cardUid, ownerPubkey, walletId, apiKey } = cardData
+    const { cardUid, walletId, apiKey } = cardData
+    const ownerPubkey: string = normalizeOwnerPubkey(cardData.ownerPubkey)
 
     // Validate required fields
     if (!cardUid || !ownerPubkey || !walletId || !apiKey) {
@@ -1015,7 +1094,8 @@ class BoltcardStore {
   /**
    * Get all cards for an owner
    */
-  async getCardsByOwner(ownerPubkey: string): Promise<BoltcardData[]> {
+  async getCardsByOwner(rawOwnerPubkey: string): Promise<BoltcardData[]> {
+    const ownerPubkey: string = normalizeOwnerPubkey(rawOwnerPubkey)
     try {
       await this.lazyCleanup()
 
@@ -1460,6 +1540,53 @@ class BoltcardStore {
     }
   }
 
+  /**
+   * Atomically record a tap-verified reset: advance the replay counter AND
+   * stamp reset_verified_at, only if `counter` is newer than the stored one
+   * and the card isn't wiped. Returns false if the tap was replayed / lost a
+   * race / the card changed; throws on database errors. Callers must not
+   * hand out card keys unless this returns true.
+   */
+  async recordVerifiedResetTap(cardId: string, counter: number): Promise<boolean> {
+    const result: QueryResult<DbRow> = await query(
+      `UPDATE boltcards
+       SET last_counter = $2, reset_verified_at = $3
+       WHERE id = $1 AND last_counter < $2 AND status != 'WIPED'
+       RETURNING id`,
+      [cardId, counter, Date.now()],
+    )
+    return (result.rowCount ?? 0) > 0
+  }
+
+  /**
+   * Mark the card WIPED only if a reset was tap-verified within `windowMs`.
+   * Atomic; consumes the verification.
+   */
+  async wipeCardAfterVerifiedReset(cardId: string, windowMs: number): Promise<boolean> {
+    try {
+      const now: number = Date.now()
+      const result: QueryResult<DbRow> = await query(
+        `UPDATE boltcards
+         SET status = 'WIPED', disabled_at = $2, reset_verified_at = NULL
+         WHERE id = $1 AND status != 'WIPED'
+           AND reset_verified_at IS NOT NULL AND reset_verified_at > $3
+         RETURNING id`,
+        [cardId, now, now - windowMs],
+      )
+      if ((result.rowCount ?? 0) > 0) {
+        console.log(`[BoltcardStore] Wiped card after verified reset: ${cardId}`)
+        return true
+      }
+      return false
+    } catch (err: unknown) {
+      console.error(
+        "[BoltcardStore] wipeCardAfterVerifiedReset error:",
+        (err as Error).message,
+      )
+      return false
+    }
+  }
+
   // ==========================================================================
   // PENDING TOP-UP MANAGEMENT (for LNURL-pay)
   // ==========================================================================
@@ -1735,4 +1862,4 @@ class BoltcardStore {
 // Export singleton instance and constants
 const boltcardStore: BoltcardStore = new BoltcardStore()
 export default boltcardStore
-export { CardStatus, TxType, PendingStatus }
+export { BoltcardStore, CardStatus, TxType, PendingStatus, CARD_ACTIVATION_FAILED }

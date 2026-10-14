@@ -219,7 +219,8 @@ export function useBoltcards(ownerPubkey: string | null | undefined): UseBoltcar
     setError(null)
 
     try {
-      const response = await fetch(`/api/boltcard/cards?ownerPubkey=${ownerPubkey}`)
+      // Owner comes from the session cookie; the pubkey is not sent.
+      const response = await fetch("/api/boltcard/cards")
       const data: ApiResponse & { cards?: BoltcardRecord[] } = await response.json()
 
       if (!response.ok) {
