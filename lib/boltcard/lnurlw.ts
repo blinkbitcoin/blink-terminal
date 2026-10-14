@@ -501,7 +501,8 @@ async function handleWithdrawCallback(
   // Leave CLAIMED before Blink can send. UNKNOWN is not auto-restored, so a
   // tap during the payment call cannot give the balance back and still pay.
   // False means the claim was already resolved: do not pay.
-  if (!(await boltcardStore.beginWithdrawalSend(invoiceHash))) {
+  const attempt = deductResult.attempt
+  if (!(await boltcardStore.beginWithdrawalSend(invoiceHash, attempt))) {
     return {
       status: "ERROR",
       reason: "This invoice was already used",
@@ -522,13 +523,13 @@ async function handleWithdrawCallback(
       // Nothing was sent. Resolve and restore in one statement. If that
       // write's result is lost, it throws — do not restore again. A retry
       // of reconciliation restores the still-open claim at most once.
-      await boltcardStore.resolvePendingWithdrawalFailed(invoiceHash)
+      await boltcardStore.resolvePendingWithdrawalFailed(invoiceHash, attempt)
       console.log(`[LNURLW] Payment failed for card ${cardId}, rolled back ${amount}`)
     } else {
       // Outcome unknown: the payment may have gone out. Keep the deduction
       // and mark the claim UNKNOWN before returning, so reconciliation will
       // not treat it as never sent.
-      await boltcardStore.finalizeWithdrawal(invoiceHash, "UNKNOWN")
+      await boltcardStore.finalizeWithdrawal(invoiceHash, "UNKNOWN", attempt)
       await boltcardStore.recordTransaction(cardId, {
         type: TxType.WITHDRAW,
         amount: amount,
@@ -550,7 +551,11 @@ async function handleWithdrawCallback(
   // The claim row is the spent-hash record. It must reach its final state
   // before we report OK, or a second tap of this invoice could deduct again.
   const inFlight = payResult.status === "PENDING"
-  await boltcardStore.finalizeWithdrawal(invoiceHash, inFlight ? "PENDING" : "SUCCESS")
+  await boltcardStore.finalizeWithdrawal(
+    invoiceHash,
+    inFlight ? "PENDING" : "SUCCESS",
+    attempt,
+  )
   await boltcardStore.recordTransaction(cardId, {
     type: TxType.WITHDRAW,
     amount: amount,
@@ -741,7 +746,13 @@ async function reconcilePendingWithdrawals(cardId?: string): Promise<{
       const card = (await boltcardStore.getCard(item.cardId, true)) as BoltcardCard | null
       if (!card || card.status === CardStatus.WIPED) {
         // Card gone: nothing to restore, close it out (one-shot resolve)
-        if (await boltcardStore.resolvePendingWithdrawal(item.paymentHash, "FAILED")) {
+        if (
+          await boltcardStore.resolvePendingWithdrawal(
+            item.paymentHash,
+            "FAILED",
+            item.attempt,
+          )
+        ) {
           resolved++
         }
         continue
@@ -759,17 +770,34 @@ async function reconcilePendingWithdrawals(cardId?: string): Promise<{
       )
 
       if (status === "PAID") {
-        if (await boltcardStore.resolvePendingWithdrawal(item.paymentHash)) resolved++
+        if (
+          await boltcardStore.resolvePendingWithdrawal(
+            item.paymentHash,
+            "SUCCESS",
+            item.attempt,
+          )
+        )
+          resolved++
       } else if (status === "EXPIRED") {
         // Terminal failure (send path): resolve AND restore the deduction in
         // one statement — at most once, and never resolved without restoring.
-        if (await boltcardStore.resolvePendingWithdrawalFailed(item.paymentHash)) {
+        if (
+          await boltcardStore.resolvePendingWithdrawalFailed(
+            item.paymentHash,
+            item.attempt,
+          )
+        ) {
           resolved++
           restored++
         }
       } else if (status === "UNSEEN" && item.kind === "RESTORE_FAILED") {
         // Definite rejection whose restore was queued. The payment was never sent.
-        if (await boltcardStore.resolvePendingWithdrawalFailed(item.paymentHash)) {
+        if (
+          await boltcardStore.resolvePendingWithdrawalFailed(
+            item.paymentHash,
+            item.attempt,
+          )
+        ) {
           resolved++
           restored++
         }
@@ -780,6 +808,7 @@ async function reconcilePendingWithdrawals(cardId?: string): Promise<{
         if (
           await boltcardStore.resolvePendingWithdrawalFailed(
             item.paymentHash,
+            item.attempt,
             Date.now() - CLAIMED_UNSEEN_GRACE_MS,
           )
         ) {

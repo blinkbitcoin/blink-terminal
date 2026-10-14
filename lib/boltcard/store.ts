@@ -1798,6 +1798,7 @@ class BoltcardStore {
            created_at = $4,
            kind = $5,
            daily_window_reset_at = $6,
+           attempt = attempt + 1,
            resolved_at = NULL,
            outcome = NULL
        WHERE payment_hash = $1
@@ -1862,6 +1863,7 @@ class BoltcardStore {
         balance: number
         dailySpent: number
         dailyResetAt: number | null
+        attempt: number
       }
     | { status: "spent" }
     | { status: "declined" }
@@ -1876,10 +1878,11 @@ class BoltcardStore {
            (payment_hash, card_id, amount, balance_after, created_at, kind, daily_window_reset_at)
          VALUES ($1, $2, $3, 0, $4, 'CLAIMED', NULL)
          ON CONFLICT (payment_hash) DO NOTHING
-         RETURNING payment_hash`,
+         RETURNING attempt`,
         [paymentHash, cardId, amountInt, now],
       )
       let owned = (inserted.rowCount ?? 0) > 0
+      let attempt = owned ? parseInt(String(inserted.rows[0].attempt), 10) : 0
       if (!owned) {
         const reclaimed: QueryResult<DbRow> = await client.query(
           `UPDATE boltcard_pending_withdrawals
@@ -1888,16 +1891,18 @@ class BoltcardStore {
                created_at = $4,
                kind = 'CLAIMED',
                daily_window_reset_at = NULL,
+               attempt = attempt + 1,
                resolved_at = NULL,
                outcome = NULL
            WHERE payment_hash = $1
              AND resolved_at IS NOT NULL
              AND outcome = 'FAILED'
              AND card_id = $2
-           RETURNING payment_hash`,
+           RETURNING attempt`,
           [paymentHash, cardId, amountInt, now],
         )
         owned = (reclaimed.rowCount ?? 0) > 0
+        if (owned) attempt = parseInt(String(reclaimed.rows[0].attempt), 10)
       }
       if (!owned) {
         await client.query("ROLLBACK")
@@ -1944,8 +1949,8 @@ class BoltcardStore {
       await client.query(
         `UPDATE boltcard_pending_withdrawals
          SET balance_after = $2, daily_window_reset_at = $3
-         WHERE payment_hash = $1`,
-        [paymentHash, balance, dailyResetAt],
+         WHERE payment_hash = $1 AND attempt = $4`,
+        [paymentHash, balance, dailyResetAt, attempt],
       )
       await client.query("COMMIT")
       return {
@@ -1953,6 +1958,7 @@ class BoltcardStore {
         balance,
         dailySpent: parseInt(String(row.daily_spent), 10),
         dailyResetAt,
+        attempt,
       }
     } catch (err: unknown) {
       await client.query("ROLLBACK").catch(() => undefined)
@@ -1968,13 +1974,13 @@ class BoltcardStore {
    * cannot undo a live send. False means the claim is no longer CLAIMED:
    * do not pay.
    */
-  async beginWithdrawalSend(paymentHash: string): Promise<boolean> {
+  async beginWithdrawalSend(paymentHash: string, attempt: number): Promise<boolean> {
     const result: QueryResult<DbRow> = await query(
       `UPDATE boltcard_pending_withdrawals
        SET kind = 'UNKNOWN'
-       WHERE payment_hash = $1 AND resolved_at IS NULL AND kind = 'CLAIMED'
+       WHERE payment_hash = $1 AND resolved_at IS NULL AND kind = 'CLAIMED' AND attempt = $2
        RETURNING payment_hash`,
-      [paymentHash],
+      [paymentHash, attempt],
     )
     return (result.rowCount ?? 0) > 0
   }
@@ -1987,14 +1993,15 @@ class BoltcardStore {
   async finalizeWithdrawal(
     paymentHash: string,
     kind: "PENDING" | "UNKNOWN" | "SUCCESS",
+    attempt: number,
   ): Promise<void> {
     const result: QueryResult<DbRow> = await query(
       `UPDATE boltcard_pending_withdrawals
        SET kind = $2,
            resolved_at = CASE WHEN $2 = 'SUCCESS' THEN $3::bigint ELSE NULL END,
            outcome = CASE WHEN $2 = 'SUCCESS' THEN 'SUCCESS' ELSE NULL END
-       WHERE payment_hash = $1 AND resolved_at IS NULL`,
-      [paymentHash, kind, Date.now()],
+       WHERE payment_hash = $1 AND resolved_at IS NULL AND attempt = $4`,
+      [paymentHash, kind, Date.now(), attempt],
     )
     if ((result.rowCount ?? 0) === 0) {
       throw new Error("pending withdrawal finalize lost the claim row")
@@ -2012,10 +2019,11 @@ class BoltcardStore {
       amount: number
       createdAt: number
       kind: string
+      attempt: number
     }>
   > {
     const result: QueryResult<DbRow> = await query(
-      `SELECT payment_hash, card_id, amount, created_at, kind
+      `SELECT payment_hash, card_id, amount, created_at, kind, attempt
        FROM boltcard_pending_withdrawals
        WHERE resolved_at IS NULL AND ($1::text IS NULL OR card_id = $1)
        ORDER BY created_at ASC`,
@@ -2027,6 +2035,7 @@ class BoltcardStore {
       amount: parseInt(String(row.amount), 10),
       createdAt: parseInt(String(row.created_at), 10),
       kind: String(row.kind),
+      attempt: parseInt(String(row.attempt), 10),
     }))
   }
 
@@ -2038,13 +2047,14 @@ class BoltcardStore {
   async resolvePendingWithdrawal(
     paymentHash: string,
     outcome: "SUCCESS" | "FAILED" = "SUCCESS",
+    attempt: number,
   ): Promise<boolean> {
     const result: QueryResult<DbRow> = await query(
       `UPDATE boltcard_pending_withdrawals
        SET resolved_at = $2, outcome = $3
-       WHERE payment_hash = $1 AND resolved_at IS NULL
+       WHERE payment_hash = $1 AND resolved_at IS NULL AND attempt = $4
        RETURNING payment_hash`,
-      [paymentHash, Date.now(), outcome],
+      [paymentHash, Date.now(), outcome, attempt],
     )
     return (result.rowCount ?? 0) > 0
   }
@@ -2063,6 +2073,7 @@ class BoltcardStore {
    */
   async resolvePendingWithdrawalFailed(
     paymentHash: string,
+    attempt: number,
     abandonedClaimedBefore?: number,
   ): Promise<boolean> {
     const abandoned = abandonedClaimedBefore !== undefined
@@ -2070,8 +2081,8 @@ class BoltcardStore {
       `WITH resolved AS (
          UPDATE boltcard_pending_withdrawals
          SET resolved_at = $2, outcome = 'FAILED'
-         WHERE payment_hash = $1 AND resolved_at IS NULL
-           ${abandoned ? "AND kind = 'CLAIMED' AND created_at < $3" : ""}
+         WHERE payment_hash = $1 AND resolved_at IS NULL AND attempt = $3
+           ${abandoned ? "AND kind = 'CLAIMED' AND created_at < $4" : ""}
          RETURNING card_id, amount, daily_window_reset_at
        )
        UPDATE boltcards
@@ -2088,8 +2099,8 @@ class BoltcardStore {
        WHERE boltcards.id = r.card_id
        RETURNING boltcards.id`,
       abandoned
-        ? [paymentHash, Date.now(), abandonedClaimedBefore]
-        : [paymentHash, Date.now()],
+        ? [paymentHash, Date.now(), attempt, abandonedClaimedBefore]
+        : [paymentHash, Date.now(), attempt],
     )
     return (result.rowCount ?? 0) > 0
   }

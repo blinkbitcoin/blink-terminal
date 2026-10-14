@@ -469,7 +469,7 @@ describe("review states (pending withdrawals, top-up flags)", () => {
   it("claimAndDeductWithdrawal claims and deducts in one transaction", async () => {
     mockPoolQuery
       .mockResolvedValueOnce({}) // BEGIN
-      .mockResolvedValueOnce({ rowCount: 1, rows: [{ payment_hash: "h" }] })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ attempt: "1" }] })
       .mockResolvedValueOnce({
         rowCount: 1,
         rows: [{ balance: "4000", daily_spent: "1000", daily_reset_at: "777" }],
@@ -481,6 +481,7 @@ describe("review states (pending withdrawals, top-up flags)", () => {
       balance: 4000,
       dailySpent: 1000,
       dailyResetAt: 777,
+      attempt: 1,
     })
     const sql = sqlCalls()
     expect(sql[0]).toBe("BEGIN")
@@ -504,25 +505,43 @@ describe("review states (pending withdrawals, top-up flags)", () => {
 
   it("beginWithdrawalSend moves only an unresolved CLAIMED row to UNKNOWN", async () => {
     mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{ payment_hash: "h" }] })
-    await expect(store().beginWithdrawalSend("h")).resolves.toBe(true)
+    await expect(store().beginWithdrawalSend("h", 1)).resolves.toBe(true)
     const q = String(mockPoolQuery.mock.calls[0][0]).replace(/\s+/g, " ")
     expect(q).toMatch(
-      /SET kind = 'UNKNOWN' WHERE payment_hash = \$1 AND resolved_at IS NULL AND kind = 'CLAIMED'/,
+      /SET kind = 'UNKNOWN' WHERE payment_hash = \$1 AND resolved_at IS NULL AND kind = 'CLAIMED' AND attempt = \$2/,
     )
   })
 
   it("an abandoned claim restores only while the row is still CLAIMED and older than the cutoff", async () => {
     mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{ id: "c1" }] })
-    await expect(store().resolvePendingWithdrawalFailed("h", 1000)).resolves.toBe(true)
+    await expect(store().resolvePendingWithdrawalFailed("h", 1, 1000)).resolves.toBe(true)
     const q = String(mockPoolQuery.mock.calls[0][0]).replace(/\s+/g, " ")
-    expect(q).toMatch(/AND kind = 'CLAIMED' AND created_at < \$3/)
-    expect(mockPoolQuery.mock.calls[0][1][2]).toBe(1000)
+    expect(q).toMatch(/AND attempt = \$3/)
+    expect(q).toMatch(/AND kind = 'CLAIMED' AND created_at < \$4/)
+    expect(mockPoolQuery.mock.calls[0][1][2]).toBe(1)
+    expect(mockPoolQuery.mock.calls[0][1][3]).toBe(1000)
 
     mockPoolQuery.mockReset()
     mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{ id: "c1" }] })
-    await store().resolvePendingWithdrawalFailed("h")
+    await store().resolvePendingWithdrawalFailed("h", 1)
     const plain = String(mockPoolQuery.mock.calls[0][0]).replace(/\s+/g, " ")
     expect(plain).not.toMatch(/kind = 'CLAIMED'/)
+  })
+
+  it("a delayed EXPIRED pinned to attempt 1 cannot restore a newer attempt", async () => {
+    mockPoolQuery.mockResolvedValueOnce({ rowCount: 0, rows: [] })
+    await expect(store().resolvePendingWithdrawalFailed("h", 1)).resolves.toBe(false)
+    const q = String(mockPoolQuery.mock.calls[0][0]).replace(/\s+/g, " ")
+    expect(q).toMatch(/AND attempt = \$3/)
+    expect(mockPoolQuery.mock.calls[0][1][2]).toBe(1)
+  })
+
+  it("a delayed PAID pinned to attempt 1 cannot resolve a newer attempt", async () => {
+    mockPoolQuery.mockResolvedValueOnce({ rowCount: 0, rows: [] })
+    await expect(store().resolvePendingWithdrawal("h", "SUCCESS", 1)).resolves.toBe(false)
+    const q = String(mockPoolQuery.mock.calls[0][0]).replace(/\s+/g, " ")
+    expect(q).toMatch(/AND attempt = \$4/)
+    expect(mockPoolQuery.mock.calls[0][1][3]).toBe(1)
   })
 
   it("flagUncreditedTopUp does not replace an existing review reason", async () => {
@@ -561,9 +580,11 @@ describe("review states (pending withdrawals, top-up flags)", () => {
 
   it("resolvePendingWithdrawal is one-shot", async () => {
     mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{}] })
-    await expect(store().resolvePendingWithdrawal("h")).resolves.toBe(true)
+    await expect(store().resolvePendingWithdrawal("h", "SUCCESS", 1)).resolves.toBe(true)
     const [sql] = mockPoolQuery.mock.calls[0]
-    expect(String(sql)).toMatch(/WHERE payment_hash = \$1 AND resolved_at IS NULL/)
+    expect(String(sql)).toMatch(
+      /WHERE payment_hash = \$1 AND resolved_at IS NULL AND attempt = \$4/,
+    )
   })
 
   it("setTopUpReviewReason / getTopUpsNeedingReview / clearTopUpReview", async () => {
@@ -641,12 +662,12 @@ describe("incrementDailySpent: checks and deduction in one statement", () => {
 describe("resolvePendingWithdrawalFailed: resolve + restore in one statement", () => {
   it("CTE resolves once and restores the deduction in the same statement", async () => {
     mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{ id: "c1" }] })
-    await expect(store().resolvePendingWithdrawalFailed("h")).resolves.toBe(true)
+    await expect(store().resolvePendingWithdrawalFailed("h", 1)).resolves.toBe(true)
 
     const [sql, params] = mockPoolQuery.mock.calls[0]
     const q = String(sql).replace(/\s+/g, " ")
     expect(q).toMatch(
-      /WITH resolved AS \( UPDATE boltcard_pending_withdrawals SET resolved_at = \$2, outcome = 'FAILED' WHERE payment_hash = \$1 AND resolved_at IS NULL RETURNING card_id, amount, daily_window_reset_at \)/,
+      /WITH resolved AS \( UPDATE boltcard_pending_withdrawals SET resolved_at = \$2, outcome = 'FAILED' WHERE payment_hash = \$1 AND resolved_at IS NULL AND attempt = \$3 RETURNING card_id, amount, daily_window_reset_at \)/,
     )
     expect(q).toMatch(/IS DISTINCT FROM r\.daily_window_reset_at/)
     expect(q).toMatch(/GREATEST\(0, daily_spent - r\.amount\)/)
@@ -655,6 +676,6 @@ describe("resolvePendingWithdrawalFailed: resolve + restore in one statement", (
 
   it("already resolved -> zero rows, nothing restored", async () => {
     mockPoolQuery.mockResolvedValueOnce({ rowCount: 0, rows: [] })
-    await expect(store().resolvePendingWithdrawalFailed("h")).resolves.toBe(false)
+    await expect(store().resolvePendingWithdrawalFailed("h", 1)).resolves.toBe(false)
   })
 })

@@ -198,6 +198,7 @@ describe("callback: k1 required, single-use, capped", () => {
       balance: 4000,
       dailySpent: 1000,
       dailyResetAt: null,
+      attempt: 1,
     })
     mockStore.beginWithdrawalSend = jest.fn().mockResolvedValue(true)
     mockStore.finalizeWithdrawal = jest.fn().mockResolvedValue(undefined)
@@ -283,7 +284,11 @@ describe("callback: k1 required, single-use, capped", () => {
 
     expect(res.status).toBe("OK")
     expect(mockStore.rollbackSpend).not.toHaveBeenCalled()
-    expect(mockStore.finalizeWithdrawal).toHaveBeenCalledWith("00".repeat(32), "PENDING")
+    expect(mockStore.finalizeWithdrawal).toHaveBeenCalledWith(
+      "00".repeat(32),
+      "PENDING",
+      1,
+    )
     expect(mockStore.recordPendingWithdrawal).not.toHaveBeenCalled()
     expect(mockStore.recordTransaction).toHaveBeenCalledWith(
       CARD_ID,
@@ -310,7 +315,11 @@ describe("callback: k1 required, single-use, capped", () => {
     pay.mockResolvedValue({ success: false, definite: false, error: "socket hang up" })
     await handleWithdrawCallback(CARD_ID, K1, invoice(1000), pay)
 
-    expect(mockStore.finalizeWithdrawal).toHaveBeenCalledWith("00".repeat(32), "UNKNOWN")
+    expect(mockStore.finalizeWithdrawal).toHaveBeenCalledWith(
+      "00".repeat(32),
+      "UNKNOWN",
+      1,
+    )
     expect(mockStore.recordPendingWithdrawal).not.toHaveBeenCalled()
   })
 
@@ -318,7 +327,10 @@ describe("callback: k1 required, single-use, capped", () => {
     mockStore.consumeWithdrawSession = jest.fn().mockResolvedValue(5000 * 1000)
     pay.mockResolvedValue({ success: false, definite: true, error: "no route" })
     await handleWithdrawCallback(CARD_ID, K1, invoice(1000), pay)
-    expect(mockStore.resolvePendingWithdrawalFailed).toHaveBeenCalledWith("00".repeat(32))
+    expect(mockStore.resolvePendingWithdrawalFailed).toHaveBeenCalledWith(
+      "00".repeat(32),
+      1,
+    )
     expect(mockStore.rollbackSpend).not.toHaveBeenCalled()
   })
 
@@ -329,7 +341,11 @@ describe("callback: k1 required, single-use, capped", () => {
     const res = await handleWithdrawCallback(CARD_ID, K1, invoice(1000), pay)
 
     expect(res.status).toBe("OK")
-    expect(mockStore.finalizeWithdrawal).toHaveBeenCalledWith("00".repeat(32), "SUCCESS")
+    expect(mockStore.finalizeWithdrawal).toHaveBeenCalledWith(
+      "00".repeat(32),
+      "SUCCESS",
+      1,
+    )
   })
 
   it("reconciliation during pay cannot restore a claim already handed to Blink", async () => {
@@ -349,7 +365,7 @@ describe("callback: k1 required, single-use, capped", () => {
 
     const pending = handleWithdrawCallback(CARD_ID, K1, invoice(1000), pay)
     await started
-    expect(mockStore.beginWithdrawalSend).toHaveBeenCalledWith("00".repeat(32))
+    expect(mockStore.beginWithdrawalSend).toHaveBeenCalledWith("00".repeat(32), 1)
 
     // Stale snapshot still says CLAIMED and old. The compare-and-set loses
     // because the row is no longer CLAIMED.
@@ -360,6 +376,7 @@ describe("callback: k1 required, single-use, capped", () => {
         amount: 1000,
         createdAt: 1,
         kind: "CLAIMED",
+        attempt: 1,
       },
     ])
     mockStore.resolvePendingWithdrawalFailed = jest.fn().mockResolvedValue(false)
@@ -379,12 +396,17 @@ describe("callback: k1 required, single-use, capped", () => {
     expect(recon).toEqual({ checked: 1, resolved: 0, restored: 0 })
     expect(mockStore.resolvePendingWithdrawalFailed).toHaveBeenCalledWith(
       "00".repeat(32),
+      1,
       expect.any(Number),
     )
 
     releasePay({ success: true, status: "SUCCESS", paymentHash: "h" })
     await expect(pending).resolves.toMatchObject({ status: "OK" })
-    expect(mockStore.finalizeWithdrawal).toHaveBeenCalledWith("00".repeat(32), "SUCCESS")
+    expect(mockStore.finalizeWithdrawal).toHaveBeenCalledWith(
+      "00".repeat(32),
+      "SUCCESS",
+      1,
+    )
     expect(mockStore.rollbackSpend).not.toHaveBeenCalled()
   })
 
@@ -871,6 +893,7 @@ describe("reconcilePendingWithdrawals", () => {
         amount: 1000,
         createdAt: 1,
         kind: "PENDING",
+        attempt: 1,
       },
     ])
   })
@@ -879,15 +902,51 @@ describe("reconcilePendingWithdrawals", () => {
     blinkStatus([{ status: "SUCCESS", direction: "SEND", settlementAmount: 1000 }])
     const res = await reconcilePendingWithdrawals(CARD_ID)
     expect(res).toEqual({ checked: 1, resolved: 1, restored: 0 })
-    expect(mockStore.resolvePendingWithdrawal).toHaveBeenCalledWith("h1")
+    expect(mockStore.resolvePendingWithdrawal).toHaveBeenCalledWith("h1", "SUCCESS", 1)
     expect(mockStore.rollbackSpend).not.toHaveBeenCalled()
+  })
+
+  it("a delayed EXPIRED is pinned to the attempt that was read", async () => {
+    mockStore.getPendingWithdrawals = jest.fn().mockResolvedValue([
+      {
+        paymentHash: "h1",
+        cardId: CARD_ID,
+        amount: 1000,
+        createdAt: 1,
+        kind: "UNKNOWN",
+        attempt: 1,
+      },
+    ])
+    mockStore.resolvePendingWithdrawalFailed = jest.fn().mockResolvedValue(false)
+    blinkStatus([{ status: "FAILURE", direction: "SEND", settlementAmount: 1000 }])
+    const res = await reconcilePendingWithdrawals(CARD_ID)
+    expect(res).toEqual({ checked: 1, resolved: 0, restored: 0 })
+    expect(mockStore.resolvePendingWithdrawalFailed).toHaveBeenCalledWith("h1", 1)
+  })
+
+  it("a delayed PAID is pinned to the attempt that was read", async () => {
+    mockStore.getPendingWithdrawals = jest.fn().mockResolvedValue([
+      {
+        paymentHash: "h1",
+        cardId: CARD_ID,
+        amount: 1000,
+        createdAt: 1,
+        kind: "UNKNOWN",
+        attempt: 2,
+      },
+    ])
+    mockStore.resolvePendingWithdrawal = jest.fn().mockResolvedValue(false)
+    blinkStatus([{ status: "SUCCESS", direction: "SEND", settlementAmount: 1000 }])
+    const res = await reconcilePendingWithdrawals(CARD_ID)
+    expect(res).toEqual({ checked: 1, resolved: 0, restored: 0 })
+    expect(mockStore.resolvePendingWithdrawal).toHaveBeenCalledWith("h1", "SUCCESS", 2)
   })
 
   it("SEND/FAILURE -> deduction restored and resolved FAILED (atomically)", async () => {
     blinkStatus([{ status: "FAILURE", direction: "SEND", settlementAmount: 1000 }])
     const res = await reconcilePendingWithdrawals(CARD_ID)
     expect(res).toEqual({ checked: 1, resolved: 1, restored: 1 })
-    expect(mockStore.resolvePendingWithdrawalFailed).toHaveBeenCalledWith("h1")
+    expect(mockStore.resolvePendingWithdrawalFailed).toHaveBeenCalledWith("h1", 1)
     expect(mockStore.rollbackSpend).not.toHaveBeenCalled()
   })
 
@@ -906,6 +965,7 @@ describe("reconcilePendingWithdrawals", () => {
         amount: 1000,
         createdAt: Date.now(),
         kind: "CLAIMED",
+        attempt: 1,
       },
     ])
     mockStore.resolvePendingWithdrawalFailed = jest.fn().mockResolvedValue(false)
@@ -914,6 +974,7 @@ describe("reconcilePendingWithdrawals", () => {
     expect(res).toEqual({ checked: 1, resolved: 0, restored: 0 })
     expect(mockStore.resolvePendingWithdrawalFailed).toHaveBeenCalledWith(
       "h1",
+      1,
       expect.any(Number),
     )
   })
