@@ -465,6 +465,7 @@ describe("review states (pending withdrawals, top-up flags)", () => {
   it("claimAndDeductWithdrawal claims and deducts in one transaction", async () => {
     mockPoolQuery
       .mockResolvedValueOnce({}) // BEGIN
+      .mockResolvedValueOnce({ rowCount: 0, rows: [] }) // hash not yet consumed
       .mockResolvedValueOnce({ rowCount: 1, rows: [{ attempt: "1" }] })
       .mockResolvedValueOnce({
         rowCount: 1,
@@ -486,9 +487,31 @@ describe("review states (pending withdrawals, top-up flags)", () => {
     expect(sql.join(" ")).not.toMatch(/ROLLBACK/)
   })
 
+  it("a hash consumed after card deletion is spent: no second deduction", async () => {
+    mockPoolQuery
+      .mockResolvedValueOnce({}) // BEGIN
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ "?column?": 1 }] }) // consumed
+      // Without the consumed-hash check this is a successful claim and deducts.
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ attempt: "1" }] })
+      .mockResolvedValueOnce({
+        rowCount: 1,
+        rows: [{ balance: "3000", daily_spent: "2000", daily_reset_at: null }],
+      })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] })
+      .mockResolvedValueOnce({})
+    await expect(store().claimAndDeductWithdrawal("h", "c1", 1000)).resolves.toEqual({
+      status: "spent",
+    })
+    const sql = sqlCalls().join(" ")
+    expect(sql).toMatch(/boltcard_consumed_payment_hashes/)
+    expect(sql).toMatch(/ROLLBACK/)
+    expect(sql).not.toMatch(/balance = balance -/)
+  })
+
   it("a taken hash, including a finished failure, is spent: no second deduction", async () => {
     mockPoolQuery
       .mockResolvedValueOnce({}) // BEGIN
+      .mockResolvedValueOnce({ rowCount: 0, rows: [] }) // not in the consumed table
       .mockResolvedValueOnce({ rowCount: 0, rows: [] }) // hash already present
       // A reintroduced reclaim would treat this as success and deduct.
       .mockResolvedValueOnce({ rowCount: 1, rows: [{ attempt: "2" }] })

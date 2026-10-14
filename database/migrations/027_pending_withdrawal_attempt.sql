@@ -2,7 +2,7 @@
 -- PENDING WITHDRAWALS: ATTEMPT GENERATION
 -- Version: 027
 -- Description: boltcard_pending_withdrawals.attempt identifies one try of a
---   payment hash. A failed hash can be re-claimed, which increments attempt.
+--   payment hash. A resolved hash stays consumed; it is not re-claimed.
 --   Reconciliation must match the attempt it read, so a delayed result for
 --   an older try cannot resolve or restore a newer one.
 --   Constant default: existing rows are attempt 1. No table rewrite, no

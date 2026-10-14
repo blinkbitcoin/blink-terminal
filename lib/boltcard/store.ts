@@ -1819,8 +1819,8 @@ class BoltcardStore {
 
   /**
    * Claim this invoice hash and deduct in one transaction. A conflicting hash
-   * is already taken, including a finished FAILED attempt: that hash is spent
-   * and the wallet must present a new invoice. Zero-row deduction rolls the
+   * is already taken, including one retained after the card row was deleted:
+   * that hash is spent and the wallet must present a new invoice. Zero-row deduction rolls the
    * claim back (definite decline). A database error throws: the transaction
    * may have committed, and callers must not treat that as a decline.
    */
@@ -1844,6 +1844,16 @@ class BoltcardStore {
     const amountInt = Math.floor(amount)
     try {
       await client.query("BEGIN")
+      // Survives card deletion. A wiped card's withdrawal rows cascade away;
+      // this hash must still be spent.
+      const consumed: QueryResult<DbRow> = await client.query(
+        `SELECT 1 FROM boltcard_consumed_payment_hashes WHERE payment_hash = $1`,
+        [paymentHash],
+      )
+      if ((consumed.rowCount ?? 0) > 0) {
+        await client.query("ROLLBACK")
+        return { status: "spent" }
+      }
       const inserted: QueryResult<DbRow> = await client.query(
         `INSERT INTO boltcard_pending_withdrawals
            (payment_hash, card_id, amount, balance_after, created_at, kind, daily_window_reset_at)
