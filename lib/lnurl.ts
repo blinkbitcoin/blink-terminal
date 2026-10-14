@@ -384,17 +384,21 @@ export async function getInvoiceFromLightningAddress(
     comment = "" // Comments not allowed
   }
 
-  // The callback must stay on the lightning-address host. A third-party JSON
-  // document must not send us to an internal or different host.
+  // The callback must stay on the lightning-address host. Blink's live
+  // metadata is the one exception: blink.sv returns a callback on
+  // lnurl.blink.sv. Anything else is rejected before it is fetched.
   let callbackUrl: URL
   try {
     callbackUrl = new URL(lnurlData.callback)
   } catch {
     throw new Error("Invalid LNURL callback")
   }
+  const metadataHost = new URL(lnurlEndpoint).hostname
+  const trustedHop =
+    metadataHost === "blink.sv" && callbackUrl.hostname === "lnurl.blink.sv"
   if (
     callbackUrl.protocol !== "https:" ||
-    callbackUrl.hostname !== new URL(lnurlEndpoint).hostname
+    (callbackUrl.hostname !== metadataHost && !trustedHop)
   ) {
     throw new Error("Invalid LNURL callback")
   }

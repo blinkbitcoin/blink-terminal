@@ -123,6 +123,11 @@ const isApiKeyAccount = (a: MergeableAccount): boolean =>
   a.type !== "ln-address" && a.type !== "npub-cash" && !!a.apiKey
 const isLnAddress = (a: MergeableAccount): boolean => a.type === "ln-address"
 const isNpubCash = (a: MergeableAccount): boolean => a.type === "npub-cash"
+
+/** npub.cash accounts are ignored. An npub-only profile still needs a wallet. */
+export function hasUsableBlinkAccount(accounts: Array<{ type?: string }>): boolean {
+  return accounts.some((account) => account.type !== "npub-cash")
+}
 const wasFromServer = (a: MergeableAccount): boolean => a.source === "server"
 
 /**

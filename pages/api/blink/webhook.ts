@@ -389,11 +389,19 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           forwardingData.npubCashActive &&
           forwardingData.npubCashLightningAddress
         ) {
+          // npub.cash is gone. Do not pay, and do not report this as forwarded.
+          // A released claim would be retried forever. Mark it failed so a later
+          // delivery does not pay. Funds that already settled into the platform
+          // wallet need a manual refund; there is no automatic payout.
           console.error("[Webhook] npub.cash forwarding is disabled")
-          forwardResult = {
-            type: "npub_cash_disabled",
-            recipientAddress: forwardingData.npubCashLightningAddress,
-          }
+          await hybridStore!.updatePaymentStatus(paymentHash!, "failed", {
+            reason: "npub_cash_unavailable",
+          })
+          await hybridStore!.logEvent(paymentHash!, "webhook_forward", "failed", {
+            error: "npub.cash is no longer available",
+          })
+          rootSpan.setAttribute("webhook.result", "npub_cash_unavailable")
+          return res.status(200).json({ status: "npub_cash_unavailable" })
         } else if (forwardingData.nwcActive && forwardingData.nwcConnectionUri) {
           // Forward to NWC wallet using stored encrypted connection URI
           console.log("[Webhook] Forwarding to NWC wallet")

@@ -1,4 +1,4 @@
-import { assertPublicHostname } from "../server/safe-fetch-json"
+import { resolvePublicAddresses } from "../server/safe-fetch-json"
 
 const isIP = (host: string): boolean =>
   /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(":")
@@ -28,6 +28,6 @@ export async function assertNwcRelays(relays: string[]): Promise<void> {
   }
   for (const relay of relays) {
     assertNwcRelayUrl(relay)
-    await assertPublicHostname(new URL(relay).hostname)
+    await resolvePublicAddresses(new URL(relay).hostname)
   }
 }

@@ -97,7 +97,7 @@ const isBlockedAddress = ({
   return true
 }
 
-type ResolvedAddress = { address: string; family: number }
+export type ResolvedAddress = { address: string; family: number }
 
 const resolveAllowedAddresses = async (hostname: string): Promise<ResolvedAddress[]> => {
   const unwrappedHostname = hostname.replace(/^\[|\]$/g, "")
@@ -290,12 +290,36 @@ export type SafeFetchJsonOptions = {
   maxBodyBytes?: number
 }
 
-/** Reject a hostname that is an IP literal or does not resolve to a public address. */
-export const assertPublicHostname = async (hostname: string): Promise<void> => {
-  if (isIP(hostname.replace(/^\[|\]$/g, ""))) {
+/**
+ * Resolve a hostname and refuse it unless every answer is public.
+ * A mixed public/private result is rejected, not filtered: a later lookup
+ * must not be able to swap in a blocked address.
+ */
+export const resolvePublicAddresses = async (
+  hostname: string,
+): Promise<ResolvedAddress[]> => {
+  const unwrappedHostname = hostname.replace(/^\[|\]$/g, "")
+  if (isIP(unwrappedHostname)) {
     throw new SafeFetchError("IP literals are not allowed", "BLOCKED_ADDRESS")
   }
-  await resolveAllowedAddresses(hostname)
+
+  const addresses = await lookup(unwrappedHostname, { all: true, verbatim: true })
+  if (
+    addresses.length === 0 ||
+    addresses.some(({ address, family }) => isBlockedAddress({ address, family }))
+  ) {
+    throw new SafeFetchError(
+      "hostname does not resolve to a public address",
+      "BLOCKED_ADDRESS",
+    )
+  }
+
+  return addresses.map(({ address, family }) => ({ address, family }))
+}
+
+/** Reject a hostname that is an IP literal or does not resolve to a public address. */
+export const assertPublicHostname = async (hostname: string): Promise<void> => {
+  await resolvePublicAddresses(hostname)
 }
 
 export const safeFetchJsonResponse = async (
