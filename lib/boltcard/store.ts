@@ -19,7 +19,7 @@ import crypto from "crypto"
 import type { QueryResult, QueryResultRow } from "pg"
 
 import AuthManager from "../auth"
-import { getSharedPool } from "../db"
+import { getClient, getSharedPool } from "../db"
 
 import * as boltcardCrypto from "./crypto"
 
@@ -1389,8 +1389,9 @@ class BoltcardStore {
           : null,
       }
     } catch (err: unknown) {
+      // A lost result is not a decline: the UPDATE may have committed.
       console.error("[BoltcardStore] incrementDailySpent error:", (err as Error).message)
-      return { success: false, error: (err as Error).message }
+      throw err
     }
   }
 
@@ -1451,8 +1452,10 @@ class BoltcardStore {
       }
       return false
     } catch (err: unknown) {
+      // A lost result is not "restore failed": the UPDATE may have committed.
+      // Callers must not queue another restore on top of that.
       console.error("[BoltcardStore] rollbackSpend error:", (err as Error).message)
-      return false
+      throw err
     }
   }
 
@@ -1658,6 +1661,21 @@ class BoltcardStore {
   }
 
   /**
+   * Tap-time maximum for an unused session, without consuming it. Null if the
+   * k1 is unknown, for another card, expired, or already used.
+   */
+  async peekWithdrawSession(k1: string, cardId: string): Promise<number | null> {
+    if (typeof k1 !== "string" || !/^[0-9a-f]{64}$/i.test(k1)) return null
+    const result: QueryResult<DbRow> = await query(
+      `SELECT max_msats FROM boltcard_withdraw_sessions
+       WHERE k1_hash = $1 AND card_id = $2 AND used_at IS NULL AND expires_at > $3`,
+      [sha256Hex(k1.toLowerCase()), cardId, Date.now()],
+    )
+    if ((result.rowCount ?? 0) === 0) return null
+    return parseInt(String(result.rows[0].max_msats), 10)
+  }
+
+  /**
    * Atomically consume a withdraw session for `cardId`. Returns the tap-time
    * maximum in msats, or null if the k1 is unknown, for another card,
    * expired, or already used. Throws on database errors.
@@ -1771,8 +1789,8 @@ class BoltcardStore {
     }
     if (!resolved) return
 
-    // A finished row occupies the primary key. Reopen it for this attempt
-    // instead of dropping the new state on the floor.
+    // Only a finished FAILED attempt can be reopened. A SUCCESS row means the
+    // invoice was spent and must not be deducted again.
     const reopened: QueryResult<DbRow> = await query(
       `UPDATE boltcard_pending_withdrawals
        SET amount = $2,
@@ -1782,7 +1800,10 @@ class BoltcardStore {
            daily_window_reset_at = $6,
            resolved_at = NULL,
            outcome = NULL
-       WHERE payment_hash = $1 AND resolved_at IS NOT NULL AND card_id = $7`,
+       WHERE payment_hash = $1
+          AND resolved_at IS NOT NULL
+          AND outcome = 'FAILED'
+          AND card_id = $7`,
       [
         paymentHash,
         amountInt,
@@ -1794,7 +1815,9 @@ class BoltcardStore {
       ],
     )
     if ((reopened.rowCount ?? 0) === 0) {
-      throw new Error("pending withdrawal conflict: could not reopen a finished row")
+      throw new Error(
+        "pending withdrawal conflict: payment hash is already spent or not reclaimable",
+      )
     }
   }
 
@@ -1819,6 +1842,145 @@ class BoltcardStore {
       cardId: row.card_id as string,
       amount: parseInt(String(row.amount), 10),
       kind: String(row.kind),
+    }
+  }
+
+  /**
+   * Claim this invoice hash and deduct in one transaction. A conflicting hash
+   * is already taken (in flight or spent) unless it is a finished FAILED
+   * attempt for the same card, which can be re-claimed. Zero-row deduction
+   * rolls the claim back (definite decline). A database error throws: the
+   * transaction may have committed, and callers must not treat that as a decline.
+   */
+  async claimAndDeductWithdrawal(
+    paymentHash: string,
+    cardId: string,
+    amount: number,
+  ): Promise<
+    | {
+        status: "claimed"
+        balance: number
+        dailySpent: number
+        dailyResetAt: number | null
+      }
+    | { status: "spent" }
+    | { status: "declined" }
+  > {
+    const client = await getClient()
+    const now = Date.now()
+    const amountInt = Math.floor(amount)
+    try {
+      await client.query("BEGIN")
+      const inserted: QueryResult<DbRow> = await client.query(
+        `INSERT INTO boltcard_pending_withdrawals
+           (payment_hash, card_id, amount, balance_after, created_at, kind, daily_window_reset_at)
+         VALUES ($1, $2, $3, 0, $4, 'CLAIMED', NULL)
+         ON CONFLICT (payment_hash) DO NOTHING
+         RETURNING payment_hash`,
+        [paymentHash, cardId, amountInt, now],
+      )
+      let owned = (inserted.rowCount ?? 0) > 0
+      if (!owned) {
+        const reclaimed: QueryResult<DbRow> = await client.query(
+          `UPDATE boltcard_pending_withdrawals
+           SET amount = $3,
+               balance_after = 0,
+               created_at = $4,
+               kind = 'CLAIMED',
+               daily_window_reset_at = NULL,
+               resolved_at = NULL,
+               outcome = NULL
+           WHERE payment_hash = $1
+             AND resolved_at IS NOT NULL
+             AND outcome = 'FAILED'
+             AND card_id = $2
+           RETURNING payment_hash`,
+          [paymentHash, cardId, amountInt, now],
+        )
+        owned = (reclaimed.rowCount ?? 0) > 0
+      }
+      if (!owned) {
+        await client.query("ROLLBACK")
+        return { status: "spent" }
+      }
+
+      const deducted: QueryResult<DbRow> = await client.query(
+        `UPDATE boltcards
+         SET balance = balance - $2,
+             daily_spent = CASE
+               WHEN daily_reset_at IS NOT NULL AND daily_reset_at < $3 THEN $2
+               ELSE daily_spent + $2
+             END,
+             daily_reset_at = CASE
+               WHEN daily_reset_at IS NOT NULL AND daily_reset_at < $3 THEN $4
+               ELSE daily_reset_at
+             END,
+             last_used_at = $3
+         WHERE id = $1
+           AND status = 'ACTIVE'
+           AND balance >= $2
+           AND (max_tx_amount IS NULL OR $2 <= max_tx_amount)
+           AND (
+             daily_limit IS NULL
+             OR (CASE
+                   WHEN daily_reset_at IS NOT NULL AND daily_reset_at < $3
+                   THEN 0
+                   ELSE daily_spent
+                 END) + $2 <= daily_limit
+           )
+         RETURNING balance, daily_spent, daily_reset_at`,
+        [cardId, amountInt, now, now + 24 * 60 * 60 * 1000],
+      )
+      if ((deducted.rowCount ?? 0) === 0) {
+        await client.query("ROLLBACK")
+        return { status: "declined" }
+      }
+
+      const row = deducted.rows[0]
+      const balance = parseInt(String(row.balance), 10)
+      const dailyResetAt = row.daily_reset_at
+        ? parseInt(String(row.daily_reset_at), 10)
+        : null
+      await client.query(
+        `UPDATE boltcard_pending_withdrawals
+         SET balance_after = $2, daily_window_reset_at = $3
+         WHERE payment_hash = $1`,
+        [paymentHash, balance, dailyResetAt],
+      )
+      await client.query("COMMIT")
+      return {
+        status: "claimed",
+        balance,
+        dailySpent: parseInt(String(row.daily_spent), 10),
+        dailyResetAt,
+      }
+    } catch (err: unknown) {
+      await client.query("ROLLBACK").catch(() => undefined)
+      throw err
+    } finally {
+      client.release()
+    }
+  }
+
+  /**
+   * Move a claimed withdrawal to its post-payment state. SUCCESS resolves the
+   * row so the hash stays spent. PENDING and UNKNOWN stay open for
+   * reconciliation. Throws if the claim row is no longer unresolved.
+   */
+  async finalizeWithdrawal(
+    paymentHash: string,
+    kind: "PENDING" | "UNKNOWN" | "SUCCESS",
+  ): Promise<void> {
+    const result: QueryResult<DbRow> = await query(
+      `UPDATE boltcard_pending_withdrawals
+       SET kind = $2,
+           resolved_at = CASE WHEN $2 = 'SUCCESS' THEN $3::bigint ELSE NULL END,
+           outcome = CASE WHEN $2 = 'SUCCESS' THEN 'SUCCESS' ELSE NULL END
+       WHERE payment_hash = $1 AND resolved_at IS NULL`,
+      [paymentHash, kind, Date.now()],
+    )
+    if ((result.rowCount ?? 0) === 0) {
+      throw new Error("pending withdrawal finalize lost the claim row")
     }
   }
 
@@ -1973,20 +2135,29 @@ class BoltcardStore {
    * Mark a pending top-up as processed
    */
   async markTopUpProcessed(paymentHash: string): Promise<boolean> {
-    try {
-      const result: QueryResult<DbRow> = await query(
-        `UPDATE boltcard_pending_topups 
-         SET processed = TRUE, processed_at = $2
-         WHERE payment_hash = $1 AND processed = FALSE
-         RETURNING payment_hash`,
-        [paymentHash, Date.now()],
-      )
+    // Zero rows = already claimed (definite). A database error throws: the
+    // claim may have committed, and callers must not treat that as "already
+    // processed and done".
+    const result: QueryResult<DbRow> = await query(
+      `UPDATE boltcard_pending_topups 
+       SET processed = TRUE, processed_at = $2
+       WHERE payment_hash = $1 AND processed = FALSE
+       RETURNING payment_hash`,
+      [paymentHash, Date.now()],
+    )
 
-      return (result.rowCount ?? 0) > 0
-    } catch (err: unknown) {
-      console.error("[BoltcardStore] markTopUpProcessed error:", (err as Error).message)
-      return false
-    }
+    return (result.rowCount ?? 0) > 0
+  }
+
+  /** True when a TOPUP audit row exists for this payment hash. */
+  async hasTopUpTransaction(paymentHash: string): Promise<boolean> {
+    const result: QueryResult<DbRow> = await query(
+      `SELECT 1 FROM boltcard_transactions
+       WHERE payment_hash = $1 AND tx_type = 'TOPUP'
+       LIMIT 1`,
+      [paymentHash],
+    )
+    return result.rows.length > 0
   }
 
   /**

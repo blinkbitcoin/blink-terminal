@@ -540,15 +540,34 @@ async function processTopUpPayment(paymentHash: string): Promise<ProcessTopUpRes
   }
 
   // 2. Claim it atomically: of concurrent processors (webhook + polling) only
-  //    one proceeds, so a payment is credited at most once.
-  if (!(await boltcardStore.markTopUpProcessed(paymentHash))) {
+  //    one proceeds, so a payment is credited at most once. A database error
+  //    is ambiguous (the claim may have committed) and must be flagged, not
+  //    reported as a clean "already processed".
+  const review = (reason: string) =>
+    boltcardStore.setTopUpReviewReason(paymentHash, reason)
+  let claimed: boolean
+  try {
+    claimed = await boltcardStore.markTopUpProcessed(paymentHash)
+  } catch (err: unknown) {
+    console.error(
+      `[LNURLP] Top-up claim outcome unknown for ${paymentHash.substring(0, 16)}...: ${(err as Error).message}`,
+    )
+    await review(`claim outcome unknown: ${(err as Error).message}`)
+    return {
+      success: false,
+      error: "Top-up claim outcome unknown - manual review needed",
+    }
+  }
+  if (!claimed) {
+    // A replay of a processed claim that never got a credit must stay visible.
+    // Cleanup deletes processed rows after 24h unless they are flagged.
+    if (!(await boltcardStore.hasTopUpTransaction(paymentHash))) {
+      await review("processed claim has no credit")
+    }
     return { success: false, error: "Top-up already processed" }
   }
   pendingTopUpsCache.delete(paymentHash)
   const release = () => boltcardStore.unmarkTopUpProcessed(paymentHash)
-  /** Keep the claim, flag it for review (queryable, excluded from cleanup). */
-  const review = (reason: string) =>
-    boltcardStore.setTopUpReviewReason(paymentHash, reason).catch(() => undefined)
 
   let creditAmount = amountSats
   let creditUnit = "sats"

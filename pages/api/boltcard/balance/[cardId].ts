@@ -141,8 +141,9 @@ async function handleBalanceGet(
     }
 
     // Reconcile this card's in-flight / unknown-outcome withdrawals
+    let withdrawalReconcile = { checked: 0, resolved: 0, restored: 0 }
     try {
-      await boltcard.lnurlw.reconcilePendingWithdrawals(cardId)
+      withdrawalReconcile = await boltcard.lnurlw.reconcilePendingWithdrawals(cardId)
     } catch (reconcileError: unknown) {
       console.error(
         `[BALANCE] Withdrawal reconciliation failed for card ${cardId}:`,
@@ -173,9 +174,10 @@ async function handleBalanceGet(
       // Continue with balance check even if top-up processing fails
     }
 
-    // Re-fetch card to get updated balance if any top-ups were processed
+    // Re-fetch when this tap credited a top-up or restored a failed withdrawal.
+    // Otherwise the response still shows the pre-reconcile balance.
     let updatedCard = card
-    if (pendingTopUpsResult.processed > 0) {
+    if (pendingTopUpsResult.processed > 0 || withdrawalReconcile.restored > 0) {
       updatedCard = (await boltcard.store.getCard(cardId)) || card
     }
 

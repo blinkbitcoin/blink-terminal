@@ -410,16 +410,23 @@ async function handleWithdrawCallback(
     return { status: "ERROR", reason: "Missing k1 - tap the card again" }
   }
 
-  // Decode invoice to get amount (no side effects yet)
+  // Decode invoice to get amount (no side effects yet). A non-whole-sat
+  // amount would deduct less than Blink pays, so refuse it before consuming
+  // the tap. An over-max invoice is also refused before consume, so the
+  // wallet can retry smaller on the same k1.
   const invoiceAmount = parseInvoiceAmount(invoice)
-  if (!invoiceAmount || invoiceAmount.sats <= 0) {
+  if (!invoiceAmount || invoiceAmount.sats <= 0 || invoiceAmount.msats % 1000 !== 0) {
     return {
       status: "ERROR",
-      reason: "Invalid invoice amount",
+      reason: "Invoice amount must be a whole number of sats",
     }
   }
+  const invoiceHash = extractPaymentHash(invoice)
+  if (!invoiceHash) {
+    return { status: "ERROR", reason: "Invoice has no payment hash" }
+  }
 
-  const maxMsats = await boltcardStore.consumeWithdrawSession(k1, cardId)
+  const maxMsats = await boltcardStore.peekWithdrawSession(k1, cardId)
   if (maxMsats === null) {
     return { status: "ERROR", reason: "Invalid or expired k1 - tap the card again" }
   }
@@ -428,6 +435,9 @@ async function handleWithdrawCallback(
       status: "ERROR",
       reason: "Invoice amount exceeds the amount allowed for this tap",
     }
+  }
+  if ((await boltcardStore.consumeWithdrawSession(k1, cardId)) === null) {
+    return { status: "ERROR", reason: "Invalid or expired k1 - tap the card again" }
   }
 
   // Get card with keys
@@ -467,29 +477,24 @@ async function handleWithdrawCallback(
     amount = invoiceAmount.sats
   }
 
-  // An unresolved row for this invoice is still being reconciled. A second
-  // deduction cannot be tracked (the hash is the primary key) and must not start.
-  const invoiceHash = extractPaymentHash(invoice)
-  if (invoiceHash) {
-    const inflight = await boltcardStore.getUnresolvedWithdrawal(invoiceHash)
-    if (inflight) {
-      return {
-        status: "ERROR",
-        reason: "A payment for this invoice is already in progress - try again shortly",
-      }
-    }
-  }
-
-  // Try to deduct from card balance (atomic operation with limit checks)
-  const deductResult = (await boltcardStore.incrementDailySpent(
+  // Claim the hash and deduct in one transaction. A taken hash (in flight or
+  // already spent) cannot debit the card again. A database error throws:
+  // the claim may have committed, so this is not a decline.
+  const deductResult = await boltcardStore.claimAndDeductWithdrawal(
+    invoiceHash,
     cardId,
     amount,
-  )) as DeductResult
-
-  if (!deductResult.success) {
+  )
+  if (deductResult.status === "spent") {
     return {
       status: "ERROR",
-      reason: deductResult.error || "Failed to process payment",
+      reason: "This invoice was already used",
+    }
+  }
+  if (deductResult.status === "declined") {
+    return {
+      status: "ERROR",
+      reason: "Payment declined (balance or spending limits)",
     }
   }
 
@@ -503,49 +508,24 @@ async function handleWithdrawCallback(
   )
 
   if (!payResult.success) {
-    const withdrawalHash =
-      payResult.paymentHash ?? extractPaymentHash(invoice) ?? undefined
     if (payResult.definite) {
-      // Nothing was sent: restore the card balance. If the restore itself
-      // fails, queue it for reconciliation (never silent).
-      const restored = await boltcardStore.rollbackSpend(
-        cardId,
-        amount,
-        deductResult.dailyResetAt ?? null,
-      )
-      if (!restored && withdrawalHash) {
-        await boltcardStore.recordPendingWithdrawal(
-          withdrawalHash,
-          cardId,
-          amount,
-          deductResult.balance as number,
-          "RESTORE_FAILED",
-          deductResult.dailyResetAt ?? null,
-        )
-      }
-      console.log(
-        `[LNURLW] Payment failed for card ${cardId}, rolled back ${amount} (restored=${restored})`,
-      )
+      // Nothing was sent. Resolve and restore in one statement. If that
+      // write's result is lost, it throws — do not restore again. A retry
+      // of reconciliation restores the still-open claim at most once.
+      await boltcardStore.resolvePendingWithdrawalFailed(invoiceHash)
+      console.log(`[LNURLW] Payment failed for card ${cardId}, rolled back ${amount}`)
     } else {
-      // Outcome unknown (transport error): the payment may have gone out.
-      // Keep the deduction so the card can't overspend; flag for review.
+      // Outcome unknown: the payment may have gone out. Keep the deduction
+      // and mark the claim UNKNOWN before returning, so reconciliation will
+      // not treat it as never sent.
+      await boltcardStore.finalizeWithdrawal(invoiceHash, "UNKNOWN")
       await boltcardStore.recordTransaction(cardId, {
         type: TxType.WITHDRAW,
         amount: amount,
-        balanceAfter: deductResult.balance as number,
+        balanceAfter: deductResult.balance,
+        paymentHash: invoiceHash,
         description: "Card payment - outcome unknown, pending review",
       })
-      const unknownHash = withdrawalHash
-      if (unknownHash) {
-        await boltcardStore.recordPendingWithdrawal(
-          unknownHash,
-          cardId,
-          amount,
-          deductResult.balance as number,
-          "UNKNOWN",
-          deductResult.dailyResetAt ?? null,
-        )
-      }
       console.error(
         `[LNURLW] Payment outcome unknown for card ${cardId}; deduction of ${amount} kept for review`,
       )
@@ -557,31 +537,22 @@ async function handleWithdrawCallback(
     }
   }
 
-  // Record the transaction. A PENDING payment is still in flight: mark it
-  // for reconciliation so a later terminal failure can restore the deduction.
+  // The claim row is the spent-hash record. It must reach its final state
+  // before we report OK, or a second tap of this invoice could deduct again.
+  const inFlight = payResult.status === "PENDING"
+  await boltcardStore.finalizeWithdrawal(invoiceHash, inFlight ? "PENDING" : "SUCCESS")
   await boltcardStore.recordTransaction(cardId, {
     type: TxType.WITHDRAW,
     amount: amount,
-    balanceAfter: deductResult.balance as number,
-    paymentHash: payResult.paymentHash,
-    description:
-      payResult.status === "PENDING"
-        ? "Card payment - in flight, pending reconciliation"
-        : "Card payment",
+    balanceAfter: deductResult.balance,
+    paymentHash: invoiceHash,
+    description: inFlight
+      ? "Card payment - in flight, pending reconciliation"
+      : "Card payment",
   })
-  if (payResult.status === "PENDING") {
-    // The pending-withdrawal row IS the reconciliation state; it must persist
-    // before we report OK, otherwise nothing would ever reconcile it.
-    await boltcardStore.recordPendingWithdrawal(
-      payResult.paymentHash as string,
-      cardId,
-      amount,
-      deductResult.balance as number,
-      "PENDING",
-      deductResult.dailyResetAt ?? null,
-    )
+  if (inFlight) {
     console.warn(
-      `[LNURLW] Card ${cardId} payment ${payResult.paymentHash} is PENDING - queued for reconciliation`,
+      `[LNURLW] Card ${cardId} payment ${invoiceHash} is PENDING - queued for reconciliation`,
     )
   }
 
@@ -781,10 +752,13 @@ async function reconcilePendingWithdrawals(cardId?: string): Promise<{
           resolved++
           restored++
         }
-      } else if (status === "UNSEEN" && item.kind === "RESTORE_FAILED") {
-        // Definite rejection and Blink has no transaction for the hash.
-        // An in-flight SEND (PENDING) must not be restored — that payment
-        // may still settle.
+      } else if (
+        status === "UNSEEN" &&
+        (item.kind === "RESTORE_FAILED" || item.kind === "CLAIMED")
+      ) {
+        // Nothing was sent: a definite rejection whose restore was queued,
+        // or a claim that committed and then the process died before pay.
+        // An in-flight SEND (PENDING) must not be restored.
         if (await boltcardStore.resolvePendingWithdrawalFailed(item.paymentHash)) {
           resolved++
           restored++

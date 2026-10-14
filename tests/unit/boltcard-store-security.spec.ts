@@ -10,6 +10,10 @@
 const mockPoolQuery = jest.fn()
 jest.mock("../../lib/db", () => ({
   getSharedPool: () => ({ query: (...args: unknown[]) => mockPoolQuery(...args) }),
+  getClient: async () => ({
+    query: (...args: unknown[]) => mockPoolQuery(...args),
+    release: () => undefined,
+  }),
 }))
 jest.mock("../../lib/auth", () => ({
   __esModule: true,
@@ -458,7 +462,49 @@ describe("review states (pending withdrawals, top-up flags)", () => {
     await store().recordPendingWithdrawal("h", "c1", 1000, 4000, "UNKNOWN", 9)
     const q = String(mockPoolQuery.mock.calls[2][0]).replace(/\s+/g, " ")
     expect(q).toMatch(/resolved_at = NULL/)
-    expect(q).toMatch(/resolved_at IS NOT NULL AND card_id = \$7/)
+    expect(q).toMatch(/outcome = 'FAILED'/)
+    expect(q).toMatch(/card_id = \$7/)
+  })
+
+  it("claimAndDeductWithdrawal claims and deducts in one transaction", async () => {
+    mockPoolQuery
+      .mockResolvedValueOnce({}) // BEGIN
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ payment_hash: "h" }] })
+      .mockResolvedValueOnce({
+        rowCount: 1,
+        rows: [{ balance: "4000", daily_spent: "1000", daily_reset_at: "777" }],
+      })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] })
+      .mockResolvedValueOnce({}) // COMMIT
+    await expect(store().claimAndDeductWithdrawal("h", "c1", 1000)).resolves.toEqual({
+      status: "claimed",
+      balance: 4000,
+      dailySpent: 1000,
+      dailyResetAt: 777,
+    })
+    const sql = sqlCalls()
+    expect(sql[0]).toBe("BEGIN")
+    expect(sql.join(" ")).toMatch(/'CLAIMED'/)
+    expect(sql.join(" ")).toMatch(/COMMIT/)
+    expect(sql.join(" ")).not.toMatch(/ROLLBACK/)
+  })
+
+  it("a taken hash is spent: the deduction statement never runs", async () => {
+    mockPoolQuery
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({ rowCount: 0, rows: [] })
+      .mockResolvedValueOnce({ rowCount: 0, rows: [] })
+      .mockResolvedValueOnce({})
+    await expect(store().claimAndDeductWithdrawal("h", "c1", 1000)).resolves.toEqual({
+      status: "spent",
+    })
+    expect(sqlCalls().join(" ")).toMatch(/ROLLBACK/)
+    expect(sqlCalls().join(" ")).not.toMatch(/balance = balance -/)
+  })
+
+  it("markTopUpProcessed throws on a database error (not a definite miss)", async () => {
+    mockPoolQuery.mockRejectedValueOnce(new Error("connection reset"))
+    await expect(store().markTopUpProcessed("h")).rejects.toThrow("connection reset")
   })
 
   it("rollbackSpend subtracts daily_spent only in the deduction's window", async () => {
