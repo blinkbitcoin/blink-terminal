@@ -793,12 +793,12 @@ async function fetchInvoiceReceipt(
       return { status: "PAID", settlementAmount: amount }
     }
 
-    // Transaction exists but not successful. Terminal failure is FAILED for
-    // receives and FAILURE for sends (Blink's TxStatus on the send path).
-    const terminalFailure = direction === "SEND" ? "FAILURE" : "FAILED"
+    // Transaction exists but not successful. Terminal failure is FAILURE on
+    // the send path and FAILED on the receive path historically; accept both
+    // spellings on both directions.
     const failedTx = transactions.find(
       (tx: BlinkTransaction) =>
-        tx.direction === direction && tx.status === terminalFailure,
+        tx.direction === direction && ["FAILED", "FAILURE"].includes(tx.status),
     )
     if (failedTx) {
       return { status: "EXPIRED" }

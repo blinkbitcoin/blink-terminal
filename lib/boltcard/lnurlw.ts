@@ -78,6 +78,8 @@ interface VerifyResult {
 interface DeductResult {
   success: boolean
   balance?: number
+  /** The daily window (next reset) the deduction belongs to. */
+  dailyResetAt?: number | null
   error?: string
 }
 
@@ -488,10 +490,25 @@ async function handleWithdrawCallback(
   )
 
   if (!payResult.success) {
+    const withdrawalHash =
+      payResult.paymentHash ?? extractPaymentHash(invoice) ?? undefined
     if (payResult.definite) {
-      // Nothing was sent: restore the card balance
-      await boltcardStore.rollbackSpend(cardId, amount)
-      console.log(`[LNURLW] Payment failed for card ${cardId}, rolled back ${amount}`)
+      // Nothing was sent: restore the card balance. If the restore itself
+      // fails, queue it for reconciliation (never silent).
+      const restored = await boltcardStore.rollbackSpend(cardId, amount)
+      if (!restored && withdrawalHash) {
+        await boltcardStore.recordPendingWithdrawal(
+          withdrawalHash,
+          cardId,
+          amount,
+          deductResult.balance as number,
+          "RESTORE_FAILED",
+          deductResult.dailyResetAt ?? null,
+        )
+      }
+      console.log(
+        `[LNURLW] Payment failed for card ${cardId}, rolled back ${amount} (restored=${restored})`,
+      )
     } else {
       // Outcome unknown (transport error): the payment may have gone out.
       // Keep the deduction so the card can't overspend; flag for review.
@@ -501,13 +518,15 @@ async function handleWithdrawCallback(
         balanceAfter: deductResult.balance as number,
         description: "Card payment - outcome unknown, pending review",
       })
-      const unknownHash = payResult.paymentHash ?? extractPaymentHash(invoice)
+      const unknownHash = withdrawalHash
       if (unknownHash) {
         await boltcardStore.recordPendingWithdrawal(
           unknownHash,
           cardId,
           amount,
           deductResult.balance as number,
+          "UNKNOWN",
+          deductResult.dailyResetAt ?? null,
         )
       }
       console.error(
@@ -541,6 +560,8 @@ async function handleWithdrawCallback(
       cardId,
       amount,
       deductResult.balance as number,
+      "PENDING",
+      deductResult.dailyResetAt ?? null,
     )
     console.warn(
       `[LNURLW] Card ${cardId} payment ${payResult.paymentHash} is PENDING - queued for reconciliation`,
@@ -742,8 +763,15 @@ async function reconcilePendingWithdrawals(cardId?: string): Promise<{
           resolved++
           restored++
         }
+      } else if (status === "PENDING" && item.kind === "RESTORE_FAILED") {
+        // The payment was definitely never sent and Blink has no transaction
+        // for the hash: restoring the deduction is safe.
+        if (await boltcardStore.resolvePendingWithdrawalFailed(item.paymentHash)) {
+          resolved++
+          restored++
+        }
       }
-      // PENDING / ERROR: leave for the next pass
+      // Otherwise: leave for the next pass
     } catch (err: unknown) {
       console.error(
         `[LNURLW] Reconciliation failed for withdrawal ${item.paymentHash.substring(0, 16)}...: ${(err as Error).message}`,

@@ -180,6 +180,8 @@ export interface IncrementResult {
   success: boolean
   balance?: number
   dailySpent?: number
+  /** The daily window (next reset) the deduction belongs to. */
+  dailyResetAt?: number | null
   error?: string
 }
 
@@ -1357,7 +1359,7 @@ class BoltcardStore {
          WHERE id = $1
            AND status = 'ACTIVE'
            AND balance >= $2
-           AND ($5::bigint IS NULL OR $2 <= $5)
+           AND (max_tx_amount IS NULL OR $2 <= max_tx_amount)
            AND (
              daily_limit IS NULL
              OR (CASE
@@ -1366,8 +1368,8 @@ class BoltcardStore {
                    ELSE daily_spent
                  END) + $2 <= daily_limit
            )
-         RETURNING balance, daily_spent`,
-        [cardId, amount, now, now + 24 * 60 * 60 * 1000, card.maxTxAmount],
+         RETURNING balance, daily_spent, daily_reset_at`,
+        [cardId, amount, now, now + 24 * 60 * 60 * 1000],
       )
 
       if ((result.rowCount ?? 0) === 0) {
@@ -1382,6 +1384,9 @@ class BoltcardStore {
         success: true,
         balance: parseInt(row.balance as string, 10),
         dailySpent: parseInt(row.daily_spent as string, 10),
+        dailyResetAt: row.daily_reset_at
+          ? parseInt(String(row.daily_reset_at), 10)
+          : null,
       }
     } catch (err: unknown) {
       console.error("[BoltcardStore] incrementDailySpent error:", (err as Error).message)
@@ -1672,13 +1677,23 @@ class BoltcardStore {
     cardId: string,
     amount: number,
     balanceAfter: number,
+    kind: "PENDING" | "UNKNOWN" | "RESTORE_FAILED" = "PENDING",
+    dailyWindowResetAt: number | null = null,
   ): Promise<void> {
     await query(
       `INSERT INTO boltcard_pending_withdrawals
-         (payment_hash, card_id, amount, balance_after, created_at)
-       VALUES ($1, $2, $3, $4, $5)
+         (payment_hash, card_id, amount, balance_after, created_at, kind, daily_window_reset_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
        ON CONFLICT (payment_hash) DO NOTHING`,
-      [paymentHash, cardId, Math.floor(amount), Math.floor(balanceAfter), Date.now()],
+      [
+        paymentHash,
+        cardId,
+        Math.floor(amount),
+        Math.floor(balanceAfter),
+        Date.now(),
+        kind,
+        dailyWindowResetAt,
+      ],
     )
   }
 
@@ -1686,13 +1701,17 @@ class BoltcardStore {
    * Unresolved pending withdrawals (optionally for one card): in-flight or
    * unknown-outcome payments awaiting reconciliation.
    */
-  async getPendingWithdrawals(
-    cardId?: string,
-  ): Promise<
-    Array<{ paymentHash: string; cardId: string; amount: number; createdAt: number }>
+  async getPendingWithdrawals(cardId?: string): Promise<
+    Array<{
+      paymentHash: string
+      cardId: string
+      amount: number
+      createdAt: number
+      kind: string
+    }>
   > {
     const result: QueryResult<DbRow> = await query(
-      `SELECT payment_hash, card_id, amount, created_at
+      `SELECT payment_hash, card_id, amount, created_at, kind
        FROM boltcard_pending_withdrawals
        WHERE resolved_at IS NULL AND ($1::text IS NULL OR card_id = $1)
        ORDER BY created_at ASC`,
@@ -1703,6 +1722,7 @@ class BoltcardStore {
       cardId: row.card_id as string,
       amount: parseInt(String(row.amount), 10),
       createdAt: parseInt(String(row.created_at), 10),
+      kind: String(row.kind),
     }))
   }
 
@@ -1738,11 +1758,18 @@ class BoltcardStore {
          UPDATE boltcard_pending_withdrawals
          SET resolved_at = $2, outcome = 'FAILED'
          WHERE payment_hash = $1 AND resolved_at IS NULL
-         RETURNING card_id, amount
+         RETURNING card_id, amount, daily_window_reset_at
        )
        UPDATE boltcards
        SET balance = balance + r.amount,
-           daily_spent = GREATEST(0, daily_spent - r.amount)
+           -- Only subtract from the same daily window the deduction happened
+           -- in; after a reset, daily_spent belongs to a NEW window.
+           daily_spent = CASE
+             WHEN r.daily_window_reset_at IS NOT NULL
+                  AND boltcards.daily_reset_at IS DISTINCT FROM r.daily_window_reset_at
+             THEN daily_spent
+             ELSE GREATEST(0, daily_spent - r.amount)
+           END
        FROM resolved r
        WHERE boltcards.id = r.card_id
        RETURNING boltcards.id`,

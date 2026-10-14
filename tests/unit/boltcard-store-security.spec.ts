@@ -412,7 +412,7 @@ describe("review states (pending withdrawals, top-up flags)", () => {
     await store().recordPendingWithdrawal("h", "c1", 1000, 4000)
     const [sql, params] = mockPoolQuery.mock.calls[0]
     expect(String(sql)).toMatch(/ON CONFLICT \(payment_hash\) DO NOTHING/)
-    expect(params).toEqual(["h", "c1", 1000, 4000, expect.any(Number)])
+    expect(params).toEqual(["h", "c1", 1000, 4000, expect.any(Number), "PENDING", null])
   })
 
   it("getPendingWithdrawals filters unresolved rows, optionally per card", async () => {
@@ -472,7 +472,12 @@ describe("incrementDailySpent: checks and deduction in one statement", () => {
 
     const res = await s.incrementDailySpent("c1", 1000)
 
-    expect(res).toEqual({ success: true, balance: 4000, dailySpent: 1000 })
+    expect(res).toEqual({
+      success: true,
+      balance: 4000,
+      dailySpent: 1000,
+      dailyResetAt: null,
+    })
     expect(mockPoolQuery).toHaveBeenCalledTimes(1)
     const [sql, params] = mockPoolQuery.mock.calls[0]
     const q = String(sql).replace(/\s+/g, " ")
@@ -481,10 +486,11 @@ describe("incrementDailySpent: checks and deduction in one statement", () => {
       /daily_spent = CASE WHEN daily_reset_at IS NOT NULL AND daily_reset_at < \$3 THEN \$2 ELSE daily_spent \+ \$2 END/,
     )
     expect(q).toMatch(/AND balance >= \$2/)
-    expect(q).toMatch(/\$5::bigint IS NULL OR \$2 <= \$5/)
+    expect(q).toMatch(/max_tx_amount IS NULL OR \$2 <= max_tx_amount/)
     expect(q).toMatch(/daily_limit IS NULL OR \(CASE/)
     expect(q).toMatch(/\+ \$2 <= daily_limit/)
-    expect(params).toEqual(["c1", 1000, expect.any(Number), expect.any(Number), 2000])
+    // the limit value comes from the row, not a stale pre-read
+    expect(params).toEqual(["c1", 1000, expect.any(Number), expect.any(Number)])
   })
 
   it("zero rows -> declined (balance or limits, atomically)", async () => {
@@ -506,11 +512,10 @@ describe("resolvePendingWithdrawalFailed: resolve + restore in one statement", (
     const [sql, params] = mockPoolQuery.mock.calls[0]
     const q = String(sql).replace(/\s+/g, " ")
     expect(q).toMatch(
-      /WITH resolved AS \( UPDATE boltcard_pending_withdrawals SET resolved_at = \$2, outcome = 'FAILED' WHERE payment_hash = \$1 AND resolved_at IS NULL RETURNING card_id, amount \)/,
+      /WITH resolved AS \( UPDATE boltcard_pending_withdrawals SET resolved_at = \$2, outcome = 'FAILED' WHERE payment_hash = \$1 AND resolved_at IS NULL RETURNING card_id, amount, daily_window_reset_at \)/,
     )
-    expect(q).toMatch(
-      /UPDATE boltcards SET balance = balance \+ r.amount, daily_spent = GREATEST\(0, daily_spent - r.amount\) FROM resolved r/,
-    )
+    expect(q).toMatch(/IS DISTINCT FROM r\.daily_window_reset_at/)
+    expect(q).toMatch(/GREATEST\(0, daily_spent - r\.amount\)/)
     expect(params[0]).toBe("h")
   })
 
