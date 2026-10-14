@@ -389,22 +389,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           forwardingData.npubCashActive &&
           forwardingData.npubCashLightningAddress
         ) {
-          // Forward to npub.cash
-          console.log(
-            "[Webhook] Forwarding to npub.cash:",
-            forwardingData.npubCashLightningAddress,
-          )
-          forwardResult = await withSpan(
-            tracer,
-            "webhook.forward.npub_cash",
-            async (span) => {
-              span.setAttribute(
-                "payment.recipient",
-                forwardingData.npubCashLightningAddress || "",
-              )
-              return forwardToNpubCash(paymentHash!, amount, forwardingData, hybridStore!)
-            },
-          )
+          console.error("[Webhook] npub.cash forwarding is disabled")
+          forwardResult = {
+            type: "npub_cash_disabled",
+            recipientAddress: forwardingData.npubCashLightningAddress,
+          }
         } else if (forwardingData.nwcActive && forwardingData.nwcConnectionUri) {
           // Forward to NWC wallet using stored encrypted connection URI
           console.log("[Webhook] Forwarding to NWC wallet")
@@ -654,96 +643,6 @@ async function forwardToLnAddress(
   return {
     type: "ln_address",
     recipientUsername,
-    baseAmount,
-    tipAmount,
-    tipResult,
-  }
-}
-
-/**
- * Forward payment to npub.cash via LNURL-pay
- */
-async function forwardToNpubCash(
-  paymentHash: string,
-  amount: number,
-  forwardingData: ForwardingData,
-  hybridStore: HybridStore,
-) {
-  // Get the environment-specific API URL from stored forwarding data.
-  // BlinkPOS credentials are set per-deployment; `environment` only
-  // selects which Blink GraphQL URL we talk to.
-  const environment = forwardingData.environment || "production"
-  const blinkposApiKey = process.env.BLINKPOS_API_KEY
-  const blinkposBtcWalletId = process.env.BLINKPOS_BTC_WALLET_ID
-  const apiUrl = getApiUrlForEnvironment(environment)
-
-  const blinkposAPI = new BlinkAPI(blinkposApiKey!, apiUrl)
-
-  const recipientAddress = forwardingData.npubCashLightningAddress
-  const baseAmount = forwardingData.baseAmount || amount
-  const tipAmount = forwardingData.tipAmount || 0
-  const tipRecipients = forwardingData.tipRecipients || []
-  const memo = forwardingData.memo || `${baseAmount} sats`
-  const displayCurrency = forwardingData.displayCurrency || "BTC"
-  const tipAmountDisplay = forwardingData.tipAmountDisplay || tipAmount
-  const forwardingMemo = generateEnhancedMemo(
-    memo,
-    baseAmount,
-    tipAmount,
-    tipRecipients,
-    displayCurrency,
-    tipAmountDisplay,
-  )
-
-  // Get invoice from npub.cash via LNURL-pay
-  // Note: getInvoiceFromLightningAddress takes sats, not millisats
-  const invoiceResult = await getInvoiceFromLightningAddress(
-    recipientAddress!,
-    baseAmount,
-    forwardingMemo,
-  )
-
-  if (!invoiceResult.paymentRequest) {
-    throw new Error(
-      `Failed to get invoice from ${recipientAddress}: No payment request returned`,
-    )
-  }
-
-  console.log("[Webhook] Got invoice from npub.cash:", {
-    recipient: recipientAddress,
-    amount: baseAmount,
-    hasPaymentRequest: !!invoiceResult.paymentRequest,
-  })
-
-  // Pay the invoice from BlinkPOS
-  const paymentResult = await blinkposAPI.payLnInvoice(
-    blinkposBtcWalletId!,
-    invoiceResult.paymentRequest,
-    forwardingMemo,
-  )
-
-  if (paymentResult.status !== "SUCCESS") {
-    throw new Error(`Payment failed: ${paymentResult.status}`)
-  }
-
-  // Send tips if applicable
-  let tipResult: TipResult | null = null
-  if (tipAmount > 0 && tipRecipients.length > 0) {
-    tipResult = await sendTips(
-      blinkposAPI,
-      blinkposBtcWalletId,
-      tipAmount,
-      tipRecipients,
-      forwardingData,
-    )
-  }
-
-  // Clean up forwarding data
-  await hybridStore.removeTipData(paymentHash)
-
-  return {
-    type: "npub_cash",
-    recipientAddress,
     baseAmount,
     tipAmount,
     tipResult,

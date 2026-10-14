@@ -395,38 +395,6 @@ export default function WalletsOverlay({
                         </p>
                       </button>
                     </div>
-
-                    {/* npub.cash - Full width below the 2-column grid */}
-                    <button
-                      type="button"
-                      onClick={() => setNewAccountType("npub-cash")}
-                      className={`w-full p-3 rounded-lg border-2 text-left transition-all hover:scale-[1.01] ${
-                        darkMode
-                          ? "border-teal-500/40 bg-teal-900/20 hover:border-teal-500/60"
-                          : "border-teal-300 bg-teal-50 hover:border-teal-400"
-                      }`}
-                    >
-                      <div className="flex items-center gap-3">
-                        <span className="text-2xl">🥜</span>
-                        <div className="flex-1">
-                          <div className="flex items-center gap-2">
-                            <span
-                              className={`font-medium text-sm ${darkMode ? "text-white" : "text-gray-900"}`}
-                            >
-                              npub.cash (Cashu)
-                            </span>
-                            <span className="px-1.5 py-0.5 text-xs font-medium rounded bg-teal-500 text-white">
-                              Zero Fees
-                            </span>
-                          </div>
-                          <p
-                            className={`text-xs mt-0.5 ${darkMode ? "text-gray-400" : "text-gray-600"}`}
-                          >
-                            Receive payments as Cashu ecash tokens
-                          </p>
-                        </div>
-                      </div>
-                    </button>
                   </div>
 
                   <button

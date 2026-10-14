@@ -19,6 +19,8 @@ import {
 
 import { isBlinkInvoice, getNonBlinkWalletError } from "../invoice-decoder"
 
+import { assertNwcRelays, assertNwcRelayUrl, MAX_NWC_RELAYS } from "./relays"
+
 /** Minimal type for the object returned by SimplePool.subscribe() */
 interface PoolSubCloser {
   close: (reason?: string) => void
@@ -145,11 +147,20 @@ class NWCClient {
   }
 
   /**
+   * Refuse a relay that is not wss or does not resolve to a public address,
+   * before any publish or subscribe opens a socket.
+   */
+  private async assertRelays(): Promise<void> {
+    await assertNwcRelays(this.uri.relays)
+  }
+
+  /**
    * Get wallet service info (supported methods, notifications, etc.)
    * @returns Promise resolving to NWCInfo or null
    */
   async getInfo(): Promise<NWCInfo | null> {
     try {
+      await this.assertRelays()
       console.log("[NWCClient] Getting wallet info...")
       const filter = {
         kinds: [13194],
@@ -459,8 +470,9 @@ class NWCClient {
     const requestEvent = finalizeEvent(eventTemplate, skBytes)
     console.log("[NWCClient] Request event created:", requestEvent.id)
 
-    // Publish to relays (all at once, like PubPay does)
+    // Publish to relays only after the relay hosts are known to be public wss.
     try {
+      await this.assertRelays()
       console.log("[NWCClient] Publishing to relays:", this.uri.relays)
       await this.pool.publish(this.uri.relays, requestEvent)
       console.log("[NWCClient] Published successfully")
@@ -619,8 +631,16 @@ class NWCClient {
       clientSecretHex = secret
     }
 
-    if (!walletPubkey || !clientSecretHex || relays.length === 0) {
+    if (
+      !walletPubkey ||
+      !clientSecretHex ||
+      relays.length === 0 ||
+      relays.length > MAX_NWC_RELAYS
+    ) {
       throw new Error("Invalid NWC connection string: missing required fields")
+    }
+    for (const relay of relays) {
+      assertNwcRelayUrl(relay)
     }
 
     const clientPubkey: string = getPublicKey(hexToBytes(clientSecretHex))

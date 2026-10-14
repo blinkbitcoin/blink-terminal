@@ -384,6 +384,21 @@ export async function getInvoiceFromLightningAddress(
     comment = "" // Comments not allowed
   }
 
+  // The callback must stay on the lightning-address host. A third-party JSON
+  // document must not send us to an internal or different host.
+  let callbackUrl: URL
+  try {
+    callbackUrl = new URL(lnurlData.callback)
+  } catch {
+    throw new Error("Invalid LNURL callback")
+  }
+  if (
+    callbackUrl.protocol !== "https:" ||
+    callbackUrl.hostname !== new URL(lnurlEndpoint).hostname
+  ) {
+    throw new Error("Invalid LNURL callback")
+  }
+
   // Request invoice
   const invoiceData: LnurlInvoiceResponse = await requestInvoiceFromCallback(
     lnurlData.callback,
@@ -450,30 +465,9 @@ export async function verifyLnurlPayment(verifyUrl: string): Promise<LnurlVerify
  * @returns Probe result with validity and capacity info
  */
 export async function probeNpubCashAddress(
-  address: string,
+  _address: string,
 ): Promise<NpubCashProbeResult> {
-  try {
-    const validation: NpubCashValidationResult = validateNpubCashAddress(address)
-    if (!validation.valid) {
-      return { valid: false, error: validation.error }
-    }
-
-    const { lnurlEndpoint } = parseLightningAddress(address)
-    const metadata: LnurlPayMetadata = await fetchLnurlPayMetadata(lnurlEndpoint)
-
-    return {
-      valid: true,
-      minSats: Math.ceil(metadata.minSendable / 1000),
-      maxSats: Math.floor(metadata.maxSendable / 1000),
-      allowsNostr: metadata.allowsNostr,
-    }
-  } catch (err: unknown) {
-    const error = err instanceof Error ? err : new Error(String(err))
-    return {
-      valid: false,
-      error: error.message,
-    }
-  }
+  return { valid: false, error: "npub.cash is no longer available" }
 }
 
 export default {

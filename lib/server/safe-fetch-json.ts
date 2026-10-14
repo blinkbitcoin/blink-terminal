@@ -290,6 +290,14 @@ export type SafeFetchJsonOptions = {
   maxBodyBytes?: number
 }
 
+/** Reject a hostname that is an IP literal or does not resolve to a public address. */
+export const assertPublicHostname = async (hostname: string): Promise<void> => {
+  if (isIP(hostname.replace(/^\[|\]$/g, ""))) {
+    throw new SafeFetchError("IP literals are not allowed", "BLOCKED_ADDRESS")
+  }
+  await resolveAllowedAddresses(hostname)
+}
+
 export const safeFetchJsonResponse = async (
   input: string,
   { maxBodyBytes = DEFAULT_MAX_BODY_BYTES }: SafeFetchJsonOptions = {},

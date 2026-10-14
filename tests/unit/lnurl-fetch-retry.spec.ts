@@ -108,12 +108,12 @@ describe("getInvoiceFromLightningAddress (SSRF)", () => {
       )
 
     await expect(getInvoiceFromLightningAddress("a@evil.example", 10)).rejects.toThrow(
-      "hostname does not resolve to a public address",
+      "Invalid LNURL callback",
     )
     expect(rawFetch).not.toHaveBeenCalled()
+    expect(mockSafeFetchJson).toHaveBeenCalledTimes(1)
     expect(mockSafeFetchJson.mock.calls[0][0]).toBe(
       "https://evil.example/.well-known/lnurlp/a",
     )
-    expect(mockSafeFetchJson.mock.calls[1][0]).toContain("https://10.0.0.5:8080/")
   })
 })
