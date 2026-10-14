@@ -370,12 +370,24 @@ async function handleTopUpCallback(
   // We'll credit the card when the invoice is paid
   // IMPORTANT: For both BTC and USD cards, we now create BTC invoices (exact sat amount)
   // So we always store amount in SATS here. For USD cards, we convert sats→cents at processing time.
-  await storePendingTopUp(
+  const stored = await storePendingTopUp(
     cardId,
     invoiceResult.paymentHash as string,
     amountSats,
     card.walletCurrency,
   )
+
+  // Never hand out an invoice we cannot credit: without the pending record,
+  // neither the webhook nor polling has the card/amount mapping.
+  if (!stored) {
+    console.error(
+      `[LNURLP] Pending top-up record failed to persist for card ${cardId}; invoice withheld`,
+    )
+    return {
+      status: "ERROR",
+      reason: "Could not register the top-up - please try again",
+    }
+  }
 
   console.log(
     `[LNURLP] Generated invoice for card ${cardId} (${card.walletCurrency}) top-up: ${amountSats} sats`,
@@ -631,8 +643,13 @@ async function processTopUpPayment(paymentHash: string): Promise<ProcessTopUpRes
 
   if (!result.success) {
     // Definite failure, nothing written. BTC: nothing external happened ->
-    // retryable. USD: the transfer already happened -> keep the claim.
-    if (currency !== "USD") await release()
+    // retryable. USD: the transfer already happened -> keep the claim AND
+    // flag it for review (the transferred funds need reconciliation).
+    if (currency !== "USD") {
+      await release()
+    } else {
+      await review(`Post-transfer credit failed: ${result.error}`)
+    }
     return { success: false, error: result.error }
   }
 
@@ -686,13 +703,19 @@ async function getAllPendingTopUps(): Promise<PendingTopUpData[]> {
  * @returns { status: PAID | PENDING | EXPIRED | ERROR }. PAID always carries a
  * finite numeric settlementAmount (otherwise ERROR).
  */
+/**
+ * Payment/invoice status lookup, classified by DIRECTION because outgoing and
+ * incoming payments have different terminal statuses:
+ * - RECEIVE (top-ups): SUCCESS is final; FAILED -> EXPIRED.
+ * - SEND (withdrawals): SUCCESS is final; FAILURE is the terminal failure.
+ */
 async function fetchInvoiceReceipt(
   paymentHash: string,
   apiKey: string,
   apiUrl: string,
   walletId: string,
+  direction: "RECEIVE" | "SEND" = "RECEIVE",
 ): Promise<InvoiceReceipt> {
-  // Query recent transactions to find if this payment hash exists as a receive
   const query = `
     query GetTransactionsByPaymentHash($paymentHash: PaymentHash!, $walletId: WalletId!) {
       me {
@@ -749,9 +772,9 @@ async function fetchInvoiceReceipt(
       return { status: "PENDING" }
     }
 
-    // Look for a successful receive transaction
+    // Look for a successful transaction in the requested direction
     const receiveTransaction = transactions.find(
-      (tx: BlinkTransaction) => tx.direction === "RECEIVE" && tx.status === "SUCCESS",
+      (tx: BlinkTransaction) => tx.direction === direction && tx.status === "SUCCESS",
     )
 
     if (receiveTransaction) {
@@ -770,8 +793,13 @@ async function fetchInvoiceReceipt(
       return { status: "PAID", settlementAmount: amount }
     }
 
-    // Transaction exists but not successful
-    const failedTx = transactions.find((tx: BlinkTransaction) => tx.status === "FAILED")
+    // Transaction exists but not successful. Terminal failure is FAILED for
+    // receives and FAILURE for sends (Blink's TxStatus on the send path).
+    const terminalFailure = direction === "SEND" ? "FAILURE" : "FAILED"
+    const failedTx = transactions.find(
+      (tx: BlinkTransaction) =>
+        tx.direction === direction && tx.status === terminalFailure,
+    )
     if (failedTx) {
       return { status: "EXPIRED" }
     }
@@ -792,8 +820,10 @@ async function checkInvoiceStatus(
   apiKey: string,
   apiUrl: string,
   walletId: string,
+  direction?: "RECEIVE" | "SEND",
 ): Promise<InvoiceStatus> {
-  return (await fetchInvoiceReceipt(paymentHash, apiKey, apiUrl, walletId)).status
+  return (await fetchInvoiceReceipt(paymentHash, apiKey, apiUrl, walletId, direction))
+    .status
 }
 
 /**

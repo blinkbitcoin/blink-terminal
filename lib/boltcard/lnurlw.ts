@@ -715,9 +715,10 @@ async function reconcilePendingWithdrawals(cardId?: string): Promise<{
     try {
       const card = (await boltcardStore.getCard(item.cardId, true)) as BoltcardCard | null
       if (!card || card.status === CardStatus.WIPED) {
-        // Card gone: nothing to restore, close it out
-        await boltcardStore.resolvePendingWithdrawal(item.paymentHash, "FAILED")
-        resolved++
+        // Card gone: nothing to restore, close it out (one-shot resolve)
+        if (await boltcardStore.resolvePendingWithdrawal(item.paymentHash, "FAILED")) {
+          resolved++
+        }
         continue
       }
 
@@ -729,16 +730,18 @@ async function reconcilePendingWithdrawals(cardId?: string): Promise<{
         card.apiKey as string,
         getApiUrlForEnvironment(card.environment as EnvironmentName),
         card.walletId,
+        "SEND",
       )
 
       if (status === "PAID") {
-        await boltcardStore.resolvePendingWithdrawal(item.paymentHash, "SUCCESS")
-        resolved++
+        if (await boltcardStore.resolvePendingWithdrawal(item.paymentHash)) resolved++
       } else if (status === "EXPIRED") {
-        // Terminal failure: the payee was never paid - restore the deduction
-        if (await boltcardStore.rollbackSpend(item.cardId, item.amount)) restored++
-        await boltcardStore.resolvePendingWithdrawal(item.paymentHash, "FAILED")
-        resolved++
+        // Terminal failure (send path): resolve AND restore the deduction in
+        // one statement — at most once, and never resolved without restoring.
+        if (await boltcardStore.resolvePendingWithdrawalFailed(item.paymentHash)) {
+          resolved++
+          restored++
+        }
       }
       // PENDING / ERROR: leave for the next pass
     } catch (err: unknown) {

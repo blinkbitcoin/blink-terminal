@@ -427,7 +427,7 @@ describe("review states (pending withdrawals, top-up flags)", () => {
 
   it("resolvePendingWithdrawal is one-shot", async () => {
     mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{}] })
-    await expect(store().resolvePendingWithdrawal("h", "SUCCESS")).resolves.toBe(true)
+    await expect(store().resolvePendingWithdrawal("h")).resolves.toBe(true)
     const [sql] = mockPoolQuery.mock.calls[0]
     expect(String(sql)).toMatch(/WHERE payment_hash = \$1 AND resolved_at IS NULL/)
   })
@@ -453,5 +453,69 @@ describe("review states (pending withdrawals, top-up flags)", () => {
     expect(String(mockPoolQuery.mock.calls[0][0])).toMatch(
       /needs_review = FALSE, review_reason = NULL/,
     )
+  })
+})
+
+describe("incrementDailySpent: checks and deduction in one statement", () => {
+  it("gates on status, balance, per-tx and daily limit in the same UPDATE", async () => {
+    mockPoolQuery.mockResolvedValueOnce({
+      rowCount: 1,
+      rows: [{ balance: "4000", daily_spent: "1000" }],
+    })
+    const s = store()
+    jest.spyOn(s, "getCard").mockResolvedValue({
+      id: "c1",
+      status: "ACTIVE",
+      maxTxAmount: 2000,
+      dailyLimit: 5000,
+    } as never)
+
+    const res = await s.incrementDailySpent("c1", 1000)
+
+    expect(res).toEqual({ success: true, balance: 4000, dailySpent: 1000 })
+    expect(mockPoolQuery).toHaveBeenCalledTimes(1)
+    const [sql, params] = mockPoolQuery.mock.calls[0]
+    const q = String(sql).replace(/\s+/g, " ")
+    expect(q).toMatch(/SET balance = balance - \$2/)
+    expect(q).toMatch(
+      /daily_spent = CASE WHEN daily_reset_at IS NOT NULL AND daily_reset_at < \$3 THEN \$2 ELSE daily_spent \+ \$2 END/,
+    )
+    expect(q).toMatch(/AND balance >= \$2/)
+    expect(q).toMatch(/\$5::bigint IS NULL OR \$2 <= \$5/)
+    expect(q).toMatch(/daily_limit IS NULL OR \(CASE/)
+    expect(q).toMatch(/\+ \$2 <= daily_limit/)
+    expect(params).toEqual(["c1", 1000, expect.any(Number), expect.any(Number), 2000])
+  })
+
+  it("zero rows -> declined (balance or limits, atomically)", async () => {
+    mockPoolQuery.mockResolvedValueOnce({ rowCount: 0, rows: [] })
+    const s = store()
+    jest
+      .spyOn(s, "getCard")
+      .mockResolvedValue({ id: "c1", status: "ACTIVE", maxTxAmount: null } as never)
+    const res = await s.incrementDailySpent("c1", 1000)
+    expect(res.success).toBe(false)
+  })
+})
+
+describe("resolvePendingWithdrawalFailed: resolve + restore in one statement", () => {
+  it("CTE resolves once and restores the deduction in the same statement", async () => {
+    mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{ id: "c1" }] })
+    await expect(store().resolvePendingWithdrawalFailed("h")).resolves.toBe(true)
+
+    const [sql, params] = mockPoolQuery.mock.calls[0]
+    const q = String(sql).replace(/\s+/g, " ")
+    expect(q).toMatch(
+      /WITH resolved AS \( UPDATE boltcard_pending_withdrawals SET resolved_at = \$2, outcome = 'FAILED' WHERE payment_hash = \$1 AND resolved_at IS NULL RETURNING card_id, amount \)/,
+    )
+    expect(q).toMatch(
+      /UPDATE boltcards SET balance = balance \+ r.amount, daily_spent = GREATEST\(0, daily_spent - r.amount\) FROM resolved r/,
+    )
+    expect(params[0]).toBe("h")
+  })
+
+  it("already resolved -> zero rows, nothing restored", async () => {
+    mockPoolQuery.mockResolvedValueOnce({ rowCount: 0, rows: [] })
+    await expect(store().resolvePendingWithdrawalFailed("h")).resolves.toBe(false)
   })
 })

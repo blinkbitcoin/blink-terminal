@@ -1330,7 +1330,6 @@ class BoltcardStore {
     try {
       const now: number = Date.now()
 
-      // First check if daily limit needs reset
       const card: BoltcardData | null = await this.getCard(cardId)
       if (!card) {
         return { success: false, error: "Card not found" }
@@ -1340,47 +1339,42 @@ class BoltcardStore {
         return { success: false, error: "Card is not active" }
       }
 
-      // Check if we need to reset daily spent
-      if (card.dailyResetAt && card.dailyResetAt < now) {
-        await query(
-          `UPDATE boltcards 
-           SET daily_spent = 0, daily_reset_at = $2 
-           WHERE id = $1`,
-          [cardId, now + 24 * 60 * 60 * 1000],
-        )
-        card.dailySpent = 0
-      }
-
-      // Check balance
-      if (card.balance < amount) {
-        return { success: false, error: "Insufficient balance" }
-      }
-
-      // Check per-transaction limit
-      if (card.maxTxAmount && amount > card.maxTxAmount) {
-        return { success: false, error: "Amount exceeds per-transaction limit" }
-      }
-
-      // Check daily limit
-      if (card.dailyLimit && card.dailySpent + amount > card.dailyLimit) {
-        return { success: false, error: "Amount exceeds daily limit" }
-      }
-
-      // Atomic update: deduct balance and increment daily spent
+      // Reset, limit validation, balance deduction and daily-spent increment
+      // in ONE conditional statement: checks and mutation see the same row,
+      // so concurrent withdrawals can never jointly exceed the daily limit.
       const result: QueryResult<DbRow> = await query(
-        `UPDATE boltcards 
+        `UPDATE boltcards
          SET balance = balance - $2,
-             daily_spent = daily_spent + $2,
+             daily_spent = CASE
+               WHEN daily_reset_at IS NOT NULL AND daily_reset_at < $3 THEN $2
+               ELSE daily_spent + $2
+             END,
+             daily_reset_at = CASE
+               WHEN daily_reset_at IS NOT NULL AND daily_reset_at < $3 THEN $4
+               ELSE daily_reset_at
+             END,
              last_used_at = $3
-         WHERE id = $1 
+         WHERE id = $1
            AND status = 'ACTIVE'
            AND balance >= $2
+           AND ($5::bigint IS NULL OR $2 <= $5)
+           AND (
+             daily_limit IS NULL
+             OR (CASE
+                   WHEN daily_reset_at IS NOT NULL AND daily_reset_at < $3
+                   THEN 0
+                   ELSE daily_spent
+                 END) + $2 <= daily_limit
+           )
          RETURNING balance, daily_spent`,
-        [cardId, amount, now],
+        [cardId, amount, now, now + 24 * 60 * 60 * 1000, card.maxTxAmount],
       )
 
       if ((result.rowCount ?? 0) === 0) {
-        return { success: false, error: "Failed to update card" }
+        return {
+          success: false,
+          error: "Payment declined (balance or spending limits)",
+        }
       }
 
       const row: DbRow = result.rows[0]
@@ -1713,12 +1707,13 @@ class BoltcardStore {
   }
 
   /**
-   * Resolve a pending withdrawal (SUCCESS, or FAILED after the deduction was
-   * restored). Unknown outcome keeps it unresolved.
+   * Resolve a pending withdrawal without touching the card (payment settled,
+   * or nothing to restore). One-shot: already-resolved rows return false.
+   * For terminal failures of a live card use resolvePendingWithdrawalFailed.
    */
   async resolvePendingWithdrawal(
     paymentHash: string,
-    outcome: "SUCCESS" | "FAILED",
+    outcome: "SUCCESS" | "FAILED" = "SUCCESS",
   ): Promise<boolean> {
     const result: QueryResult<DbRow> = await query(
       `UPDATE boltcard_pending_withdrawals
@@ -1726,6 +1721,32 @@ class BoltcardStore {
        WHERE payment_hash = $1 AND resolved_at IS NULL
        RETURNING payment_hash`,
       [paymentHash, Date.now(), outcome],
+    )
+    return (result.rowCount ?? 0) > 0
+  }
+
+  /**
+   * Terminal failure: mark resolved AND restore the card's deduction in ONE
+   * statement. If the row was already resolved (or is missing), zero rows are
+   * returned and nothing is restored; if the card write fails, the statement
+   * rolls back and the row stays unresolved. The deduction is restored at
+   * most once.
+   */
+  async resolvePendingWithdrawalFailed(paymentHash: string): Promise<boolean> {
+    const result: QueryResult<DbRow> = await query(
+      `WITH resolved AS (
+         UPDATE boltcard_pending_withdrawals
+         SET resolved_at = $2, outcome = 'FAILED'
+         WHERE payment_hash = $1 AND resolved_at IS NULL
+         RETURNING card_id, amount
+       )
+       UPDATE boltcards
+       SET balance = balance + r.amount,
+           daily_spent = GREATEST(0, daily_spent - r.amount)
+       FROM resolved r
+       WHERE boltcards.id = r.card_id
+       RETURNING boltcards.id`,
+      [paymentHash, Date.now()],
     )
     return (result.rowCount ?? 0) > 0
   }
