@@ -452,18 +452,14 @@ describe("review states (pending withdrawals, top-up flags)", () => {
     expect(mockPoolQuery).toHaveBeenCalledTimes(2)
   })
 
-  it("a finished row is reopened for a new attempt of the same hash", async () => {
-    mockPoolQuery
-      .mockResolvedValueOnce({ rowCount: 0, rows: [] })
-      .mockResolvedValueOnce({
-        rows: [{ card_id: "c1", amount: "1000", kind: "PENDING", resolved_at: "5" }],
-      })
-      .mockResolvedValueOnce({ rowCount: 1, rows: [{}] })
-    await store().recordPendingWithdrawal("h", "c1", 1000, 4000, "UNKNOWN", 9)
-    const q = String(mockPoolQuery.mock.calls[2][0]).replace(/\s+/g, " ")
-    expect(q).toMatch(/resolved_at = NULL/)
-    expect(q).toMatch(/outcome = 'FAILED'/)
-    expect(q).toMatch(/card_id = \$7/)
+  it("a finished row is not reopened", async () => {
+    mockPoolQuery.mockResolvedValueOnce({ rowCount: 0, rows: [] }).mockResolvedValueOnce({
+      rows: [{ card_id: "c1", amount: "1000", kind: "PENDING", resolved_at: "5" }],
+    })
+    await expect(
+      store().recordPendingWithdrawal("h", "c1", 1000, 4000, "UNKNOWN", 9),
+    ).rejects.toThrow(/already spent/)
+    expect(sqlCalls().join(" ")).not.toMatch(/resolved_at = NULL/)
   })
 
   it("claimAndDeductWithdrawal claims and deducts in one transaction", async () => {
@@ -490,17 +486,25 @@ describe("review states (pending withdrawals, top-up flags)", () => {
     expect(sql.join(" ")).not.toMatch(/ROLLBACK/)
   })
 
-  it("a taken hash is spent: the deduction statement never runs", async () => {
+  it("a taken hash, including a finished failure, is spent: no second deduction", async () => {
     mockPoolQuery
-      .mockResolvedValueOnce({})
-      .mockResolvedValueOnce({ rowCount: 0, rows: [] })
-      .mockResolvedValueOnce({ rowCount: 0, rows: [] })
+      .mockResolvedValueOnce({}) // BEGIN
+      .mockResolvedValueOnce({ rowCount: 0, rows: [] }) // hash already present
+      // A reintroduced reclaim would treat this as success and deduct.
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{ attempt: "2" }] })
+      .mockResolvedValueOnce({
+        rowCount: 1,
+        rows: [{ balance: "3000", daily_spent: "2000", daily_reset_at: null }],
+      })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [] })
       .mockResolvedValueOnce({})
     await expect(store().claimAndDeductWithdrawal("h", "c1", 1000)).resolves.toEqual({
       status: "spent",
     })
-    expect(sqlCalls().join(" ")).toMatch(/ROLLBACK/)
-    expect(sqlCalls().join(" ")).not.toMatch(/balance = balance -/)
+    const sql = sqlCalls().join(" ")
+    expect(sql).toMatch(/ROLLBACK/)
+    expect(sql).not.toMatch(/balance = balance -/)
+    expect(sql).not.toMatch(/attempt = attempt \+ 1/)
   })
 
   it("beginWithdrawalSend moves only an unresolved CLAIMED row to UNKNOWN", async () => {

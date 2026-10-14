@@ -1704,8 +1704,7 @@ class BoltcardStore {
    * unresolved) a different amount throws — the hash must not silently keep
    * stale data. An unresolved RESTORE_FAILED row is upgraded to PENDING or
    * UNKNOWN so reconciliation will not treat an in-flight retry as never sent.
-   * A finished row is reopened for the new attempt (the hash is the primary
-   * key). Throws on database errors — callers must not report success unless
+   * A finished row keeps the hash; a new invoice is required. Throws on database errors — callers must not report success unless
    * this persists.
    */
   async recordPendingWithdrawal(
@@ -1789,37 +1788,9 @@ class BoltcardStore {
     }
     if (!resolved) return
 
-    // Only a finished FAILED attempt can be reopened. A SUCCESS row means the
-    // invoice was spent and must not be deducted again.
-    const reopened: QueryResult<DbRow> = await query(
-      `UPDATE boltcard_pending_withdrawals
-       SET amount = $2,
-           balance_after = $3,
-           created_at = $4,
-           kind = $5,
-           daily_window_reset_at = $6,
-           attempt = attempt + 1,
-           resolved_at = NULL,
-           outcome = NULL
-       WHERE payment_hash = $1
-          AND resolved_at IS NOT NULL
-          AND outcome = 'FAILED'
-          AND card_id = $7`,
-      [
-        paymentHash,
-        amountInt,
-        Math.floor(balanceAfter),
-        Date.now(),
-        kind,
-        dailyWindowResetAt,
-        cardId,
-      ],
-    )
-    if ((reopened.rowCount ?? 0) === 0) {
-      throw new Error(
-        "pending withdrawal conflict: payment hash is already spent or not reclaimable",
-      )
-    }
+    // A finished row keeps the hash. Reopening it would let a later try be
+    // refunded from the earlier try's Blink transaction.
+    throw new Error("pending withdrawal conflict: payment hash is already spent")
   }
 
   /**
@@ -1848,10 +1819,10 @@ class BoltcardStore {
 
   /**
    * Claim this invoice hash and deduct in one transaction. A conflicting hash
-   * is already taken (in flight or spent) unless it is a finished FAILED
-   * attempt for the same card, which can be re-claimed. Zero-row deduction
-   * rolls the claim back (definite decline). A database error throws: the
-   * transaction may have committed, and callers must not treat that as a decline.
+   * is already taken, including a finished FAILED attempt: that hash is spent
+   * and the wallet must present a new invoice. Zero-row deduction rolls the
+   * claim back (definite decline). A database error throws: the transaction
+   * may have committed, and callers must not treat that as a decline.
    */
   async claimAndDeductWithdrawal(
     paymentHash: string,
@@ -1881,33 +1852,11 @@ class BoltcardStore {
          RETURNING attempt`,
         [paymentHash, cardId, amountInt, now],
       )
-      let owned = (inserted.rowCount ?? 0) > 0
-      let attempt = owned ? parseInt(String(inserted.rows[0].attempt), 10) : 0
-      if (!owned) {
-        const reclaimed: QueryResult<DbRow> = await client.query(
-          `UPDATE boltcard_pending_withdrawals
-           SET amount = $3,
-               balance_after = 0,
-               created_at = $4,
-               kind = 'CLAIMED',
-               daily_window_reset_at = NULL,
-               attempt = attempt + 1,
-               resolved_at = NULL,
-               outcome = NULL
-           WHERE payment_hash = $1
-             AND resolved_at IS NOT NULL
-             AND outcome = 'FAILED'
-             AND card_id = $2
-           RETURNING attempt`,
-          [paymentHash, cardId, amountInt, now],
-        )
-        owned = (reclaimed.rowCount ?? 0) > 0
-        if (owned) attempt = parseInt(String(reclaimed.rows[0].attempt), 10)
-      }
-      if (!owned) {
+      if ((inserted.rowCount ?? 0) === 0) {
         await client.query("ROLLBACK")
         return { status: "spent" }
       }
+      const attempt = parseInt(String(inserted.rows[0].attempt), 10)
 
       const deducted: QueryResult<DbRow> = await client.query(
         `UPDATE boltcards
