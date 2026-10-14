@@ -236,6 +236,9 @@ const PendingStatus = {
 // Default registration expiry (15 minutes)
 const REGISTRATION_EXPIRY_MS: number = 15 * 60 * 1000
 
+/** Thrown when a newly minted / reprogrammed card could not be activated. */
+const CARD_ACTIVATION_FAILED = "Failed to activate card"
+
 /**
  * Owner pubkeys are stored and looked up lowercase (hex), matching the Nostr
  * session; migration 023 normalizes legacy rows.
@@ -650,6 +653,12 @@ class BoltcardStore {
           cardUid,
         )
         if (updated) {
+          // reprogramCard resets the card to PENDING: re-activate (the NFC
+          // Programmer app has no confirmation callback) before handing out
+          // keys, and fail if that didn't persist.
+          if (!(await this.activateCard(existingCard.id))) {
+            throw new Error(CARD_ACTIVATION_FAILED)
+          }
           // Mark registration as completed
           await query(
             `UPDATE boltcard_pending_registrations 
@@ -687,9 +696,13 @@ class BoltcardStore {
       throw new Error("Failed to create card")
     }
 
-    // Auto-activate the card since NFC Programmer app doesn't have a confirmation callback
-    // If programming fails, user can delete and re-register the card
-    await this.activateCard(card.id)
+    // Auto-activate the card since NFC Programmer app doesn't have a confirmation callback.
+    // If activation didn't persist, fail WITHOUT returning keys. The card row
+    // exists, so the link stays consumed; the owner recovers by starting a new
+    // registration and tapping the same card (same-owner reprogram path).
+    if (!(await this.activateCard(card.id))) {
+      throw new Error(CARD_ACTIVATION_FAILED)
+    }
 
     // Mark registration as completed
     await query(
@@ -1849,4 +1862,4 @@ class BoltcardStore {
 // Export singleton instance and constants
 const boltcardStore: BoltcardStore = new BoltcardStore()
 export default boltcardStore
-export { BoltcardStore, CardStatus, TxType, PendingStatus }
+export { BoltcardStore, CardStatus, TxType, PendingStatus, CARD_ACTIVATION_FAILED }

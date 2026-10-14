@@ -499,6 +499,24 @@ describe("keys link (NFC Programmer app)", () => {
     expect((await post()).statusCode).toBe(404)
   })
 
+  it("activation failure -> 500 with a recovery hint and no keys", async () => {
+    mockStore.getPendingRegistration = jest
+      .fn()
+      .mockResolvedValue({ status: "PENDING", expiresAt: Date.now() + 60_000 })
+    mockStore.completePendingRegistration = jest
+      .fn()
+      .mockRejectedValue(new Error("Failed to activate card"))
+
+    const res = await post()
+
+    expect(res.statusCode).toBe(500)
+    expect(res.body).toEqual({
+      status: "ERROR",
+      reason:
+        "Card could not be activated - start a new registration and tap the same card",
+    })
+  })
+
   it("returns keys once and never logs keys, headers or the registration id", async () => {
     mockStore.getPendingRegistration = jest
       .fn()

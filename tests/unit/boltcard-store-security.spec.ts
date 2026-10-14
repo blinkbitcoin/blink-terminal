@@ -16,7 +16,7 @@ jest.mock("../../lib/auth", () => ({
   default: { encryptApiKey: (k: string) => k, decryptApiKey: (k: string) => k },
 }))
 
-import { BoltcardStore } from "../../lib/boltcard/store"
+import { BoltcardStore, CARD_ACTIVATION_FAILED } from "../../lib/boltcard/store"
 
 const pendingRow = {
   id: "r".repeat(32),
@@ -133,6 +133,61 @@ describe("completePendingRegistration: claim released only if nothing was writte
       s.completePendingRegistration(pendingRow.id, "04a39493cc8680"),
     ).rejects.toThrow("boom")
     expect(released()).toBe(false)
+  })
+
+  it("activateCard returns false (its real failure contract) -> fails without keys, stays consumed", async () => {
+    mockDb()
+    const s = store()
+    jest.spyOn(s, "createCard").mockResolvedValue({ id: "card-1" } as never)
+    jest.spyOn(s, "activateCard").mockResolvedValue(false)
+    const getCard = jest.spyOn(s, "getCard")
+
+    await expect(
+      s.completePendingRegistration(pendingRow.id, "04a39493cc8680"),
+    ).rejects.toThrow(CARD_ACTIVATION_FAILED)
+    expect(released()).toBe(false)
+    // never linked, never loaded with keys
+    expect(
+      mockPoolQuery.mock.calls.some(([sql]) => /card_id = \$4/.test(String(sql))),
+    ).toBe(false)
+    expect(getCard).not.toHaveBeenCalled()
+  })
+
+  it("reprogram (same owner) re-activates the card, then links and returns keys", async () => {
+    mockDb({
+      existingCard: { id: "x", owner_pubkey: pendingRow.owner_pubkey, status: "PENDING" },
+    })
+    const s = store()
+    jest.spyOn(s, "reprogramCard").mockResolvedValue({ id: "x" } as never)
+    const activate = jest.spyOn(s, "activateCard").mockResolvedValue(true)
+    jest.spyOn(s, "getCard").mockResolvedValue({ id: "x", k0: "k" } as never)
+
+    await expect(
+      s.completePendingRegistration(pendingRow.id, "04a39493cc8680"),
+    ).resolves.toEqual({
+      id: "x",
+      k0: "k",
+    })
+    expect(activate).toHaveBeenCalledWith("x")
+    expect(
+      mockPoolQuery.mock.calls.some(([sql]) => /card_id = \$4/.test(String(sql))),
+    ).toBe(true)
+  })
+
+  it("reprogram whose activation returns false -> fails without keys, stays consumed", async () => {
+    mockDb({
+      existingCard: { id: "x", owner_pubkey: pendingRow.owner_pubkey, status: "ACTIVE" },
+    })
+    const s = store()
+    jest.spyOn(s, "reprogramCard").mockResolvedValue({ id: "x" } as never)
+    jest.spyOn(s, "activateCard").mockResolvedValue(false)
+    const getCard = jest.spyOn(s, "getCard")
+
+    await expect(
+      s.completePendingRegistration(pendingRow.id, "04a39493cc8680"),
+    ).rejects.toThrow(CARD_ACTIVATION_FAILED)
+    expect(released()).toBe(false)
+    expect(getCard).not.toHaveBeenCalled()
   })
 
   it("the final linkage update throws -> the link stays consumed", async () => {

@@ -29,7 +29,7 @@ import type { NextApiRequest, NextApiResponse } from "next"
 
 import * as boltcardCrypto from "../../../../lib/boltcard/crypto"
 import * as lnurlw from "../../../../lib/boltcard/lnurlw"
-import boltcardStore from "../../../../lib/boltcard/store"
+import boltcardStore, { CARD_ACTIVATION_FAILED } from "../../../../lib/boltcard/store"
 import { withRateLimit, RATE_LIMIT_READ } from "../../../../lib/rate-limit"
 
 async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -164,6 +164,15 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     console.error(`[KeysAPI][${requestId}] ERROR:`, error)
 
     // Handle specific errors
+    if (error instanceof Error && error.message === CARD_ACTIVATION_FAILED) {
+      // No keys: the card row exists but isn't active. Recovery is a fresh
+      // registration with the same card (same-owner reprogram).
+      return res.status(500).json({
+        status: "ERROR",
+        reason:
+          "Card could not be activated - start a new registration and tap the same card",
+      })
+    }
     if (error instanceof Error && error.message === "Registration is not pending") {
       return res.status(404).json({ status: "ERROR", reason: "Registration not found" })
     }
