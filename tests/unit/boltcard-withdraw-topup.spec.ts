@@ -229,6 +229,21 @@ describe("callback: k1 required, single-use, capped", () => {
     expect(mockStore.consumeWithdrawSession).toHaveBeenCalledWith(K1, CARD_ID)
   })
 
+  it("a PENDING payment returns OK but is recorded as in-flight for reconciliation", async () => {
+    mockStore.consumeWithdrawSession = jest.fn().mockResolvedValue(5000 * 1000)
+    pay.mockResolvedValue({ success: true, status: "PENDING", paymentHash: "h" })
+    const res = await handleWithdrawCallback(CARD_ID, K1, invoice(1000), pay)
+
+    expect(res.status).toBe("OK")
+    expect(mockStore.rollbackSpend).not.toHaveBeenCalled()
+    expect(mockStore.recordTransaction).toHaveBeenCalledWith(
+      CARD_ID,
+      expect.objectContaining({
+        description: "Card payment - in flight, pending reconciliation",
+      }),
+    )
+  })
+
   it("a definite payment failure restores the balance", async () => {
     mockStore.consumeWithdrawSession = jest.fn().mockResolvedValue(5000 * 1000)
     pay.mockResolvedValue({ success: false, definite: true, error: "no route" })
@@ -264,8 +279,8 @@ describe("payCardInvoice: wallet by currency, outcome classification", () => {
   })
 
   it.each([
-    ["SUCCESS", { success: true }],
-    ["PENDING", { success: true }],
+    ["SUCCESS", { success: true, status: "SUCCESS" }],
+    ["PENDING", { success: true, status: "PENDING" }],
     ["FAILURE", { success: false, definite: true }],
     ["WEIRD", { success: false, definite: false }],
   ])("status %s", async (status, expected) => {
@@ -349,11 +364,72 @@ describe("processTopUpPayment: verified, claimed once, USD only on transfer succ
     )
   })
 
-  it("BTC: credit failure releases the claim for a retry", async () => {
+  it("BTC: a definite credit failure (zero rows) releases the claim for a retry", async () => {
     receipt("SUCCESS", 1000)
-    mockStore.topUpCard = jest.fn().mockResolvedValue({ success: false, error: "x" })
+    mockStore.topUpCard = jest.fn().mockResolvedValue({
+      success: false,
+      error: "Card not found or not active",
+    })
     await processTopUpPayment(HASH)
     expect(mockStore.unmarkTopUpProcessed).toHaveBeenCalledWith(HASH)
+  })
+
+  it("BTC: an ambiguous credit error (write may have committed) keeps the claim", async () => {
+    receipt("SUCCESS", 1000)
+    mockStore.topUpCard = jest.fn().mockRejectedValue(new Error("connection reset"))
+    const res = await processTopUpPayment(HASH)
+    expect(res.success).toBe(false)
+    expect(mockStore.unmarkTopUpProcessed).not.toHaveBeenCalled()
+  })
+
+  it("a receipt without a usable settlement amount fails closed", async () => {
+    receipt("SUCCESS", undefined as unknown as number)
+    const res = await processTopUpPayment(HASH)
+    expect(res.success).toBe(false)
+    expect(mockStore.markTopUpProcessed).not.toHaveBeenCalled()
+    expect(mockStore.topUpCard).not.toHaveBeenCalled()
+  })
+
+  it("activates a PENDING card BEFORE claiming or transferring", async () => {
+    receipt("SUCCESS", 1000)
+    const order: string[] = []
+    mockStore.getCard = jest
+      .fn()
+      .mockResolvedValue(
+        card({ status: "PENDING", walletCurrency: "USD", walletId: "wallet-usd" }),
+      )
+    mockStore.getPendingTopUp = jest
+      .fn()
+      .mockResolvedValue({ cardId: CARD_ID, amount: 1000, currency: "USD" })
+    mockStore.activateCard = jest.fn().mockImplementation(async () => {
+      order.push("activate")
+      return true
+    })
+    mockStore.markTopUpProcessed = jest.fn().mockImplementation(async () => {
+      order.push("claim")
+      return true
+    })
+    mockBlink.intraLedgerPaymentSend = jest.fn().mockImplementation(async () => {
+      order.push("transfer")
+      return { status: "SUCCESS" }
+    })
+    mockBlink.getExchangeRatePublic.mockResolvedValue({ satPriceInCurrency: 0.07 })
+
+    expect((await processTopUpPayment(HASH)).success).toBe(true)
+    expect(order).toEqual(["activate", "claim", "transfer"])
+  })
+
+  it("a PENDING card whose activation fails: no claim, no transfer, retryable", async () => {
+    receipt("SUCCESS", 1000)
+    mockStore.getCard = jest.fn().mockResolvedValue(card({ status: "PENDING" }))
+    mockStore.activateCard = jest.fn().mockResolvedValue(false)
+
+    const res = await processTopUpPayment(HASH)
+
+    expect(res.success).toBe(false)
+    expect(mockStore.markTopUpProcessed).not.toHaveBeenCalled()
+    expect(mockBlink.intraLedgerPaymentSend).not.toHaveBeenCalled()
+    expect(mockStore.topUpCard).not.toHaveBeenCalled()
   })
 
   describe("USD card", () => {
@@ -368,11 +444,21 @@ describe("processTopUpPayment: verified, claimed once, USD only on transfer succ
       receipt("SUCCESS", 1000)
     })
 
-    it("transfer status not SUCCESS -> released, no credit", async () => {
-      mockBlink.intraLedgerPaymentSend.mockResolvedValue({ status: "FAILURE" })
+    it.each([
+      ["FAILED (terminal failure)", "FAILED", true],
+      ["failed (lowercase)", "failed", true],
+      ["PENDING (may still settle)", "PENDING", false],
+      ["ALREADY_PAID (it moved)", "ALREADY_PAID", false],
+      ["an unrecognized status", "WEIRD", false],
+    ])("transfer %s -> released=%p", async (_name, status, released) => {
+      mockBlink.intraLedgerPaymentSend.mockResolvedValue({ status })
       expect((await processTopUpPayment(HASH)).success).toBe(false)
       expect(mockStore.topUpCard).not.toHaveBeenCalled()
-      expect(mockStore.unmarkTopUpProcessed).toHaveBeenCalledWith(HASH)
+      if (released) {
+        expect(mockStore.unmarkTopUpProcessed).toHaveBeenCalledWith(HASH)
+      } else {
+        expect(mockStore.unmarkTopUpProcessed).not.toHaveBeenCalled()
+      }
     })
 
     it("transfer rejected by the API -> released, no credit", async () => {

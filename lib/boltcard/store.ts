@@ -1279,6 +1279,19 @@ class BoltcardStore {
   /**
    * Get transactions for a card
    */
+  _rowToTransaction(row: DbRow): TransactionRecord {
+    return {
+      id: row.id as number,
+      cardId: row.card_id as string,
+      type: row.tx_type as string,
+      amount: parseInt(row.amount as string, 10),
+      balanceAfter: parseInt(row.balance_after as string, 10),
+      paymentHash: row.payment_hash as string | null,
+      description: row.description as string | null,
+      createdAt: parseInt(row.created_at as string, 10),
+    }
+  }
+
   async getCardTransactions(
     cardId: string,
     limit: number = 50,
@@ -1857,43 +1870,45 @@ class BoltcardStore {
     paymentHash: string,
     description: string | null = null,
   ): Promise<TopUpResult> {
-    try {
-      // Atomic update: add to balance
-      const result: QueryResult<DbRow> = await query(
-        `UPDATE boltcards 
+    // Balance mutation AND its audit record in ONE statement: no credited
+    // balance without its transaction row, and no window between them.
+    // Zero rows = definite failure (card missing / not active, nothing
+    // written); a thrown database error is AMBIGUOUS (the write may have
+    // committed) and is rethrown so callers keep the top-up claim.
+    const result: QueryResult<DbRow> = await query(
+      `WITH credited AS (
+         UPDATE boltcards
          SET balance = balance + $2
          WHERE id = $1 AND status = 'ACTIVE'
-         RETURNING balance`,
-        [cardId, amount],
-      )
-
-      if ((result.rowCount ?? 0) === 0) {
-        return { success: false, error: "Card not found or not active" }
-      }
-
-      const newBalance: number = parseInt(result.rows[0].balance as string, 10)
-
-      // Record the top-up transaction
-      const tx: TransactionRecord | null = await this.recordTransaction(cardId, {
-        type: TxType.TOPUP,
+         RETURNING balance
+       )
+       INSERT INTO boltcard_transactions
+         (card_id, tx_type, amount, balance_after, payment_hash, description, created_at)
+       SELECT id, $3, $2, balance, $4, $5, $6 FROM credited
+       RETURNING *`,
+      [
+        cardId,
         amount,
-        balanceAfter: newBalance,
-        paymentHash,
-        description: description || "Card top-up",
-      })
+        TxType.TOPUP,
+        paymentHash || null,
+        description || "Card top-up",
+        Date.now(),
+      ],
+    )
 
-      console.log(
-        `[BoltcardStore] Topped up card ${cardId}: +${amount} (new balance: ${newBalance})`,
-      )
+    if ((result.rowCount ?? 0) === 0) {
+      return { success: false, error: "Card not found or not active" }
+    }
 
-      return {
-        success: true,
-        balance: newBalance,
-        transaction: tx,
-      }
-    } catch (err: unknown) {
-      console.error("[BoltcardStore] topUpCard error:", (err as Error).message)
-      return { success: false, error: (err as Error).message }
+    const newBalance: number = parseInt(result.rows[0].balance_after as string, 10)
+    console.log(
+      `[BoltcardStore] Topped up card ${cardId}: +${amount} (new balance: ${newBalance})`,
+    )
+
+    return {
+      success: true,
+      balance: newBalance,
+      transaction: this._rowToTransaction(result.rows[0]),
     }
   }
 

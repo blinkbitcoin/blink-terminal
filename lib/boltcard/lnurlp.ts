@@ -509,14 +509,22 @@ async function processTopUpPayment(paymentHash: string): Promise<ProcessTopUpRes
   if (receipt.status !== "PAID") {
     return { success: false, error: `Top-up not paid (${receipt.status})` }
   }
-  if (
-    typeof receipt.settlementAmount === "number" &&
-    Math.abs(receipt.settlementAmount) < amountSats
-  ) {
+  if (Math.abs(receipt.settlementAmount as number) < amountSats) {
     console.error(
       `[LNURLP] Top-up ${paymentHash.substring(0, 16)}... received ${receipt.settlementAmount} < expected ${amountSats} sats`,
     )
     return { success: false, error: "Received amount is lower than the top-up amount" }
+  }
+
+  // A card still PENDING is activated by its first top-up — BEFORE claiming
+  // or transferring anything. If activation doesn't persist, nothing has been
+  // claimed or moved and the top-up can retry once the card is active.
+  if (card.status === CardStatus.PENDING) {
+    if (!(await boltcardStore.activateCard(cardId))) {
+      console.error(`[LNURLP] Could not activate card ${cardId} for its first top-up`)
+      return { success: false, error: "Card could not be activated" }
+    }
+    console.log(`[LNURLP] Card ${cardId} activated on first top-up`)
   }
 
   // 2. Claim it atomically: of concurrent processors (webhook + polling) only
@@ -557,10 +565,24 @@ async function processTopUpPayment(paymentHash: string): Promise<ProcessTopUpRes
       }
     }
 
-    if (transferResult.status !== "SUCCESS") {
+    // The API documents success | failed | pending | already_paid. Only a
+    // terminal FAILED guarantees nothing was transferred (retryable). PENDING
+    // may still settle, ALREADY_PAID did move, and unknown statuses say
+    // nothing — all keep the claim for manual review.
+    const transferStatus = String(transferResult.status || "").toUpperCase()
+    if (transferStatus === "FAILED") {
       console.error(`[LNURLP] Transfer failed: ${JSON.stringify(transferResult)}`)
       await release()
       return { success: false, error: "USD transfer failed" }
+    }
+    if (transferStatus !== "SUCCESS") {
+      console.error(
+        `[LNURLP] Transfer status ${transferStatus} for top-up ${paymentHash.substring(0, 16)}... - manual review needed`,
+      )
+      return {
+        success: false,
+        error: `USD transfer ${transferStatus.toLowerCase()} - manual review needed`,
+      }
     }
 
     try {
@@ -580,24 +602,29 @@ async function processTopUpPayment(paymentHash: string): Promise<ProcessTopUpRes
     }
   }
 
-  // A card that's still PENDING is activated by its first top-up (credit
-  // requires an ACTIVE card).
-  if (card.status === CardStatus.PENDING) {
-    await boltcardStore.activateCard(cardId)
-    console.log(`[LNURLP] Card ${cardId} activated on first top-up`)
+  // 4. Credit the card's local balance. topUpCard distinguishes a definite
+  // failure (zero rows: card missing/not active — nothing written) from an
+  // ambiguous database error (the write may have committed), which throws.
+  let result: TopUpResult
+  try {
+    result = await boltcardStore.topUpCard(
+      cardId,
+      creditAmount,
+      paymentHash,
+      `Top-up via LNURL-pay (${amountSats} sats)`,
+    )
+  } catch (err: unknown) {
+    // Ambiguous: the balance write may have committed. NEVER release the
+    // claim (a retry would credit twice) — flag for manual review.
+    console.error(
+      `[LNURLP] Top-up credit outcome unknown for ${paymentHash.substring(0, 16)}... - manual review needed: ${(err as Error).message}`,
+    )
+    return { success: false, error: "Credit outcome unknown - manual review needed" }
   }
 
-  // 4. Credit the card's local balance
-  const result: TopUpResult = await boltcardStore.topUpCard(
-    cardId,
-    creditAmount,
-    paymentHash,
-    `Top-up via LNURL-pay (${amountSats} sats)`,
-  )
-
   if (!result.success) {
-    // BTC: nothing external happened yet -> retryable. USD: the transfer
-    // already happened -> keep the claim (manual review).
+    // Definite failure, nothing written. BTC: nothing external happened ->
+    // retryable. USD: the transfer already happened -> keep the claim.
     if (currency !== "USD") await release()
     return { success: false, error: result.error }
   }
@@ -649,7 +676,8 @@ async function getAllPendingTopUps(): Promise<PendingTopUpData[]> {
  * @param apiKey - Blink API key
  * @param apiUrl - Blink API URL
  * @param walletId - Wallet ID to check transactions for
- * @returns { status: PAID | PENDING | EXPIRED | ERROR, settlementAmount? }
+ * @returns { status: PAID | PENDING | EXPIRED | ERROR }. PAID always carries a
+ * finite numeric settlementAmount (otherwise ERROR).
  */
 async function fetchInvoiceReceipt(
   paymentHash: string,
@@ -720,16 +748,19 @@ async function fetchInvoiceReceipt(
     )
 
     if (receiveTransaction) {
-      console.log(
-        `[LNURLP] Found paid invoice: ${paymentHash.substring(0, 16)}... amount: ${receiveTransaction.settlementAmount}`,
-      )
-      return {
-        status: "PAID",
-        settlementAmount:
-          typeof receiveTransaction.settlementAmount === "number"
-            ? receiveTransaction.settlementAmount
-            : undefined,
+      // Fail closed: without a finite numeric settlement amount we cannot
+      // prove the expected amount was received.
+      const amount = Number(receiveTransaction.settlementAmount)
+      if (!Number.isFinite(amount)) {
+        console.error(
+          `[LNURLP] Paid invoice ${paymentHash.substring(0, 16)}... has no usable settlementAmount`,
+        )
+        return { status: "ERROR" }
       }
+      console.log(
+        `[LNURLP] Found paid invoice: ${paymentHash.substring(0, 16)}... amount: ${amount}`,
+      )
+      return { status: "PAID", settlementAmount: amount }
     }
 
     // Transaction exists but not successful

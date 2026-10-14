@@ -363,3 +363,45 @@ describe("withdraw sessions (tap-bound k1)", () => {
     )
   })
 })
+
+describe("topUpCard: atomic credit + audit, definite vs ambiguous failure", () => {
+  const TX_ROW = {
+    id: 1,
+    card_id: "c1",
+    tx_type: "TOPUP",
+    amount: "1000",
+    balance_after: "6000",
+    payment_hash: "h",
+    description: "d",
+    created_at: "1",
+  }
+
+  it("credits the balance and inserts the TOPUP row in ONE statement", async () => {
+    mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [TX_ROW] })
+
+    const result = await store().topUpCard("c1", 1000, "h", "d")
+
+    expect(result).toMatchObject({ success: true, balance: 6000 })
+    expect(mockPoolQuery).toHaveBeenCalledTimes(1)
+    const [sql, params] = mockPoolQuery.mock.calls[0]
+    const q = String(sql).replace(/\s+/g, " ")
+    expect(q).toMatch(/WITH credited AS \( UPDATE boltcards SET balance = balance \+ \$2/)
+    expect(q).toMatch(/WHERE id = \$1 AND status = 'ACTIVE'/)
+    expect(q).toMatch(
+      /INSERT INTO boltcard_transactions .* SELECT id, \$3, \$2, balance, \$4, \$5, \$6 FROM credited/,
+    )
+    expect(params.slice(0, 4)).toEqual(["c1", 1000, "TOPUP", "h"])
+  })
+
+  it("zero rows = definite failure (nothing written)", async () => {
+    mockPoolQuery.mockResolvedValueOnce({ rowCount: 0, rows: [] })
+    await expect(store().topUpCard("c1", 1000, "h")).resolves.toMatchObject({
+      success: false,
+    })
+  })
+
+  it("a database error is ambiguous and THROWS (callers keep the claim)", async () => {
+    mockPoolQuery.mockRejectedValueOnce(new Error("connection reset"))
+    await expect(store().topUpCard("c1", 1000, "h")).rejects.toThrow("connection reset")
+  })
+})

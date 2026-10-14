@@ -87,6 +87,8 @@ interface PayInvoiceResult {
   error?: string
   /** For failures: true if the payment definitely was not sent. */
   definite?: boolean
+  /** Payment status as reported by the wallet ("PENDING" while in flight). */
+  status?: string
 }
 
 type PayInvoiceFn = (
@@ -510,14 +512,23 @@ async function handleWithdrawCallback(
     }
   }
 
-  // Record the transaction
+  // Record the transaction. A PENDING payment is still in flight: mark it
+  // for reconciliation so a later terminal failure can restore the deduction.
   await boltcardStore.recordTransaction(cardId, {
     type: TxType.WITHDRAW,
     amount: amount,
     balanceAfter: deductResult.balance as number,
     paymentHash: payResult.paymentHash,
-    description: "Card payment",
+    description:
+      payResult.status === "PENDING"
+        ? "Card payment - in flight, pending reconciliation"
+        : "Card payment",
   })
+  if (payResult.status === "PENDING") {
+    console.warn(
+      `[LNURLW] Card ${cardId} payment ${payResult.paymentHash} is PENDING - flagged for reconciliation`,
+    )
+  }
 
   console.log(
     `[LNURLW] Card ${cardId} payment successful: ${amount} ${card.walletCurrency === "USD" ? "cents" : "sats"}`,
@@ -567,7 +578,11 @@ async function payCardInvoice(
   try {
     const result = await blinkAPI.payLnInvoice(walletId, invoice, "Boltcard payment")
     if (result.status === "SUCCESS" || result.status === "PENDING") {
-      return { success: true, paymentHash: extractPaymentHash(invoice) ?? undefined }
+      return {
+        success: true,
+        status: result.status,
+        paymentHash: extractPaymentHash(invoice) ?? undefined,
+      }
     }
     if (result.status === "FAILURE") {
       return { success: false, definite: true, error: "Payment failed" }
