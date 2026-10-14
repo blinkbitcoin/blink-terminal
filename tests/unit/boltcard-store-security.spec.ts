@@ -502,6 +502,23 @@ describe("review states (pending withdrawals, top-up flags)", () => {
     expect(sqlCalls().join(" ")).not.toMatch(/balance = balance -/)
   })
 
+  it("leaseWithdrawalClaim refreshes only an unresolved CLAIMED row", async () => {
+    mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{ payment_hash: "h" }] })
+    await expect(store().leaseWithdrawalClaim("h")).resolves.toBe(true)
+    const q = String(mockPoolQuery.mock.calls[0][0]).replace(/\s+/g, " ")
+    expect(q).toMatch(
+      /SET created_at = \$2 WHERE payment_hash = \$1 AND resolved_at IS NULL AND kind = 'CLAIMED'/,
+    )
+  })
+
+  it("flagUncreditedTopUp does not replace an existing review reason", async () => {
+    mockPoolQuery.mockResolvedValueOnce({ rowCount: 0, rows: [] })
+    await store().flagUncreditedTopUp("h")
+    const q = String(mockPoolQuery.mock.calls[0][0]).replace(/\s+/g, " ")
+    expect(q).toMatch(/AND NOT needs_review/)
+    expect(mockPoolQuery.mock.calls[0][1][1]).toMatch(/no credit/)
+  })
+
   it("markTopUpProcessed throws on a database error (not a definite miss)", async () => {
     mockPoolQuery.mockRejectedValueOnce(new Error("connection reset"))
     await expect(store().markTopUpProcessed("h")).rejects.toThrow("connection reset")

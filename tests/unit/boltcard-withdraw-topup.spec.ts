@@ -199,6 +199,7 @@ describe("callback: k1 required, single-use, capped", () => {
       dailySpent: 1000,
       dailyResetAt: null,
     })
+    mockStore.leaseWithdrawalClaim = jest.fn().mockResolvedValue(true)
     mockStore.finalizeWithdrawal = jest.fn().mockResolvedValue(undefined)
     mockStore.resolvePendingWithdrawalFailed = jest.fn().mockResolvedValue(true)
     mockStore.recordTransaction = jest.fn().mockResolvedValue(undefined)
@@ -329,6 +330,16 @@ describe("callback: k1 required, single-use, capped", () => {
 
     expect(res.status).toBe("OK")
     expect(mockStore.finalizeWithdrawal).toHaveBeenCalledWith("00".repeat(32), "SUCCESS")
+  })
+
+  it("a claim resolved before pay is not paid", async () => {
+    mockStore.consumeWithdrawSession = jest.fn().mockResolvedValue(5000 * 1000)
+    mockStore.leaseWithdrawalClaim = jest.fn().mockResolvedValue(false)
+
+    const res = await handleWithdrawCallback(CARD_ID, K1, invoice(1000), pay)
+
+    expect(res.status).toBe("ERROR")
+    expect(pay).not.toHaveBeenCalled()
   })
 
   it("a spent invoice hash is refused without paying again", async () => {
@@ -465,10 +476,8 @@ describe("processTopUpPayment: verified, claimed once, USD only on transfer succ
     mockStore.hasTopUpTransaction = jest.fn().mockResolvedValue(false)
     expect((await processTopUpPayment(HASH)).success).toBe(false)
     expect(mockStore.topUpCard).not.toHaveBeenCalled()
-    expect(mockStore.setTopUpReviewReason).toHaveBeenCalledWith(
-      HASH,
-      expect.stringContaining("no credit"),
-    )
+    expect(mockStore.flagUncreditedTopUp).toHaveBeenCalledWith(HASH)
+    expect(mockStore.setTopUpReviewReason).not.toHaveBeenCalled()
   })
 
   it("an ambiguous claim error is flagged, not treated as already processed", async () => {
@@ -831,6 +840,22 @@ describe("reconcilePendingWithdrawals", () => {
     const res = await reconcilePendingWithdrawals(CARD_ID)
     expect(res).toEqual({ checked: 1, resolved: 0, restored: 0 })
     expect(mockStore.resolvePendingWithdrawal).not.toHaveBeenCalled()
+  })
+
+  it("a fresh CLAIMED row with no Blink transaction is left alone (pay still in flight)", async () => {
+    mockStore.getPendingWithdrawals = jest.fn().mockResolvedValue([
+      {
+        paymentHash: "h1",
+        cardId: CARD_ID,
+        amount: 1000,
+        createdAt: Date.now(),
+        kind: "CLAIMED",
+      },
+    ])
+    blinkStatus([])
+    const res = await reconcilePendingWithdrawals(CARD_ID)
+    expect(res).toEqual({ checked: 1, resolved: 0, restored: 0 })
+    expect(mockStore.resolvePendingWithdrawalFailed).not.toHaveBeenCalled()
   })
 
   it("a CLAIMED row with no Blink transaction is restored (died before pay)", async () => {

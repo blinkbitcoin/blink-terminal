@@ -1963,6 +1963,23 @@ class BoltcardStore {
   }
 
   /**
+   * Refresh the claim's timestamp immediately before paying. Reconciliation
+   * will not restore a CLAIMED row until this stamp is older than the grace
+   * window, so a balance tap during the Blink call cannot undo a live payment.
+   * False means the row was already resolved: do not pay.
+   */
+  async leaseWithdrawalClaim(paymentHash: string): Promise<boolean> {
+    const result: QueryResult<DbRow> = await query(
+      `UPDATE boltcard_pending_withdrawals
+       SET created_at = $2
+       WHERE payment_hash = $1 AND resolved_at IS NULL AND kind = 'CLAIMED'
+       RETURNING payment_hash`,
+      [paymentHash, Date.now()],
+    )
+    return (result.rowCount ?? 0) > 0
+  }
+
+  /**
    * Move a claimed withdrawal to its post-payment state. SUCCESS resolves the
    * row so the hash stays spent. PENDING and UNKNOWN stay open for
    * reconciliation. Throws if the claim row is no longer unresolved.
@@ -2170,6 +2187,19 @@ class BoltcardStore {
        SET needs_review = TRUE, review_reason = $2
        WHERE payment_hash = $1`,
       [paymentHash, reason],
+    )
+  }
+
+  /**
+   * Flag a processed claim that has no credit, without replacing a reason
+   * that an earlier failure already recorded.
+   */
+  async flagUncreditedTopUp(paymentHash: string): Promise<void> {
+    await query(
+      `UPDATE boltcard_pending_topups
+       SET needs_review = TRUE, review_reason = $2
+       WHERE payment_hash = $1 AND NOT needs_review`,
+      [paymentHash, "processed claim has no credit"],
     )
   }
 

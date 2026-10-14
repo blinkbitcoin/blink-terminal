@@ -562,7 +562,8 @@ async function processTopUpPayment(paymentHash: string): Promise<ProcessTopUpRes
     // A replay of a processed claim that never got a credit must stay visible.
     // Cleanup deletes processed rows after 24h unless they are flagged.
     if (!(await boltcardStore.hasTopUpTransaction(paymentHash))) {
-      await review("processed claim has no credit")
+      // Does not replace a reason already recorded by the first failure.
+      await boltcardStore.flagUncreditedTopUp(paymentHash)
     }
     return { success: false, error: "Top-up already processed" }
   }
