@@ -35,25 +35,31 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
   try {
     // Owner session required; another owner's card answers 404
-    const owned = await requireOwnedCard(req, res, cardId)
+    const owned = await requireOwnedCard(req, res, cardId, { includeKeys: true })
     if (!owned) return
     const { card, pubkey: userPubkey } = owned
 
-    // Get IssuerKey for the owner
-    const issuerKey = await boltcard.store.getIssuerKey(userPubkey)
-
-    if (!issuerKey) {
-      console.error(
-        `[WipeKeys] IssuerKey not found for owner: ${userPubkey.substring(0, 8)}...`,
-      )
-      return res.status(500).json({
-        error: "IssuerKey not found",
-        message: "Unable to derive card keys. Please contact support.",
-      })
+    // Prefer the keys stored with the card (written at registration and on
+    // every reprogram), so wipe keys never depend on how the owner's
+    // issuer-key row is keyed. Derive only if stored keys are missing.
+    const stored = [card.k0, card.k1, card.k2, card.k3, card.k4]
+    let keys: { k0: string; k1: string; k2: string; k3: string; k4: string }
+    if (stored.every((key) => typeof key === "string" && key.length > 0)) {
+      const [k0, k1, k2, k3, k4] = stored as string[]
+      keys = { k0, k1, k2, k3, k4 }
+    } else {
+      const issuerKey = await boltcard.store.getIssuerKey(userPubkey)
+      if (!issuerKey) {
+        console.error(
+          `[WipeKeys] IssuerKey not found for owner: ${userPubkey.substring(0, 8)}...`,
+        )
+        return res.status(500).json({
+          error: "IssuerKey not found",
+          message: "Unable to derive card keys. Please contact support.",
+        })
+      }
+      keys = boltcard.crypto.deriveAllKeys(issuerKey, card.cardUid, card.version)
     }
-
-    // Derive keys for the card's current version
-    const keys = boltcard.crypto.deriveAllKeys(issuerKey, card.cardUid, card.version)
 
     // Build wipe JSON in the format expected by NFC Programmer app
     // Format documented at: https://github.com/nicklaros/bolt-card-programmer

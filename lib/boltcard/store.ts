@@ -236,6 +236,13 @@ const PendingStatus = {
 // Default registration expiry (15 minutes)
 const REGISTRATION_EXPIRY_MS: number = 15 * 60 * 1000
 
+/**
+ * Owner pubkeys are stored and looked up lowercase (hex), matching the Nostr
+ * session; migration 023 normalizes legacy rows.
+ */
+const normalizeOwnerPubkey = (pubkey: string): string =>
+  typeof pubkey === "string" ? pubkey.toLowerCase() : pubkey
+
 // ==========================================================================
 // Database connection pool (delegates to shared pool)
 // ==========================================================================
@@ -340,8 +347,9 @@ class BoltcardStore {
    * Get or create IssuerKey for a user
    * Each user has exactly one IssuerKey used to derive all their card keys
    */
-  async getOrCreateIssuerKey(ownerPubkey: string): Promise<string> {
-    if (!/^[0-9a-fA-F]{64}$/.test(ownerPubkey)) {
+  async getOrCreateIssuerKey(rawOwnerPubkey: string): Promise<string> {
+    const ownerPubkey: string = normalizeOwnerPubkey(rawOwnerPubkey)
+    if (!/^[0-9a-f]{64}$/.test(ownerPubkey)) {
       throw new Error("Invalid owner pubkey format")
     }
 
@@ -400,7 +408,8 @@ class BoltcardStore {
   /**
    * Get IssuerKey for a user (returns null if not found)
    */
-  async getIssuerKey(ownerPubkey: string): Promise<string | null> {
+  async getIssuerKey(rawOwnerPubkey: string): Promise<string | null> {
+    const ownerPubkey: string = normalizeOwnerPubkey(rawOwnerPubkey)
     try {
       const result: QueryResult<DbRow> = await query(
         `SELECT issuer_key_encrypted FROM boltcard_issuer_keys WHERE owner_pubkey = $1`,
@@ -430,7 +439,8 @@ class BoltcardStore {
     data: PendingRegistrationData,
     options: PendingRegistrationOptions = {},
   ): Promise<PendingRegistrationRecord> {
-    const { ownerPubkey, walletId, apiKey } = data
+    const { walletId, apiKey } = data
+    const ownerPubkey: string = normalizeOwnerPubkey(data.ownerPubkey)
 
     if (!ownerPubkey || !walletId || !apiKey) {
       throw new Error("Missing required fields: ownerPubkey, walletId, apiKey")
@@ -580,21 +590,28 @@ class BoltcardStore {
       throw new Error("Registration is not pending")
     }
 
+    // Set just before the first write (delete / reprogram / create). Until
+    // then a failure provably minted nothing and the claim may be released.
+    const progress = { mutated: false }
     try {
       return await this._completeClaimedRegistration(
         registrationId,
         registration,
         cardUid,
+        progress,
       )
     } catch (err: unknown) {
-      // Nothing was minted: release the claim so the owner can retry
-      // (e.g. after tapping the wrong card).
-      await query(
-        `UPDATE boltcard_pending_registrations
-         SET status = $2, completed_at = NULL
-         WHERE id = $1 AND card_id IS NULL AND status = $3`,
-        [registrationId, PendingStatus.PENDING, PendingStatus.COMPLETED],
-      ).catch(() => undefined)
+      if (!progress.mutated) {
+        // Nothing was written: release the claim so the owner can retry
+        // (e.g. after tapping a card that belongs to someone else).
+        await query(
+          `UPDATE boltcard_pending_registrations
+           SET status = $2, completed_at = NULL
+           WHERE id = $1 AND card_id IS NULL AND status = $3`,
+          [registrationId, PendingStatus.PENDING, PendingStatus.COMPLETED],
+        ).catch(() => undefined)
+      }
+      // Otherwise the link stays consumed: a card may exist already.
       throw err
     }
   }
@@ -603,6 +620,7 @@ class BoltcardStore {
     registrationId: string,
     registration: PendingRegistrationRecord,
     cardUid: string,
+    progress: { mutated: boolean } = { mutated: false },
   ): Promise<BoltcardData | null> {
     // Check if card UID already exists
     const existingCard: BoltcardData | null = await this.getCardByUid(cardUid)
@@ -612,6 +630,7 @@ class BoltcardStore {
         console.log(
           `[BoltcardStore] Deleting WIPED card ${existingCard.id} to allow fresh registration`,
         )
+        progress.mutated = true
         await query(`DELETE FROM boltcard_transactions WHERE card_id = $1`, [
           existingCard.id,
         ])
@@ -620,8 +639,12 @@ class BoltcardStore {
         ])
         await query(`DELETE FROM boltcards WHERE id = $1`, [existingCard.id])
         // Fall through to create new card below
-      } else if (existingCard.ownerPubkey === registration.ownerPubkey) {
+      } else if (
+        normalizeOwnerPubkey(existingCard.ownerPubkey) ===
+        normalizeOwnerPubkey(registration.ownerPubkey)
+      ) {
         // Same owner, active card - this is a re-program, increment version
+        progress.mutated = true
         const updated: BoltcardData | null = await this.reprogramCard(
           existingCard.id,
           cardUid,
@@ -642,6 +665,7 @@ class BoltcardStore {
     }
 
     // Create the card
+    progress.mutated = true
     const card: BoltcardData | null = await this.createCard(
       {
         cardUid,
@@ -709,8 +733,9 @@ class BoltcardStore {
    * Get pending registrations for an owner
    */
   async getPendingRegistrationsByOwner(
-    ownerPubkey: string,
+    rawOwnerPubkey: string,
   ): Promise<PendingRegistrationSummary[]> {
+    const ownerPubkey: string = normalizeOwnerPubkey(rawOwnerPubkey)
     try {
       await this.lazyCleanup()
 
@@ -804,7 +829,8 @@ class BoltcardStore {
     cardData: CardCreateData,
     options: CardCreateOptions = {},
   ): Promise<BoltcardData | null> {
-    const { cardUid, ownerPubkey, walletId, apiKey } = cardData
+    const { cardUid, walletId, apiKey } = cardData
+    const ownerPubkey: string = normalizeOwnerPubkey(cardData.ownerPubkey)
 
     // Validate required fields
     if (!cardUid || !ownerPubkey || !walletId || !apiKey) {
@@ -1055,7 +1081,8 @@ class BoltcardStore {
   /**
    * Get all cards for an owner
    */
-  async getCardsByOwner(ownerPubkey: string): Promise<BoltcardData[]> {
+  async getCardsByOwner(rawOwnerPubkey: string): Promise<BoltcardData[]> {
+    const ownerPubkey: string = normalizeOwnerPubkey(rawOwnerPubkey)
     try {
       await this.lazyCleanup()
 
@@ -1501,21 +1528,21 @@ class BoltcardStore {
   }
 
   /**
-   * Record that a reset of this card was just tap-verified (SUN/CMAC).
+   * Atomically record a tap-verified reset: advance the replay counter AND
+   * stamp reset_verified_at, only if `counter` is newer than the stored one
+   * and the card isn't wiped. Returns false if the tap was replayed / lost a
+   * race / the card changed; throws on database errors. Callers must not
+   * hand out card keys unless this returns true.
    */
-  async markResetVerified(cardId: string): Promise<boolean> {
-    try {
-      const result: QueryResult<DbRow> = await query(
-        `UPDATE boltcards SET reset_verified_at = $2
-         WHERE id = $1 AND status != 'WIPED'
-         RETURNING id`,
-        [cardId, Date.now()],
-      )
-      return (result.rowCount ?? 0) > 0
-    } catch (err: unknown) {
-      console.error("[BoltcardStore] markResetVerified error:", (err as Error).message)
-      return false
-    }
+  async recordVerifiedResetTap(cardId: string, counter: number): Promise<boolean> {
+    const result: QueryResult<DbRow> = await query(
+      `UPDATE boltcards
+       SET last_counter = $2, reset_verified_at = $3
+       WHERE id = $1 AND last_counter < $2 AND status != 'WIPED'
+       RETURNING id`,
+      [cardId, counter, Date.now()],
+    )
+    return (result.rowCount ?? 0) > 0
   }
 
   /**

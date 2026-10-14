@@ -59,7 +59,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     const { card } = owned
 
     // Check card status
-    if (card.status === "wiped") {
+    if (card.status === "WIPED") {
       return res.status(400).json({ error: "Cannot fund a wiped card" })
     }
 

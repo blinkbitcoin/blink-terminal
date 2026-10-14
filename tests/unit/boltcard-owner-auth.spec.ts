@@ -252,6 +252,31 @@ describe("cards/[cardId]: owner only, every method", () => {
   })
 })
 
+describe("legacy owner stored with mixed-case pubkey", () => {
+  beforeEach(() => {
+    mockStore.getCard = jest
+      .fn()
+      .mockResolvedValue(card({ ownerPubkey: OWNER.toUpperCase() }))
+  })
+
+  it("is still recognized as the owner by the lowercase session", async () => {
+    mockStore.getCardTransactions = jest.fn().mockResolvedValue([])
+    const res = await call(cardHandler as Handler, {
+      token: "token-owner",
+      query: { cardId: card().id },
+    })
+    expect(res.statusCode).toBe(200)
+  })
+
+  it("can get wipe keys", async () => {
+    const res = await call(wipeKeysHandler as Handler, {
+      token: "token-owner",
+      query: { cardId: card().id },
+    })
+    expect(res.statusCode).toBe(200)
+  })
+})
+
 describe("fund: owner only", () => {
   const fund = (token?: string) =>
     call(fundHandler as Handler, {
@@ -267,6 +292,17 @@ describe("fund: owner only", () => {
 
   it("another owner's card -> 404, balance untouched", async () => {
     expect((await fund("token-other")).statusCode).toBe(404)
+    expect(mockStore.updateCardBalance).not.toHaveBeenCalled()
+  })
+
+  it("refuses to fund a wiped card", async () => {
+    mockStore.getCard = jest.fn().mockResolvedValue(card({ status: "WIPED" }))
+    const res = await call(fundHandler as Handler, {
+      token: "token-owner",
+      method: "POST",
+      body: { cardId: card().id, amount: 100 },
+    })
+    expect(res.statusCode).toBe(400)
     expect(mockStore.updateCardBalance).not.toHaveBeenCalled()
   })
 
@@ -402,7 +438,20 @@ describe("wipe-keys / recover-keys", () => {
     expect(mockStore.getIssuerKey).not.toHaveBeenCalled()
   })
 
-  it("wipe-keys: the owner gets wipe keys", async () => {
+  it("wipe-keys: the owner gets the card's stored keys (no issuer-key dependency)", async () => {
+    const res = await call(wipeKeysHandler as Handler, {
+      token: "token-owner",
+      query: { cardId: card().id },
+    })
+    expect(res.statusCode).toBe(200)
+    expect((res.body as { keys: Record<string, string> }).keys.k0).toBe(
+      KEYS.k0.toUpperCase(),
+    )
+    expect(mockStore.getIssuerKey).not.toHaveBeenCalled()
+  })
+
+  it("wipe-keys: derives from the issuer key only when stored keys are missing", async () => {
+    mockStore.getCard = jest.fn().mockResolvedValue(card({ k0: null }))
     mockStore.getIssuerKey = jest.fn().mockResolvedValue("0".repeat(32))
     const res = await call(wipeKeysHandler as Handler, {
       token: "token-owner",
@@ -470,12 +519,8 @@ describe("keys link (NFC Programmer app)", () => {
 describe("reset: tap-verified, then a short confirm window", () => {
   const cardId = card().id
 
-  it("a valid reset tap records the verification", async () => {
-    mockVerifyCardTap.mockReturnValue({ valid: true, counter: 5 })
-    mockStore.updateLastCounter = jest.fn().mockResolvedValue(true)
-    mockStore.markResetVerified = jest.fn().mockResolvedValue(true)
-
-    const res = await call(resetHandler as Handler, {
+  const resetTap = () =>
+    call(resetHandler as Handler, {
       method: "POST",
       query: { cardId },
       body: {
@@ -483,8 +528,37 @@ describe("reset: tap-verified, then a short confirm window", () => {
       },
     })
 
+  it("a valid reset tap is recorded atomically, then keys are returned", async () => {
+    mockVerifyCardTap.mockReturnValue({ valid: true, counter: 5 })
+    mockStore.recordVerifiedResetTap = jest.fn().mockResolvedValue(true)
+
+    const res = await resetTap()
+
     expect(res.statusCode).toBe(200)
-    expect(mockStore.markResetVerified).toHaveBeenCalledWith(cardId)
+    expect(mockStore.recordVerifiedResetTap).toHaveBeenCalledWith(cardId, 5)
+    expect(mockStore.updateLastCounter).not.toHaveBeenCalled()
+    expect(JSON.stringify(res.body)).toContain(KEYS.k0.toUpperCase())
+  })
+
+  it("a replayed / concurrent tap (record not persisted) -> 409 without keys", async () => {
+    mockVerifyCardTap.mockReturnValue({ valid: true, counter: 5 })
+    mockStore.recordVerifiedResetTap = jest.fn().mockResolvedValue(false)
+
+    const res = await resetTap()
+
+    expect(res.statusCode).toBe(409)
+    expect(JSON.stringify(res.body)).not.toContain(KEYS.k0.toUpperCase())
+    expect(JSON.stringify(res.body)).not.toContain(KEYS.k0)
+  })
+
+  it("a database error while recording -> 500 without keys", async () => {
+    mockVerifyCardTap.mockReturnValue({ valid: true, counter: 5 })
+    mockStore.recordVerifiedResetTap = jest.fn().mockRejectedValue(new Error("db down"))
+
+    const res = await resetTap()
+
+    expect(res.statusCode).toBe(500)
+    expect(JSON.stringify(res.body).toLowerCase()).not.toContain(KEYS.k0)
   })
 
   it("an invalid tap is refused and not recorded", async () => {
@@ -497,7 +571,7 @@ describe("reset: tap-verified, then a short confirm window", () => {
       },
     })
     expect(res.statusCode).toBe(401)
-    expect(mockStore.markResetVerified).not.toHaveBeenCalled()
+    expect(mockStore.recordVerifiedResetTap).not.toHaveBeenCalled()
   })
 
   it("confirm without a recent verified reset -> 403, card not wiped", async () => {
