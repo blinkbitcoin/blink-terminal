@@ -81,7 +81,11 @@ jest.mock("../../lib/rate-limit", () => ({
 }))
 
 import { BlinkAuthError, PaymentRejectedError } from "../../lib/blink-api"
-import { handleTopUpCallback, processTopUpPayment } from "../../lib/boltcard/lnurlp"
+import {
+  checkAndProcessPendingTopUps,
+  handleTopUpCallback,
+  processTopUpPayment,
+} from "../../lib/boltcard/lnurlp"
 import {
   handleWithdrawCallback,
   handleWithdrawRequest,
@@ -288,8 +292,33 @@ describe("callback: k1 required, single-use, capped", () => {
     mockStore.consumeWithdrawSession = jest.fn().mockResolvedValue(5000 * 1000)
     pay.mockResolvedValue({ success: false, definite: true, error: "no route" })
     await handleWithdrawCallback(CARD_ID, K1, invoice(1000), pay)
-    expect(mockStore.rollbackSpend).toHaveBeenCalledWith(CARD_ID, 1000)
+    expect(mockStore.rollbackSpend).toHaveBeenCalledWith(CARD_ID, 1000, null)
     expect(mockStore.recordPendingWithdrawal).not.toHaveBeenCalled()
+  })
+
+  it("a definite failure rolls the deduction back inside its daily window", async () => {
+    mockStore.consumeWithdrawSession = jest.fn().mockResolvedValue(5000 * 1000)
+    mockStore.incrementDailySpent = jest
+      .fn()
+      .mockResolvedValue({ success: true, balance: 4000, dailyResetAt: 777 })
+    pay.mockResolvedValue({ success: false, definite: true, error: "no route" })
+
+    await handleWithdrawCallback(CARD_ID, K1, invoice(1000), pay)
+
+    expect(mockStore.rollbackSpend).toHaveBeenCalledWith(CARD_ID, 1000, 777)
+  })
+
+  it("an unresolved withdrawal for this invoice is refused before any deduction", async () => {
+    mockStore.consumeWithdrawSession = jest.fn().mockResolvedValue(5000 * 1000)
+    mockStore.getUnresolvedWithdrawal = jest
+      .fn()
+      .mockResolvedValue({ cardId: CARD_ID, amount: 1000, kind: "RESTORE_FAILED" })
+
+    const res = await handleWithdrawCallback(CARD_ID, K1, invoice(1000), pay)
+
+    expect(res.status).toBe("ERROR")
+    expect(mockStore.incrementDailySpent).not.toHaveBeenCalled()
+    expect(pay).not.toHaveBeenCalled()
   })
 
   it("a failed rollback after a definite rejection is queued as RESTORE_FAILED (never silent)", async () => {
@@ -528,6 +557,7 @@ describe("processTopUpPayment: verified, claimed once, USD only on transfer succ
 
     it.each([
       ["FAILED (terminal failure)", "FAILED", true],
+      ["FAILURE (PaymentSendResult)", "FAILURE", true],
       ["failed (lowercase)", "failed", true],
       ["PENDING (may still settle)", "PENDING", false],
       ["ALREADY_PAID (it moved)", "ALREADY_PAID", false],
@@ -637,6 +667,38 @@ describe("handleTopUpCallback: no invoice without a persisted pending record", (
 
     expect((res as { pr?: string }).pr).toBe("lnbc1x")
     expect(mockStore.storePendingTopUp).toHaveBeenCalledWith(CARD_ID, "h1", 1000, "BTC")
+  })
+})
+
+describe("unpaid top-up invoices are not cleaned up", () => {
+  it("no Blink transaction (UNSEEN) is left pending, not marked processed", async () => {
+    mockStore.getPendingTopUpsForCard = jest
+      .fn()
+      .mockResolvedValue([{ paymentHash: "ab".repeat(32), amount: 1000 }])
+    mockStore.markTopUpProcessed = jest.fn().mockResolvedValue(true)
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          data: {
+            me: {
+              defaultAccount: { walletById: { transactionsByPaymentHash: [] } },
+            },
+          },
+        }),
+    }) as unknown as typeof fetch
+
+    const res = await checkAndProcessPendingTopUps(
+      CARD_ID,
+      "blink_key",
+      "production",
+      "wallet-btc",
+      "BTC",
+    )
+
+    expect(res.processed).toBe(0)
+    expect(mockStore.markTopUpProcessed).not.toHaveBeenCalled()
+    expect(mockStore.processTopUpPayment).not.toHaveBeenCalled()
   })
 })
 
@@ -750,6 +812,22 @@ describe("reconcilePendingWithdrawals", () => {
     expect(res).toEqual({ checked: 1, resolved: 1, restored: 1 })
   })
 
+  it("a RESTORE_FAILED row with an in-flight SEND is not restored", async () => {
+    mockStore.getPendingWithdrawals = jest.fn().mockResolvedValue([
+      {
+        paymentHash: "h1",
+        cardId: CARD_ID,
+        amount: 1000,
+        createdAt: 1,
+        kind: "RESTORE_FAILED",
+      },
+    ])
+    blinkStatus([{ status: "PENDING", direction: "SEND", settlementAmount: 1000 }])
+    const res = await reconcilePendingWithdrawals(CARD_ID)
+    expect(res).toEqual({ checked: 1, resolved: 0, restored: 0 })
+    expect(mockStore.resolvePendingWithdrawalFailed).not.toHaveBeenCalled()
+  })
+
   it("a RESTORE_FAILED row with a settled send resolves without restoring", async () => {
     mockStore.getPendingWithdrawals = jest.fn().mockResolvedValue([
       {
@@ -773,10 +851,17 @@ describe("reconcilePendingWithdrawals", () => {
   })
 
   it("still PENDING -> left for the next pass", async () => {
-    blinkStatus([])
+    blinkStatus([{ status: "PENDING", direction: "SEND", settlementAmount: 1000 }])
     const res = await reconcilePendingWithdrawals(CARD_ID)
     expect(res).toEqual({ checked: 1, resolved: 0, restored: 0 })
     expect(mockStore.resolvePendingWithdrawal).not.toHaveBeenCalled()
+  })
+
+  it("a PENDING-kind row with no transaction yet is not restored", async () => {
+    blinkStatus([])
+    const res = await reconcilePendingWithdrawals(CARD_ID)
+    expect(res).toEqual({ checked: 1, resolved: 0, restored: 0 })
+    expect(mockStore.resolvePendingWithdrawalFailed).not.toHaveBeenCalled()
   })
 
   it("a wiped card closes its pending withdrawal without restoring", async () => {

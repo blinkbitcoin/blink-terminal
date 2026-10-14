@@ -147,7 +147,7 @@ interface CheckAndProcessResult {
   errors: number
 }
 
-type InvoiceStatus = "PAID" | "PENDING" | "EXPIRED" | "ERROR"
+type InvoiceStatus = "PAID" | "PENDING" | "UNSEEN" | "EXPIRED" | "ERROR"
 
 interface WalletInfo {
   id: string
@@ -581,12 +581,13 @@ async function processTopUpPayment(paymentHash: string): Promise<ProcessTopUpRes
       }
     }
 
-    // The API documents success | failed | pending | already_paid. Only a
-    // terminal FAILED guarantees nothing was transferred (retryable). PENDING
-    // may still settle, ALREADY_PAID did move, and unknown statuses say
-    // nothing — all keep the claim for manual review.
+    // PaymentSendResult (blinkbitcoin public schema) is SUCCESS | FAILURE |
+    // PENDING | ALREADY_PAID. FAILED is accepted too so a spelling drift
+    // cannot wedge a transfer that never moved. Only a terminal failure
+    // releases the claim. PENDING may still settle, ALREADY_PAID did move,
+    // and unknown statuses say nothing — those keep the claim for review.
     const transferStatus = String(transferResult.status || "").toUpperCase()
-    if (transferStatus === "FAILED") {
+    if (transferStatus === "FAILED" || transferStatus === "FAILURE") {
       console.error(`[LNURLP] Transfer failed: ${JSON.stringify(transferResult)}`)
       await release()
       return { success: false, error: "USD transfer failed" }
@@ -700,8 +701,10 @@ async function getAllPendingTopUps(): Promise<PendingTopUpData[]> {
  * @param apiKey - Blink API key
  * @param apiUrl - Blink API URL
  * @param walletId - Wallet ID to check transactions for
- * @returns { status: PAID | PENDING | EXPIRED | ERROR }. PAID always carries a
- * finite numeric settlementAmount (otherwise ERROR).
+ * @returns { status: PAID | PENDING | UNSEEN | EXPIRED | ERROR }. PAID always
+ * carries a finite numeric settlementAmount (otherwise ERROR). UNSEEN means
+ * Blink has no transaction for the hash; PENDING means one exists and is not
+ * terminal.
  */
 /**
  * Payment/invoice status lookup, classified by DIRECTION because outgoing and
@@ -768,8 +771,9 @@ async function fetchInvoiceReceipt(
       data.data?.me?.defaultAccount?.walletById?.transactionsByPaymentHash
 
     if (!transactions || transactions.length === 0) {
-      // No transaction found - invoice might still be pending or expired
-      return { status: "PENDING" }
+      // No transaction at all. Distinct from an in-flight SEND/PENDING so a
+      // never-sent payment can be restored without touching one that may settle.
+      return { status: "UNSEEN" }
     }
 
     // Look for a successful transaction in the requested direction
@@ -924,7 +928,8 @@ async function checkAndProcessPendingTopUps(
           `[LNURLP] Cleaned up expired top-up invoice: ${(pending.paymentHash as string).substring(0, 16)}...`,
         )
       }
-      // For 'PENDING' or 'ERROR' status, we leave it for next check
+      // PENDING (in flight), UNSEEN (no transaction yet), or ERROR: next check.
+      // UNSEEN is not an expiry — do not mark the top-up processed.
     } catch (err: unknown) {
       console.error(`[LNURLP] Error processing pending top-up: ${(err as Error).message}`)
       errors++

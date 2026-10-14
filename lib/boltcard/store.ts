@@ -1416,17 +1416,30 @@ class BoltcardStore {
   }
 
   /**
-   * Rollback a failed spend (restore balance and daily spent)
-   * Used when payment fails after balance was deducted
+   * Rollback a failed spend (restore balance, and daily spent only if the
+   * deduction still belongs to the card's current daily window).
+   * Used when payment fails after balance was deducted.
+   * dailyWindowResetAt is the window returned by incrementDailySpent; null
+   * means the card has no window, so daily_spent is subtracted as before.
    */
-  async rollbackSpend(cardId: string, amount: number): Promise<boolean> {
+  async rollbackSpend(
+    cardId: string,
+    amount: number,
+    dailyWindowResetAt: number | null = null,
+  ): Promise<boolean> {
     try {
       const result: QueryResult<DbRow> = await query(
-        `UPDATE boltcards 
-         SET balance = balance + $2, daily_spent = GREATEST(0, daily_spent - $2)
+        `UPDATE boltcards
+         SET balance = balance + $2,
+             daily_spent = CASE
+               WHEN $3::bigint IS NOT NULL
+                    AND daily_reset_at IS DISTINCT FROM $3
+               THEN daily_spent
+               ELSE GREATEST(0, daily_spent - $2)
+             END
          WHERE id = $1
          RETURNING id, balance, daily_spent`,
-        [cardId, amount],
+        [cardId, amount, dailyWindowResetAt],
       )
 
       if ((result.rowCount ?? 0) > 0) {
@@ -1668,9 +1681,14 @@ class BoltcardStore {
   // ==========================================================================
 
   /**
-   * Record a withdrawal whose payment is not yet final (PENDING or unknown
-   * outcome), keyed by payment hash. Idempotent. Throws on database errors —
-   * callers must not report success unless this persists.
+   * Record a withdrawal whose payment is not yet final, keyed by payment hash.
+   * Same card, amount, and kind is idempotent. A different card or (while
+   * unresolved) a different amount throws — the hash must not silently keep
+   * stale data. An unresolved RESTORE_FAILED row is upgraded to PENDING or
+   * UNKNOWN so reconciliation will not treat an in-flight retry as never sent.
+   * A finished row is reopened for the new attempt (the hash is the primary
+   * key). Throws on database errors — callers must not report success unless
+   * this persists.
    */
   async recordPendingWithdrawal(
     paymentHash: string,
@@ -1680,21 +1698,128 @@ class BoltcardStore {
     kind: "PENDING" | "UNKNOWN" | "RESTORE_FAILED" = "PENDING",
     dailyWindowResetAt: number | null = null,
   ): Promise<void> {
-    await query(
+    const amountInt = Math.floor(amount)
+    const inserted: QueryResult<DbRow> = await query(
       `INSERT INTO boltcard_pending_withdrawals
          (payment_hash, card_id, amount, balance_after, created_at, kind, daily_window_reset_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (payment_hash) DO NOTHING`,
+       ON CONFLICT (payment_hash) DO NOTHING
+       RETURNING payment_hash`,
       [
         paymentHash,
         cardId,
-        Math.floor(amount),
+        amountInt,
         Math.floor(balanceAfter),
         Date.now(),
         kind,
         dailyWindowResetAt,
       ],
     )
+    if ((inserted.rowCount ?? 0) > 0) return
+
+    // The hash is the primary key, so a blind DO NOTHING would keep a stale
+    // row (wrong card, amount, or kind) and reconciliation would act on it.
+    const existing: QueryResult<DbRow> = await query(
+      `SELECT card_id, amount, kind, resolved_at
+       FROM boltcard_pending_withdrawals
+       WHERE payment_hash = $1`,
+      [paymentHash],
+    )
+    const row = existing.rows[0]
+    if (!row) {
+      throw new Error("pending withdrawal conflict: row vanished during insert")
+    }
+
+    const sameCard = row.card_id === cardId
+    const sameAmount = parseInt(String(row.amount), 10) === amountInt
+    const existingKind = String(row.kind)
+    const resolved = row.resolved_at != null
+
+    if (!sameCard) {
+      throw new Error(
+        "pending withdrawal conflict: payment hash already recorded for a different card",
+      )
+    }
+    if (!resolved && !sameAmount) {
+      throw new Error(
+        "pending withdrawal conflict: payment hash already recorded for a different amount",
+      )
+    }
+    if (!resolved && existingKind === kind) return
+
+    // An in-flight attempt must not stay marked "never sent", or reconciliation
+    // can restore it while the payment is still in flight. Never downgrade.
+    if (
+      !resolved &&
+      existingKind === "RESTORE_FAILED" &&
+      (kind === "PENDING" || kind === "UNKNOWN")
+    ) {
+      const upgraded: QueryResult<DbRow> = await query(
+        `UPDATE boltcard_pending_withdrawals
+         SET kind = $2, daily_window_reset_at = $3
+         WHERE payment_hash = $1
+           AND resolved_at IS NULL
+           AND card_id = $4
+           AND amount = $5
+           AND kind = 'RESTORE_FAILED'`,
+        [paymentHash, kind, dailyWindowResetAt, cardId, amountInt],
+      )
+      if ((upgraded.rowCount ?? 0) === 0) {
+        throw new Error("pending withdrawal conflict: kind upgrade lost the race")
+      }
+      return
+    }
+    if (!resolved) return
+
+    // A finished row occupies the primary key. Reopen it for this attempt
+    // instead of dropping the new state on the floor.
+    const reopened: QueryResult<DbRow> = await query(
+      `UPDATE boltcard_pending_withdrawals
+       SET amount = $2,
+           balance_after = $3,
+           created_at = $4,
+           kind = $5,
+           daily_window_reset_at = $6,
+           resolved_at = NULL,
+           outcome = NULL
+       WHERE payment_hash = $1 AND resolved_at IS NOT NULL AND card_id = $7`,
+      [
+        paymentHash,
+        amountInt,
+        Math.floor(balanceAfter),
+        Date.now(),
+        kind,
+        dailyWindowResetAt,
+        cardId,
+      ],
+    )
+    if ((reopened.rowCount ?? 0) === 0) {
+      throw new Error("pending withdrawal conflict: could not reopen a finished row")
+    }
+  }
+
+  /**
+   * Unresolved withdrawal for a payment hash, if one is still being reconciled.
+   * A second attempt of that invoice must not deduct again.
+   */
+  async getUnresolvedWithdrawal(paymentHash: string): Promise<{
+    cardId: string
+    amount: number
+    kind: string
+  } | null> {
+    const result: QueryResult<DbRow> = await query(
+      `SELECT card_id, amount, kind
+       FROM boltcard_pending_withdrawals
+       WHERE payment_hash = $1 AND resolved_at IS NULL`,
+      [paymentHash],
+    )
+    const row = result.rows[0]
+    if (!row) return null
+    return {
+      cardId: row.card_id as string,
+      amount: parseInt(String(row.amount), 10),
+      kind: String(row.kind),
+    }
   }
 
   /**

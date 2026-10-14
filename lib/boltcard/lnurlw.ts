@@ -467,6 +467,19 @@ async function handleWithdrawCallback(
     amount = invoiceAmount.sats
   }
 
+  // An unresolved row for this invoice is still being reconciled. A second
+  // deduction cannot be tracked (the hash is the primary key) and must not start.
+  const invoiceHash = extractPaymentHash(invoice)
+  if (invoiceHash) {
+    const inflight = await boltcardStore.getUnresolvedWithdrawal(invoiceHash)
+    if (inflight) {
+      return {
+        status: "ERROR",
+        reason: "A payment for this invoice is already in progress - try again shortly",
+      }
+    }
+  }
+
   // Try to deduct from card balance (atomic operation with limit checks)
   const deductResult = (await boltcardStore.incrementDailySpent(
     cardId,
@@ -495,7 +508,11 @@ async function handleWithdrawCallback(
     if (payResult.definite) {
       // Nothing was sent: restore the card balance. If the restore itself
       // fails, queue it for reconciliation (never silent).
-      const restored = await boltcardStore.rollbackSpend(cardId, amount)
+      const restored = await boltcardStore.rollbackSpend(
+        cardId,
+        amount,
+        deductResult.dailyResetAt ?? null,
+      )
       if (!restored && withdrawalHash) {
         await boltcardStore.recordPendingWithdrawal(
           withdrawalHash,
@@ -717,8 +734,9 @@ function parseInvoiceAmount(invoice: string): InvoiceAmount | null {
 
 /**
  * Reconcile pending withdrawals by payment hash: PAID -> resolved SUCCESS;
- * EXPIRED/FAILED (terminal) -> deduction restored and resolved FAILED;
- * still PENDING -> left for the next pass. Returns per-row outcomes.
+ * EXPIRED (terminal send failure) -> deduction restored and resolved FAILED;
+ * RESTORE_FAILED + UNSEEN (no transaction) -> restored; an in-flight SEND
+ * stays for the next pass. Returns per-row outcomes.
  *
  * Triggered from the balance check (the owner's tap) and available for ops.
  * A global scheduler is blink-wip#1619.
@@ -763,15 +781,16 @@ async function reconcilePendingWithdrawals(cardId?: string): Promise<{
           resolved++
           restored++
         }
-      } else if (status === "PENDING" && item.kind === "RESTORE_FAILED") {
-        // The payment was definitely never sent and Blink has no transaction
-        // for the hash: restoring the deduction is safe.
+      } else if (status === "UNSEEN" && item.kind === "RESTORE_FAILED") {
+        // Definite rejection and Blink has no transaction for the hash.
+        // An in-flight SEND (PENDING) must not be restored — that payment
+        // may still settle.
         if (await boltcardStore.resolvePendingWithdrawalFailed(item.paymentHash)) {
           resolved++
           restored++
         }
       }
-      // Otherwise: leave for the next pass
+      // PENDING (a send exists and is in flight) or ERROR: next pass
     } catch (err: unknown) {
       console.error(
         `[LNURLW] Reconciliation failed for withdrawal ${item.paymentHash.substring(0, 16)}...: ${(err as Error).message}`,

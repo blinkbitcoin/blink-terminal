@@ -407,12 +407,69 @@ describe("topUpCard: atomic credit + audit, definite vs ambiguous failure", () =
 })
 
 describe("review states (pending withdrawals, top-up flags)", () => {
-  it("recordPendingWithdrawal is idempotent on the payment hash", async () => {
-    mockPoolQuery.mockResolvedValue({ rowCount: 0, rows: [] })
+  it("recordPendingWithdrawal inserts idempotently on the payment hash", async () => {
+    mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{ payment_hash: "h" }] })
     await store().recordPendingWithdrawal("h", "c1", 1000, 4000)
     const [sql, params] = mockPoolQuery.mock.calls[0]
     expect(String(sql)).toMatch(/ON CONFLICT \(payment_hash\) DO NOTHING/)
+    expect(String(sql)).toMatch(/RETURNING payment_hash/)
     expect(params).toEqual(["h", "c1", 1000, 4000, expect.any(Number), "PENDING", null])
+    expect(mockPoolQuery).toHaveBeenCalledTimes(1)
+  })
+
+  it("a hash conflict with a different amount throws (not a silent no-op)", async () => {
+    mockPoolQuery.mockResolvedValueOnce({ rowCount: 0, rows: [] }).mockResolvedValueOnce({
+      rows: [{ card_id: "c1", amount: "999", kind: "PENDING", resolved_at: null }],
+    })
+    await expect(store().recordPendingWithdrawal("h", "c1", 1000, 4000)).rejects.toThrow(
+      /different amount/,
+    )
+  })
+
+  it("RESTORE_FAILED is upgraded to an in-flight kind, never downgraded", async () => {
+    mockPoolQuery
+      .mockResolvedValueOnce({ rowCount: 0, rows: [] })
+      .mockResolvedValueOnce({
+        rows: [
+          { card_id: "c1", amount: "1000", kind: "RESTORE_FAILED", resolved_at: null },
+        ],
+      })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{}] })
+    await store().recordPendingWithdrawal("h", "c1", 1000, 4000, "PENDING", 777)
+    const [sql, params] = mockPoolQuery.mock.calls[2]
+    expect(String(sql)).toMatch(/kind = 'RESTORE_FAILED'/)
+    expect(params).toEqual(["h", "PENDING", 777, "c1", 1000])
+
+    mockPoolQuery.mockReset()
+    mockPoolQuery.mockResolvedValueOnce({ rowCount: 0, rows: [] }).mockResolvedValueOnce({
+      rows: [{ card_id: "c1", amount: "1000", kind: "PENDING", resolved_at: null }],
+    })
+    await store().recordPendingWithdrawal("h", "c1", 1000, 4000, "RESTORE_FAILED", null)
+    expect(mockPoolQuery).toHaveBeenCalledTimes(2)
+  })
+
+  it("a finished row is reopened for a new attempt of the same hash", async () => {
+    mockPoolQuery
+      .mockResolvedValueOnce({ rowCount: 0, rows: [] })
+      .mockResolvedValueOnce({
+        rows: [{ card_id: "c1", amount: "1000", kind: "PENDING", resolved_at: "5" }],
+      })
+      .mockResolvedValueOnce({ rowCount: 1, rows: [{}] })
+    await store().recordPendingWithdrawal("h", "c1", 1000, 4000, "UNKNOWN", 9)
+    const q = String(mockPoolQuery.mock.calls[2][0]).replace(/\s+/g, " ")
+    expect(q).toMatch(/resolved_at = NULL/)
+    expect(q).toMatch(/resolved_at IS NOT NULL AND card_id = \$7/)
+  })
+
+  it("rollbackSpend subtracts daily_spent only in the deduction's window", async () => {
+    mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{ id: "c1" }] })
+    await expect(store().rollbackSpend("c1", 1000, 777)).resolves.toBe(true)
+    const q = String(mockPoolQuery.mock.calls[0][0]).replace(/\s+/g, " ")
+    expect(q).toMatch(/balance = balance \+ \$2/)
+    expect(q).toMatch(
+      /WHEN \$3::bigint IS NOT NULL AND daily_reset_at IS DISTINCT FROM \$3 THEN daily_spent ELSE GREATEST\(0, daily_spent - \$2\) END/,
+    )
+    expect(mockPoolQuery.mock.calls[0][1]).toEqual(["c1", 1000, 777])
   })
 
   it("getPendingWithdrawals filters unresolved rows, optionally per card", async () => {
