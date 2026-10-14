@@ -19,7 +19,7 @@ import {
 
 import { isBlinkInvoice, getNonBlinkWalletError } from "../invoice-decoder"
 
-import { pinNwcRelays, PinnedWebSocket } from "./pinned-socket"
+import { createPinnedWebSocket } from "./pinned-socket"
 import { assertNwcRelays, assertNwcRelayUrl, MAX_NWC_RELAYS } from "./relays"
 
 /** Minimal type for the object returned by SimplePool.subscribe() */
@@ -164,12 +164,12 @@ class NWCClient {
 
   private async openPool(): Promise<SimplePool> {
     if (typeof window === "undefined") {
-      await pinNwcRelays(this.uri.relays)
-      if (typeof PinnedWebSocket !== "function") {
+      const Socket = await createPinnedWebSocket(this.uri.relays)
+      if (typeof Socket !== "function") {
         throw new Error("Invalid NWC connection")
       }
       const pool = new SimplePool({
-        websocketImplementation: PinnedWebSocket,
+        websocketImplementation: Socket,
       } as ConstructorParameters<typeof SimplePool>[0])
       this.pool = pool
       return pool
@@ -707,6 +707,8 @@ class NWCClient {
     } catch (_e: unknown) {
       // Ignore
     }
+    this.pool = null
+    this.poolReady = null
   }
 }
 
