@@ -8,9 +8,9 @@
  * instances / serverless invocations. If Redis is unavailable, it falls back to
  * a per-process in-memory store so the limiter still degrades safely.
  *
- * IMPORTANT: client IP is taken from `x-forwarded-for` / `x-real-ip`. This is
- * only trustworthy when the app runs behind a proxy that overwrites these
- * headers. Ensure your ingress/load balancer sets them.
+ * IMPORTANT: client IP is taken from `x-real-ip`, else the rightmost
+ * `x-forwarded-for` hop (see getClientIp). This is only trustworthy behind a
+ * proxy that sets/overwrites these headers (ingress-nginx does).
  *
  * Tier presets:
  *   - AUTH        10 req/min  (login, challenge, verify)
@@ -168,14 +168,28 @@ function createRateLimiter(opts: RateLimitOptions) {
 // Client IP extraction
 // ---------------------------------------------------------------------------
 
+/**
+ * Client IP as seen by OUR ingress, never a client-chosen value.
+ *
+ * Behind ingress-nginx (L4 LoadBalancer, externalTrafficPolicy: Local,
+ * use-forwarded-headers: false) `$remote_addr` is the real client and nginx
+ * overwrites X-Real-IP / X-Forwarded-For with it. Prefer X-Real-IP; for
+ * X-Forwarded-For take the RIGHTMOST hop (the one appended by our proxy) —
+ * the leftmost entry is whatever the client sent if the chain ever appends.
+ */
 function getClientIp(req: NextApiRequest): string {
-  const forwarded = req.headers["x-forwarded-for"]
-  if (typeof forwarded === "string") {
-    return forwarded.split(",")[0].trim()
-  }
   const realIp = req.headers["x-real-ip"]
-  if (typeof realIp === "string") {
+  if (typeof realIp === "string" && realIp.trim()) {
     return realIp.trim()
+  }
+  const forwarded = req.headers["x-forwarded-for"]
+  const forwardedValue = Array.isArray(forwarded) ? forwarded.join(",") : forwarded
+  if (typeof forwardedValue === "string" && forwardedValue.trim()) {
+    const hops = forwardedValue
+      .split(",")
+      .map((hop) => hop.trim())
+      .filter(Boolean)
+    if (hops.length > 0) return hops[hops.length - 1]
   }
   return req.socket?.remoteAddress || "unknown"
 }
