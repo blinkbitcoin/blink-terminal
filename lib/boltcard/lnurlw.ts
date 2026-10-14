@@ -498,9 +498,10 @@ async function handleWithdrawCallback(
     }
   }
 
-  // Lease the claim before paying. A balance tap during the Blink call must
-  // not restore this row; a missing row means it was already resolved.
-  if (!(await boltcardStore.leaseWithdrawalClaim(invoiceHash))) {
+  // Leave CLAIMED before Blink can send. UNKNOWN is not auto-restored, so a
+  // tap during the payment call cannot give the balance back and still pay.
+  // False means the claim was already resolved: do not pay.
+  if (!(await boltcardStore.beginWithdrawalSend(invoiceHash))) {
     return {
       status: "ERROR",
       reason: "This invoice was already used",
@@ -716,8 +717,9 @@ function parseInvoiceAmount(invoice: string): InvoiceAmount | null {
  * Reconcile pending withdrawals by payment hash: PAID -> resolved SUCCESS;
  * EXPIRED (terminal send failure) -> deduction restored and resolved FAILED;
  * RESTORE_FAILED + UNSEEN (no transaction) -> restored immediately.
- * CLAIMED + UNSEEN is restored only after the pay lease expires, so a live
- * payment is not undone. An in-flight SEND stays for the next pass.
+ * CLAIMED + UNSEEN is an abandoned claim: restored only by a compare-and-set
+ * that still sees CLAIMED and a stamp older than the grace. A row handed to
+ * pay (UNKNOWN) is not restored. An in-flight SEND stays for the next pass.
  *
  * Triggered from the balance check (the owner's tap) and available for ops.
  * A global scheduler is blink-wip#1619.
@@ -765,16 +767,22 @@ async function reconcilePendingWithdrawals(cardId?: string): Promise<{
           resolved++
           restored++
         }
-      } else if (
-        status === "UNSEEN" &&
-        (item.kind === "RESTORE_FAILED" ||
-          (item.kind === "CLAIMED" &&
-            Date.now() - item.createdAt >= CLAIMED_UNSEEN_GRACE_MS))
-      ) {
-        // RESTORE_FAILED: the payment was definitely never sent.
-        // CLAIMED past the lease: the process died before pay. A fresh
-        // CLAIMED row is the callback still inside the Blink call.
+      } else if (status === "UNSEEN" && item.kind === "RESTORE_FAILED") {
+        // Definite rejection whose restore was queued. The payment was never sent.
         if (await boltcardStore.resolvePendingWithdrawalFailed(item.paymentHash)) {
+          resolved++
+          restored++
+        }
+      } else if (status === "UNSEEN" && item.kind === "CLAIMED") {
+        // Abandoned only if the row is still CLAIMED and older than the grace
+        // at the moment of the write. A concurrent beginWithdrawalSend wins
+        // the row and this matches nothing.
+        if (
+          await boltcardStore.resolvePendingWithdrawalFailed(
+            item.paymentHash,
+            Date.now() - CLAIMED_UNSEEN_GRACE_MS,
+          )
+        ) {
           resolved++
           restored++
         }

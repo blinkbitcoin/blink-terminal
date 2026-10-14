@@ -199,7 +199,7 @@ describe("callback: k1 required, single-use, capped", () => {
       dailySpent: 1000,
       dailyResetAt: null,
     })
-    mockStore.leaseWithdrawalClaim = jest.fn().mockResolvedValue(true)
+    mockStore.beginWithdrawalSend = jest.fn().mockResolvedValue(true)
     mockStore.finalizeWithdrawal = jest.fn().mockResolvedValue(undefined)
     mockStore.resolvePendingWithdrawalFailed = jest.fn().mockResolvedValue(true)
     mockStore.recordTransaction = jest.fn().mockResolvedValue(undefined)
@@ -332,9 +332,65 @@ describe("callback: k1 required, single-use, capped", () => {
     expect(mockStore.finalizeWithdrawal).toHaveBeenCalledWith("00".repeat(32), "SUCCESS")
   })
 
+  it("reconciliation during pay cannot restore a claim already handed to Blink", async () => {
+    mockStore.consumeWithdrawSession = jest.fn().mockResolvedValue(5000 * 1000)
+    let releasePay: (value: unknown) => void = () => undefined
+    let payStarted: () => void = () => undefined
+    const started = new Promise<void>((resolve) => {
+      payStarted = resolve
+    })
+    pay.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          releasePay = resolve
+          payStarted()
+        }),
+    )
+
+    const pending = handleWithdrawCallback(CARD_ID, K1, invoice(1000), pay)
+    await started
+    expect(mockStore.beginWithdrawalSend).toHaveBeenCalledWith("00".repeat(32))
+
+    // Stale snapshot still says CLAIMED and old. The compare-and-set loses
+    // because the row is no longer CLAIMED.
+    mockStore.getPendingWithdrawals = jest.fn().mockResolvedValue([
+      {
+        paymentHash: "00".repeat(32),
+        cardId: CARD_ID,
+        amount: 1000,
+        createdAt: 1,
+        kind: "CLAIMED",
+      },
+    ])
+    mockStore.resolvePendingWithdrawalFailed = jest.fn().mockResolvedValue(false)
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          data: {
+            me: {
+              defaultAccount: { walletById: { transactionsByPaymentHash: [] } },
+            },
+          },
+        }),
+    }) as unknown as typeof fetch
+
+    const recon = await reconcilePendingWithdrawals(CARD_ID)
+    expect(recon).toEqual({ checked: 1, resolved: 0, restored: 0 })
+    expect(mockStore.resolvePendingWithdrawalFailed).toHaveBeenCalledWith(
+      "00".repeat(32),
+      expect.any(Number),
+    )
+
+    releasePay({ success: true, status: "SUCCESS", paymentHash: "h" })
+    await expect(pending).resolves.toMatchObject({ status: "OK" })
+    expect(mockStore.finalizeWithdrawal).toHaveBeenCalledWith("00".repeat(32), "SUCCESS")
+    expect(mockStore.rollbackSpend).not.toHaveBeenCalled()
+  })
+
   it("a claim resolved before pay is not paid", async () => {
     mockStore.consumeWithdrawSession = jest.fn().mockResolvedValue(5000 * 1000)
-    mockStore.leaseWithdrawalClaim = jest.fn().mockResolvedValue(false)
+    mockStore.beginWithdrawalSend = jest.fn().mockResolvedValue(false)
 
     const res = await handleWithdrawCallback(CARD_ID, K1, invoice(1000), pay)
 
@@ -842,7 +898,7 @@ describe("reconcilePendingWithdrawals", () => {
     expect(mockStore.resolvePendingWithdrawal).not.toHaveBeenCalled()
   })
 
-  it("a fresh CLAIMED row with no Blink transaction is left alone (pay still in flight)", async () => {
+  it("a fresh CLAIMED row is only restored if the compare-and-set still matches", async () => {
     mockStore.getPendingWithdrawals = jest.fn().mockResolvedValue([
       {
         paymentHash: "h1",
@@ -852,10 +908,14 @@ describe("reconcilePendingWithdrawals", () => {
         kind: "CLAIMED",
       },
     ])
+    mockStore.resolvePendingWithdrawalFailed = jest.fn().mockResolvedValue(false)
     blinkStatus([])
     const res = await reconcilePendingWithdrawals(CARD_ID)
     expect(res).toEqual({ checked: 1, resolved: 0, restored: 0 })
-    expect(mockStore.resolvePendingWithdrawalFailed).not.toHaveBeenCalled()
+    expect(mockStore.resolvePendingWithdrawalFailed).toHaveBeenCalledWith(
+      "h1",
+      expect.any(Number),
+    )
   })
 
   it("a CLAIMED row with no Blink transaction is restored (died before pay)", async () => {

@@ -502,13 +502,27 @@ describe("review states (pending withdrawals, top-up flags)", () => {
     expect(sqlCalls().join(" ")).not.toMatch(/balance = balance -/)
   })
 
-  it("leaseWithdrawalClaim refreshes only an unresolved CLAIMED row", async () => {
+  it("beginWithdrawalSend moves only an unresolved CLAIMED row to UNKNOWN", async () => {
     mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{ payment_hash: "h" }] })
-    await expect(store().leaseWithdrawalClaim("h")).resolves.toBe(true)
+    await expect(store().beginWithdrawalSend("h")).resolves.toBe(true)
     const q = String(mockPoolQuery.mock.calls[0][0]).replace(/\s+/g, " ")
     expect(q).toMatch(
-      /SET created_at = \$2 WHERE payment_hash = \$1 AND resolved_at IS NULL AND kind = 'CLAIMED'/,
+      /SET kind = 'UNKNOWN' WHERE payment_hash = \$1 AND resolved_at IS NULL AND kind = 'CLAIMED'/,
     )
+  })
+
+  it("an abandoned claim restores only while the row is still CLAIMED and older than the cutoff", async () => {
+    mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{ id: "c1" }] })
+    await expect(store().resolvePendingWithdrawalFailed("h", 1000)).resolves.toBe(true)
+    const q = String(mockPoolQuery.mock.calls[0][0]).replace(/\s+/g, " ")
+    expect(q).toMatch(/AND kind = 'CLAIMED' AND created_at < \$3/)
+    expect(mockPoolQuery.mock.calls[0][1][2]).toBe(1000)
+
+    mockPoolQuery.mockReset()
+    mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{ id: "c1" }] })
+    await store().resolvePendingWithdrawalFailed("h")
+    const plain = String(mockPoolQuery.mock.calls[0][0]).replace(/\s+/g, " ")
+    expect(plain).not.toMatch(/kind = 'CLAIMED'/)
   })
 
   it("flagUncreditedTopUp does not replace an existing review reason", async () => {

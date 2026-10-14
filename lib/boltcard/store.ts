@@ -1963,18 +1963,18 @@ class BoltcardStore {
   }
 
   /**
-   * Refresh the claim's timestamp immediately before paying. Reconciliation
-   * will not restore a CLAIMED row until this stamp is older than the grace
-   * window, so a balance tap during the Blink call cannot undo a live payment.
-   * False means the row was already resolved: do not pay.
+   * Hand a CLAIMED withdrawal to the pay path. UNKNOWN is not auto-restored
+   * when Blink has no transaction, so a balance tap during the payment call
+   * cannot undo a live send. False means the claim is no longer CLAIMED:
+   * do not pay.
    */
-  async leaseWithdrawalClaim(paymentHash: string): Promise<boolean> {
+  async beginWithdrawalSend(paymentHash: string): Promise<boolean> {
     const result: QueryResult<DbRow> = await query(
       `UPDATE boltcard_pending_withdrawals
-       SET created_at = $2
+       SET kind = 'UNKNOWN'
        WHERE payment_hash = $1 AND resolved_at IS NULL AND kind = 'CLAIMED'
        RETURNING payment_hash`,
-      [paymentHash, Date.now()],
+      [paymentHash],
     )
     return (result.rowCount ?? 0) > 0
   }
@@ -2055,13 +2055,23 @@ class BoltcardStore {
    * returned and nothing is restored; if the card write fails, the statement
    * rolls back and the row stays unresolved. The deduction is restored at
    * most once.
+   *
+   * abandonedClaimedBefore: compare-and-set for a claim the process never
+   * handed to pay. Restores only if the row is still CLAIMED and older than
+   * that cutoff. A row that has moved to UNKNOWN, or whose stamp is newer,
+   * matches nothing and is not restored.
    */
-  async resolvePendingWithdrawalFailed(paymentHash: string): Promise<boolean> {
+  async resolvePendingWithdrawalFailed(
+    paymentHash: string,
+    abandonedClaimedBefore?: number,
+  ): Promise<boolean> {
+    const abandoned = abandonedClaimedBefore !== undefined
     const result: QueryResult<DbRow> = await query(
       `WITH resolved AS (
          UPDATE boltcard_pending_withdrawals
          SET resolved_at = $2, outcome = 'FAILED'
          WHERE payment_hash = $1 AND resolved_at IS NULL
+           ${abandoned ? "AND kind = 'CLAIMED' AND created_at < $3" : ""}
          RETURNING card_id, amount, daily_window_reset_at
        )
        UPDATE boltcards
@@ -2077,7 +2087,9 @@ class BoltcardStore {
        FROM resolved r
        WHERE boltcards.id = r.card_id
        RETURNING boltcards.id`,
-      [paymentHash, Date.now()],
+      abandoned
+        ? [paymentHash, Date.now(), abandonedClaimedBefore]
+        : [paymentHash, Date.now()],
     )
     return (result.rowCount ?? 0) > 0
   }
