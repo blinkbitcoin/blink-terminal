@@ -6,17 +6,49 @@
 --              created earlier stored whatever case the client sent, and the
 --              owner lookups are case-sensitive.
 --
---              boltcards / boltcard_pending_registrations: plain normalization
---              (no uniqueness on owner_pubkey).
---              boltcard_issuer_keys (owner_pubkey is the PRIMARY KEY): per
---              lower(owner_pubkey) group, exactly one row becomes the lowercase
---              key - an existing lowercase row wins, otherwise the oldest.
---              Any other variant in a colliding group is left untouched and
---              reported with a WARNING (failing here would block the
---              migration init container). Card wipe keys do not depend on it:
---              each card stores its own K0-K4.
+--              All-or-nothing (single transaction). If the same pubkey has
+--              more than one case variant in boltcard_issuer_keys (the PRIMARY
+--              KEY), the issuer keys cannot be reconciled in SQL (ciphertexts
+--              are salted) and picking one could bind cards to the wrong key.
+--              The migration then ABORTS before changing anything, listing the
+--              affected (public) pubkeys; schema_version stays at 22 and the
+--              migration re-runs after remediation.
+--
+-- Pre-deploy check (must return no rows):
+--   SELECT lower(owner_pubkey), count(*) FROM boltcard_issuer_keys
+--   GROUP BY 1 HAVING count(*) > 1;
+--
+-- Remediation if it does: for each card of that owner, re-derive K0 with each
+-- candidate issuer key (deriveAllKeys(issuerKey, card_uid, version)) and
+-- compare with the card's stored K0 to find which key the cards use; keep that
+-- row, delete the other(s), then redeploy.
 -- Date: 2026-10-14
 -- ============================================
+
+BEGIN;
+
+DO $$
+DECLARE
+    collisions TEXT;
+BEGIN
+    SELECT string_agg(format('%s (%s rows)', lower_pubkey, n), ', ')
+    INTO collisions
+    FROM (
+        SELECT lower(owner_pubkey) AS lower_pubkey, count(*) AS n
+        FROM boltcard_issuer_keys
+        GROUP BY lower(owner_pubkey)
+        HAVING count(*) > 1
+    ) groups;
+
+    IF collisions IS NOT NULL THEN
+        RAISE EXCEPTION 'Migration 023 aborted: boltcard_issuer_keys has case-variant collisions that need manual remediation (see migration header): %', collisions;
+    END IF;
+END $$;
+
+-- No collisions: each issuer-key row maps to a distinct lowercase pubkey.
+UPDATE boltcard_issuer_keys
+SET owner_pubkey = lower(owner_pubkey)
+WHERE owner_pubkey <> lower(owner_pubkey);
 
 UPDATE boltcards
 SET owner_pubkey = lower(owner_pubkey)
@@ -26,35 +58,6 @@ UPDATE boltcard_pending_registrations
 SET owner_pubkey = lower(owner_pubkey)
 WHERE owner_pubkey <> lower(owner_pubkey);
 
-WITH ranked AS (
-    SELECT
-        owner_pubkey,
-        row_number() OVER (
-            PARTITION BY lower(owner_pubkey)
-            ORDER BY (owner_pubkey = lower(owner_pubkey)) DESC, created_at ASC
-        ) AS rn
-    FROM boltcard_issuer_keys
-)
-UPDATE boltcard_issuer_keys k
-SET owner_pubkey = lower(k.owner_pubkey)
-FROM ranked r
-WHERE r.owner_pubkey = k.owner_pubkey
-  AND r.rn = 1
-  AND k.owner_pubkey <> lower(k.owner_pubkey);
-
-DO $$
-DECLARE
-    leftover INTEGER;
-BEGIN
-    SELECT COUNT(*) INTO leftover
-    FROM boltcard_issuer_keys
-    WHERE owner_pubkey <> lower(owner_pubkey);
-
-    IF leftover > 0 THEN
-        RAISE WARNING 'Migration 023: % mixed-case boltcard_issuer_keys row(s) collide with an existing lowercase key and were left as-is; resolve manually (recover-keys for cards derived from them will not work)', leftover;
-    END IF;
-END $$;
-
 INSERT INTO system_metrics (metric_name, metric_value, metric_unit, tags)
 VALUES (
     'schema_version',
@@ -62,6 +65,8 @@ VALUES (
     'version',
     '{"description": "Normalize Bolt Card owner pubkeys to lowercase", "date": "2026-10-14"}'
 );
+
+COMMIT;
 
 DO $$
 BEGIN
