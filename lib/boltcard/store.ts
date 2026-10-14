@@ -236,6 +236,12 @@ const PendingStatus = {
 // Default registration expiry (15 minutes)
 const REGISTRATION_EXPIRY_MS: number = 15 * 60 * 1000
 
+/** Lifetime of a tap-bound LNURL-withdraw session (k1). */
+const WITHDRAW_SESSION_TTL_MS: number = 5 * 60 * 1000
+
+const sha256Hex = (value: string): string =>
+  crypto.createHash("sha256").update(value).digest("hex")
+
 /** Thrown when a newly minted / reprogrammed card could not be activated. */
 const CARD_ACTIVATION_FAILED = "Failed to activate card"
 
@@ -325,6 +331,11 @@ class BoltcardStore {
           `[BoltcardStore] Lazy cleanup: expired ${expiredCount} pending registration(s)`,
         )
       }
+
+      // Drop withdraw sessions a day after expiry
+      await query(`DELETE FROM boltcard_withdraw_sessions WHERE expires_at < $1`, [
+        now - 24 * 60 * 60 * 1000,
+      ])
     } catch (err: unknown) {
       console.error("[BoltcardStore] Lazy cleanup error:", (err as Error).message)
     }
@@ -1588,6 +1599,59 @@ class BoltcardStore {
   }
 
   // ==========================================================================
+  // WITHDRAW SESSIONS (single-use, tap-bound LNURL-withdraw k1)
+  // ==========================================================================
+
+  /**
+   * For a tap that already passed SUN/CMAC verification: in ONE statement,
+   * advance last_counter (only if `counter` is newer and the card is ACTIVE)
+   * and create a withdraw session. Returns the raw k1 (only ever returned to
+   * the tapping wallet), or null if the tap was replayed / lost a race / the
+   * card isn't active. Throws on database errors.
+   */
+  async startWithdrawSession(
+    cardId: string,
+    counter: number,
+    maxMsats: number,
+    ttlMs: number = WITHDRAW_SESSION_TTL_MS,
+  ): Promise<string | null> {
+    const k1: string = crypto.randomBytes(32).toString("hex")
+    const now: number = Date.now()
+    const result: QueryResult<DbRow> = await query(
+      `WITH advanced AS (
+         UPDATE boltcards SET last_counter = $2
+         WHERE id = $1 AND last_counter < $2 AND status = 'ACTIVE'
+         RETURNING id
+       )
+       INSERT INTO boltcard_withdraw_sessions
+         (k1_hash, card_id, counter, max_msats, created_at, expires_at)
+       SELECT $3, id, $2, $4, $5, $6 FROM advanced
+       RETURNING k1_hash`,
+      [cardId, counter, sha256Hex(k1), Math.floor(maxMsats), now, now + ttlMs],
+    )
+    return (result.rowCount ?? 0) > 0 ? k1 : null
+  }
+
+  /**
+   * Atomically consume a withdraw session for `cardId`. Returns the tap-time
+   * maximum in msats, or null if the k1 is unknown, for another card,
+   * expired, or already used. Throws on database errors.
+   */
+  async consumeWithdrawSession(k1: string, cardId: string): Promise<number | null> {
+    if (typeof k1 !== "string" || !/^[0-9a-f]{64}$/i.test(k1)) return null
+    const now: number = Date.now()
+    const result: QueryResult<DbRow> = await query(
+      `UPDATE boltcard_withdraw_sessions
+       SET used_at = $3
+       WHERE k1_hash = $1 AND card_id = $2 AND used_at IS NULL AND expires_at > $3
+       RETURNING max_msats`,
+      [sha256Hex(k1.toLowerCase()), cardId, now],
+    )
+    if ((result.rowCount ?? 0) === 0) return null
+    return parseInt(String(result.rows[0].max_msats), 10)
+  }
+
+  // ==========================================================================
   // PENDING TOP-UP MANAGEMENT (for LNURL-pay)
   // ==========================================================================
 
@@ -1669,6 +1733,26 @@ class BoltcardStore {
       return (result.rowCount ?? 0) > 0
     } catch (err: unknown) {
       console.error("[BoltcardStore] markTopUpProcessed error:", (err as Error).message)
+      return false
+    }
+  }
+
+  /**
+   * Release a top-up claim (markTopUpProcessed) when nothing was credited or
+   * transferred, so it can be processed again later.
+   */
+  async unmarkTopUpProcessed(paymentHash: string): Promise<boolean> {
+    try {
+      const result: QueryResult<DbRow> = await query(
+        `UPDATE boltcard_pending_topups
+         SET processed = FALSE, processed_at = NULL
+         WHERE payment_hash = $1 AND processed = TRUE
+         RETURNING payment_hash`,
+        [paymentHash],
+      )
+      return (result.rowCount ?? 0) > 0
+    } catch (err: unknown) {
+      console.error("[BoltcardStore] unmarkTopUpProcessed error:", (err as Error).message)
       return false
     }
   }

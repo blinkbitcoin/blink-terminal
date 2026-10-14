@@ -618,7 +618,8 @@ class BlinkAPI {
     const data = await this.query(mutation, variables)
 
     if (data.intraLedgerPaymentSend?.errors?.length > 0) {
-      throw new Error(data.intraLedgerPaymentSend.errors[0].message)
+      const [error] = data.intraLedgerPaymentSend.errors
+      throw new PaymentRejectedError(error.message, error.code)
     }
 
     return data.intraLedgerPaymentSend

@@ -304,3 +304,62 @@ describe("owner pubkeys are normalized to lowercase", () => {
     expect(insert?.[1][1]).toBe(LOWER)
   })
 })
+
+describe("withdraw sessions (tap-bound k1)", () => {
+  it("startWithdrawSession advances the counter and inserts the session in one statement", async () => {
+    mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{ k1_hash: "x" }] })
+
+    const k1 = await store().startWithdrawSession("c1", 9, 5_000_000)
+
+    expect(k1).toMatch(/^[0-9a-f]{64}$/)
+    expect(mockPoolQuery).toHaveBeenCalledTimes(1)
+    const [sql, params] = mockPoolQuery.mock.calls[0]
+    const q = String(sql).replace(/\s+/g, " ")
+    expect(q).toMatch(/WITH advanced AS \( UPDATE boltcards SET last_counter = \$2/)
+    expect(q).toMatch(/WHERE id = \$1 AND last_counter < \$2 AND status = 'ACTIVE'/)
+    expect(q).toMatch(
+      /INSERT INTO boltcard_withdraw_sessions .* SELECT \$3, id, \$2, \$4, \$5, \$6 FROM advanced/,
+    )
+    // Only the hash is stored
+    expect(params[2]).toMatch(/^[0-9a-f]{64}$/)
+    expect(params[2]).not.toBe(k1)
+    expect(params.slice(0, 2)).toEqual(["c1", 9])
+    expect(params[3]).toBe(5_000_000)
+  })
+
+  it("startWithdrawSession returns null for a replayed tap", async () => {
+    mockPoolQuery.mockResolvedValueOnce({ rowCount: 0, rows: [] })
+    await expect(store().startWithdrawSession("c1", 9, 5_000_000)).resolves.toBeNull()
+  })
+
+  it("consumeWithdrawSession is single-use, card-bound and unexpired", async () => {
+    mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [{ max_msats: "5000000" }] })
+
+    await expect(store().consumeWithdrawSession("f".repeat(64), "c1")).resolves.toBe(
+      5_000_000,
+    )
+
+    const [sql, params] = mockPoolQuery.mock.calls[0]
+    expect(String(sql).replace(/\s+/g, " ")).toMatch(
+      /WHERE k1_hash = \$1 AND card_id = \$2 AND used_at IS NULL AND expires_at > \$3/,
+    )
+    expect(params[0]).not.toBe("f".repeat(64)) // hashed
+    expect(params[1]).toBe("c1")
+  })
+
+  it.each(["", "c1", "z".repeat(64), "f".repeat(63)])(
+    "consumeWithdrawSession rejects malformed k1 %p without querying",
+    async (k1) => {
+      await expect(store().consumeWithdrawSession(k1, "c1")).resolves.toBeNull()
+      expect(mockPoolQuery).not.toHaveBeenCalled()
+    },
+  )
+
+  it("unmarkTopUpProcessed only releases a processed claim", async () => {
+    mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [] })
+    await expect(store().unmarkTopUpProcessed("h")).resolves.toBe(true)
+    expect(String(mockPoolQuery.mock.calls[0][0])).toMatch(
+      /WHERE payment_hash = \$1 AND processed = TRUE/,
+    )
+  })
+})

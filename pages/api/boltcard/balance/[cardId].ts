@@ -128,8 +128,17 @@ async function handleBalanceGet(
       })
     }
 
-    // Update last counter for replay protection
-    await boltcard.store.updateLastCounter(cardId, tapResult.counter as number)
+    // Replay protection: the counter must actually advance (atomic, newer only)
+    const advanced = await boltcard.store.updateLastCounter(
+      cardId,
+      tapResult.counter as number,
+    )
+    if (!advanced) {
+      return res.status(409).json({
+        status: "ERROR",
+        reason: "Card tap already used - tap again",
+      })
+    }
 
     // Check and process any pending top-ups before returning balance
     // This detects paid invoices that weren't processed via webhook
