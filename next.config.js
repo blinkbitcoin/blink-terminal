@@ -157,6 +157,10 @@ const nextConfig = {
           /[\\/]server[\\/]safe-fetch-json$/,
           path.resolve(__dirname, "lib/server/safe-fetch-json.browser.ts"),
         ),
+        new webpack.NormalModuleReplacementPlugin(
+          /[\\/]nwc[\\/]pinned-socket$/,
+          path.resolve(__dirname, "lib/nwc/pinned-socket.browser.ts"),
+        ),
       )
     }
 

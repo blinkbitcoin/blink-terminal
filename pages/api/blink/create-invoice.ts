@@ -74,19 +74,9 @@ async function createDirectMerchantInvoice(params: {
     }
   }
 
-  // 2) npub.cash merchant — LNURL-pay against their lightning address.
-  if (npubCashActive && npubCashLightningAddress) {
-    const invoice = await getInvoiceFromLightningAddress(
-      npubCashLightningAddress,
-      amountSats,
-      memo,
-    )
-    return {
-      paymentRequest: invoice.paymentRequest,
-      paymentHash: invoice.paymentHash,
-      satoshis: amountSats,
-      verifyUrl: invoice.verify,
-    }
+  // npub.cash is gone. The route handler rejects this before we get here.
+  if (npubCashActive || npubCashLightningAddress) {
+    throw new Error("npub.cash is no longer available")
   }
 
   // 3) NWC merchant — make the invoice on the merchant's own wallet.
@@ -178,6 +168,10 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       }>
 
       // Get the API URL for the specified environment
+      if (npubCashActive || npubCashLightningAddress) {
+        return res.status(400).json({ error: "npub.cash is no longer available" })
+      }
+
       const apiUrl = getApiUrlForEnvironment(environment)
 
       rootSpan.setAttribute("invoice.amount", parseFloat(String(amount)) || 0)

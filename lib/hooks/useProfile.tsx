@@ -37,7 +37,11 @@ import ProfileStorage, {
   type ProfileExportData,
 } from "../storage/ProfileStorage"
 
-import { mergeProfileData, pushLocalOnlyToServer } from "./profileMerge"
+import {
+  hasUsableBlinkAccount,
+  mergeProfileData,
+  pushLocalOnlyToServer,
+} from "./profileMerge"
 import { useNostrAuth } from "./useNostrAuth"
 
 // ============= Server Response Types =============
@@ -1470,19 +1474,13 @@ export function ProfileProvider({ children }: ProfileProviderProps): React.JSX.E
       state.nwcConnections.find((c: StoredNWCConnection) => c.isActive) || null,
     [state.nwcConnections],
   )
-  const hasBlinkAccount: boolean = state.blinkAccounts.length > 0
+  const hasBlinkAccount: boolean = hasUsableBlinkAccount(state.blinkAccounts)
   const hasNWCConnection: boolean = state.nwcConnections.length > 0
-  const npubCashWallets = useMemo(
-    (): LocalBlinkAccount[] =>
-      state.blinkAccounts.filter((a: LocalBlinkAccount) => a.type === "npub-cash"),
-    [state.blinkAccounts],
-  )
-  const hasNpubCashWallet: boolean = npubCashWallets.length > 0
-  const activeNpubCashWallet = useMemo(
-    (): LocalBlinkAccount | null =>
-      npubCashWallets.find((w: LocalBlinkAccount) => w.isActive) || null,
-    [npubCashWallets],
-  )
+  // npub.cash is no longer available. Stored accounts are ignored so an old
+  // session cannot select one or send it to create-invoice.
+  const npubCashWallets = useMemo((): LocalBlinkAccount[] => [], [])
+  const hasNpubCashWallet = false
+  const activeNpubCashWallet = null
 
   const value: ProfileContextValue = {
     // State

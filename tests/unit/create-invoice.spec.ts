@@ -166,18 +166,17 @@ describe("create-invoice (direct mode)", () => {
     expect(mockStoreTipData).not.toHaveBeenCalled()
   })
 
-  it("npub.cash merchant: mints via LNURL against the given address", async () => {
+  it("npub.cash is rejected with no outbound invoice fetch", async () => {
     const { req, res } = mockReqRes({
       amount: 3000,
       currency: "BTC",
       npubCashActive: true,
-      npubCashLightningAddress: "user@npub.cash",
+      npubCashLightningAddress: "x@169.254.169.254",
     })
     await handler(req, res)
 
-    expect(res._status).toBe(200)
-    expect(mockGetInvoice).toHaveBeenCalledWith("user@npub.cash", 3000, "")
-    expect(mockStoreTipData).not.toHaveBeenCalled()
+    expect(res._status).toBe(400)
+    expect(mockGetInvoice).not.toHaveBeenCalled()
   })
 
   it("NWC merchant: make_invoice on the merchant wallet (millisats) + closes client", async () => {
@@ -250,7 +249,7 @@ describe("create-invoice (direct mode)", () => {
     })
     await handler(req, res)
     expect(res._status).toBe(400)
-    expect(res._json.error).toMatch(/npubCashLightningAddress/)
+    expect(res._json.error).toMatch(/no longer available/)
     expect(mockGetInvoice).not.toHaveBeenCalled()
   })
 

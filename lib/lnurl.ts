@@ -384,6 +384,25 @@ export async function getInvoiceFromLightningAddress(
     comment = "" // Comments not allowed
   }
 
+  // The callback must stay on the lightning-address host. Blink's live
+  // metadata is the one exception: blink.sv returns a callback on
+  // lnurl.blink.sv. Anything else is rejected before it is fetched.
+  let callbackUrl: URL
+  try {
+    callbackUrl = new URL(lnurlData.callback)
+  } catch {
+    throw new Error("Invalid LNURL callback")
+  }
+  const metadataHost = new URL(lnurlEndpoint).hostname
+  const trustedHop =
+    metadataHost === "blink.sv" && callbackUrl.hostname === "lnurl.blink.sv"
+  if (
+    callbackUrl.protocol !== "https:" ||
+    (callbackUrl.hostname !== metadataHost && !trustedHop)
+  ) {
+    throw new Error("Invalid LNURL callback")
+  }
+
   // Request invoice
   const invoiceData: LnurlInvoiceResponse = await requestInvoiceFromCallback(
     lnurlData.callback,
@@ -450,30 +469,9 @@ export async function verifyLnurlPayment(verifyUrl: string): Promise<LnurlVerify
  * @returns Probe result with validity and capacity info
  */
 export async function probeNpubCashAddress(
-  address: string,
+  _address: string,
 ): Promise<NpubCashProbeResult> {
-  try {
-    const validation: NpubCashValidationResult = validateNpubCashAddress(address)
-    if (!validation.valid) {
-      return { valid: false, error: validation.error }
-    }
-
-    const { lnurlEndpoint } = parseLightningAddress(address)
-    const metadata: LnurlPayMetadata = await fetchLnurlPayMetadata(lnurlEndpoint)
-
-    return {
-      valid: true,
-      minSats: Math.ceil(metadata.minSendable / 1000),
-      maxSats: Math.floor(metadata.maxSendable / 1000),
-      allowsNostr: metadata.allowsNostr,
-    }
-  } catch (err: unknown) {
-    const error = err instanceof Error ? err : new Error(String(err))
-    return {
-      valid: false,
-      error: error.message,
-    }
-  }
+  return { valid: false, error: "npub.cash is no longer available" }
 }
 
 export default {

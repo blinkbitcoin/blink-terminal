@@ -16,6 +16,7 @@
  */
 
 import {
+  hasUsableBlinkAccount,
   mergeProfileData,
   pushLocalOnlyToServer,
   type MergeableAccount,
@@ -442,5 +443,17 @@ describe("pushLocalOnlyToServer", () => {
     )
 
     expect(order).toEqual(["api-done", "lnAddr-start"])
+  })
+})
+
+describe("hasUsableBlinkAccount", () => {
+  it("is false when the only stored account is npub.cash", () => {
+    expect(hasUsableBlinkAccount([{ type: "npub-cash" }])).toBe(false)
+  })
+
+  it("is true when a non-npub account is stored", () => {
+    expect(hasUsableBlinkAccount([{ type: "npub-cash" }, { type: "ln-address" }])).toBe(
+      true,
+    )
   })
 })

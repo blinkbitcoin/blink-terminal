@@ -56,6 +56,13 @@ const parseHttpsUrl = (input: string): URL => {
   return url
 }
 
+/** Browser builds do not DNS-check. Server builds reject non-public hosts. */
+export const resolvePublicAddresses = async (
+  _hostname: string,
+): Promise<Array<{ address: string; family: number }>> => []
+
+export const assertPublicHostname = async (_hostname: string): Promise<void> => {}
+
 export const safeFetchJsonResponse = async (
   input: string,
   { maxBodyBytes = DEFAULT_MAX_BODY_BYTES }: SafeFetchJsonOptions = {},

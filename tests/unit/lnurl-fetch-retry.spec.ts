@@ -30,7 +30,7 @@ import { fetchJsonWithRetry, getInvoiceFromLightningAddress } from "../../lib/ln
 import { SafeFetchError } from "../../lib/server/safe-fetch-json"
 
 beforeEach(() => {
-  jest.clearAllMocks()
+  mockSafeFetchJson.mockReset()
 })
 
 describe("fetchJsonWithRetry", () => {
@@ -108,12 +108,47 @@ describe("getInvoiceFromLightningAddress (SSRF)", () => {
       )
 
     await expect(getInvoiceFromLightningAddress("a@evil.example", 10)).rejects.toThrow(
-      "hostname does not resolve to a public address",
+      "Invalid LNURL callback",
     )
     expect(rawFetch).not.toHaveBeenCalled()
+    expect(mockSafeFetchJson).toHaveBeenCalledTimes(1)
     expect(mockSafeFetchJson.mock.calls[0][0]).toBe(
       "https://evil.example/.well-known/lnurlp/a",
     )
-    expect(mockSafeFetchJson.mock.calls[1][0]).toContain("https://10.0.0.5:8080/")
+  })
+
+  it("allows blink.sv metadata to call lnurl.blink.sv", async () => {
+    mockSafeFetchJson
+      .mockResolvedValueOnce({
+        tag: "payRequest",
+        callback: "https://lnurl.blink.sv/lnurlp/blink.sv/merchant/invoice",
+        minSendable: 1000,
+        maxSendable: 1_000_000,
+        metadata: "[]",
+      })
+      .mockResolvedValueOnce({ pr: "lnbc-blink", paymentHash: "abc" })
+
+    const invoice = await getInvoiceFromLightningAddress("merchant@blink.sv", 10)
+
+    expect(invoice.paymentRequest).toBe("lnbc-blink")
+    expect(mockSafeFetchJson).toHaveBeenCalledTimes(2)
+    expect(String(mockSafeFetchJson.mock.calls[1][0])).toContain(
+      "https://lnurl.blink.sv/",
+    )
+  })
+
+  it("rejects a Blink address callback that leaves the trusted hosts", async () => {
+    mockSafeFetchJson.mockResolvedValueOnce({
+      tag: "payRequest",
+      callback: "https://evil.example/invoice",
+      minSendable: 1000,
+      maxSendable: 1_000_000,
+      metadata: "[]",
+    })
+
+    await expect(getInvoiceFromLightningAddress("merchant@blink.sv", 10)).rejects.toThrow(
+      "Invalid LNURL callback",
+    )
+    expect(mockSafeFetchJson).toHaveBeenCalledTimes(1)
   })
 })

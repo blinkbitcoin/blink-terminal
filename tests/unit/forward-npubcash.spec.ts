@@ -90,61 +90,15 @@ beforeEach(() => {
 })
 
 describe("forward-npubcash security", () => {
-  it("DRAIN VECTOR: rejects request with no paymentHash", async () => {
-    const { req, res } = mockReqRes({
-      totalAmount: 5_000_000,
-      recipientAddress: "npub1attacker@npub.cash",
-    })
-    await handler(req, res)
-    expect(res._status).toBe(401)
-    expect(mockClaim).not.toHaveBeenCalled()
-    expect(mockPayLnInvoice).not.toHaveBeenCalled()
-  })
-
-  it("does not pay out when claim returns not_found", async () => {
-    mockClaim.mockResolvedValue({
-      claimed: false,
-      reason: "not_found",
-      paymentData: null,
-    })
-    const { req, res } = mockReqRes({ paymentHash: VALID_HASH })
-    await handler(req, res)
-    expect(res._json.skipForwarding).toBe(true)
-    expect(mockPayLnInvoice).not.toHaveBeenCalled()
-  })
-
-  it("DRAIN VECTOR: ignores client recipient/amount; uses stored values", async () => {
-    mockClaim.mockResolvedValue({
-      claimed: true,
-      reason: "success",
-      paymentData: {
-        baseAmount: 1000,
-        tipAmount: 0,
-        tipRecipients: [],
-        displayCurrency: "BTC",
-        environment: "production",
-        npubCashLightningAddress: "npub1honest@npub.cash",
-      },
-    })
-
+  it("is disabled: 410 and no payout", async () => {
     const { req, res } = mockReqRes({
       paymentHash: VALID_HASH,
       totalAmount: 9_999_999,
       recipientAddress: "npub1attacker@npub.cash",
     })
     await handler(req, res)
-
-    expect(res._status).toBe(200)
-    // LNURL invoice was requested for the STORED recipient + STORED amount.
-    expect(mockGetInvoiceFromLnAddr).toHaveBeenCalledWith(
-      "npub1honest@npub.cash",
-      1000,
-      expect.any(String),
-    )
-    expect(mockVerifyInvoice).toHaveBeenCalledWith(
-      expect.objectContaining({ expectedSats: 1000, requireBlinkNode: true }),
-    )
-    expect(mockPayLnInvoice).toHaveBeenCalledTimes(1)
-    expect(mockRemoveTipData).toHaveBeenCalledWith(VALID_HASH)
+    expect(res._status).toBe(410)
+    expect(mockGetInvoiceFromLnAddr).not.toHaveBeenCalled()
+    expect(mockPayLnInvoice).not.toHaveBeenCalled()
   })
 })

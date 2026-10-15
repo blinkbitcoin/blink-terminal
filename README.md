@@ -45,8 +45,7 @@ A powerful Bitcoin Lightning terminal for Blink power users. Execute advanced op
 
 - **Split Payments**: Automatically split payments between merchant and tip recipient
 - **Zero-Fee Forwarding**: Uses Blink intraledger transactions for instant, free forwarding
-- **Flexible Destinations**: Forward to Blink usernames, Lightning Addresses, or npub.cash addresses
-- **npub.cash Integration**: Special support for npub.cash addresses with zero-fee forwarding
+- **Flexible Destinations**: Forward to Blink usernames or Lightning Addresses
 - **Configurable Presets**: Set custom tip percentages (e.g., 10%, 15%, 20%)
 
 ### Wallet Connectivity
@@ -345,7 +344,7 @@ docker-compose -f docker-compose.prod.yml up -d
 | Transaction History & CSV Export      | Completed   |
 | NWC Integration                       | Completed   |
 | Lightning Address Forwarding          | Completed   |
-| npub.cash Integration                 | Completed   |
+| npub.cash Integration                 | Removed     |
 | Cross-Device Sync                     | Completed   |
 | NFC Payments                          | Completed   |
 | Nostr Authentication (NIP-07, NIP-55) | Completed   |

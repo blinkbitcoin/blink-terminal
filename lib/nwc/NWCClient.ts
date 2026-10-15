@@ -19,6 +19,9 @@ import {
 
 import { isBlinkInvoice, getNonBlinkWalletError } from "../invoice-decoder"
 
+import { createPinnedWebSocket } from "./pinned-socket"
+import { assertNwcRelays, assertNwcRelayUrl, MAX_NWC_RELAYS } from "./relays"
+
 /** Minimal type for the object returned by SimplePool.subscribe() */
 interface PoolSubCloser {
   close: (reason?: string) => void
@@ -132,8 +135,10 @@ class NWCClient {
   /** @type {NWCUri} */
   uri: NWCUri
 
-  /** @type {SimplePool} */
-  pool: SimplePool
+  /** @type {SimplePool | null} */
+  pool: SimplePool | null = null
+
+  private poolReady: Promise<SimplePool> | null = null
 
   /**
    * Create an NWC client from a connection string
@@ -141,7 +146,39 @@ class NWCClient {
    */
   constructor(connectionString: string) {
     this.uri = this.parseConnectionString(connectionString)
-    this.pool = new SimplePool()
+  }
+
+  /**
+   * Open the pool only after relays are pinned to a public lookup.
+   * On the server, a missing pin means do not dial.
+   */
+  private ensurePool(): Promise<SimplePool> {
+    if (!this.poolReady) {
+      this.poolReady = this.openPool().catch((err: unknown) => {
+        this.poolReady = null
+        throw err
+      })
+    }
+    return this.poolReady
+  }
+
+  private async openPool(): Promise<SimplePool> {
+    if (typeof window === "undefined") {
+      const Socket = await createPinnedWebSocket(this.uri.relays)
+      if (typeof Socket !== "function") {
+        throw new Error("Invalid NWC connection")
+      }
+      const pool = new SimplePool({
+        websocketImplementation: Socket,
+      } as ConstructorParameters<typeof SimplePool>[0])
+      this.pool = pool
+      return pool
+    }
+
+    await assertNwcRelays(this.uri.relays)
+    const pool = new SimplePool()
+    this.pool = pool
+    return pool
   }
 
   /**
@@ -150,6 +187,7 @@ class NWCClient {
    */
   async getInfo(): Promise<NWCInfo | null> {
     try {
+      const pool = await this.ensurePool()
       console.log("[NWCClient] Getting wallet info...")
       const filter = {
         kinds: [13194],
@@ -164,10 +202,7 @@ class NWCClient {
         }, 10000)
       })
 
-      const getPromise: Promise<NostrEvent | null> = this.pool.get(
-        this.uri.relays,
-        filter,
-      )
+      const getPromise: Promise<NostrEvent | null> = pool.get(this.uri.relays, filter)
       const evt: NostrEvent | null = await Promise.race([getPromise, timeoutPromise])
 
       if (!evt) {
@@ -459,10 +494,12 @@ class NWCClient {
     const requestEvent = finalizeEvent(eventTemplate, skBytes)
     console.log("[NWCClient] Request event created:", requestEvent.id)
 
-    // Publish to relays (all at once, like PubPay does)
+    // Publish only after the relay hosts are pinned to a public lookup.
+    let pool: SimplePool
     try {
+      pool = await this.ensurePool()
       console.log("[NWCClient] Publishing to relays:", this.uri.relays)
-      await this.pool.publish(this.uri.relays, requestEvent)
+      await pool.publish(this.uri.relays, requestEvent)
       console.log("[NWCClient] Published successfully")
     } catch (err: unknown) {
       console.error("[NWCClient] Publish failed:", err)
@@ -509,7 +546,7 @@ class NWCClient {
 
       try {
         // Use subscribe() like PubPay does - passing filter directly, not in array
-        sub = this.pool.subscribe(this.uri.relays, filter, {
+        sub = pool.subscribe(this.uri.relays, filter, {
           onevent: async (evt: NostrEvent): Promise<void> => {
             console.log("[NWCClient] Received event:", evt.id.slice(0, 8) + "...")
             if (resolved) return
@@ -619,8 +656,16 @@ class NWCClient {
       clientSecretHex = secret
     }
 
-    if (!walletPubkey || !clientSecretHex || relays.length === 0) {
+    if (
+      !walletPubkey ||
+      !clientSecretHex ||
+      relays.length === 0 ||
+      relays.length > MAX_NWC_RELAYS
+    ) {
       throw new Error("Invalid NWC connection string: missing required fields")
+    }
+    for (const relay of relays) {
+      assertNwcRelayUrl(relay)
     }
 
     const clientPubkey: string = getPublicKey(hexToBytes(clientSecretHex))
@@ -658,10 +703,12 @@ class NWCClient {
    */
   close(): void {
     try {
-      this.pool.close(this.uri.relays)
+      this.pool?.close(this.uri.relays)
     } catch (_e: unknown) {
       // Ignore
     }
+    this.pool = null
+    this.poolReady = null
   }
 }
 
