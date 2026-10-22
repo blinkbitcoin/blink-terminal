@@ -99,6 +99,18 @@ import whitelistHandler from "../../pages/api/network/whitelist/check"
 
 type Handler = (req: never, res: never) => unknown
 
+/**
+ * The exact headers the browser client sends on mutations: fetch with
+ * Content-Type: application/json plus the same-origin Origin the browser
+ * attaches automatically. Passed explicitly per test — the call() helper
+ * must not inject these, or it masks client/guard contract drift (PR #92
+ * review: a bodyless DELETE without Content-Type shipped exactly that way).
+ */
+const CLIENT_MUTATION_HEADERS = {
+  "content-type": "application/json",
+  "origin": "https://terminal.example",
+}
+
 const call = async (
   handler: Handler,
   {
@@ -136,15 +148,10 @@ const call = async (
       method,
       query,
       body,
-      // Browser mutations always send Origin + JSON content type; tests
-      // override these explicitly to exercise the mutation guard.
-      headers: {
-        host: "terminal.example",
-        ...(method === "POST" || method === "DELETE"
-          ? { "content-type": "application/json", "origin": "https://terminal.example" }
-          : {}),
-        ...headers,
-      },
+      // No guard-relevant headers are injected here: every test passes the
+      // exact client shape explicitly, or the guard/client contract drift
+      // gets masked (PR #92 review).
+      headers: { host: "terminal.example", ...headers },
       cookies: token ? { "auth-token": token } : {},
       url: "/api/network",
     } as never,
@@ -206,8 +213,14 @@ describe("no session -> 401 on every previously header-authenticated route", () 
     const res = await call(handler as Handler, {
       method: method as string,
       query: { communityId: "1" },
-      // Even a valid-looking super-admin header must not count as auth.
-      headers: { "x-user-npub": SUPER_ADMIN_NPUB, "x-user-pubkey": SUPER_ADMIN_HEX },
+      headers: {
+        // Even a valid-looking super-admin header must not count as auth.
+        "x-user-npub": SUPER_ADMIN_NPUB,
+        "x-user-pubkey": SUPER_ADMIN_HEX,
+        // Mutations get the client header shape so the 401 comes from the
+        // missing session, not from the mutation guard.
+        ...(method === "POST" || method === "DELETE" ? CLIENT_MUTATION_HEADERS : {}),
+      },
     })
     expect(res.statusCode).toBe(401)
     expect(res.body).toEqual({ success: false, error: "Authentication required" })
@@ -243,7 +256,7 @@ describe("forged X-User-Npub is ignored (regression for blink-wip#1679)", () => 
     const res = await call(communitiesHandler as Handler, {
       token: "token-other",
       method: "POST",
-      headers: { "x-user-npub": SUPER_ADMIN_NPUB },
+      headers: { ...CLIENT_MUTATION_HEADERS, "x-user-npub": SUPER_ADMIN_NPUB },
       body: { name: "AOSO-E4-Probe-2", slug: "probe2", leaderNpub: OTHER_NPUB },
     })
     expect(res.statusCode).toBe(403)
@@ -289,7 +302,11 @@ describe("forged X-User-Npub is ignored (regression for blink-wip#1679)", () => 
     const res = await call(applyHandler as Handler, {
       token: "token-owner",
       method: "POST",
-      headers: { "x-user-npub": OTHER_NPUB, "x-user-pubkey": OTHER },
+      headers: {
+        ...CLIENT_MUTATION_HEADERS,
+        "x-user-npub": OTHER_NPUB,
+        "x-user-pubkey": OTHER,
+      },
       body: { communityId: "1", applicationNote: "hi" },
     })
     expect(res.statusCode).toBe(200)
@@ -300,7 +317,7 @@ describe("forged X-User-Npub is ignored (regression for blink-wip#1679)", () => 
     const res = await call(syncHandler as Handler, {
       token: "token-other",
       method: "POST",
-      headers: { "x-user-npub": SUPER_ADMIN_NPUB },
+      headers: { ...CLIENT_MUTATION_HEADERS, "x-user-npub": SUPER_ADMIN_NPUB },
       body: { syncAll: true },
     })
     expect(res.statusCode).toBe(403)
@@ -324,7 +341,7 @@ describe("forged X-User-Npub is ignored (regression for blink-wip#1679)", () => 
     const res = await call(reviewHandler as Handler, {
       token: "token-owner",
       method: "POST",
-      headers: { "x-user-npub": OTHER_NPUB },
+      headers: { ...CLIENT_MUTATION_HEADERS, "x-user-npub": OTHER_NPUB },
       body: { applicationId: "5", action: "approve" },
     })
     expect(res.statusCode).toBe(200)
@@ -357,7 +374,7 @@ describe("mutation guard (same-site CSRF boundary, PR #92 review)", () => {
     const res = await call(reviewHandler as Handler, {
       token: "token-owner",
       method: "POST",
-      headers: { origin: "https://evil.example" },
+      headers: { ...CLIENT_MUTATION_HEADERS, origin: "https://evil.example" },
       body: { applicationId: "5", action: "approve" },
     })
     expect(res.statusCode).toBe(403)
@@ -368,7 +385,7 @@ describe("mutation guard (same-site CSRF boundary, PR #92 review)", () => {
     const res = await call(reviewHandler as Handler, {
       token: "token-owner",
       method: "POST",
-      headers: { origin: undefined as unknown as string },
+      headers: { "content-type": "application/json" },
       body: { applicationId: "5", action: "approve" },
     })
     expect(res.statusCode).toBe(403)
@@ -378,7 +395,7 @@ describe("mutation guard (same-site CSRF boundary, PR #92 review)", () => {
     const res = await call(reviewHandler as Handler, {
       token: "token-owner",
       method: "POST",
-      headers: { origin: "not a url" },
+      headers: { ...CLIENT_MUTATION_HEADERS, origin: "not a url" },
       body: { applicationId: "5", action: "approve" },
     })
     expect(res.statusCode).toBe(403)
@@ -395,9 +412,9 @@ describe("mutation guard (same-site CSRF boundary, PR #92 review)", () => {
       token: "token-owner",
       method: "POST",
       headers: {
+        ...CLIENT_MUTATION_HEADERS,
         "host": "internal:3000",
         "x-forwarded-host": "terminal.example",
-        "origin": "https://terminal.example",
       },
       body: { applicationId: "5", action: "approve" },
     })
@@ -458,6 +475,7 @@ describe("session-bound mutations execute for the right session", () => {
     const res = await call(consentHandler as Handler, {
       token: "token-owner",
       method: "POST",
+      headers: { ...CLIENT_MUTATION_HEADERS },
       body: { communityId: "1", apiKey: "blink_valid" },
     })
     expect(res.statusCode).toBe(200)
@@ -469,13 +487,16 @@ describe("session-bound mutations execute for the right session", () => {
     )
   })
 
-  it("consent DELETE revokes for the session npub", async () => {
+  it("consent DELETE revokes for the session npub (exact client shape: JSON content-type, no body)", async () => {
     mockDb.getMembership = jest.fn().mockResolvedValue({ id: 3, status: "approved" })
     mockDb.createOrUpdateConsent = jest.fn().mockResolvedValue({ id: 9 })
     const res = await call(consentHandler as Handler, {
       token: "token-owner",
       method: "DELETE",
       query: { communityId: "1" },
+      // components/Network.tsx revokeConsent sends Content-Type: application/json
+      // and NO body. This is the request the guard must accept.
+      headers: { ...CLIENT_MUTATION_HEADERS },
     })
     expect(res.statusCode).toBe(200)
     expect(mockDb.createOrUpdateConsent).toHaveBeenCalledWith(
@@ -484,6 +505,19 @@ describe("session-bound mutations execute for the right session", () => {
       "1",
       expect.objectContaining({ consentGiven: false }),
     )
+  })
+
+  it("consent DELETE without Content-Type -> 415 (regression: bodyless fetch sends none)", async () => {
+    // The pre-fix client sent exactly this request and the guard 415'd it,
+    // silently breaking revocation (PR #92 re-review HIGH).
+    const res = await call(consentHandler as Handler, {
+      token: "token-owner",
+      method: "DELETE",
+      query: { communityId: "1" },
+      headers: { origin: "https://terminal.example" },
+    })
+    expect(res.statusCode).toBe(415)
+    expect(mockDb.createOrUpdateConsent).not.toHaveBeenCalled()
   })
 
   it("members DELETE removes a member as the leader session", async () => {
@@ -498,6 +532,7 @@ describe("session-bound mutations execute for the right session", () => {
       token: "token-owner",
       method: "DELETE",
       query: { communityId: "1" },
+      headers: { ...CLIENT_MUTATION_HEADERS },
       body: { membershipId: "5" },
     })
     expect(res.statusCode).toBe(200)
@@ -532,6 +567,7 @@ describe("session-bound mutations execute for the right session", () => {
     const res = await call(communitiesHandler as Handler, {
       token: "token-admin",
       method: "POST",
+      headers: { ...CLIENT_MUTATION_HEADERS },
       body: { name: "New", slug: "new", leaderNpub: OWNER_NPUB },
     })
     expect(res.statusCode).toBe(201)
@@ -550,6 +586,7 @@ describe("session-bound mutations execute for the right session", () => {
     const res = await call(syncHandler as Handler, {
       token: "token-owner",
       method: "POST",
+      headers: { ...CLIENT_MUTATION_HEADERS },
       body: { communityId: "1" },
     })
     expect(res.statusCode).toBe(200)
@@ -564,6 +601,7 @@ describe("session-bound mutations execute for the right session", () => {
     const res = await call(syncHandler as Handler, {
       token: "token-admin",
       method: "POST",
+      headers: { ...CLIENT_MUTATION_HEADERS },
       body: { syncAll: true },
     })
     expect(res.statusCode).toBe(200)
