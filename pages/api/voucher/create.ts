@@ -12,21 +12,23 @@ import { isValidExpiryId, DEFAULT_EXPIRY_ID } from "../../../lib/voucher-expiry"
 import voucherStore from "../../../lib/voucher-store"
 
 /**
- * Tolerance for rate drift and rounding between the client's quote and the
- * server-side check. Attacks are orders of magnitude off (1 BTC vs 1 cent),
- * so 2% is far tighter than needed while robust to normal price movement.
+ * Tolerance for rate drift between the client's quote and the server-side
+ * check. Attacks are orders of magnitude off (1 BTC vs 1 cent), so 2% is far
+ * tighter than needed while robust to normal price movement. An additional
+ * ±1 cent allowance covers the client's round() quantization in both flow
+ * directions (blink-wip#1665 re-review).
  */
 const USD_PAIR_TOLERANCE = 0.02
+const USD_PAIR_QUANTIZATION_CENTS = 1
 
 /**
- * The sats a USD-cent amount is worth at the server-side rate, fetched with
- * the caller's own API key (same auth context as the ownership check).
- * null = the rate could not be verified; callers must fail closed.
+ * USD cents per sat at the server-side rate, fetched with the caller's own
+ * API key (same auth context as the ownership check). null = the rate could
+ * not be verified; callers must fail closed.
  */
-async function expectedSatsForUsdCents(
+async function getUsdCentsPerSat(
   apiKey: string,
   environment: EnvironmentName,
-  usdCents: number,
 ): Promise<number | null> {
   try {
     const rate = await new BlinkAPI(
@@ -41,7 +43,7 @@ async function expectedSatsForUsdCents(
     ) {
       return null
     }
-    return Math.round(usdCents / centsPerSat)
+    return centsPerSat
   } catch (_err: unknown) {
     return null
   }
@@ -161,37 +163,46 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       })
     }
 
-    // Balance check, matching the GraphQL create-withdraw-link control
-    // (blink-wip#1665): the REST path used to publish ACTIVE vouchers the
-    // wallet cannot back (redemption then fails against the empty escrow and
-    // k1 is never returned). Minor units on both sides: sats for BTC wallets,
-    // cents for USD wallets.
-    const requiredBalance =
-      actualWalletCurrency === "USD" ? parseInt(String(usdAmount)) : amountNum
-    if (requiredBalance > ownedWallet.balance) {
-      return res.status(400).json({
-        error: "Amount is more than the wallet balance",
-      })
-    }
+    // Backing check (blink-wip#1665): the wallet must fund this voucher on
+    // top of its existing ACTIVE liabilities. The own-balance fast-fail is
+    // here; the aggregate is enforced atomically per wallet inside the
+    // store's insert (maxLiabilityMinor/liabilityMinor).
+    let maxLiabilityMinor: number
+    let liabilityMinor: number
 
-    // Cross-check the USD/sats pair against a server-side rate (fetched with
-    // the caller's key): the client supplies both denominations and nothing
-    // else ties them together — a mismatched pair stores an ACTIVE voucher
-    // advertising sats the USD amount doesn't back, or vice versa
-    // (blink-wip#1665 re-review).
     if (actualWalletCurrency === "USD") {
       const usdCents = parseInt(String(usdAmount))
-      const expected = await expectedSatsForUsdCents(apiKey, environment, usdCents)
-      if (expected === null) {
+      const centsPerSat = await getUsdCentsPerSat(apiKey, environment)
+      if (centsPerSat === null) {
         return res.status(503).json({
           error: "Could not verify the exchange rate right now, please retry",
         })
       }
-      if (Math.abs(amountNum - expected) / expected > USD_PAIR_TOLERANCE) {
+
+      // Cross-check the USD/sats pair in CENT space: the client derives one
+      // denomination from the other with round(), so allow ±1 cent
+      // quantization plus 2% rate drift.
+      const impliedCents = amountNum * centsPerSat
+      const toleranceCents = USD_PAIR_QUANTIZATION_CENTS + USD_PAIR_TOLERANCE * usdCents
+      if (Math.abs(impliedCents - usdCents) > toleranceCents) {
         return res.status(400).json({
           error: "amount does not match usdAmount at the current exchange rate",
         })
       }
+
+      // Conservative backing: the sats actually paid at redemption must be
+      // fundable even at the tolerant edge of the pair check.
+      liabilityMinor = Math.max(usdCents, Math.ceil(impliedCents))
+      maxLiabilityMinor = ownedWallet.balance
+    } else {
+      liabilityMinor = amountNum
+      maxLiabilityMinor = ownedWallet.balance
+    }
+
+    if (liabilityMinor > maxLiabilityMinor) {
+      return res.status(400).json({
+        error: "Amount is more than the wallet balance",
+      })
     }
 
     // Validate expiryId if provided
@@ -207,6 +218,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       environment: environment,
       walletCurrency: actualWalletCurrency,
       usdAmount: actualWalletCurrency === "USD" ? parseInt(String(usdAmount)) : undefined,
+      maxLiabilityMinor,
+      liabilityMinor,
     })
 
     console.log("✅ Voucher created successfully:", {
@@ -238,8 +251,11 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     const message = error instanceof Error ? error.message : "Unknown error"
     console.error("❌ Voucher creation error:", error)
 
-    // Check for wallet limit error
-    if (message.includes("Maximum unclaimed vouchers")) {
+    // Check for wallet limit / backing errors
+    if (
+      message.includes("Maximum unclaimed vouchers") ||
+      message.includes("exceeds the wallet balance")
+    ) {
       return res.status(400).json({
         error: message,
       })

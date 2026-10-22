@@ -57,6 +57,20 @@ interface CreateVoucherOptions {
   environment?: string
   walletCurrency?: string
   usdAmount?: number
+  /**
+   * Backing ceiling in minor units (sats for BTC wallets, cents for USD).
+   * When set, the insert runs in a per-wallet transaction that sums existing
+   * ACTIVE, unexpired voucher liabilities and refuses when
+   * existing + liabilityMinor exceeds this ceiling (blink-wip#1665: each
+   * create used to check only its own amount against the live balance, so
+   * sequential/concurrent creates could aggregate beyond it).
+   */
+  maxLiabilityMinor?: number
+  /**
+   * This voucher's liability in the same minor units as maxLiabilityMinor.
+   * Defaults to the stored amount (sats) / usdAmountCents (USD).
+   */
+  liabilityMinor?: number
 }
 
 interface VoucherStats {
@@ -235,32 +249,73 @@ class VoucherStore {
     // Encrypt API key for storage
     const apiKeyEncrypted: string = AuthManager.encryptApiKey(apiKey)
 
-    try {
-      const result: QueryResult<VoucherRow> = await query(
-        `INSERT INTO vouchers 
+    const insertSql = `INSERT INTO vouchers
          (id, amount_sats, wallet_id, api_key_encrypted, status, claimed,
           created_at, expires_at, expiry_id, display_amount, display_currency, commission_percent, environment,
           wallet_currency, usd_amount_cents)
          VALUES ($1, $2, $3, $4, 'ACTIVE', false, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-         RETURNING *`,
-        [
-          chargeId,
-          amount,
-          walletId,
-          apiKeyEncrypted,
-          now,
-          expiresAt,
-          expiryId,
-          options.displayAmount || null,
-          options.displayCurrency || null,
-          options.commissionPercent || 0,
-          environment,
-          walletCurrency,
-          usdAmountCents,
-        ],
-      )
+         RETURNING *`
+    const insertParams = [
+      chargeId,
+      amount,
+      walletId,
+      apiKeyEncrypted,
+      now,
+      expiresAt,
+      expiryId,
+      options.displayAmount || null,
+      options.displayCurrency || null,
+      options.commissionPercent || 0,
+      environment,
+      walletCurrency,
+      usdAmountCents,
+    ]
 
-      const row: VoucherRow = result.rows[0]
+    try {
+      let row: VoucherRow
+
+      if (options.maxLiabilityMinor === undefined) {
+        const result: QueryResult<VoucherRow> = await query(insertSql, insertParams)
+        row = result.rows[0]
+      } else {
+        // Check-plus-insert must be atomic per wallet: concurrent creators
+        // both read the same live Blink balance, so serialize on the wallet
+        // and count existing liabilities inside the transaction.
+        const client = await getPool().connect()
+        try {
+          await client.query("BEGIN")
+          await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [walletId])
+
+          const liabilityColumn =
+            walletCurrency === "USD" ? "usd_amount_cents" : "amount_sats"
+          const liability: number =
+            options.liabilityMinor ??
+            (walletCurrency === "USD" ? (usdAmountCents as number) : amount)
+
+          const existingResult = await client.query(
+            `SELECT COALESCE(SUM(${liabilityColumn}), 0) AS total FROM vouchers
+             WHERE wallet_id = $1 AND status = 'ACTIVE' AND expires_at > $2`,
+            [walletId, now],
+          )
+          const existing: number = parseInt(
+            String(existingResult.rows[0]?.total ?? "0"),
+            10,
+          )
+          if (existing + liability > options.maxLiabilityMinor) {
+            throw new Error("Voucher amount exceeds the wallet balance")
+          }
+
+          const result = await client.query(insertSql, insertParams)
+          await client.query("COMMIT")
+          row = result.rows[0] as VoucherRow
+        } catch (txErr: unknown) {
+          await client.query("ROLLBACK").catch(() => {})
+          throw txErr
+        } finally {
+          client.release()
+        }
+      }
+
       const voucher: Voucher = this._rowToVoucher(row, apiKey) as Voucher // Pass original apiKey to avoid decryption
 
       const expiryDate: string = new Date(voucher.expiresAt).toISOString()

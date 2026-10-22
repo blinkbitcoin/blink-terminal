@@ -569,12 +569,16 @@ describe("voucher create: live ownership + confirmed wallet currency", () => {
     })
 
     it("rejects a USD voucher above the wallet balance (cents vs cents)", async () => {
+      // Consistent pair (501 cents = 10020 sats at 0.05 cents/sat), but the
+      // USD wallet holds only 500 cents.
       const res = await create({
         walletId: "wallet-usd",
         walletCurrency: "USD",
-        usdAmount: 501, // USD wallet has 500 cents
+        usdAmount: 501,
+        amount: 10020,
       })
       expect(res.statusCode).toBe(400)
+      expect(res.body).toEqual({ error: "Amount is more than the wallet balance" })
       expect(mockStore.createVoucher).not.toHaveBeenCalled()
     })
 
@@ -612,14 +616,42 @@ describe("voucher create: live ownership + confirmed wallet currency", () => {
       expect(mockStore.createVoucher).not.toHaveBeenCalled()
     })
 
-    it("accepts a pair within the 2% drift tolerance", async () => {
-      // 100 cents = 2000 sats expected; 2040 is exactly +2%.
-      expect((await usd({ amount: 2040, usdAmount: 100 })).statusCode).toBe(200)
+    it("accepts a pair within tolerance (±1 cent quantization + 2% drift)", async () => {
+      // 100 cents = 2000 sats expected; 2060 sats implies exactly 103 cents
+      // (the +1 cent quantization + 2% = 3 cent boundary).
+      expect((await usd({ amount: 2060, usdAmount: 100 })).statusCode).toBe(200)
       expect(mockStore.createVoucher).toHaveBeenCalled()
     })
 
     it("rejects a pair just outside the tolerance", async () => {
-      expect((await usd({ amount: 2041, usdAmount: 100 })).statusCode).toBe(400)
+      // 2061 sats implies 103.05 cents — beyond the 3 cent allowance.
+      expect((await usd({ amount: 2061, usdAmount: 100 })).statusCode).toBe(400)
+      expect(mockStore.createVoucher).not.toHaveBeenCalled()
+    })
+
+    it("applies the tolerance in the negative direction too", async () => {
+      // 1939 sats implies 96.95 cents — 3.05 below the supplied 100 cents.
+      expect((await usd({ amount: 1939, usdAmount: 100 })).statusCode).toBe(400)
+    })
+
+    it("accepts an honest small pair the sats-space check would quantize away", async () => {
+      // Production client formula: round(15 sats * 0.05) = 1 cent. The server
+      // must not reconstruct 1 / 0.05 = 20 sats and cry 25% drift.
+      expect((await usd({ amount: 15, usdAmount: 1 })).statusCode).toBe(200)
+      expect(mockStore.createVoucher).toHaveBeenCalled()
+    })
+
+    it("the pair tolerance cannot weaken backing", async () => {
+      // Wallet holds exactly 100 cents; 2039 sats is within pair tolerance
+      // (101.95 implied cents) but costs 102 cents at the same rate.
+      setBlinkAccounts({
+        [OWNER_KEY]: {
+          [PROD]: [{ id: "wallet-usd", walletCurrency: "USD", balance: 100 }],
+        },
+      })
+      const res = await usd({ amount: 2039, usdAmount: 100 })
+      expect(res.statusCode).toBe(400)
+      expect(res.body).toEqual({ error: "Amount is more than the wallet balance" })
       expect(mockStore.createVoucher).not.toHaveBeenCalled()
     })
 
@@ -637,6 +669,23 @@ describe("voucher create: live ownership + confirmed wallet currency", () => {
     it("never consults the rate for BTC vouchers", async () => {
       expect((await create({ amount: 500 })).statusCode).toBe(200)
       expect(mockGetExchangeRate).not.toHaveBeenCalled()
+    })
+
+    it("fetches the rate for the voucher's environment (staging)", async () => {
+      setBlinkAccounts({
+        [OWNER_KEY]: {
+          [STAGING]: [{ id: "wallet-stg-usd", walletCurrency: "USD", balance: 1000 }],
+        },
+      })
+      const res = await create({
+        walletId: "wallet-stg-usd",
+        walletCurrency: "USD",
+        usdAmount: 100,
+        amount: 2000,
+        environment: "staging",
+      })
+      expect(res.statusCode).toBe(200)
+      expect(mockGetExchangeRate).toHaveBeenCalledWith(OWNER_KEY, STAGING, "USD")
     })
   })
 })

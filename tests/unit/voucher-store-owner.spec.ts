@@ -7,8 +7,14 @@
  */
 
 const mockPoolQuery = jest.fn()
+const mockClientQuery = jest.fn()
+const mockClientRelease = jest.fn()
 jest.mock("../../lib/db", () => ({
-  getSharedPool: () => ({ query: (...args: unknown[]) => mockPoolQuery(...args) }),
+  getSharedPool: () => ({
+    query: (...args: unknown[]) => mockPoolQuery(...args),
+    connect: () =>
+      Promise.resolve({ query: mockClientQuery, release: mockClientRelease }),
+  }),
 }))
 const mockDecrypt = jest.fn(() => "decrypted")
 jest.mock("../../lib/auth", () => ({
@@ -47,6 +53,8 @@ const store = () => {
 
 beforeEach(() => {
   mockPoolQuery.mockReset()
+  mockClientQuery.mockReset()
+  mockClientRelease.mockClear()
   mockDecrypt.mockClear()
 })
 
@@ -135,5 +143,89 @@ describe("getVoucherStatsByWalletIds", () => {
       expiringSoon: 0,
     })
     expect(mockPoolQuery).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * Backing-ceiling creation (blink-wip#1665): with maxLiabilityMinor set, the
+ * insert runs in a per-wallet-locked transaction that counts existing ACTIVE,
+ * unexpired liabilities — sequential or concurrent creates cannot aggregate
+ * beyond the wallet balance.
+ */
+describe("createVoucher liability ceiling", () => {
+  const create = (
+    amount: number,
+    options: Record<string, unknown> = {},
+    existingTotal = "600",
+  ) => {
+    // Quota check goes through the pool; the transaction through the client.
+    mockPoolQuery.mockResolvedValue({ rows: [{ count: "0" }] })
+    mockClientQuery.mockImplementation(async (text: string) => {
+      if (text.startsWith("SELECT COALESCE(SUM"))
+        return { rows: [{ total: existingTotal }] }
+      if (text.startsWith("INSERT"))
+        return { rows: [row({ amount_sats: String(amount) })] }
+      return { rows: [] } // BEGIN / lock / COMMIT / ROLLBACK
+    })
+    return store().createVoucher(amount, "blink_key", "w1", options as never)
+  }
+
+  const queries = () => mockClientQuery.mock.calls.map((c) => c[0] as string)
+
+  it("inserts within the ceiling, under a per-wallet advisory lock", async () => {
+    const voucher = await create(400, { maxLiabilityMinor: 1000 }) // 600 + 400 = 1000
+
+    expect(voucher.amount).toBe(400)
+    const sql = queries()
+    expect(sql[0]).toBe("BEGIN")
+    expect(sql[1]).toContain("pg_advisory_xact_lock")
+    expect(sql[2]).toContain("COALESCE(SUM(amount_sats)")
+    expect(sql[3]).toContain("INSERT INTO vouchers")
+    expect(sql[4]).toBe("COMMIT")
+    // The lock is taken on the wallet id
+    expect(mockClientQuery.mock.calls[1][1]).toEqual(["w1"])
+    expect(mockClientRelease).toHaveBeenCalled()
+  })
+
+  it("refuses when existing liabilities + the new amount exceed the ceiling", async () => {
+    await expect(create(401, { maxLiabilityMinor: 1000 })).rejects.toThrow(
+      "exceeds the wallet balance",
+    )
+    const sql = queries()
+    expect(sql.some((q) => q.startsWith("INSERT"))).toBe(false)
+    expect(sql).toContain("ROLLBACK")
+    expect(mockClientRelease).toHaveBeenCalled()
+  })
+
+  it("sums USD liabilities in cents", async () => {
+    await create(2000, {
+      maxLiabilityMinor: 1000,
+      walletCurrency: "USD",
+      usdAmount: 100,
+    })
+    expect(queries()[2]).toContain("COALESCE(SUM(usd_amount_cents)")
+  })
+
+  it("liabilityMinor overrides the stored amount in the check", async () => {
+    // Conservative USD backing: the sats' cent cost can exceed stored cents.
+    await expect(
+      create(400, { maxLiabilityMinor: 1000, liabilityMinor: 401 }), // 600 + 401 > 1000
+    ).rejects.toThrow("exceeds the wallet balance")
+  })
+
+  it("uses the stored amount/cents as the default liability", async () => {
+    // existing 600 + default liability 400 (amount) = 1000, within ceiling
+    await expect(create(400, { maxLiabilityMinor: 1000 })).resolves.toBeTruthy()
+  })
+
+  it("without a ceiling, no transaction client is acquired", async () => {
+    mockPoolQuery.mockImplementation(async (text: string) =>
+      text.startsWith("INSERT")
+        ? { rows: [row({ amount_sats: "400" })] }
+        : { rows: [{ count: "0" }] },
+    )
+    const voucher = await store().createVoucher(400, "blink_key", "w1")
+    expect(voucher.amount).toBe(400)
+    expect(mockClientQuery).not.toHaveBeenCalled()
   })
 })
