@@ -16,14 +16,26 @@ export function toEnvironment(value: unknown): EnvironmentName {
 
 /** Outcome of a live ownership lookup. Callers must fail closed on `ok: false`. */
 export type OwnedWalletsResult =
-  | { ok: true; wallets: Map<string, string> }
+  | { ok: true; wallets: Map<string, OwnedWallet> }
   | { ok: false; reason: "invalid" | "unavailable" }
 
+/** A wallet owned by the API key's account. */
+export interface OwnedWallet {
+  walletCurrency: string
+  /**
+   * Wallet balance in minor units (sats for BTC, cents for USD). Always a
+   * finite number: a Blink response without one fails closed as
+   * "unavailable", so a schema change can't bypass balance checks.
+   */
+  balance: number
+}
+
 /**
- * The wallets the API key's account currently owns, as walletId → walletCurrency
- * ("BTC" | "USD"), fetched live from Blink.
+ * The wallets the API key's account currently owns, as
+ * walletId → { walletCurrency, balance }, fetched live from Blink.
  * - `invalid`: Blink refused the key (revoked / wrong / insufficient scope).
- * - `unavailable`: ownership could not be checked (network, 5xx, bad response).
+ * - `unavailable`: ownership could not be checked (network, 5xx, bad response,
+ *   or a wallet row without a finite balance — fail closed).
  */
 export async function getOwnedWallets(
   apiKey: string,
@@ -35,15 +47,26 @@ export async function getOwnedWallets(
       getApiUrlForEnvironment(environment),
     ).getWalletInfo()
     if (!Array.isArray(wallets)) return { ok: false, reason: "unavailable" }
-    return {
-      ok: true,
-      wallets: new Map(
-        wallets.map((wallet: { id: string; walletCurrency: string }) => [
-          wallet.id,
-          wallet.walletCurrency,
-        ]),
-      ),
+    const owned = new Map<string, OwnedWallet>()
+    for (const wallet of wallets as {
+      id: string
+      walletCurrency: string
+      balance: unknown
+    }[]) {
+      if (
+        typeof wallet?.id !== "string" ||
+        typeof wallet.walletCurrency !== "string" ||
+        typeof wallet.balance !== "number" ||
+        !Number.isFinite(wallet.balance)
+      ) {
+        return { ok: false, reason: "unavailable" }
+      }
+      owned.set(wallet.id, {
+        walletCurrency: wallet.walletCurrency,
+        balance: wallet.balance,
+      })
     }
+    return { ok: true, wallets: owned }
   } catch (error: unknown) {
     return {
       ok: false,

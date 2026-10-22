@@ -271,7 +271,7 @@ const STAGING = "https://api.staging.blink.sv/graphql"
 let blinkDown = false
 let blinkAccounts: Record<
   string,
-  Record<string, Array<{ id: string; walletCurrency: string }>>
+  Record<string, Array<{ id: string; walletCurrency: string; balance: number }>>
 >
 
 const setBlinkAccounts = (accounts: typeof blinkAccounts) => {
@@ -284,19 +284,20 @@ const setBlinkAccounts = (accounts: typeof blinkAccounts) => {
   })
 }
 
-const BTC_WALLET = { id: "wallet-1", walletCurrency: "BTC" }
-const USD_WALLET = { id: "wallet-usd", walletCurrency: "USD" }
+// Balances are minor units: sats for BTC wallets, cents for USD wallets.
+const BTC_WALLET = { id: "wallet-1", walletCurrency: "BTC", balance: 1000 }
+const USD_WALLET = { id: "wallet-usd", walletCurrency: "USD", balance: 500 }
 
 beforeEach(() => {
   blinkDown = false
   setBlinkAccounts({
     [OWNER_KEY]: {
       [PROD]: [BTC_WALLET, USD_WALLET],
-      [STAGING]: [{ id: "wallet-stg", walletCurrency: "BTC" }],
+      [STAGING]: [{ id: "wallet-stg", walletCurrency: "BTC", balance: 1000 }],
     },
     // A rotated replacement key for the same account
     blink_new_owner_key: { [PROD]: [BTC_WALLET, USD_WALLET] },
-    [OTHER_KEY]: { [PROD]: [{ id: "wallet-9", walletCurrency: "BTC" }] },
+    [OTHER_KEY]: { [PROD]: [{ id: "wallet-9", walletCurrency: "BTC", balance: 1000 }] },
   })
 })
 
@@ -543,5 +544,42 @@ describe("voucher create: live ownership + confirmed wallet currency", () => {
   it("normalizes an unknown environment to production", async () => {
     await create({ environment: "http://evil.example" })
     expect(mockGetWalletInfo).toHaveBeenCalledWith(OWNER_KEY, PROD)
+  })
+
+  // blink-wip#1665: the REST path must enforce the same balance check the
+  // GraphQL create-withdraw-link path does, so the service never publishes
+  // an ACTIVE voucher the wallet cannot back.
+  describe("balance check (blink-wip#1665)", () => {
+    it("rejects a BTC voucher above the wallet balance", async () => {
+      const res = await create({ amount: 1001 }) // BTC wallet has 1000 sats
+      expect(res.statusCode).toBe(400)
+      expect(res.body).toEqual({ error: "Amount is more than the wallet balance" })
+      expect(mockStore.createVoucher).not.toHaveBeenCalled()
+    })
+
+    it("accepts a voucher at exactly the wallet balance", async () => {
+      expect((await create({ amount: 1000 })).statusCode).toBe(200)
+      expect(mockStore.createVoucher).toHaveBeenCalled()
+    })
+
+    it("rejects a USD voucher above the wallet balance (cents vs cents)", async () => {
+      const res = await create({
+        walletId: "wallet-usd",
+        walletCurrency: "USD",
+        usdAmount: 501, // USD wallet has 500 cents
+      })
+      expect(res.statusCode).toBe(400)
+      expect(mockStore.createVoucher).not.toHaveBeenCalled()
+    })
+
+    it("fails closed (503) when Blink omits the balance", async () => {
+      setBlinkAccounts({
+        [OWNER_KEY]: {
+          [PROD]: [{ id: "wallet-1", walletCurrency: "BTC" } as never],
+        },
+      })
+      expect((await create()).statusCode).toBe(503)
+      expect(mockStore.createVoucher).not.toHaveBeenCalled()
+    })
   })
 })

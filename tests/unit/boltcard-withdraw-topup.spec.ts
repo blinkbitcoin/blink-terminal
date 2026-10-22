@@ -146,8 +146,8 @@ beforeEach(() => {
   mockVerifyCardTap.mockReset()
   mockStore.getCard = jest.fn().mockResolvedValue(card())
   mockBlink.getWalletInfo.mockResolvedValue([
-    { id: "wallet-btc", walletCurrency: "BTC" },
-    { id: "wallet-usd", walletCurrency: "USD" },
+    { id: "wallet-btc", walletCurrency: "BTC", balance: 100000 },
+    { id: "wallet-usd", walletCurrency: "USD", balance: 100000 },
   ])
 })
 

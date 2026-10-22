@@ -117,10 +117,11 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
         ? res.status(403).json({ error: "API key is not valid for this wallet" })
         : res.status(OWNERSHIP_UNAVAILABLE.status).json(OWNERSHIP_UNAVAILABLE.body)
     }
-    const actualWalletCurrency = ownership.wallets.get(walletId)
-    if (!actualWalletCurrency) {
+    const ownedWallet = ownership.wallets.get(walletId)
+    if (!ownedWallet) {
       return res.status(403).json({ error: "API key is not valid for this wallet" })
     }
+    const actualWalletCurrency = ownedWallet.walletCurrency
     if (actualWalletCurrency !== walletCurrency) {
       return res.status(400).json({ error: "walletCurrency does not match the wallet" })
     }

@@ -108,20 +108,32 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     if (!ownership.ok && ownership.reason === "unavailable") {
       return res.status(OWNERSHIP_UNAVAILABLE.status).json(OWNERSHIP_UNAVAILABLE.body)
     }
-    const actualWalletCurrency = ownership.ok
-      ? ownership.wallets.get(walletId)
-      : undefined
-    if (!actualWalletCurrency) {
+    const ownedWallet = ownership.ok ? ownership.wallets.get(walletId) : undefined
+    if (!ownedWallet) {
       return res.status(403).json({
         error: "API key is not valid for this wallet",
       })
     }
+    const actualWalletCurrency = ownedWallet.walletCurrency
 
     // The stored currency (memo, USD fields, listing) must match the wallet
     // that actually pays out.
     if (actualWalletCurrency !== walletCurrency) {
       return res.status(400).json({
         error: "walletCurrency does not match the wallet",
+      })
+    }
+
+    // Balance check, matching the GraphQL create-withdraw-link control
+    // (blink-wip#1665): the REST path used to publish ACTIVE vouchers the
+    // wallet cannot back (redemption then fails against the empty escrow and
+    // k1 is never returned). Minor units on both sides: sats for BTC wallets,
+    // cents for USD wallets.
+    const requiredBalance =
+      actualWalletCurrency === "USD" ? parseInt(String(usdAmount)) : amountNum
+    if (requiredBalance > ownedWallet.balance) {
+      return res.status(400).json({
+        error: "Amount is more than the wallet balance",
       })
     }
 
