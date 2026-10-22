@@ -275,6 +275,10 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
     // UI state
     const [loading, setLoading] = useState<boolean>(true)
     const [error, setError] = useState<string>("")
+    // Revoke failures render beside the Revoke control itself — the shared
+    // `error` state is written by unrelated actions and not displayed in the
+    // community dashboard (PR #92 review).
+    const [revokeError, setRevokeError] = useState<string>("")
     // Set by sessionFetch when the server session (24h JWT cookie) is gone:
     // local npubKey state outlives it, and 401s must not look like empty data.
     const [sessionExpired, setSessionExpired] = useState<boolean>(false)
@@ -477,6 +481,8 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
     const revokeConsent = async (communityId: string) => {
       if (!npubKey) return
 
+      setRevokeError("")
+
       try {
         // Content-Type is set explicitly even without a body: the server's
         // mutation guard requires application/json on every mutation.
@@ -502,12 +508,12 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
           })
         } else if (response.status !== 401) {
           // 401 is surfaced by the session-expired banner; anything else
-          // needs its own message or the button looks like a no-op.
-          setError(data.error || "Failed to revoke consent")
+          // renders beside the Revoke control.
+          setRevokeError(data.error || "Failed to revoke consent")
         }
       } catch (err: unknown) {
         console.error("Error revoking consent:", err)
-        setError("Failed to revoke consent")
+        setRevokeError("Failed to revoke consent")
       }
     }
 
@@ -2042,6 +2048,11 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
                     Revoke
                   </button>
                 </div>
+                {revokeError && (
+                  <div className="mt-2 text-sm text-red-600 dark:text-red-400">
+                    {revokeError}
+                  </div>
+                )}
               </div>
             )}
 
