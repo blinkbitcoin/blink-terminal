@@ -38,6 +38,13 @@ export const paymentHashSchema = z.string().regex(/^[a-f0-9]{64}$/i, {
   message: "Invalid payment hash format (expected 64 hex characters)",
 })
 
+/**
+ * Maximum memo length across the app. The receipt route
+ * (pages/api/transaction/receipt-pdf.ts) enforces the same bound — it imports
+ * this constant rather than duplicating the literal (PR #93 review).
+ */
+export const MEMO_MAX_LENGTH = 640
+
 /** Lightning invoice / payment request (lnbc...). */
 export const invoiceSchema = z.string().min(1)
 
@@ -54,7 +61,7 @@ export const nostrPubkeySchema = z.string().regex(/^[a-f0-9]{64}$/i, {
 export const createInvoiceSchema = z.object({
   amount: z.union([z.string(), z.number()]),
   currency: currencySchema,
-  memo: z.string().max(640).optional(),
+  memo: z.string().max(MEMO_MAX_LENGTH).optional(),
   walletId: z.string().optional(),
   apiKey: z.string().optional(),
   userWalletId: z.string().optional(),
@@ -83,7 +90,7 @@ export const createInvoiceSchema = z.object({
 export const forwardWithTipsSchema = z.object({
   paymentHash: paymentHashSchema,
   totalAmount: z.coerce.number().int().positive().optional(),
-  memo: z.string().max(640).optional().default(""),
+  memo: z.string().max(MEMO_MAX_LENGTH).optional().default(""),
   environment: environmentSchema.optional(),
 })
 
@@ -92,7 +99,7 @@ export const payInvoiceSchema = z.object({
   paymentHash: paymentHashSchema,
   invoice: invoiceSchema.optional(),
   paymentRequest: invoiceSchema.optional(),
-  memo: z.string().max(640).optional().default(""),
+  memo: z.string().max(MEMO_MAX_LENGTH).optional().default(""),
   environment: environmentSchema,
 })
 
@@ -132,7 +139,7 @@ export const nostrLoginSchema = z.object({
 export const createVoucherSchema = z.object({
   amount: satAmountSchema,
   currency: currencySchema.optional().default("BTC"),
-  memo: z.string().max(640).optional(),
+  memo: z.string().max(MEMO_MAX_LENGTH).optional(),
   recipientLnAddress: z.string().optional(),
   expiresInHours: z.coerce.number().int().positive().max(8760).optional(),
 })
