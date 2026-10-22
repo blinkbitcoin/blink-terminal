@@ -45,6 +45,7 @@ jest.mock("../../lib/rate-limit", () => ({
 
 const mockPayLnInvoice = jest.fn()
 const mockGetWalletInfo = jest.fn()
+const mockGetExchangeRate = jest.fn()
 jest.mock("../../lib/blink-api", () => {
   class PaymentRejectedError extends Error {
     code?: string
@@ -57,6 +58,7 @@ jest.mock("../../lib/blink-api", () => {
   const BlinkAPI = jest.fn().mockImplementation((apiKey: string, apiUrl: string) => ({
     payLnInvoice: (...args: unknown[]) => mockPayLnInvoice(...args),
     getWalletInfo: () => mockGetWalletInfo(apiKey, apiUrl),
+    getExchangeRate: (currency: string) => mockGetExchangeRate(apiKey, apiUrl, currency),
   }))
   return {
     __esModule: true,
@@ -154,6 +156,9 @@ beforeEach(() => {
   jest.clearAllMocks()
   jest.spyOn(console, "log").mockImplementation(() => {})
   jest.spyOn(console, "error").mockImplementation(() => {})
+  // Server-side rate for USD pair cross-checks: 0.05 cents/sat, so
+  // 100 cents = 2000 sats.
+  mockGetExchangeRate.mockResolvedValue({ satPriceInCurrency: 0.05, currency: "USD" })
   mockStore.getVoucher.mockResolvedValue(voucher())
   mockStore.claimVoucher.mockResolvedValue(true)
   mockStore.unclaimVoucher.mockResolvedValue(true)
@@ -520,11 +525,12 @@ describe("voucher create: live ownership + confirmed wallet currency", () => {
     const res = await create({
       walletId: "wallet-usd",
       walletCurrency: "USD",
-      usdAmount: 100,
+      usdAmount: 100, // 100 cents = 2000 sats at the mocked 0.05 cents/sat
+      amount: 2000,
     })
     expect(res.statusCode).toBe(200)
     expect(mockStore.createVoucher).toHaveBeenCalledWith(
-      500,
+      2000,
       OWNER_KEY,
       "wallet-usd",
       expect.objectContaining({ walletCurrency: "USD", usdAmount: 100 }),
@@ -580,6 +586,57 @@ describe("voucher create: live ownership + confirmed wallet currency", () => {
       })
       expect((await create()).statusCode).toBe(503)
       expect(mockStore.createVoucher).not.toHaveBeenCalled()
+    })
+  })
+
+  // The client supplies both denominations; the server must tie them together
+  // with an authoritative rate, or a mismatched pair stores an ACTIVE voucher
+  // advertising a value the USD amount doesn't back.
+  describe("USD amount/sats pair cross-check", () => {
+    const usd = (body: Record<string, unknown>) =>
+      create({ walletId: "wallet-usd", walletCurrency: "USD", ...body })
+
+    it("rejects the report's pair: 1 BTC advertised for 1 cent", async () => {
+      const res = await usd({ amount: 100000000, usdAmount: 1 })
+      expect(res.statusCode).toBe(400)
+      expect(res.body).toEqual({
+        error: "amount does not match usdAmount at the current exchange rate",
+      })
+      expect(mockStore.createVoucher).not.toHaveBeenCalled()
+    })
+
+    it("rejects the inverse: sats far below the USD amount", async () => {
+      // 500 cents = 10000 sats at the mocked rate; 100 sats is way off.
+      const res = await usd({ amount: 100, usdAmount: 500 })
+      expect(res.statusCode).toBe(400)
+      expect(mockStore.createVoucher).not.toHaveBeenCalled()
+    })
+
+    it("accepts a pair within the 2% drift tolerance", async () => {
+      // 100 cents = 2000 sats expected; 2040 is exactly +2%.
+      expect((await usd({ amount: 2040, usdAmount: 100 })).statusCode).toBe(200)
+      expect(mockStore.createVoucher).toHaveBeenCalled()
+    })
+
+    it("rejects a pair just outside the tolerance", async () => {
+      expect((await usd({ amount: 2041, usdAmount: 100 })).statusCode).toBe(400)
+      expect(mockStore.createVoucher).not.toHaveBeenCalled()
+    })
+
+    it("fails closed (503) when the rate cannot be verified", async () => {
+      mockGetExchangeRate.mockRejectedValueOnce(new Error("rate unavailable"))
+      expect((await usd({ amount: 2000, usdAmount: 100 })).statusCode).toBe(503)
+      expect(mockStore.createVoucher).not.toHaveBeenCalled()
+    })
+
+    it("fails closed (503) on a malformed rate payload", async () => {
+      mockGetExchangeRate.mockResolvedValueOnce({ satPriceInCurrency: 0 })
+      expect((await usd({ amount: 2000, usdAmount: 100 })).statusCode).toBe(503)
+    })
+
+    it("never consults the rate for BTC vouchers", async () => {
+      expect((await create({ amount: 500 })).statusCode).toBe(200)
+      expect(mockGetExchangeRate).not.toHaveBeenCalled()
     })
   })
 })

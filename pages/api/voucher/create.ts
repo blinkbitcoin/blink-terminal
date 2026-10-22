@@ -1,6 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
-import type { EnvironmentName } from "../../../lib/config/api"
+import { BlinkAPI } from "../../../lib/blink-api"
+import { getApiUrlForEnvironment, type EnvironmentName } from "../../../lib/config/api"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
 import {
   getOwnedWallets,
@@ -9,6 +10,42 @@ import {
 } from "../../../lib/voucher-auth"
 import { isValidExpiryId, DEFAULT_EXPIRY_ID } from "../../../lib/voucher-expiry"
 import voucherStore from "../../../lib/voucher-store"
+
+/**
+ * Tolerance for rate drift and rounding between the client's quote and the
+ * server-side check. Attacks are orders of magnitude off (1 BTC vs 1 cent),
+ * so 2% is far tighter than needed while robust to normal price movement.
+ */
+const USD_PAIR_TOLERANCE = 0.02
+
+/**
+ * The sats a USD-cent amount is worth at the server-side rate, fetched with
+ * the caller's own API key (same auth context as the ownership check).
+ * null = the rate could not be verified; callers must fail closed.
+ */
+async function expectedSatsForUsdCents(
+  apiKey: string,
+  environment: EnvironmentName,
+  usdCents: number,
+): Promise<number | null> {
+  try {
+    const rate = await new BlinkAPI(
+      apiKey,
+      getApiUrlForEnvironment(environment),
+    ).getExchangeRate("USD")
+    const centsPerSat = rate.satPriceInCurrency
+    if (
+      typeof centsPerSat !== "number" ||
+      !Number.isFinite(centsPerSat) ||
+      centsPerSat <= 0
+    ) {
+      return null
+    }
+    return Math.round(usdCents / centsPerSat)
+  } catch (_err: unknown) {
+    return null
+  }
+}
 
 /**
  * API endpoint to create a new voucher charge
@@ -135,6 +172,26 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       return res.status(400).json({
         error: "Amount is more than the wallet balance",
       })
+    }
+
+    // Cross-check the USD/sats pair against a server-side rate (fetched with
+    // the caller's key): the client supplies both denominations and nothing
+    // else ties them together — a mismatched pair stores an ACTIVE voucher
+    // advertising sats the USD amount doesn't back, or vice versa
+    // (blink-wip#1665 re-review).
+    if (actualWalletCurrency === "USD") {
+      const usdCents = parseInt(String(usdAmount))
+      const expected = await expectedSatsForUsdCents(apiKey, environment, usdCents)
+      if (expected === null) {
+        return res.status(503).json({
+          error: "Could not verify the exchange rate right now, please retry",
+        })
+      }
+      if (Math.abs(amountNum - expected) / expected > USD_PAIR_TOLERANCE) {
+        return res.status(400).json({
+          error: "amount does not match usdAmount at the current exchange rate",
+        })
+      }
     }
 
     // Validate expiryId if provided
