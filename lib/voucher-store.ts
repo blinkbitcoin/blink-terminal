@@ -29,6 +29,25 @@ import {
   getVoucherStatus,
 } from "./voucher-expiry"
 
+/**
+ * Aggregate liabilities of ACTIVE, unexpired vouchers for one wallet, in the
+ * wallet's minor units. Exported as constants so the PGlite spec executes the
+ * exact SQL the store runs (PR #94 review: mocked client.query let a Postgres
+ * parameter-type failure ship).
+ *
+ * $1 = walletId, $2 = now (ms). USD also takes $3 = server cents-per-sat rate
+ * (cast to numeric: amount_sats is BIGINT, and an uncast "0.05" parameter would
+ * be inferred as bigint and rejected).
+ */
+export const ACTIVE_LIABILITY_SUM_SQL_BTC = `SELECT COALESCE(SUM(amount_sats), 0) AS total FROM vouchers
+   WHERE wallet_id = $1 AND status = 'ACTIVE' AND expires_at > $2`
+
+export const ACTIVE_LIABILITY_SUM_SQL_USD = `SELECT COALESCE(
+     SUM(GREATEST(COALESCE(usd_amount_cents, 0), CEIL(amount_sats * $3::numeric))),
+     0
+   ) AS total FROM vouchers
+   WHERE wallet_id = $1 AND status = 'ACTIVE' AND expires_at > $2`
+
 interface Voucher {
   id: string
   amount: number
@@ -307,22 +326,18 @@ class VoucherStore {
             if (typeof rate !== "number" || !Number.isFinite(rate) || rate <= 0) {
               throw new Error("USD liability check requires the current rate")
             }
-            const existingResult = await client.query(
-              `SELECT COALESCE(
-                 SUM(GREATEST(COALESCE(usd_amount_cents, 0), CEIL(amount_sats * $3))),
-                 0
-               ) AS total FROM vouchers
-               WHERE wallet_id = $1 AND status = 'ACTIVE' AND expires_at > $2`,
-              [walletId, now, rate],
-            )
+            const existingResult = await client.query(ACTIVE_LIABILITY_SUM_SQL_USD, [
+              walletId,
+              now,
+              rate,
+            ])
             // numeric SUM can return "103.000000"; round UP (conservative).
             existing = Math.ceil(Number(existingResult.rows[0]?.total ?? 0))
           } else {
-            const existingResult = await client.query(
-              `SELECT COALESCE(SUM(amount_sats), 0) AS total FROM vouchers
-               WHERE wallet_id = $1 AND status = 'ACTIVE' AND expires_at > $2`,
-              [walletId, now],
-            )
+            const existingResult = await client.query(ACTIVE_LIABILITY_SUM_SQL_BTC, [
+              walletId,
+              now,
+            ])
             existing = parseInt(String(existingResult.rows[0]?.total ?? "0"), 10)
           }
           if (existing + liability > options.maxLiabilityMinor) {

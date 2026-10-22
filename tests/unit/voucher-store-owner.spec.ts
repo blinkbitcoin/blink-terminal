@@ -208,7 +208,7 @@ describe("createVoucher liability ceiling", () => {
     // display cents are persisted, so the aggregate must use
     // max(stored cents, ceil(sats * current rate)) (PR #94 review).
     expect(sumQuery).toContain("GREATEST")
-    expect(sumQuery).toContain("CEIL(amount_sats * $3)")
+    expect(sumQuery).toContain("CEIL(amount_sats * $3::numeric)")
     expect(mockClientQuery.mock.calls[2][1]).toEqual(["w1", expect.any(Number), 0.05])
   })
 
