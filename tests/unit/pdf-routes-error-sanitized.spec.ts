@@ -20,6 +20,14 @@ jest.mock("../../lib/rate-limit", () => ({
   RATE_LIMIT_PUBLIC: {},
   RATE_LIMIT_WRITE: {},
 }))
+// receipt-pdf requires a POS session (blink-wip#1664)
+jest.mock("../../lib/auth", () => ({
+  __esModule: true,
+  default: {
+    verifySession: (token?: string) =>
+      token === "pos-session" ? { username: "alice" } : null,
+  },
+}))
 
 import paycodePdfHandler from "../../pages/api/paycode/pdf"
 import receiptPdfHandler from "../../pages/api/transaction/receipt-pdf"
@@ -40,7 +48,16 @@ const call = async (handler: Handler, body: unknown) => {
       return this
     },
   }
-  await handler({ method: "POST", body, headers: {}, query: {} } as never, res as never)
+  await handler(
+    {
+      method: "POST",
+      body,
+      headers: {},
+      query: {},
+      cookies: { "auth-token": "pos-session" },
+    } as never,
+    res as never,
+  )
   return res
 }
 
