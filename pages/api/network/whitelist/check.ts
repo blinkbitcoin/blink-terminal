@@ -9,6 +9,7 @@
 
 import type { NextApiRequest, NextApiResponse } from "next"
 
+import { requireSessionNpub } from "../../../../lib/auth/session-pubkey"
 import { withRateLimit, RATE_LIMIT_READ } from "../../../../lib/rate-limit"
 
 // Super admin - can create communities and whitelist new leaders
@@ -26,14 +27,10 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     return res.status(405).json({ error: "Method not allowed" })
   }
 
-  const userNpub = req.headers["x-user-npub"] as string | undefined
-
-  if (!userNpub) {
-    return res.status(401).json({
-      success: false,
-      error: "Authentication required",
-    })
-  }
+  // Identity comes from the verified Nostr session only (blink-wip#1679) —
+  // the unsigned X-User-Npub header is no longer accepted.
+  const userNpub = requireSessionNpub(req, res)
+  if (!userNpub) return
 
   try {
     // Check role hierarchy

@@ -7,6 +7,7 @@
 
 import type { NextApiRequest, NextApiResponse } from "next"
 
+import { requireSessionNpub } from "../../../lib/auth/session-pubkey"
 import type { MetricsRow } from "../../../lib/network/db"
 import * as db from "../../../lib/network/db"
 import {
@@ -38,14 +39,9 @@ async function canTriggerSync(userNpub: string, communityId?: string): Promise<b
 }
 
 async function handler(req: NextApiRequest, res: NextApiResponse) {
-  const userNpub = req.headers["x-user-npub"] as string | undefined
-
-  if (!userNpub) {
-    return res.status(401).json({
-      success: false,
-      error: "Authentication required",
-    })
-  }
+  // Identity from the verified Nostr session only (blink-wip#1679).
+  const userNpub = requireSessionNpub(req, res)
+  if (!userNpub) return
 
   // GET - Get sync status and metrics
   if (req.method === "GET") {

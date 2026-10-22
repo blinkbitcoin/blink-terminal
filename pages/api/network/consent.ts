@@ -9,6 +9,7 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
 import AuthManager from "../../../lib/auth"
+import { requireSessionNpub } from "../../../lib/auth/session-pubkey"
 import BlinkAPI from "../../../lib/blink-api"
 import * as db from "../../../lib/network/db"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
@@ -60,14 +61,9 @@ async function isUserMemberOfCommunity(
 }
 
 async function handler(req: NextApiRequest, res: NextApiResponse) {
-  const userNpub = req.headers["x-user-npub"] as string | undefined
-
-  if (!userNpub) {
-    return res.status(401).json({
-      success: false,
-      error: "Authentication required",
-    })
-  }
+  // Identity from the verified Nostr session only (blink-wip#1679).
+  const userNpub = requireSessionNpub(req, res)
+  if (!userNpub) return
 
   // GET - Check consent status
   if (req.method === "GET") {

@@ -6,6 +6,7 @@
 
 import type { NextApiRequest, NextApiResponse } from "next"
 
+import { requireSessionIdentity } from "../../../../lib/auth/session-pubkey"
 import * as db from "../../../../lib/network/db"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../../lib/rate-limit"
 
@@ -14,15 +15,11 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     return res.status(405).json({ error: "Method not allowed" })
   }
 
-  const userNpub = req.headers["x-user-npub"] as string | undefined
-  const userPubkeyHex = req.headers["x-user-pubkey"] as string | undefined
-
-  if (!userNpub) {
-    return res.status(401).json({
-      success: false,
-      error: "Authentication required",
-    })
-  }
+  // Identity from the verified Nostr session only (blink-wip#1679) — the
+  // unsigned X-User-Npub / X-User-Pubkey headers are no longer accepted.
+  const identity = requireSessionIdentity(req, res)
+  if (!identity) return
+  const { npub: userNpub, pubkey: userPubkeyHex } = identity
 
   const { communityId, applicationNote } = req.body as {
     communityId: string
@@ -65,7 +62,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     const membership = await db.applyToJoinCommunity(
       communityId,
       userNpub,
-      userPubkeyHex ?? "",
+      userPubkeyHex,
       applicationNote ?? null,
     )
 

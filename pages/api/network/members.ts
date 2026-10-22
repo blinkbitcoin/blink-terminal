@@ -7,6 +7,7 @@
 
 import type { NextApiRequest, NextApiResponse } from "next"
 
+import { requireSessionNpub } from "../../../lib/auth/session-pubkey"
 import * as db from "../../../lib/network/db"
 import { withRateLimit, RATE_LIMIT_READ } from "../../../lib/rate-limit"
 
@@ -25,14 +26,9 @@ interface MemberRecord {
 }
 
 async function handler(req: NextApiRequest, res: NextApiResponse) {
-  const userNpub = req.headers["x-user-npub"] as string | undefined
-
-  if (!userNpub) {
-    return res.status(401).json({
-      success: false,
-      error: "Authentication required",
-    })
-  }
+  // Identity from the verified Nostr session only (blink-wip#1679).
+  const userNpub = requireSessionNpub(req, res)
+  if (!userNpub) return
 
   const { communityId } = req.query as { communityId?: string }
 

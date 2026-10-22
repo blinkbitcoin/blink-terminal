@@ -384,11 +384,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       if (!npubKey) return
 
       try {
-        const response = await fetch("/api/network/consent", {
-          headers: {
-            "X-User-Npub": npubKey,
-          },
-        })
+        const response = await fetch("/api/network/consent")
         const data = await response.json()
 
         if (data.success && data.consents) {
@@ -415,7 +411,6 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "X-User-Npub": npubKey,
           },
           body: JSON.stringify({
             communityId: consentCommunity.id,
@@ -457,9 +452,6 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       try {
         const response = await fetch(`/api/network/consent?communityId=${communityId}`, {
           method: "DELETE",
-          headers: {
-            "X-User-Npub": npubKey,
-          },
         })
 
         const data = await response.json()
@@ -522,7 +514,6 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "X-User-Npub": npubKey,
           },
           body: JSON.stringify({ communityId }),
         })
@@ -561,11 +552,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
 
       setLoadingMembers(true)
       try {
-        const response = await fetch(`/api/network/members?communityId=${communityId}`, {
-          headers: {
-            "X-User-Npub": npubKey,
-          },
-        })
+        const response = await fetch(`/api/network/members?communityId=${communityId}`)
         const data = await response.json()
 
         if (data.success) {
@@ -607,7 +594,6 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
             method: "DELETE",
             headers: {
               "Content-Type": "application/json",
-              "X-User-Npub": npubKey,
             },
             body: JSON.stringify({ membershipId }),
           },
@@ -636,11 +622,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       if (!npubKey) return
 
       try {
-        const response = await fetch("/api/network/memberships", {
-          headers: {
-            "X-User-Npub": npubKey,
-          },
-        })
+        const response = await fetch("/api/network/memberships")
         const data = await response.json()
 
         if (data.success) {
@@ -670,11 +652,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       if (!npubKey) return
 
       try {
-        const response = await fetch("/api/network/whitelist/check", {
-          headers: {
-            "X-User-Npub": npubKey,
-          },
-        })
+        const response = await fetch("/api/network/whitelist/check")
         const data = await response.json()
         setIsSuperAdmin(data.isSuperAdmin || false)
         setIsWhitelistedLeader(data.isWhitelisted || false)
@@ -693,11 +671,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
           ? `/api/network/memberships/pending?communityId=${communityId}`
           : "/api/network/memberships/pending"
 
-        const response = await fetch(url, {
-          headers: {
-            "X-User-Npub": npubKey,
-          },
-        })
+        const response = await fetch(url)
         const data = await response.json()
 
         if (data.success) {
@@ -725,7 +699,6 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "X-User-Npub": npubKey,
           },
           body: JSON.stringify({
             communityId: applyingTo.id,
@@ -787,7 +760,6 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "X-User-Npub": npubKey,
           },
           body: JSON.stringify({
             applicationId,
