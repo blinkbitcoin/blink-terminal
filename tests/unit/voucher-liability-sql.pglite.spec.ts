@@ -120,6 +120,33 @@ describe("ACTIVE_LIABILITY_SUM_SQL_USD against real Postgres (PGlite)", () => {
     ).toBe(103)
   })
 
+  it("counts CLAIMED (in-flight redemption) vouchers as liabilities", () => {
+    // claimVoucher sets CLAIMED before the payment round trip; the voucher
+    // must stay in the liability set until settlement (blink-wip#1665).
+    expect(
+      sumUsd(
+        [
+          seedRow("v1", "w1", 2060, 100, { status: "CLAIMED" }),
+          seedRow("v2", "w1", 2060, 100),
+        ],
+        0.05,
+      ),
+    ).toBe(206)
+  })
+
+  it("drops liabilities only on settlement outcomes (PAID/CANCELLED)", () => {
+    expect(
+      sumUsd(
+        [
+          seedRow("v1", "w1", 2060, 100, { status: "PAID" }),
+          seedRow("v2", "w1", 2060, 100, { status: "CANCELLED" }),
+          seedRow("v3", "w1", 2060, 100, { status: "CLAIMED" }),
+        ],
+        0.05,
+      ),
+    ).toBe(103)
+  })
+
   it("treats missing usd_amount_cents as 0 and still re-rates from sats", () => {
     expect(sumUsd([seedRow("v1", "w1", 2060, null)], 0.05)).toBe(103)
   })
@@ -130,11 +157,11 @@ describe("ACTIVE_LIABILITY_SUM_SQL_USD against real Postgres (PGlite)", () => {
 })
 
 describe("ACTIVE_LIABILITY_SUM_SQL_BTC against real Postgres (PGlite)", () => {
-  it("sums plain sats for the wallet", () => {
+  it("sums plain sats for the wallet, including in-flight CLAIMED", () => {
     const result = probe(
       [
         seedRow("v1", "w1", 600, null),
-        seedRow("v2", "w1", 400, null),
+        seedRow("v2", "w1", 400, null, { status: "CLAIMED" }),
         seedRow("v3", "w2", 9999, null),
       ],
       ACTIVE_LIABILITY_SUM_SQL_BTC,

@@ -245,6 +245,33 @@ describe("createVoucher liability ceiling", () => {
     ).rejects.toThrow("exceeds the wallet balance")
   })
 
+  it("counts in-flight CLAIMED vouchers in both aggregates", async () => {
+    // claimVoucher marks CLAIMED before the payment round trip; a create
+    // during that window must still see the liability (blink-wip#1665).
+    await create(400, { maxLiabilityMinor: 1000 })
+    expect(queries()[2]).toContain("status IN ('ACTIVE', 'CLAIMED')")
+
+    mockClientQuery.mockClear()
+    await create(2000, {
+      maxLiabilityMinor: 1000,
+      walletCurrency: "USD",
+      usdAmount: 100,
+      usdCentsPerSat: 0.05,
+    })
+    expect(queries()[2]).toContain("status IN ('ACTIVE', 'CLAIMED')")
+  })
+
+  it("claim-then-create: a full-balance in-flight redemption blocks a second full-balance voucher", async () => {
+    // The reviewer's reproduction: 1,000-sat voucher claimed (payment in
+    // flight), balance still reads 1,000 — the second 1,000-sat voucher must
+    // be refused. (The mock's existingTotal is what the real SUM returns for
+    // the CLAIMED row; the PGlite spec proves the SQL produces it.)
+    await expect(create(1000, { maxLiabilityMinor: 1000 }, "1000")).rejects.toThrow(
+      "exceeds the wallet balance",
+    )
+    expect(queries().some((q) => q.startsWith("INSERT"))).toBe(false)
+  })
+
   it("uses the stored amount/cents as the default liability", async () => {
     // existing 600 + default liability 400 (amount) = 1000, within ceiling
     await expect(create(400, { maxLiabilityMinor: 1000 })).resolves.toBeTruthy()
