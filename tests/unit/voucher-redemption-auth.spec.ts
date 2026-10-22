@@ -22,6 +22,7 @@ const mockStore = {
   getVoucherStatsByWalletIds: jest.fn(),
   claimVoucher: jest.fn(),
   unclaimVoucher: jest.fn(),
+  markVoucherPaid: jest.fn(),
   cancelVoucher: jest.fn(),
   createVoucher: jest.fn(),
 }
@@ -161,6 +162,7 @@ beforeEach(() => {
   mockGetExchangeRate.mockResolvedValue({ satPriceInCurrency: 0.05, currency: "USD" })
   mockStore.getVoucher.mockResolvedValue(voucher())
   mockStore.claimVoucher.mockResolvedValue(true)
+  mockStore.markVoucherPaid.mockResolvedValue(true)
   mockStore.unclaimVoucher.mockResolvedValue(true)
 })
 
@@ -192,6 +194,24 @@ describe("voucher callback: invoice must match face value", () => {
     expect(res.body).toEqual({ status: "OK" })
     expect(mockStore.claimVoucher).toHaveBeenCalledTimes(1)
     expect(mockPayLnInvoice).toHaveBeenCalledWith("wallet-1", pr, expect.any(String))
+  })
+
+  // Settled vouchers must leave the ACTIVE/CLAIMED liability aggregate —
+  // Blink has already debited the wallet (PR #94 review). PENDING and
+  // unknown outcomes stay CLAIMED (counted).
+  it.each(["SUCCESS", "ALREADY_PAID"])("marks the voucher PAID on %s", async (status) => {
+    mockPayLnInvoice.mockResolvedValueOnce({ status })
+    const chargeId = "a".repeat(32)
+
+    expect((await redeem(invoice({ sats: 500 }))).body).toEqual({ status: "OK" })
+    expect(mockStore.markVoucherPaid).toHaveBeenCalledWith(chargeId)
+  })
+
+  it("still returns OK when the PAID write fails (payment already executed)", async () => {
+    mockPayLnInvoice.mockResolvedValueOnce({ status: "SUCCESS" })
+    mockStore.markVoucherPaid.mockResolvedValueOnce(false)
+
+    expect((await redeem(invoice({ sats: 500 }))).body).toEqual({ status: "OK" })
   })
 
   it("checks USD vouchers against the sats amount fixed at issuance", async () => {
@@ -266,6 +286,15 @@ describe("voucher callback: release only when nothing was sent", () => {
     mockPayLnInvoice.mockResolvedValueOnce({ status: "PENDING" })
     expect((await redeem(invoice({ sats: 500 }))).body).toEqual({ status: "OK" })
     expect(mockStore.unclaimVoucher).not.toHaveBeenCalled()
+    expect(mockStore.markVoucherPaid).not.toHaveBeenCalled()
+  })
+
+  it("never marks PAID on FAILURE or unknown outcomes", async () => {
+    mockPayLnInvoice.mockResolvedValueOnce({ status: "FAILURE" })
+    await redeem(invoice({ sats: 500 }))
+    mockPayLnInvoice.mockResolvedValueOnce({ status: "WEIRD" })
+    await redeem(invoice({ sats: 500 }))
+    expect(mockStore.markVoucherPaid).not.toHaveBeenCalled()
   })
 })
 

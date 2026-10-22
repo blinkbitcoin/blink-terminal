@@ -288,3 +288,19 @@ describe("createVoucher liability ceiling", () => {
     expect(mockClientQuery).not.toHaveBeenCalled()
   })
 })
+
+describe("markVoucherPaid", () => {
+  it("transitions only CLAIMED -> PAID", async () => {
+    mockPoolQuery.mockResolvedValue({ rows: [{ id: "v1" }], rowCount: 1 })
+    await expect(store().markVoucherPaid("v1")).resolves.toBe(true)
+    const [sql, params] = mockPoolQuery.mock.calls[0] as [string, unknown[]]
+    expect(sql).toContain("SET status = 'PAID'")
+    expect(sql).toContain("status = 'CLAIMED'")
+    expect(params).toEqual(["v1"])
+  })
+
+  it("returns false when the voucher is not CLAIMED", async () => {
+    mockPoolQuery.mockResolvedValue({ rows: [], rowCount: 0 })
+    await expect(store().markVoucherPaid("v1")).resolves.toBe(false)
+  })
+})

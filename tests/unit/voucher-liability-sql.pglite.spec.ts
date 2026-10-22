@@ -12,6 +12,7 @@
  */
 
 import { spawnSync } from "child_process"
+import fs from "fs"
 import path from "path"
 
 // voucher-store imports AuthManager at module scope (JWT_SECRET guard).
@@ -25,6 +26,8 @@ jest.mock("../../lib/db", () => ({ getSharedPool: () => ({ query: jest.fn() }) }
 import {
   ACTIVE_LIABILITY_SUM_SQL_BTC,
   ACTIVE_LIABILITY_SUM_SQL_USD,
+  CLAIM_VOUCHER_SQL,
+  MARK_VOUCHER_PAID_SQL,
 } from "../../lib/voucher-store"
 
 const NOW = Date.now()
@@ -34,7 +37,11 @@ const DDL = `CREATE TABLE vouchers (
   usd_amount_cents INTEGER,
   wallet_id TEXT NOT NULL,
   status TEXT NOT NULL,
-  expires_at BIGINT NOT NULL
+  expires_at BIGINT NOT NULL,
+  claimed BOOLEAN NOT NULL DEFAULT false,
+  claimed_at BIGINT,
+  cancelled_at BIGINT,
+  wallet_currency TEXT
 )`
 
 interface ProbeResult {
@@ -168,5 +175,101 @@ describe("ACTIVE_LIABILITY_SUM_SQL_BTC against real Postgres (PGlite)", () => {
       ["w1", NOW],
     )
     expect(parseInt(String(result.rows[0]?.total ?? "0"), 10)).toBe(1000)
+  })
+})
+
+/**
+ * Full redemption lifecycle through the exact production transition
+ * statements: ACTIVE -> CLAIMED (counted) -> PAID (exits the aggregate).
+ */
+describe("voucher lifecycle vs the liability aggregate (PGlite)", () => {
+  it("a settled redemption leaves the aggregate; in-flight stays counted", () => {
+    const seeds = [seedRow("v1", "w1", 500, null)]
+    // ACTIVE counts
+    expect(sumUsd(seeds, 0.05)).toBe(25)
+
+    // Claim (payment in flight) — still counted
+    const claimed = probe(seeds, CLAIM_VOUCHER_SQL, ["v1", NOW])
+    expect(claimed.rows).toEqual([{ id: "v1" }])
+    // Claim then PAID in one probe run: settled — excluded
+    const lifecycleSeeds = [
+      ...seeds,
+      [CLAIM_VOUCHER_SQL, ["v1", NOW]] as [string, unknown[]],
+      [MARK_VOUCHER_PAID_SQL, ["v1"]] as [string, unknown[]],
+    ]
+    expect(sumUsd(lifecycleSeeds, 0.05)).toBe(0)
+  })
+
+  it("mark-paid does not transition a non-CLAIMED voucher", () => {
+    const result = probe([seedRow("v1", "w1", 500, null)], MARK_VOUCHER_PAID_SQL, ["v1"])
+    expect(result.rows).toEqual([]) // RETURNING produced nothing: still ACTIVE
+    // And it remains a liability
+    expect(sumUsd([seedRow("v1", "w1", 500, null)], 0.05)).toBe(25)
+  })
+
+  it("the reviewer's scenario: settled vouchers restore issuance capacity", () => {
+    // Two 500-sat vouchers redeemed from a 2,000-sat wallet: once settled,
+    // the aggregate must drop to 0 (Blink reports the debited balance).
+    const lifecycleSeeds = [
+      seedRow("v1", "w1", 500, null),
+      seedRow("v2", "w1", 500, null),
+      [CLAIM_VOUCHER_SQL, ["v1", NOW]] as [string, unknown[]],
+      [CLAIM_VOUCHER_SQL, ["v2", NOW]] as [string, unknown[]],
+      [MARK_VOUCHER_PAID_SQL, ["v1"]] as [string, unknown[]],
+      [MARK_VOUCHER_PAID_SQL, ["v2"]] as [string, unknown[]],
+    ]
+    expect(sumUsd(lifecycleSeeds, 0.05)).toBe(0)
+    // Mid-lifecycle: both claimed, both counted
+    const claimedSeeds = [
+      seedRow("v1", "w1", 500, null),
+      seedRow("v2", "w1", 500, null),
+      [CLAIM_VOUCHER_SQL, ["v1", NOW]] as [string, unknown[]],
+      [CLAIM_VOUCHER_SQL, ["v2", NOW]] as [string, unknown[]],
+    ]
+    expect(sumUsd(claimedSeeds, 0.05)).toBe(50)
+  })
+})
+
+/**
+ * Migration 029's voucher_stats view: the "claimed" bucket must count
+ * CLAIMED + PAID so settled redemptions still read as redeemed.
+ */
+describe("migration 029 voucher_stats view (PGlite)", () => {
+  it("counts CLAIMED and PAID as claimed", () => {
+    const migration = fs.readFileSync(
+      path.join(process.cwd(), "database/migrations/029_voucher_paid_status.sql"),
+      "utf8",
+    )
+    const viewStart = migration.indexOf("CREATE OR REPLACE VIEW voucher_stats")
+    const viewEnd = migration.indexOf("FROM vouchers;") + "FROM vouchers".length
+    const viewSql = migration.slice(viewStart, viewEnd)
+
+    const program = {
+      ddl: [DDL, viewSql],
+      seeds: [
+        seedRow("v1", "w1", 500, null),
+        seedRow("v2", "w1", 500, null, { status: "CLAIMED" }),
+        seedRow("v3", "w1", 500, null, { status: "PAID" }),
+        seedRow("v4", "w1", 500, null, { status: "CANCELLED" }),
+      ],
+      query: "SELECT active, claimed FROM voucher_stats",
+      params: [],
+    }
+    const run2 = spawnSync(
+      process.execPath,
+      [path.join(process.cwd(), "scripts", "pglite-sql-probe.mjs")],
+      {
+        env: { ...process.env, PROBE_PROGRAM: JSON.stringify(program) },
+        encoding: "utf8",
+        timeout: 60000,
+      },
+    )
+    if (run2.status !== 0) throw new Error(`PGlite probe failed: ${run2.stderr}`)
+    const rows = JSON.parse(run2.stdout).rows as Array<{
+      active: string
+      claimed: string
+    }>
+    expect(Number(rows[0].active)).toBe(1)
+    expect(Number(rows[0].claimed)).toBe(2)
   })
 })

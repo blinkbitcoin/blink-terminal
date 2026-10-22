@@ -55,6 +55,28 @@ export const ACTIVE_LIABILITY_SUM_SQL_USD = `SELECT COALESCE(
    ) AS total FROM vouchers
    WHERE wallet_id = $1 AND status IN ('ACTIVE', 'CLAIMED') AND expires_at > $2`
 
+/**
+ * Voucher redemption transitions, exported so the PGlite spec can run the
+ * exact production statements through a full lifecycle. $1 = chargeId,
+ * $2 = now (ms).
+ *
+ * CLAIMED is entered BEFORE the payment round trip and exited only by
+ * settlement (PAID, via markVoucherPaid), definite-failure unclaim (back to
+ * ACTIVE), cancellation or expiry — see the liability comment above.
+ */
+export const CLAIM_VOUCHER_SQL = `UPDATE vouchers
+   SET claimed = true, claimed_at = $2, status = 'CLAIMED'
+   WHERE id = $1
+     AND status = 'ACTIVE'
+     AND NOT claimed
+     AND expires_at > $2
+   RETURNING id`
+
+export const MARK_VOUCHER_PAID_SQL = `UPDATE vouchers
+   SET status = 'PAID'
+   WHERE id = $1 AND status = 'CLAIMED'
+   RETURNING id`
+
 interface Voucher {
   id: string
   amount: number
@@ -492,16 +514,10 @@ class VoucherStore {
       const now: number = Date.now()
 
       // Atomic update - only claims if ACTIVE and not already claimed
-      const result: QueryResult<VoucherRow> = await query(
-        `UPDATE vouchers 
-         SET claimed = true, claimed_at = $2, status = 'CLAIMED'
-         WHERE id = $1 
-           AND status = 'ACTIVE' 
-           AND NOT claimed
-           AND expires_at > $2
-         RETURNING id`,
-        [chargeId, now],
-      )
+      const result: QueryResult<VoucherRow> = await query(CLAIM_VOUCHER_SQL, [
+        chargeId,
+        now,
+      ])
 
       if (result.rowCount === 0) {
         console.log(`[VoucherStore] Cannot claim voucher: ${chargeId}`)
@@ -512,6 +528,37 @@ class VoucherStore {
       return true
     } catch (err: unknown) {
       console.error("[VoucherStore] claimVoucher error:", (err as Error).message)
+      return false
+    }
+  }
+
+  /**
+   * Mark a claimed voucher paid after the redemption payment settled
+   * (SUCCESS / ALREADY_PAID). Settled vouchers must leave the liability
+   * aggregate — Blink has already debited the wallet (PR #94 review).
+   * PENDING/unknown outcomes stay CLAIMED (counted) by simply not calling
+   * this. claimed stays true: the voucher was redeemed.
+   *
+   * @param chargeId - Voucher charge ID
+   * @returns Success (false if the voucher was not CLAIMED)
+   */
+  async markVoucherPaid(chargeId: string): Promise<boolean> {
+    try {
+      const result: QueryResult<VoucherRow> = await query(MARK_VOUCHER_PAID_SQL, [
+        chargeId,
+      ])
+
+      if (result.rowCount === 0) {
+        console.error(
+          `[VoucherStore] Cannot mark voucher paid (not CLAIMED): ${chargeId}`,
+        )
+        return false
+      }
+
+      console.log(`[VoucherStore] Voucher paid: ${chargeId}`)
+      return true
+    } catch (err: unknown) {
+      console.error("[VoucherStore] markVoucherPaid error:", (err as Error).message)
       return false
     }
   }

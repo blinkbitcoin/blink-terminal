@@ -200,6 +200,21 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       const isSuccess =
         paymentResult.status === "SUCCESS" || paymentResult.status === "ALREADY_PAID"
 
+      if (isSuccess) {
+        // Settlement confirmed: the wallet has been debited, so the voucher
+        // must leave the liability aggregate (PAID exits the
+        // ACTIVE/CLAIMED set). If this write fails the voucher stays CLAIMED
+        // — a conservative over-count, never a double-pay risk — so log
+        // loudly for ops but still answer OK.
+        const marked = await voucherStore.markVoucherPaid(chargeId)
+        if (!marked) {
+          console.error(
+            "❌ Voucher settled but could not be marked PAID (stays CLAIMED):",
+            chargeId.substring(0, 8) + "...",
+          )
+        }
+      }
+
       if (!isSuccess) {
         // If payment is pending, we still return OK but log it
         if (paymentResult.status === "PENDING") {
