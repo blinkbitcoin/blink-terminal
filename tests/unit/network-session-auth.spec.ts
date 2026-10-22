@@ -374,7 +374,7 @@ describe("mutation guard (same-site CSRF boundary, PR #92 review)", () => {
     expect(res.statusCode).toBe(403)
   })
 
-  it("rejects an unparseable Origin", async () => {
+  it("rejects an unparsable Origin", async () => {
     const res = await call(reviewHandler as Handler, {
       token: "token-owner",
       method: "POST",
