@@ -687,5 +687,34 @@ describe("voucher create: live ownership + confirmed wallet currency", () => {
       expect(res.statusCode).toBe(200)
       expect(mockGetExchangeRate).toHaveBeenCalledWith(OWNER_KEY, STAGING, "USD")
     })
+
+    it("passes the conservative liability AND the rate to the store, so the next voucher re-rates this one", async () => {
+      // 2060 sats at 0.05 cents/sat: stored display value is 100 cents, but
+      // the conservative liability is 103 cents. The store must receive both
+      // the override and the rate, or the next create would sum the smaller
+      // persisted cents and undercount the aggregate (PR #94 re-review).
+      const res = await usd({ amount: 2060, usdAmount: 100 })
+      expect(res.statusCode).toBe(200)
+      expect(mockStore.createVoucher).toHaveBeenCalledWith(
+        2060,
+        OWNER_KEY,
+        "wallet-usd",
+        expect.objectContaining({
+          usdAmount: 100,
+          liabilityMinor: 103,
+          maxLiabilityMinor: 500,
+          usdCentsPerSat: 0.05,
+        }),
+      )
+    })
+
+    it("maps the store's aggregate-liability refusal to 400", async () => {
+      // Sequential create: the first voucher's liabilities already consumed
+      // the balance, the locked aggregate check refuses the second.
+      mockStore.createVoucher.mockRejectedValueOnce(
+        new Error("Voucher amount exceeds the wallet balance"),
+      )
+      expect((await create({ amount: 900 })).statusCode).toBe(400)
+    })
   })
 })

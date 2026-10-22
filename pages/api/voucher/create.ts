@@ -169,10 +169,11 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     // store's insert (maxLiabilityMinor/liabilityMinor).
     let maxLiabilityMinor: number
     let liabilityMinor: number
+    let centsPerSat: number | null = null
 
     if (actualWalletCurrency === "USD") {
       const usdCents = parseInt(String(usdAmount))
-      const centsPerSat = await getUsdCentsPerSat(apiKey, environment)
+      centsPerSat = await getUsdCentsPerSat(apiKey, environment)
       if (centsPerSat === null) {
         return res.status(503).json({
           error: "Could not verify the exchange rate right now, please retry",
@@ -220,6 +221,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       usdAmount: actualWalletCurrency === "USD" ? parseInt(String(usdAmount)) : undefined,
       maxLiabilityMinor,
       liabilityMinor,
+      usdCentsPerSat:
+        actualWalletCurrency === "USD" ? (centsPerSat ?? undefined) : undefined,
     })
 
     console.log("✅ Voucher created successfully:", {

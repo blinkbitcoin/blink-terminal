@@ -71,6 +71,15 @@ interface CreateVoucherOptions {
    * Defaults to the stored amount (sats) / usdAmountCents (USD).
    */
   liabilityMinor?: number
+  /**
+   * Server-side USD cents-per-sat rate. Required when a USD voucher is
+   * created with a backing ceiling: existing ACTIVE USD vouchers are summed
+   * at max(stored cents, ceil(amount_sats × rate)) — the same conservative
+   * formula the route applies to the new voucher — because only the smaller
+   * display cents are persisted (PR #94 review). Liabilities are evaluated at
+   * the current rate: redemption pays sats at today's value.
+   */
+  usdCentsPerSat?: number
 }
 
 interface VoucherStats {
@@ -286,21 +295,36 @@ class VoucherStore {
           await client.query("BEGIN")
           await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [walletId])
 
-          const liabilityColumn =
-            walletCurrency === "USD" ? "usd_amount_cents" : "amount_sats"
           const liability: number =
             options.liabilityMinor ??
             (walletCurrency === "USD" ? (usdAmountCents as number) : amount)
 
-          const existingResult = await client.query(
-            `SELECT COALESCE(SUM(${liabilityColumn}), 0) AS total FROM vouchers
-             WHERE wallet_id = $1 AND status = 'ACTIVE' AND expires_at > $2`,
-            [walletId, now],
-          )
-          const existing: number = parseInt(
-            String(existingResult.rows[0]?.total ?? "0"),
-            10,
-          )
+          let existing: number
+          if (walletCurrency === "USD") {
+            // Only the display cents are persisted; existing USD vouchers
+            // must be re-rated conservatively or the aggregate undercounts.
+            const rate = options.usdCentsPerSat
+            if (typeof rate !== "number" || !Number.isFinite(rate) || rate <= 0) {
+              throw new Error("USD liability check requires the current rate")
+            }
+            const existingResult = await client.query(
+              `SELECT COALESCE(
+                 SUM(GREATEST(COALESCE(usd_amount_cents, 0), CEIL(amount_sats * $3))),
+                 0
+               ) AS total FROM vouchers
+               WHERE wallet_id = $1 AND status = 'ACTIVE' AND expires_at > $2`,
+              [walletId, now, rate],
+            )
+            // numeric SUM can return "103.000000"; round UP (conservative).
+            existing = Math.ceil(Number(existingResult.rows[0]?.total ?? 0))
+          } else {
+            const existingResult = await client.query(
+              `SELECT COALESCE(SUM(amount_sats), 0) AS total FROM vouchers
+               WHERE wallet_id = $1 AND status = 'ACTIVE' AND expires_at > $2`,
+              [walletId, now],
+            )
+            existing = parseInt(String(existingResult.rows[0]?.total ?? "0"), 10)
+          }
           if (existing + liability > options.maxLiabilityMinor) {
             throw new Error("Voucher amount exceeds the wallet balance")
           }

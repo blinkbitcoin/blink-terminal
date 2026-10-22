@@ -161,8 +161,7 @@ describe("createVoucher liability ceiling", () => {
     // Quota check goes through the pool; the transaction through the client.
     mockPoolQuery.mockResolvedValue({ rows: [{ count: "0" }] })
     mockClientQuery.mockImplementation(async (text: string) => {
-      if (text.startsWith("SELECT COALESCE(SUM"))
-        return { rows: [{ total: existingTotal }] }
+      if (text.includes("SUM(")) return { rows: [{ total: existingTotal }] }
       if (text.startsWith("INSERT"))
         return { rows: [row({ amount_sats: String(amount) })] }
       return { rows: [] } // BEGIN / lock / COMMIT / ROLLBACK
@@ -202,8 +201,41 @@ describe("createVoucher liability ceiling", () => {
       maxLiabilityMinor: 1000,
       walletCurrency: "USD",
       usdAmount: 100,
+      usdCentsPerSat: 0.05,
     })
-    expect(queries()[2]).toContain("COALESCE(SUM(usd_amount_cents)")
+    const sumQuery = queries()[2]
+    // Existing USD vouchers are re-rated conservatively: only the smaller
+    // display cents are persisted, so the aggregate must use
+    // max(stored cents, ceil(sats * current rate)) (PR #94 review).
+    expect(sumQuery).toContain("GREATEST")
+    expect(sumQuery).toContain("CEIL(amount_sats * $3)")
+    expect(mockClientQuery.mock.calls[2][1]).toEqual(["w1", expect.any(Number), 0.05])
+  })
+
+  it("fails closed when a USD ceiling check has no rate", async () => {
+    await expect(
+      create(2000, { maxLiabilityMinor: 1000, walletCurrency: "USD", usdAmount: 100 }),
+    ).rejects.toThrow("USD liability check requires the current rate")
+    expect(queries()).toContain("ROLLBACK")
+    expect(queries().some((q) => q.startsWith("INSERT"))).toBe(false)
+  })
+
+  it("rounds a decimal-string SUM up (conservative direction)", async () => {
+    // Postgres numeric SUM can return "100.5"; flooring would accept a
+    // voucher the ceiling should reject: 101 + 900 > 1000 vs 100 + 900 = 1000.
+    await expect(
+      create(
+        400,
+        {
+          maxLiabilityMinor: 1000,
+          liabilityMinor: 900,
+          walletCurrency: "USD",
+          usdAmount: 100,
+          usdCentsPerSat: 0.05,
+        },
+        "100.5",
+      ),
+    ).rejects.toThrow("exceeds the wallet balance")
   })
 
   it("liabilityMinor overrides the stored amount in the check", async () => {
