@@ -14,33 +14,11 @@
 
 import type { NextApiRequest, NextApiResponse } from "next"
 
-import AuthManager from "../auth"
+import { requireSessionPubkey } from "../auth/session-pubkey"
 
 import boltcardStore from "./store"
 
-const NOSTR_PUBKEY = /^[0-9a-f]{64}$/
-
-/** The Nostr pubkey of the authenticated session, or null. */
-export function getSessionPubkey(req: NextApiRequest): string | null {
-  const session = AuthManager.verifySession(req.cookies?.["auth-token"])
-  const username = session?.username
-  if (typeof username !== "string" || !username.startsWith("nostr:")) return null
-  const pubkey = username.slice("nostr:".length).toLowerCase()
-  return NOSTR_PUBKEY.test(pubkey) ? pubkey : null
-}
-
-/** Session pubkey, or answers 401 and returns null. */
-export function requireSessionPubkey(
-  req: NextApiRequest,
-  res: NextApiResponse,
-): string | null {
-  const pubkey = getSessionPubkey(req)
-  if (!pubkey) {
-    res.status(401).json({ error: "Authentication required" })
-    return null
-  }
-  return pubkey
-}
+export { getSessionPubkey, requireSessionPubkey } from "../auth/session-pubkey"
 
 type OwnedCard = NonNullable<Awaited<ReturnType<typeof boltcardStore.getCard>>>
 

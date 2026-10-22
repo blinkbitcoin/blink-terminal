@@ -275,6 +275,13 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
     // UI state
     const [loading, setLoading] = useState<boolean>(true)
     const [error, setError] = useState<string>("")
+    // Revoke failures render beside the Revoke control itself — the shared
+    // `error` state is written by unrelated actions and not displayed in the
+    // community dashboard (PR #92 review).
+    const [revokeError, setRevokeError] = useState<string>("")
+    // Set by sessionFetch when the server session (24h JWT cookie) is gone:
+    // local npubKey state outlives it, and 401s must not look like empty data.
+    const [sessionExpired, setSessionExpired] = useState<boolean>(false)
     const [searchQuery, setSearchQuery] = useState<string>("")
 
     // Consent modal state
@@ -312,6 +319,31 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
     const [loadingMembers, setLoadingMembers] = useState<boolean>(false)
     const [removingMemberId, setRemovingMemberId] = useState<number | null>(null)
     const [showRemoveConfirm, setShowRemoveConfirm] = useState<number | null>(null) // membership id to confirm removal
+
+    // Authenticated calls go through sessionFetch: a 401 means the server
+    // session (24h JWT cookie) expired even though local npubKey state is
+    // still present — surface that instead of rendering empty data.
+    const sessionFetch = async (input: string, init?: RequestInit): Promise<Response> => {
+      const response = await fetch(input, init)
+      if (response.status === 401) setSessionExpired(true)
+      return response
+    }
+
+    const sessionExpiredBanner = sessionExpired ? (
+      <div className="mb-4 bg-amber-100 dark:bg-amber-900 border border-amber-400 dark:border-amber-700 text-amber-800 dark:text-amber-100 px-4 py-3 rounded-lg">
+        Your sign-in session has expired. Please sign out and sign in again to manage your
+        communities.
+      </div>
+    ) : null
+
+    // Single shell for every view: the session-expiry banner renders outside
+    // the per-view early returns, so no view can miss it (PR #92 review).
+    const withSessionBanner = (content: React.ReactNode): React.ReactNode => (
+      <div className="h-full flex flex-col bg-white dark:bg-black">
+        {sessionExpiredBanner}
+        <div className="flex-1 min-h-0 flex flex-col">{content}</div>
+      </div>
+    )
 
     // Fetch communities on mount
     useEffect(() => {
@@ -384,11 +416,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       if (!npubKey) return
 
       try {
-        const response = await fetch("/api/network/consent", {
-          headers: {
-            "X-User-Npub": npubKey,
-          },
-        })
+        const response = await sessionFetch("/api/network/consent")
         const data = await response.json()
 
         if (data.success && data.consents) {
@@ -411,11 +439,10 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       setError("")
 
       try {
-        const response = await fetch("/api/network/consent", {
+        const response = await sessionFetch("/api/network/consent", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "X-User-Npub": npubKey,
           },
           body: JSON.stringify({
             communityId: consentCommunity.id,
@@ -454,13 +481,20 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
     const revokeConsent = async (communityId: string) => {
       if (!npubKey) return
 
+      setRevokeError("")
+
       try {
-        const response = await fetch(`/api/network/consent?communityId=${communityId}`, {
-          method: "DELETE",
-          headers: {
-            "X-User-Npub": npubKey,
+        // Content-Type is set explicitly even without a body: the server's
+        // mutation guard requires application/json on every mutation.
+        const response = await sessionFetch(
+          `/api/network/consent?communityId=${communityId}`,
+          {
+            method: "DELETE",
+            headers: {
+              "Content-Type": "application/json",
+            },
           },
-        })
+        )
 
         const data = await response.json()
 
@@ -472,9 +506,14 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
             }
             return updated
           })
+        } else if (response.status !== 401) {
+          // 401 is surfaced by the session-expired banner; anything else
+          // renders beside the Revoke control.
+          setRevokeError(data.error || "Failed to revoke consent")
         }
       } catch (err: unknown) {
         console.error("Error revoking consent:", err)
+        setRevokeError("Failed to revoke consent")
       }
     }
 
@@ -518,11 +557,10 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       setError("")
 
       try {
-        const response = await fetch("/api/network/sync", {
+        const response = await sessionFetch("/api/network/sync", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "X-User-Npub": npubKey,
           },
           body: JSON.stringify({ communityId }),
         })
@@ -561,11 +599,9 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
 
       setLoadingMembers(true)
       try {
-        const response = await fetch(`/api/network/members?communityId=${communityId}`, {
-          headers: {
-            "X-User-Npub": npubKey,
-          },
-        })
+        const response = await sessionFetch(
+          `/api/network/members?communityId=${communityId}`,
+        )
         const data = await response.json()
 
         if (data.success) {
@@ -601,13 +637,12 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       setError("")
 
       try {
-        const response = await fetch(
+        const response = await sessionFetch(
           `/api/network/members?communityId=${selectedCommunity.id}`,
           {
             method: "DELETE",
             headers: {
               "Content-Type": "application/json",
-              "X-User-Npub": npubKey,
             },
             body: JSON.stringify({ membershipId }),
           },
@@ -636,11 +671,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       if (!npubKey) return
 
       try {
-        const response = await fetch("/api/network/memberships", {
-          headers: {
-            "X-User-Npub": npubKey,
-          },
-        })
+        const response = await sessionFetch("/api/network/memberships")
         const data = await response.json()
 
         if (data.success) {
@@ -670,15 +701,16 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       if (!npubKey) return
 
       try {
-        const response = await fetch("/api/network/whitelist/check", {
-          headers: {
-            "X-User-Npub": npubKey,
-          },
-        })
+        const response = await sessionFetch("/api/network/whitelist/check")
         const data = await response.json()
-        setIsSuperAdmin(data.isSuperAdmin || false)
-        setIsWhitelistedLeader(data.isWhitelisted || false)
-        setUserRole(data.role || "user")
+        // Only a successful response may set role state — a 401 body would
+        // silently downgrade a leader/admin to "user".
+        if (data.success) {
+          setIsSuperAdmin(data.isSuperAdmin || false)
+          setIsWhitelistedLeader(data.isWhitelisted || false)
+          setUserRole(data.role || "user")
+          setSessionExpired(false)
+        }
       } catch (err: unknown) {
         console.error("Error checking whitelist status:", err)
       }
@@ -693,11 +725,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
           ? `/api/network/memberships/pending?communityId=${communityId}`
           : "/api/network/memberships/pending"
 
-        const response = await fetch(url, {
-          headers: {
-            "X-User-Npub": npubKey,
-          },
-        })
+        const response = await sessionFetch(url)
         const data = await response.json()
 
         if (data.success) {
@@ -721,11 +749,10 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       setError("")
 
       try {
-        const response = await fetch("/api/network/memberships/apply", {
+        const response = await sessionFetch("/api/network/memberships/apply", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "X-User-Npub": npubKey,
           },
           body: JSON.stringify({
             communityId: applyingTo.id,
@@ -783,11 +810,10 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       )
 
       try {
-        const response = await fetch("/api/network/memberships/review", {
+        const response = await sessionFetch("/api/network/memberships/review", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "X-User-Npub": npubKey,
           },
           body: JSON.stringify({
             applicationId,
@@ -886,7 +912,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
 
     // Render loading state
     if (loading && communities.length === 0) {
-      return (
+      return withSessionBanner(
         <div
           className="h-full flex flex-col bg-white dark:bg-black"
           style={{ fontFamily: "'Source Sans Pro', sans-serif" }}
@@ -899,7 +925,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
               </div>
             </div>
           </div>
-        </div>
+        </div>,
       )
     }
 
@@ -907,7 +933,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
     // DISCOVERY VIEW
     // ============================================
     if (currentView === "discovery") {
-      return (
+      return withSessionBanner(
         <div
           className="h-full flex flex-col bg-white dark:bg-black overflow-hidden"
           style={{ fontFamily: "'Source Sans Pro', sans-serif" }}
@@ -1335,7 +1361,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
               </div>
             </div>
           )}
-        </div>
+        </div>,
       )
     }
 
@@ -1346,7 +1372,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       const approvedMemberships = myMemberships.filter((m) => m.status === "approved")
       const pendingMemberships = myMemberships.filter((m) => m.status === "pending")
 
-      return (
+      return withSessionBanner(
         <div
           className="h-full flex flex-col bg-white dark:bg-black overflow-hidden"
           style={{ fontFamily: "'Source Sans Pro', sans-serif" }}
@@ -1420,18 +1446,22 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
 
             {/* Active Memberships */}
             {approvedMemberships.length === 0 ? (
-              <div className="text-center py-12">
-                <div className="text-6xl mb-4">🤝</div>
-                <p className="text-gray-600 dark:text-gray-400 text-lg">
-                  You haven&apos;t joined any communities yet
-                </p>
-                <button
-                  onClick={() => navigateToView("discovery")}
-                  className="mt-4 px-6 py-2 bg-teal-600 text-white rounded-lg hover:bg-teal-700 transition-colors"
-                >
-                  Browse Communities
-                </button>
-              </div>
+              // With an expired session the membership list is unknown, not
+              // empty — the banner explains; don't claim "no memberships".
+              !sessionExpired && (
+                <div className="text-center py-12">
+                  <div className="text-6xl mb-4">🤝</div>
+                  <p className="text-gray-600 dark:text-gray-400 text-lg">
+                    You haven&apos;t joined any communities yet
+                  </p>
+                  <button
+                    onClick={() => navigateToView("discovery")}
+                    className="mt-4 px-6 py-2 bg-teal-600 text-white rounded-lg hover:bg-teal-700 transition-colors"
+                  >
+                    Browse Communities
+                  </button>
+                </div>
+              )
             ) : (
               <div className="space-y-4">
                 <h3 className="text-sm font-semibold text-gray-600 dark:text-gray-400">
@@ -1518,7 +1548,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
               </div>
             )}
           </div>
-        </div>
+        </div>,
       )
     }
 
@@ -1526,7 +1556,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
     // MOST ACTIVE VIEW (Leaderboard)
     // ============================================
     if (currentView === "most-active") {
-      return (
+      return withSessionBanner(
         <div
           className="h-full flex flex-col bg-white dark:bg-black overflow-hidden"
           style={{ fontFamily: "'Source Sans Pro', sans-serif" }}
@@ -1729,7 +1759,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
               </div>
             )}
           </div>
-        </div>
+        </div>,
       )
     }
 
@@ -1742,7 +1772,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       )
       const isLeader = membership?.role === "leader"
 
-      return (
+      return withSessionBanner(
         <div
           className="h-full flex flex-col bg-white dark:bg-black overflow-hidden"
           style={{ fontFamily: "'Source Sans Pro', sans-serif" }}
@@ -2018,6 +2048,11 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
                     Revoke
                   </button>
                 </div>
+                {revokeError && (
+                  <div className="mt-2 text-sm text-red-600 dark:text-red-400">
+                    {revokeError}
+                  </div>
+                )}
               </div>
             )}
 
@@ -2129,7 +2164,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
               </div>
             </div>
           )}
-        </div>
+        </div>,
       )
     }
 
@@ -2152,7 +2187,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
         return `${Math.round(hoursAgo / 24)} days ago`
       }
 
-      return (
+      return withSessionBanner(
         <div
           className="h-full flex flex-col bg-white dark:bg-black overflow-hidden"
           style={{ fontFamily: "'Source Sans Pro', sans-serif" }}
@@ -2619,7 +2654,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
               )}
             </div>
           </div>
-        </div>
+        </div>,
       )
     }
 
@@ -2629,7 +2664,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
     if (currentView === "create") {
       // Only super admin can access this view
       if (!isSuperAdmin) {
-        return (
+        return withSessionBanner(
           <div
             className="h-full flex flex-col bg-white dark:bg-black overflow-hidden"
             style={{ fontFamily: "'Source Sans Pro', sans-serif" }}
@@ -2649,11 +2684,11 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
                 </button>
               </div>
             </div>
-          </div>
+          </div>,
         )
       }
 
-      return (
+      return withSessionBanner(
         <div
           className="h-full flex flex-col bg-white dark:bg-black overflow-hidden"
           style={{ fontFamily: "'Source Sans Pro', sans-serif" }}
@@ -2752,7 +2787,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
               </div>
             </div>
           </div>
-        </div>
+        </div>,
       )
     }
 
