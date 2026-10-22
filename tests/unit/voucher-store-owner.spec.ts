@@ -248,8 +248,12 @@ describe("createVoucher liability ceiling", () => {
   it("counts in-flight CLAIMED vouchers in both aggregates", async () => {
     // claimVoucher marks CLAIMED before the payment round trip; a create
     // during that window must still see the liability (blink-wip#1665).
+    // Expiry applies only to ACTIVE: a CLAIMED voucher past expires_at may
+    // still settle and debit the wallet.
     await create(400, { maxLiabilityMinor: 1000 })
-    expect(queries()[2]).toContain("status IN ('ACTIVE', 'CLAIMED')")
+    expect(queries()[2]).toContain(
+      "(status = 'CLAIMED' OR (status = 'ACTIVE' AND expires_at > $2))",
+    )
 
     mockClientQuery.mockClear()
     await create(2000, {
@@ -258,7 +262,9 @@ describe("createVoucher liability ceiling", () => {
       usdAmount: 100,
       usdCentsPerSat: 0.05,
     })
-    expect(queries()[2]).toContain("status IN ('ACTIVE', 'CLAIMED')")
+    expect(queries()[2]).toContain(
+      "(status = 'CLAIMED' OR (status = 'ACTIVE' AND expires_at > $2))",
+    )
   })
 
   it("claim-then-create: a full-balance in-flight redemption blocks a second full-balance voucher", async () => {

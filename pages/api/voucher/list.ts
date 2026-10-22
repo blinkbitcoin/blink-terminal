@@ -105,11 +105,17 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
     // Filter by status if requested
     if (filterStatus && filterStatus !== "all") {
-      const validStatuses = ["ACTIVE", "CLAIMED", "CANCELLED", "EXPIRED"]
+      const validStatuses = ["ACTIVE", "CLAIMED", "PAID", "CANCELLED", "EXPIRED"]
       const normalizedFilter = filterStatus.toUpperCase()
 
       if (validStatuses.includes(normalizedFilter)) {
-        vouchers = vouchers.filter((v: VoucherRecord) => v.status === normalizedFilter)
+        // PAID is terminal CLAIMED: the redeemed bucket covers both, matching
+        // voucher_stats and the dashboard UI.
+        vouchers = vouchers.filter((v: VoucherRecord) =>
+          normalizedFilter === "CLAIMED"
+            ? v.status === "CLAIMED" || v.status === "PAID"
+            : v.status === normalizedFilter,
+        )
       }
     }
 

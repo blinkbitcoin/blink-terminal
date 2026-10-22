@@ -9,6 +9,10 @@
  * Jest's CJS runtime cannot run PGlite (dynamic import callback), so the
  * exact SQL constants the store executes are passed to a plain-Node PGlite
  * child process (scripts/pglite-sql-probe.mjs) — same SQL, real Postgres.
+ *
+ * The base DDL mirrors migration 008 (including valid_voucher_status) and
+ * every probe applies migration 029's exported ALTER statements, so the
+ * lifecycle runs against production-faithful constraints.
  */
 
 import { spawnSync } from "child_process"
@@ -31,30 +35,63 @@ import {
 } from "../../lib/voucher-store"
 
 const NOW = Date.now()
+const DAY_MS = 24 * 60 * 60 * 1000
+
+/**
+ * Migration 008's schema for the columns these probes touch, including the
+ * status constraint that predates PAID.
+ */
 const DDL = `CREATE TABLE vouchers (
   id TEXT PRIMARY KEY,
-  amount_sats BIGINT NOT NULL,
+  amount_sats BIGINT NOT NULL CHECK (amount_sats > 0),
   usd_amount_cents INTEGER,
   wallet_id TEXT NOT NULL,
-  status TEXT NOT NULL,
+  status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
   expires_at BIGINT NOT NULL,
   claimed BOOLEAN NOT NULL DEFAULT false,
   claimed_at BIGINT,
   cancelled_at BIGINT,
-  wallet_currency TEXT
+  wallet_currency VARCHAR(3) NOT NULL DEFAULT 'BTC',
+  CONSTRAINT valid_voucher_status CHECK (status IN ('ACTIVE', 'CLAIMED', 'CANCELLED', 'EXPIRED'))
 )`
+
+const MIGRATION_029 = fs.readFileSync(
+  path.join(process.cwd(), "database/migrations/029_voucher_paid_status.sql"),
+  "utf8",
+)
+
+/** Slice one marked section out of migration 029 (the exact text it runs). */
+const migrationSection = (name: string): string => {
+  const begin = `-- MIGRATION-029:${name}:BEGIN`
+  const end = `-- MIGRATION-029:${name}:END`
+  const start = MIGRATION_029.indexOf(begin)
+  const stop = MIGRATION_029.indexOf(end)
+  if (start === -1 || stop === -1) {
+    throw new Error(`Migration 029 section not found: ${name}`)
+  }
+  return MIGRATION_029.slice(start + begin.length, stop).trim()
+}
+
+const STATUS_CONSTRAINT_STATEMENTS = migrationSection("STATUS-CONSTRAINT")
+  .split(";")
+  .map((statement) => statement.trim())
+  .filter(Boolean)
+const CLEANUP_FUNCTION_SQL = migrationSection("CLEANUP-FUNCTION")
 
 interface ProbeResult {
   ok: boolean
-  rows: Array<{ total: string }>
+  rows: Array<Record<string, unknown>>
 }
 
-const probe = (
-  seeds: Array<[string, unknown[]]>,
-  query: string,
-  params: unknown[],
-): ProbeResult => {
-  const program = { ddl: [DDL], seeds, query, params }
+interface ProbeOptions {
+  /** Apply migration 029's status constraint (default true). */
+  applyConstraint?: boolean
+  extraDdl?: string[]
+}
+
+const runProgram = (
+  program: unknown,
+): { status: number | null; stdout: string; stderr: string } => {
   const run = spawnSync(
     process.execPath,
     [path.join(process.cwd(), "scripts", "pglite-sql-probe.mjs")],
@@ -65,10 +102,50 @@ const probe = (
     },
   )
   if (run.error) throw run.error
-  if (run.status !== 0) {
-    throw new Error(`PGlite probe failed: ${run.stderr}`)
+  return { status: run.status, stdout: run.stdout, stderr: run.stderr }
+}
+
+const buildProgram = (
+  seeds: Array<[string, unknown[]]>,
+  query: string,
+  params: unknown[],
+  options: ProbeOptions = {},
+): unknown => ({
+  ddl: [
+    DDL,
+    ...(options.applyConstraint === false ? [] : STATUS_CONSTRAINT_STATEMENTS),
+    ...(options.extraDdl ?? []),
+  ],
+  seeds,
+  query,
+  params,
+})
+
+/** Run a probe expected to succeed; returns parsed rows. */
+const probe = (
+  seeds: Array<[string, unknown[]]>,
+  query: string,
+  params: unknown[],
+  options: ProbeOptions = {},
+): ProbeResult => {
+  const program = buildProgram(seeds, query, params, options)
+  const { status, stdout, stderr } = runProgram(program)
+  if (status !== 0) {
+    throw new Error(`PGlite probe failed: ${stderr}`)
   }
-  return JSON.parse(run.stdout) as ProbeResult
+  return JSON.parse(stdout) as ProbeResult
+}
+
+/** Run a probe expected to fail; returns the Postgres error text. */
+const probeFailure = (
+  seeds: Array<[string, unknown[]]>,
+  query: string,
+  params: unknown[],
+  options: ProbeOptions = {},
+): string => {
+  const { status, stderr } = runProgram(buildProgram(seeds, query, params, options))
+  expect(status).not.toBe(0)
+  return stderr
 }
 
 const seedRow = (
@@ -76,10 +153,15 @@ const seedRow = (
   walletId: string,
   sats: number,
   cents: number | null,
-  overrides: { status?: string; expiresAt?: number } = {},
+  overrides: {
+    status?: string
+    expiresAt?: number
+    claimed?: boolean
+    claimedAt?: number | null
+  } = {},
 ): [string, unknown[]] => [
-  `INSERT INTO vouchers (id, amount_sats, usd_amount_cents, wallet_id, status, expires_at)
-   VALUES ($1, $2, $3, $4, $5, $6)`,
+  `INSERT INTO vouchers (id, amount_sats, usd_amount_cents, wallet_id, status, expires_at, claimed, claimed_at)
+   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
   [
     id,
     sats,
@@ -87,12 +169,19 @@ const seedRow = (
     walletId,
     overrides.status ?? "ACTIVE",
     overrides.expiresAt ?? NOW + 3_600_000,
+    overrides.claimed ?? false,
+    overrides.claimedAt ?? null,
   ],
 ]
 
 const sumUsd = (seeds: Array<[string, unknown[]]>, rate: number): number => {
   const result = probe(seeds, ACTIVE_LIABILITY_SUM_SQL_USD, ["w1", NOW, rate])
   return Math.ceil(Number(result.rows[0]?.total ?? 0))
+}
+
+const sumBtc = (seeds: Array<[string, unknown[]]>): number => {
+  const result = probe(seeds, ACTIVE_LIABILITY_SUM_SQL_BTC, ["w1", NOW])
+  return parseInt(String(result.rows[0]?.total ?? "0"), 10)
 }
 
 describe("ACTIVE_LIABILITY_SUM_SQL_USD against real Postgres (PGlite)", () => {
@@ -113,14 +202,32 @@ describe("ACTIVE_LIABILITY_SUM_SQL_USD against real Postgres (PGlite)", () => {
     ).toBe(253)
   })
 
-  it("excludes expired, non-ACTIVE and other-wallet rows", () => {
+  it("excludes expired ACTIVE, terminal and other-wallet rows", () => {
     expect(
       sumUsd(
         [
           seedRow("v1", "w1", 2060, 100),
-          seedRow("v2", "w1", 2060, 100, { expiresAt: NOW - 1000 }),
+          seedRow("v2", "w1", 2060, 100, { expiresAt: NOW - 1000 }), // expired ACTIVE
           seedRow("v3", "w1", 2060, 100, { status: "PAID" }),
           seedRow("v4", "w2", 2060, 100),
+        ],
+        0.05,
+      ),
+    ).toBe(103)
+  })
+
+  it("keeps expired CLAIMED counted (expiry only ends ACTIVE)", () => {
+    // A voucher claimed just before expiry may still settle (PENDING/unknown),
+    // so its liability must not disappear when expires_at passes.
+    expect(
+      sumUsd(
+        [
+          seedRow("v1", "w1", 2060, 100, {
+            status: "CLAIMED",
+            claimed: true,
+            expiresAt: NOW - 1000,
+          }),
+          seedRow("v2", "w1", 2060, 100, { expiresAt: NOW - 1000 }), // expired ACTIVE
         ],
         0.05,
       ),
@@ -133,7 +240,7 @@ describe("ACTIVE_LIABILITY_SUM_SQL_USD against real Postgres (PGlite)", () => {
     expect(
       sumUsd(
         [
-          seedRow("v1", "w1", 2060, 100, { status: "CLAIMED" }),
+          seedRow("v1", "w1", 2060, 100, { status: "CLAIMED", claimed: true }),
           seedRow("v2", "w1", 2060, 100),
         ],
         0.05,
@@ -147,7 +254,7 @@ describe("ACTIVE_LIABILITY_SUM_SQL_USD against real Postgres (PGlite)", () => {
         [
           seedRow("v1", "w1", 2060, 100, { status: "PAID" }),
           seedRow("v2", "w1", 2060, 100, { status: "CANCELLED" }),
-          seedRow("v3", "w1", 2060, 100, { status: "CLAIMED" }),
+          seedRow("v3", "w1", 2060, 100, { status: "CLAIMED", claimed: true }),
         ],
         0.05,
       ),
@@ -165,16 +272,26 @@ describe("ACTIVE_LIABILITY_SUM_SQL_USD against real Postgres (PGlite)", () => {
 
 describe("ACTIVE_LIABILITY_SUM_SQL_BTC against real Postgres (PGlite)", () => {
   it("sums plain sats for the wallet, including in-flight CLAIMED", () => {
-    const result = probe(
-      [
+    expect(
+      sumBtc([
         seedRow("v1", "w1", 600, null),
-        seedRow("v2", "w1", 400, null, { status: "CLAIMED" }),
+        seedRow("v2", "w1", 400, null, { status: "CLAIMED", claimed: true }),
         seedRow("v3", "w2", 9999, null),
-      ],
-      ACTIVE_LIABILITY_SUM_SQL_BTC,
-      ["w1", NOW],
-    )
-    expect(parseInt(String(result.rows[0]?.total ?? "0"), 10)).toBe(1000)
+      ]),
+    ).toBe(1000)
+  })
+
+  it("keeps expired CLAIMED counted and excludes expired ACTIVE", () => {
+    expect(
+      sumBtc([
+        seedRow("v1", "w1", 600, null, {
+          status: "CLAIMED",
+          claimed: true,
+          expiresAt: NOW - DAY_MS,
+        }),
+        seedRow("v2", "w1", 400, null, { expiresAt: NOW - 1000 }),
+      ]),
+    ).toBe(600)
   })
 })
 
@@ -198,6 +315,20 @@ describe("voucher lifecycle vs the liability aggregate (PGlite)", () => {
       [MARK_VOUCHER_PAID_SQL, ["v1"]] as [string, unknown[]],
     ]
     expect(sumUsd(lifecycleSeeds, 0.05)).toBe(0)
+  })
+
+  it("an expired CLAIMED redemption stays counted until PAID", () => {
+    const seeds = [
+      seedRow("v1", "w1", 500, null, {
+        status: "CLAIMED",
+        claimed: true,
+        claimedAt: NOW - DAY_MS,
+        expiresAt: NOW - 1000,
+      }),
+    ]
+    expect(sumUsd(seeds, 0.05)).toBe(25)
+    const paidSeeds = [...seeds, [MARK_VOUCHER_PAID_SQL, ["v1"]] as [string, unknown[]]]
+    expect(sumUsd(paidSeeds, 0.05)).toBe(0)
   })
 
   it("mark-paid does not transition a non-CLAIMED voucher", () => {
@@ -228,6 +359,82 @@ describe("voucher lifecycle vs the liability aggregate (PGlite)", () => {
     ]
     expect(sumUsd(claimedSeeds, 0.05)).toBe(50)
   })
+
+  it("settlement fails against migration 008's constraint without migration 029", () => {
+    // Regression for the review blocker: PAID was not in valid_voucher_status,
+    // so every production settlement update raised SQLSTATE 23514 and settled
+    // vouchers stayed CLAIMED (counted) until expiry.
+    const error = probeFailure(
+      [seedRow("v1", "w1", 500, null, { status: "CLAIMED", claimed: true })],
+      MARK_VOUCHER_PAID_SQL,
+      ["v1"],
+      { applyConstraint: false },
+    )
+    expect(error).toContain("valid_voucher_status")
+  })
+
+  it("migration 029 allows CLAIMED -> PAID against the real constraint", () => {
+    const result = probe(
+      [seedRow("v1", "w1", 500, null, { status: "CLAIMED", claimed: true })],
+      MARK_VOUCHER_PAID_SQL,
+      ["v1"],
+    )
+    expect(result.rows).toEqual([{ id: "v1" }])
+  })
+})
+
+/**
+ * Migration 029's cleanup_old_vouchers(): PAID follows the claimed 30-day
+ * retention policy, and the retention arithmetic must not overflow int4.
+ */
+describe("migration 029 cleanup_old_vouchers (PGlite)", () => {
+  const cleanupSeeds: Array<[string, unknown[]]> = [
+    // Old redeemed rows (31 days): deleted
+    [
+      `INSERT INTO vouchers (id, amount_sats, wallet_id, status, expires_at, claimed_at, claimed)
+       VALUES ($1, 500, 'w1', 'CLAIMED', $2, $3, true)`,
+      ["old-claimed", NOW - 32 * DAY_MS, NOW - 31 * DAY_MS],
+    ],
+    [
+      `INSERT INTO vouchers (id, amount_sats, wallet_id, status, expires_at, claimed_at, claimed)
+       VALUES ($1, 500, 'w1', 'PAID', $2, $3, true)`,
+      ["old-paid", NOW - 32 * DAY_MS, NOW - 31 * DAY_MS],
+    ],
+    // Old cancelled row (31 days): deleted by the unchanged policy
+    [
+      `INSERT INTO vouchers (id, amount_sats, wallet_id, status, expires_at, cancelled_at)
+       VALUES ($1, 500, 'w1', 'CANCELLED', $2, $3)`,
+      ["old-cancelled", NOW - 32 * DAY_MS, NOW - 31 * DAY_MS],
+    ],
+    // Fresh redeemed rows: retained
+    seedRow("new-claimed", "w1", 500, null, {
+      status: "CLAIMED",
+      claimed: true,
+      claimedAt: NOW - DAY_MS,
+      expiresAt: NOW - 1000, // expiry is irrelevant to retention
+    }),
+    seedRow("new-paid", "w1", 500, null, {
+      status: "PAID",
+      claimed: true,
+      claimedAt: NOW - DAY_MS,
+      expiresAt: NOW - 1000,
+    }),
+    seedRow("active", "w1", 500, null),
+  ]
+
+  it("deletes old CLAIMED and PAID rows and keeps fresh ones", () => {
+    const result = probe(
+      [...cleanupSeeds, ["SELECT cleanup_old_vouchers()", []]],
+      "SELECT status, COUNT(*)::int AS n FROM vouchers GROUP BY status ORDER BY status",
+      [],
+      { extraDdl: [CLEANUP_FUNCTION_SQL] },
+    )
+    expect(result.rows).toEqual([
+      { status: "ACTIVE", n: 1 },
+      { status: "CLAIMED", n: 1 },
+      { status: "PAID", n: 1 },
+    ])
+  })
 })
 
 /**
@@ -236,40 +443,22 @@ describe("voucher lifecycle vs the liability aggregate (PGlite)", () => {
  */
 describe("migration 029 voucher_stats view (PGlite)", () => {
   it("counts CLAIMED and PAID as claimed", () => {
-    const migration = fs.readFileSync(
-      path.join(process.cwd(), "database/migrations/029_voucher_paid_status.sql"),
-      "utf8",
-    )
-    const viewStart = migration.indexOf("CREATE OR REPLACE VIEW voucher_stats")
-    const viewEnd = migration.indexOf("FROM vouchers;") + "FROM vouchers".length
-    const viewSql = migration.slice(viewStart, viewEnd)
+    const viewStart = MIGRATION_029.indexOf("CREATE OR REPLACE VIEW voucher_stats")
+    const viewEnd = MIGRATION_029.indexOf("FROM vouchers;") + "FROM vouchers".length
+    const viewSql = MIGRATION_029.slice(viewStart, viewEnd)
 
-    const program = {
-      ddl: [DDL, viewSql],
-      seeds: [
+    const result = probe(
+      [
         seedRow("v1", "w1", 500, null),
-        seedRow("v2", "w1", 500, null, { status: "CLAIMED" }),
-        seedRow("v3", "w1", 500, null, { status: "PAID" }),
+        seedRow("v2", "w1", 500, null, { status: "CLAIMED", claimed: true }),
+        seedRow("v3", "w1", 500, null, { status: "PAID", claimed: true }),
         seedRow("v4", "w1", 500, null, { status: "CANCELLED" }),
       ],
-      query: "SELECT active, claimed FROM voucher_stats",
-      params: [],
-    }
-    const run2 = spawnSync(
-      process.execPath,
-      [path.join(process.cwd(), "scripts", "pglite-sql-probe.mjs")],
-      {
-        env: { ...process.env, PROBE_PROGRAM: JSON.stringify(program) },
-        encoding: "utf8",
-        timeout: 60000,
-      },
+      "SELECT active, claimed FROM voucher_stats",
+      [],
+      { extraDdl: [viewSql] },
     )
-    if (run2.status !== 0) throw new Error(`PGlite probe failed: ${run2.stderr}`)
-    const rows = JSON.parse(run2.stdout).rows as Array<{
-      active: string
-      claimed: string
-    }>
-    expect(Number(rows[0].active)).toBe(1)
-    expect(Number(rows[0].claimed)).toBe(2)
+    expect(Number(result.rows[0].active)).toBe(1)
+    expect(Number(result.rows[0].claimed)).toBe(2)
   })
 })

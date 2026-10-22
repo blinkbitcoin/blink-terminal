@@ -30,30 +30,31 @@ import {
 } from "./voucher-expiry"
 
 /**
- * Aggregate liabilities of ACTIVE, unexpired vouchers for one wallet, in the
- * wallet's minor units. Exported as constants so the PGlite spec executes the
- * exact SQL the store runs (PR #94 review: mocked client.query let a Postgres
+ * Aggregate liabilities of unsettled vouchers for one wallet, in the wallet's
+ * minor units. Exported as constants so the PGlite spec executes the exact
+ * SQL the store runs (PR #94 review: mocked client.query let a Postgres
  * parameter-type failure ship).
  *
- * CLAIMED vouchers are counted too: claim happens BEFORE the payment round
- * trip (callback.ts), so an in-flight redemption would otherwise vanish from
- * the aggregate while the wallet balance still reads pre-payment — a
- * concurrent create could then publish another full-balance voucher
- * (blink-wip#1665). Settlement (PAID), cancellation and expiry exit the set;
- * definite-failure unclaim moves CLAIMED back to ACTIVE, staying counted.
+ * Expiry only applies to ACTIVE: an unclaimed voucher past expiry can never be
+ * redeemed. CLAIMED is counted regardless of expiry because claim happens
+ * BEFORE the payment round trip (callback.ts): a voucher claimed just before
+ * expiry may still settle (PENDING/unknown outcome) and debit the wallet.
+ * Settlement (PAID), cancellation, definite-failure unclaim (CLAIMED ->
+ * ACTIVE, which then expires normally) and the 30-day claimed-retention
+ * cleanup exit the set (blink-wip#1665).
  *
  * $1 = walletId, $2 = now (ms). USD also takes $3 = server cents-per-sat rate
  * (cast to numeric: amount_sats is BIGINT, and an uncast "0.05" parameter would
  * be inferred as bigint and rejected).
  */
 export const ACTIVE_LIABILITY_SUM_SQL_BTC = `SELECT COALESCE(SUM(amount_sats), 0) AS total FROM vouchers
-   WHERE wallet_id = $1 AND status IN ('ACTIVE', 'CLAIMED') AND expires_at > $2`
+   WHERE wallet_id = $1 AND (status = 'CLAIMED' OR (status = 'ACTIVE' AND expires_at > $2))`
 
 export const ACTIVE_LIABILITY_SUM_SQL_USD = `SELECT COALESCE(
      SUM(GREATEST(COALESCE(usd_amount_cents, 0), CEIL(amount_sats * $3::numeric))),
      0
    ) AS total FROM vouchers
-   WHERE wallet_id = $1 AND status IN ('ACTIVE', 'CLAIMED') AND expires_at > $2`
+   WHERE wallet_id = $1 AND (status = 'CLAIMED' OR (status = 'ACTIVE' AND expires_at > $2))`
 
 /**
  * Voucher redemption transitions, exported so the PGlite spec can run the
@@ -108,10 +109,10 @@ interface CreateVoucherOptions {
   /**
    * Backing ceiling in minor units (sats for BTC wallets, cents for USD).
    * When set, the insert runs in a per-wallet transaction that sums existing
-   * ACTIVE, unexpired voucher liabilities and refuses when
-   * existing + liabilityMinor exceeds this ceiling (blink-wip#1665: each
-   * create used to check only its own amount against the live balance, so
-   * sequential/concurrent creates could aggregate beyond it).
+   * unsettled voucher liabilities (unexpired ACTIVE + in-flight CLAIMED) and
+   * refuses when existing + liabilityMinor exceeds this ceiling
+   * (blink-wip#1665: each create used to check only its own amount against the
+   * live balance, so sequential/concurrent creates could aggregate beyond it).
    */
   maxLiabilityMinor?: number
   /**
