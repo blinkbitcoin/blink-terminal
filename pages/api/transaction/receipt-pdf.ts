@@ -7,6 +7,7 @@ import React from "react"
 
 import AuthManager from "../../../lib/auth"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
+import { MEMO_MAX_LENGTH } from "../../../lib/validation"
 
 // Dynamic import to avoid issues with font registration at module load time
 let pdfModule: typeof import("../../../lib/pdf/TransactionReceiptPDF") | null = null
@@ -44,9 +45,7 @@ const LIMITS = {
   id: 128, // payment hashes / txids are 64 hex chars
   short: 64, // status, amount, date, currency codes, usernames
   hash: 128, // paymentHash, preImage, transactionHash, address
-  // Matches the app's memo contract (lib/validation.ts: z.string().max(640))
-  // so every memo the POS accepts can also be receipted. Keep in sync.
-  memo: 640,
+  memo: MEMO_MAX_LENGTH, // the app's memo contract (lib/validation.ts)
 } as const
 
 interface ViaInput {
@@ -85,6 +84,30 @@ function cappedNumber(value: unknown): number | null | undefined {
   if (value === undefined || value === null) return undefined
   if (typeof value !== "number" || !Number.isFinite(value)) return null
   return value
+}
+
+/**
+ * Blink's GraphQL SignedDisplayMajorAmount scalar is a STRING on the wire
+ * ("10.50") and pages/api/blink/transactions.ts passes it through unchanged.
+ * Accept that strict bounded decimal-string format (no exponents, no
+ * whitespace) plus plain finite numbers, and normalize to the number the PDF
+ * component expects. (PR #93 review: requiring a number 400'd every normal
+ * Blink transaction.)
+ */
+const DISPLAY_AMOUNT_STRING = /^-?\d{1,15}(\.\d{1,8})?$/
+
+function displayAmount(value: unknown): number | null | undefined {
+  if (value === undefined || value === null) return undefined
+  if (typeof value === "number") return Number.isFinite(value) ? value : null
+  if (
+    typeof value === "string" &&
+    value.length <= 25 &&
+    DISPLAY_AMOUNT_STRING.test(value)
+  ) {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return null
 }
 
 function sanitizeVia(value: unknown): ViaInput | null | undefined {
@@ -166,13 +189,18 @@ function sanitizeTransaction(body: unknown): TransactionInput | string {
   const numbers: [string, unknown][] = [
     ["settlementAmount", tx.settlementAmount],
     ["settlementFee", tx.settlementFee],
-    ["settlementDisplayAmount", tx.settlementDisplayAmount],
   ]
   const cleanNumbers: Record<string, number | undefined> = {}
   for (const [name, value] of numbers) {
     const capped = cappedNumber(value)
     if (capped === null) return `Invalid ${name} (finite number)`
     cleanNumbers[name] = capped
+  }
+
+  // Wire type is a decimal string ("10.50"); normalized to a number.
+  const settlementDisplayAmount = displayAmount(tx.settlementDisplayAmount)
+  if (settlementDisplayAmount === null) {
+    return "Invalid settlementDisplayAmount (decimal amount)"
   }
 
   const initiationVia = sanitizeVia(tx.initiationVia)
@@ -191,7 +219,7 @@ function sanitizeTransaction(body: unknown): TransactionInput | string {
     memo: clean.memo,
     settlementAmount: cleanNumbers.settlementAmount,
     settlementFee: cleanNumbers.settlementFee,
-    settlementDisplayAmount: cleanNumbers.settlementDisplayAmount,
+    settlementDisplayAmount,
     initiationVia,
     settlementVia,
   }

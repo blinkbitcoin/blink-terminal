@@ -64,6 +64,10 @@ const VALID_TX = {
   settlementCurrency: "BTC",
   settlementAmount: 1000,
   settlementFee: 0,
+  // Blink GraphQL wire type: SignedDisplayMajorAmount is a STRING ("10.50"),
+  // passed through unchanged by pages/api/blink/transactions.ts.
+  settlementDisplayAmount: "10.50",
+  settlementDisplayCurrency: "USD",
   date: "2026-10-22",
   memo: "coffee",
   initiationVia: { __typename: "InitiationViaLn", paymentHash: "b".repeat(64) },
@@ -186,6 +190,56 @@ describe("input bounding (the DoS fix)", () => {
     }
     expect(element.props.transaction.evil).toBeUndefined()
     expect(element.props.transaction.id).toBe(VALID_TX.id)
+  })
+})
+
+describe("settlementDisplayAmount wire format (Blink SignedDisplayMajorAmount)", () => {
+  const renderedTx = () =>
+    (
+      mockRenderToBuffer.mock.calls[0][0] as {
+        props: { transaction: Record<string, unknown> }
+      }
+    ).props.transaction
+
+  it("accepts the production string shape and normalizes to a number", async () => {
+    const res = await call({ transaction: VALID_TX }, { token: "pos-session" })
+    expect(res.statusCode).toBe(200)
+    expect(renderedTx().settlementDisplayAmount).toBe(10.5)
+  })
+
+  it("accepts a negative string amount", async () => {
+    const res = await call(
+      { transaction: { ...VALID_TX, settlementDisplayAmount: "-10.50" } },
+      { token: "pos-session" },
+    )
+    expect(res.statusCode).toBe(200)
+    expect(renderedTx().settlementDisplayAmount).toBe(-10.5)
+  })
+
+  it("still accepts a plain finite number (NWC-shaped rows)", async () => {
+    const res = await call(
+      { transaction: { ...VALID_TX, settlementDisplayAmount: 10.5 } },
+      { token: "pos-session" },
+    )
+    expect(res.statusCode).toBe(200)
+    expect(renderedTx().settlementDisplayAmount).toBe(10.5)
+  })
+
+  it.each([
+    ["abc", "not a number"],
+    ["1e5", "exponent notation"],
+    ["9".repeat(100), "overlong string"],
+    ["10.50 ", "trailing whitespace"],
+    ["10,50", "comma decimal"],
+    [Number.NaN, "NaN"],
+    [Number.POSITIVE_INFINITY, "Infinity"],
+  ])("rejects %s (%s) -> 400, nothing rendered", async (value, _label) => {
+    const res = await call(
+      { transaction: { ...VALID_TX, settlementDisplayAmount: value } },
+      { token: "pos-session" },
+    )
+    expect(res.statusCode).toBe(400)
+    expect(mockRenderToBuffer).not.toHaveBeenCalled()
   })
 })
 
