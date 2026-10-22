@@ -30,7 +30,7 @@ const tx = (overrides: Record<string, unknown> = {}) => ({
   id: "tx1",
   direction: "SEND",
   status: "SUCCESS",
-  settlementAmount: 500,
+  settlementAmount: -500,
   settlementCurrency: "BTC",
   createdAt: Math.floor(NOW / 1000), // Blink Timestamp is Unix seconds
   memo: "BlinkPOS Voucher: 500 sats",
@@ -39,7 +39,18 @@ const tx = (overrides: Record<string, unknown> = {}) => ({
 
 describe("matchRedemptionCandidates", () => {
   it("matches a unique settled BTC payment at the claim time", () => {
+    // Production shape: Blink's settlementAmount is signed (credit - debit),
+    // so an outgoing payment is negative.
     expect(matchRedemptionCandidates(voucher(), [tx()])).toHaveLength(1)
+  })
+
+  it("matches by settlement-amount magnitude, not sign", () => {
+    expect(
+      matchRedemptionCandidates(voucher(), [tx({ settlementAmount: -500 })]),
+    ).toHaveLength(1)
+    expect(
+      matchRedemptionCandidates(voucher(), [tx({ settlementAmount: 500 })]),
+    ).toHaveLength(1)
   })
 
   it("matches a settled USD voucher in cents", () => {
@@ -49,7 +60,7 @@ describe("matchRedemptionCandidates", () => {
       walletCurrency: "USD",
     })
     const usdTx = tx({
-      settlementAmount: 100,
+      settlementAmount: -100,
       settlementCurrency: "USD",
       memo: "BlinkPOS USD Voucher: $1.00 USD = 2000 sats",
     })
@@ -57,9 +68,9 @@ describe("matchRedemptionCandidates", () => {
   })
 
   it("requires the settlement amount to equal the voucher amount", () => {
-    expect(matchRedemptionCandidates(voucher(), [tx({ settlementAmount: 501 })])).toEqual(
-      [],
-    )
+    expect(
+      matchRedemptionCandidates(voucher(), [tx({ settlementAmount: -501 })]),
+    ).toEqual([])
     // A BTC payment cannot confirm a USD voucher (and vice versa).
     expect(
       matchRedemptionCandidates(voucher({ walletCurrency: "USD", usdAmountCents: 100 }), [

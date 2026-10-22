@@ -150,8 +150,9 @@ function matchRedemptionCandidates(voucher, transactions) {
     const txCurrency = String(tx.settlementCurrency || "").toUpperCase()
     if (txCurrency && txCurrency !== currency) return false
 
-    // settlementAmount is in the currency's minor units (sats / cents).
-    return Number(tx.settlementAmount) === expectedMinor
+    // settlementAmount is signed (credit - debit): outgoing payments are
+    // negative in Blink's ledger. Compare magnitude in minor units (sats/cents).
+    return Math.abs(Number(tx.settlementAmount)) === expectedMinor
   })
 }
 
