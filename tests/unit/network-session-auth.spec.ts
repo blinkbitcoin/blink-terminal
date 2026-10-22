@@ -76,6 +76,16 @@ jest.mock("../../lib/rate-limit", () => ({
   RATE_LIMIT_WRITE: {},
 }))
 
+// Sync triggers call into the sync service; keep it in-memory.
+const mockSyncCommunityTransactions = jest.fn()
+const mockSyncAllCommunities = jest.fn()
+jest.mock("../../lib/network/syncService", () => ({
+  __esModule: true,
+  syncCommunityTransactions: (...args: unknown[]) =>
+    mockSyncCommunityTransactions(...args),
+  syncAllCommunities: (...args: unknown[]) => mockSyncAllCommunities(...args),
+}))
+
 import { getSessionNpub, requireSessionIdentity } from "../../lib/auth/session-pubkey"
 import communitiesHandler from "../../pages/api/network/communities"
 import consentHandler from "../../pages/api/network/consent"
@@ -126,7 +136,15 @@ const call = async (
       method,
       query,
       body,
-      headers: { host: "terminal.example", ...headers },
+      // Browser mutations always send Origin + JSON content type; tests
+      // override these explicitly to exercise the mutation guard.
+      headers: {
+        host: "terminal.example",
+        ...(method === "POST" || method === "DELETE"
+          ? { "content-type": "application/json", "origin": "https://terminal.example" }
+          : {}),
+        ...headers,
+      },
       cookies: token ? { "auth-token": token } : {},
       url: "/api/network",
     } as never,
@@ -141,6 +159,8 @@ jest.spyOn(console, "error").mockImplementation(() => {})
 
 beforeEach(() => {
   for (const fn of Object.values(mockDbFns)) fn.mockReset()
+  mockSyncCommunityTransactions.mockReset()
+  mockSyncAllCommunities.mockReset()
   // Mirror the real db.ts: the hardcoded super admin is always an admin.
   mockDb.isSuperAdmin = jest.fn(async (npub: string) => npub === SUPER_ADMIN_NPUB)
 })
@@ -318,5 +338,235 @@ describe("public routes stay reachable without a session", () => {
     const res = await call(communitiesHandler as Handler, {})
     expect(res.statusCode).toBe(200)
     expect(res.body).toMatchObject({ success: true, communities: [] })
+  })
+})
+
+describe("mutation guard (same-site CSRF boundary, PR #92 review)", () => {
+  it("rejects form-urlencoded mutations before auth or DB", async () => {
+    const res = await call(reviewHandler as Handler, {
+      token: "token-owner",
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: { applicationId: "5", action: "approve" },
+    })
+    expect(res.statusCode).toBe(415)
+    expect(mockDb.query).not.toHaveBeenCalled()
+  })
+
+  it("rejects a hostile same-site Origin", async () => {
+    const res = await call(reviewHandler as Handler, {
+      token: "token-owner",
+      method: "POST",
+      headers: { origin: "https://evil.example" },
+      body: { applicationId: "5", action: "approve" },
+    })
+    expect(res.statusCode).toBe(403)
+    expect(mockDb.query).not.toHaveBeenCalled()
+  })
+
+  it("rejects a missing Origin", async () => {
+    const res = await call(reviewHandler as Handler, {
+      token: "token-owner",
+      method: "POST",
+      headers: { origin: undefined as unknown as string },
+      body: { applicationId: "5", action: "approve" },
+    })
+    expect(res.statusCode).toBe(403)
+  })
+
+  it("rejects an unparseable Origin", async () => {
+    const res = await call(reviewHandler as Handler, {
+      token: "token-owner",
+      method: "POST",
+      headers: { origin: "not a url" },
+      body: { applicationId: "5", action: "approve" },
+    })
+    expect(res.statusCode).toBe(403)
+  })
+
+  it("honours x-forwarded-host behind a proxy", async () => {
+    mockDb.query = jest.fn().mockResolvedValue({
+      rows: [{ id: "5", status: "pending", leader_npub: OWNER_NPUB }],
+    })
+    mockDb.reviewApplication = jest
+      .fn()
+      .mockResolvedValue({ id: "5", status: "approved" })
+    const res = await call(reviewHandler as Handler, {
+      token: "token-owner",
+      method: "POST",
+      headers: {
+        "host": "internal:3000",
+        "x-forwarded-host": "terminal.example",
+        "origin": "https://terminal.example",
+      },
+      body: { applicationId: "5", action: "approve" },
+    })
+    expect(res.statusCode).toBe(200)
+  })
+
+  it.each([
+    [
+      "communities POST",
+      communitiesHandler,
+      "POST",
+      { name: "x", slug: "x", leaderNpub: OWNER_NPUB },
+    ],
+    ["consent POST", consentHandler, "POST", { communityId: "1", apiKey: "blink_x" }],
+    ["consent DELETE", consentHandler, "DELETE", {}],
+    ["apply POST", applyHandler, "POST", { communityId: "1" }],
+    ["sync POST", syncHandler, "POST", { syncAll: true }],
+  ])(
+    "%s: form post -> 415 before anything runs",
+    async (_name, handler, method, body) => {
+      const res = await call(handler as Handler, {
+        token: "token-admin",
+        method: method as string,
+        query: { communityId: "1" },
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body,
+      })
+      expect(res.statusCode).toBe(415)
+    },
+  )
+
+  it("members DELETE: form post -> 415 before the mutation runs", async () => {
+    // members.ts checks leadership (DB lookup) before method dispatch.
+    mockDb.getCommunityById = jest
+      .fn()
+      .mockResolvedValue({ id: "1", leader_npub: SUPER_ADMIN_NPUB })
+    const res = await call(membersHandler as Handler, {
+      token: "token-admin",
+      method: "DELETE",
+      query: { communityId: "1" },
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: { membershipId: "5" },
+    })
+    expect(res.statusCode).toBe(415)
+    expect(mockDb.removeMember).not.toHaveBeenCalled()
+  })
+})
+
+describe("session-bound mutations execute for the right session", () => {
+  it("consent POST stores consent for the session npub", async () => {
+    mockDb.getMembership = jest.fn().mockResolvedValue({ id: 3, status: "approved" })
+    mockDb.getConsentByUser = jest.fn().mockResolvedValue(null)
+    mockDb.createOrUpdateConsent = jest.fn().mockResolvedValue({
+      id: 9,
+      blink_username: "alice",
+      consented_at: "2026-10-22",
+    })
+    const res = await call(consentHandler as Handler, {
+      token: "token-owner",
+      method: "POST",
+      body: { communityId: "1", apiKey: "blink_valid" },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(mockDb.createOrUpdateConsent).toHaveBeenCalledWith(
+      3,
+      OWNER_NPUB,
+      "1",
+      expect.objectContaining({ consentGiven: true }),
+    )
+  })
+
+  it("consent DELETE revokes for the session npub", async () => {
+    mockDb.getMembership = jest.fn().mockResolvedValue({ id: 3, status: "approved" })
+    mockDb.createOrUpdateConsent = jest.fn().mockResolvedValue({ id: 9 })
+    const res = await call(consentHandler as Handler, {
+      token: "token-owner",
+      method: "DELETE",
+      query: { communityId: "1" },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(mockDb.createOrUpdateConsent).toHaveBeenCalledWith(
+      3,
+      OWNER_NPUB,
+      "1",
+      expect.objectContaining({ consentGiven: false }),
+    )
+  })
+
+  it("members DELETE removes a member as the leader session", async () => {
+    mockDb.getCommunityById = jest
+      .fn()
+      .mockResolvedValue({ id: "1", leader_npub: OWNER_NPUB })
+    mockDb.getMembershipById = jest
+      .fn()
+      .mockResolvedValue({ id: 5, community_id: "1", role: "member" })
+    mockDb.removeMember = jest.fn().mockResolvedValue(undefined)
+    const res = await call(membersHandler as Handler, {
+      token: "token-owner",
+      method: "DELETE",
+      query: { communityId: "1" },
+      body: { membershipId: "5" },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(mockDb.removeMember).toHaveBeenCalledWith("5", OWNER_NPUB)
+  })
+
+  it("memberships GET returns the session user's memberships", async () => {
+    mockDb.getUserMemberships = jest.fn().mockResolvedValue([])
+    const res = await call(membershipsHandler as Handler, { token: "token-owner" })
+    expect(res.statusCode).toBe(200)
+    expect(mockDb.getUserMemberships).toHaveBeenCalledWith(OWNER_NPUB)
+    expect(res.body).toMatchObject({ success: true, memberships: [] })
+  })
+
+  it("pending GET lists applications for the leader's communities", async () => {
+    mockDb.listCommunities = jest.fn().mockResolvedValue([
+      { id: "1", leader_npub: OWNER_NPUB },
+      { id: "2", leader_npub: OTHER_NPUB },
+    ])
+    mockDb.getPendingApplications = jest
+      .fn()
+      .mockResolvedValue([{ id: 11, status: "pending" }])
+    const res = await call(pendingHandler as Handler, { token: "token-owner" })
+    expect(res.statusCode).toBe(200)
+    expect(mockDb.getPendingApplications).toHaveBeenCalledWith("1")
+    expect(mockDb.getPendingApplications).not.toHaveBeenCalledWith("2")
+  })
+
+  it("communities POST creates a community as super admin", async () => {
+    mockDb.isLeaderWhitelisted = jest.fn().mockResolvedValue(true)
+    mockDb.createCommunity = jest.fn().mockResolvedValue({ id: 9, name: "New" })
+    const res = await call(communitiesHandler as Handler, {
+      token: "token-admin",
+      method: "POST",
+      body: { name: "New", slug: "new", leaderNpub: OWNER_NPUB },
+    })
+    expect(res.statusCode).toBe(201)
+    expect(mockDb.createCommunity).toHaveBeenCalled()
+    expect(mockDb.addToWhitelist).not.toHaveBeenCalled()
+  })
+
+  it("sync POST syncs one community as its leader", async () => {
+    mockDb.getCommunityById = jest
+      .fn()
+      .mockResolvedValue({ id: "1", leader_npub: OWNER_NPUB })
+    mockSyncCommunityTransactions.mockResolvedValue({
+      members_synced: 1,
+      total_transactions: 2,
+    })
+    const res = await call(syncHandler as Handler, {
+      token: "token-owner",
+      method: "POST",
+      body: { communityId: "1" },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(mockSyncCommunityTransactions).toHaveBeenCalledWith("1")
+  })
+
+  it("sync POST syncAll runs as super admin only", async () => {
+    mockSyncAllCommunities.mockResolvedValue({
+      communities_synced: 2,
+      total_transactions: 5,
+    })
+    const res = await call(syncHandler as Handler, {
+      token: "token-admin",
+      method: "POST",
+      body: { syncAll: true },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(mockSyncAllCommunities).toHaveBeenCalled()
   })
 })

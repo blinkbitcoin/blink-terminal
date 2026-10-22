@@ -7,6 +7,7 @@
 
 import type { NextApiRequest, NextApiResponse } from "next"
 
+import { requireTrustedMutation } from "../../../lib/auth/mutation-guard"
 import { requireSessionNpub } from "../../../lib/auth/session-pubkey"
 import * as db from "../../../lib/network/db"
 import { withRateLimit, RATE_LIMIT_READ } from "../../../lib/rate-limit"
@@ -97,6 +98,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
   // DELETE - Remove a member
   if (req.method === "DELETE") {
+    if (!requireTrustedMutation(req, res)) return
+
     try {
       const { membershipId } = req.body as { membershipId: string }
 

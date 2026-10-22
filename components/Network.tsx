@@ -275,6 +275,9 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
     // UI state
     const [loading, setLoading] = useState<boolean>(true)
     const [error, setError] = useState<string>("")
+    // Set by sessionFetch when the server session (24h JWT cookie) is gone:
+    // local npubKey state outlives it, and 401s must not look like empty data.
+    const [sessionExpired, setSessionExpired] = useState<boolean>(false)
     const [searchQuery, setSearchQuery] = useState<string>("")
 
     // Consent modal state
@@ -312,6 +315,22 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
     const [loadingMembers, setLoadingMembers] = useState<boolean>(false)
     const [removingMemberId, setRemovingMemberId] = useState<number | null>(null)
     const [showRemoveConfirm, setShowRemoveConfirm] = useState<number | null>(null) // membership id to confirm removal
+
+    // Authenticated calls go through sessionFetch: a 401 means the server
+    // session (24h JWT cookie) expired even though local npubKey state is
+    // still present — surface that instead of rendering empty data.
+    const sessionFetch = async (input: string, init?: RequestInit): Promise<Response> => {
+      const response = await fetch(input, init)
+      if (response.status === 401) setSessionExpired(true)
+      return response
+    }
+
+    const sessionExpiredBanner = sessionExpired ? (
+      <div className="mb-4 bg-amber-100 dark:bg-amber-900 border border-amber-400 dark:border-amber-700 text-amber-800 dark:text-amber-100 px-4 py-3 rounded-lg">
+        Your sign-in session has expired. Please sign out and sign in again to manage your
+        communities.
+      </div>
+    ) : null
 
     // Fetch communities on mount
     useEffect(() => {
@@ -384,7 +403,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       if (!npubKey) return
 
       try {
-        const response = await fetch("/api/network/consent")
+        const response = await sessionFetch("/api/network/consent")
         const data = await response.json()
 
         if (data.success && data.consents) {
@@ -407,7 +426,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       setError("")
 
       try {
-        const response = await fetch("/api/network/consent", {
+        const response = await sessionFetch("/api/network/consent", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -450,9 +469,12 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       if (!npubKey) return
 
       try {
-        const response = await fetch(`/api/network/consent?communityId=${communityId}`, {
-          method: "DELETE",
-        })
+        const response = await sessionFetch(
+          `/api/network/consent?communityId=${communityId}`,
+          {
+            method: "DELETE",
+          },
+        )
 
         const data = await response.json()
 
@@ -510,7 +532,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       setError("")
 
       try {
-        const response = await fetch("/api/network/sync", {
+        const response = await sessionFetch("/api/network/sync", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -552,7 +574,9 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
 
       setLoadingMembers(true)
       try {
-        const response = await fetch(`/api/network/members?communityId=${communityId}`)
+        const response = await sessionFetch(
+          `/api/network/members?communityId=${communityId}`,
+        )
         const data = await response.json()
 
         if (data.success) {
@@ -588,7 +612,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       setError("")
 
       try {
-        const response = await fetch(
+        const response = await sessionFetch(
           `/api/network/members?communityId=${selectedCommunity.id}`,
           {
             method: "DELETE",
@@ -622,7 +646,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       if (!npubKey) return
 
       try {
-        const response = await fetch("/api/network/memberships")
+        const response = await sessionFetch("/api/network/memberships")
         const data = await response.json()
 
         if (data.success) {
@@ -652,11 +676,12 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       if (!npubKey) return
 
       try {
-        const response = await fetch("/api/network/whitelist/check")
+        const response = await sessionFetch("/api/network/whitelist/check")
         const data = await response.json()
         setIsSuperAdmin(data.isSuperAdmin || false)
         setIsWhitelistedLeader(data.isWhitelisted || false)
         setUserRole(data.role || "user")
+        if (data.success) setSessionExpired(false)
       } catch (err: unknown) {
         console.error("Error checking whitelist status:", err)
       }
@@ -671,7 +696,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
           ? `/api/network/memberships/pending?communityId=${communityId}`
           : "/api/network/memberships/pending"
 
-        const response = await fetch(url)
+        const response = await sessionFetch(url)
         const data = await response.json()
 
         if (data.success) {
@@ -695,7 +720,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       setError("")
 
       try {
-        const response = await fetch("/api/network/memberships/apply", {
+        const response = await sessionFetch("/api/network/memberships/apply", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -756,7 +781,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
       )
 
       try {
-        const response = await fetch("/api/network/memberships/review", {
+        const response = await sessionFetch("/api/network/memberships/review", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -972,6 +997,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
 
           {/* Community List */}
           <div className="flex-1 overflow-y-auto px-4 py-4">
+            {sessionExpiredBanner}
             {error && (
               <div className="mb-4 bg-red-100 dark:bg-red-900 border border-red-400 dark:border-red-700 text-red-700 dark:text-red-200 px-4 py-3 rounded-lg">
                 {error}
@@ -1199,6 +1225,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
                   />
                 </div>
 
+                {sessionExpiredBanner}
                 {error && (
                   <div className="mb-4 text-sm text-red-600 dark:text-red-400">
                     {error}
@@ -1278,6 +1305,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
                   </p>
                 </div>
 
+                {sessionExpiredBanner}
                 {error && (
                   <div className="mb-4 text-sm text-red-600 dark:text-red-400">
                     {error}
@@ -2072,6 +2100,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
                   </p>
                 </div>
 
+                {sessionExpiredBanner}
                 {error && (
                   <div className="mb-4 text-sm text-red-600 dark:text-red-400">
                     {error}
@@ -2209,6 +2238,7 @@ const Network = forwardRef<NetworkRef, NetworkProps>(
                 ✅ {reviewSuccess}
               </div>
             )}
+            {sessionExpiredBanner}
             {error && (
               <div className="mb-4 p-3 bg-red-100 dark:bg-red-900/30 border border-red-300 dark:border-red-700 rounded-lg text-red-700 dark:text-red-300 text-sm">
                 ❌ {error}

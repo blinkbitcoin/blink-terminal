@@ -9,6 +9,7 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
 import AuthManager from "../../../lib/auth"
+import { requireTrustedMutation } from "../../../lib/auth/mutation-guard"
 import { requireSessionNpub } from "../../../lib/auth/session-pubkey"
 import BlinkAPI from "../../../lib/blink-api"
 import * as db from "../../../lib/network/db"
@@ -126,6 +127,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
   // POST - Submit consent
   if (req.method === "POST") {
+    if (!requireTrustedMutation(req, res)) return
+
     const { communityId, apiKey } = req.body as { communityId: string; apiKey: string }
 
     if (!communityId) {
@@ -259,6 +262,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
   // DELETE - Revoke consent
   if (req.method === "DELETE") {
+    if (!requireTrustedMutation(req, res)) return
+
     const { communityId } = req.query as { communityId?: string }
 
     if (!communityId) {

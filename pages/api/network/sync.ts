@@ -7,6 +7,7 @@
 
 import type { NextApiRequest, NextApiResponse } from "next"
 
+import { requireTrustedMutation } from "../../../lib/auth/mutation-guard"
 import { requireSessionNpub } from "../../../lib/auth/session-pubkey"
 import type { MetricsRow } from "../../../lib/network/db"
 import * as db from "../../../lib/network/db"
@@ -103,6 +104,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
   // POST - Trigger sync
   if (req.method === "POST") {
+    if (!requireTrustedMutation(req, res)) return
+
     const { communityId, syncAll } = req.body as {
       communityId?: string
       syncAll?: boolean

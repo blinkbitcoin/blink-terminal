@@ -6,6 +6,7 @@
 
 import type { NextApiRequest, NextApiResponse } from "next"
 
+import { requireTrustedMutation } from "../../../../lib/auth/mutation-guard"
 import { requireSessionIdentity } from "../../../../lib/auth/session-pubkey"
 import * as db from "../../../../lib/network/db"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../../lib/rate-limit"
@@ -14,6 +15,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" })
   }
+
+  if (!requireTrustedMutation(req, res)) return
 
   // Identity from the verified Nostr session only (blink-wip#1679) — the
   // unsigned X-User-Npub / X-User-Pubkey headers are no longer accepted.
