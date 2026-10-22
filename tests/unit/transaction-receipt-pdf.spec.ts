@@ -111,6 +111,15 @@ describe("input bounding (the DoS fix)", () => {
     )
   })
 
+  it("a max-length memo (640, the app's own contract) renders", async () => {
+    const res = await call(
+      { transaction: { ...VALID_TX, memo: "m".repeat(640) } },
+      { token: "pos-session" },
+    )
+    expect(res.statusCode).toBe(200)
+    expect(mockRenderToBuffer).toHaveBeenCalled()
+  })
+
   it("the 200 KB id from the report is rejected before rendering", async () => {
     const res = await call(
       { transaction: { ...VALID_TX, id: "x".repeat(200 * 1024) } },
@@ -122,7 +131,7 @@ describe("input bounding (the DoS fix)", () => {
 
   it.each([
     ["id", "x".repeat(129)],
-    ["memo", "x".repeat(513)],
+    ["memo", "x".repeat(641)],
     ["status", "x".repeat(65)],
     ["amount", "x".repeat(65)],
     ["date", "x".repeat(65)],

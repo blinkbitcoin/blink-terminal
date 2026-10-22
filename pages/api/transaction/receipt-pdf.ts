@@ -44,7 +44,9 @@ const LIMITS = {
   id: 128, // payment hashes / txids are 64 hex chars
   short: 64, // status, amount, date, currency codes, usernames
   hash: 128, // paymentHash, preImage, transactionHash, address
-  memo: 512,
+  // Matches the app's memo contract (lib/validation.ts: z.string().max(640))
+  // so every memo the POS accepts can also be receipted. Keep in sync.
+  memo: 640,
 } as const
 
 interface ViaInput {
