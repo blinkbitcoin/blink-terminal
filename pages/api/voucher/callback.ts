@@ -4,6 +4,7 @@ import BlinkAPI, { BlinkAuthError, PaymentRejectedError } from "../../../lib/bli
 import { getApiUrlForEnvironment, type EnvironmentName } from "../../../lib/config/api"
 import { verifyForwardInvoice } from "../../../lib/payout-guard"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
+import { buildVoucherMemo } from "../../../lib/voucher-memo"
 import voucherStore from "../../../lib/voucher-store"
 
 /**
@@ -154,37 +155,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
         apiUrl,
       )
 
-      // Build memo with commission and display info if available
-      let memo: string
-      const isUsdVoucher = voucher.walletCurrency === "USD"
-
-      if (isUsdVoucher && voucher.usdAmountCents) {
-        // USD voucher - show USD value prominently
-        const usdAmount = (voucher.usdAmountCents / 100).toFixed(2)
-        if (
-          voucher.displayAmount &&
-          voucher.displayCurrency &&
-          voucher.displayCurrency !== "USD"
-        ) {
-          // Display currency is different from USD (e.g., ARS)
-          if (voucher.commissionPercent && voucher.commissionPercent > 0) {
-            memo = `BlinkPOS USD Voucher: ${voucher.displayCurrency} ${voucher.displayAmount} (${voucher.commissionPercent}% commission) = $${usdAmount} USD`
-          } else {
-            memo = `BlinkPOS USD Voucher: ${voucher.displayCurrency} ${voucher.displayAmount} = $${usdAmount} USD`
-          }
-        } else {
-          memo = `BlinkPOS USD Voucher: $${usdAmount} USD = ${voucher.amount} sats`
-        }
-      } else if (voucher.displayAmount && voucher.displayCurrency) {
-        // BTC voucher with display currency
-        if (voucher.commissionPercent && voucher.commissionPercent > 0) {
-          memo = `BlinkPOS Voucher: ${voucher.displayCurrency} ${voucher.displayAmount} (${voucher.commissionPercent}% commission) = ${voucher.amount} sats`
-        } else {
-          memo = `BlinkPOS Voucher: ${voucher.displayCurrency} ${voucher.displayAmount} = ${voucher.amount} sats`
-        }
-      } else {
-        memo = `BlinkPOS Voucher: ${voucher.amount} sats`
-      }
+      // Exact memo is also the reconciliation key for legacy claims
+      const memo = buildVoucherMemo(voucher)
 
       console.log("⚡ Paying invoice from voucher wallet...", {
         walletId: voucher.walletId,

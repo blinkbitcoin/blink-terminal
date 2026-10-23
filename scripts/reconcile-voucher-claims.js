@@ -10,18 +10,27 @@
  * Settlement was never persisted, so the DB alone cannot tell a settled claim
  * from a PENDING/unknown-outcome one.
  *
- * This tool asks Blink's ledger (authoritative) and transitions a CLAIMED
- * voucher to PAID only when exactly one settled outgoing payment matches:
- *   - direction SEND, status SUCCESS/ALREADY_PAID
- *   - paid from the voucher's wallet currency (BTC sats / USD cents)
- *   - settlement amount equals the voucher's amount
- *   - memo is a BlinkPOS voucher memo (written by the redemption callback)
+ * This tool asks Blink's ledger (authoritative), scoped to the voucher's
+ * wallet, and transitions a CLAIMED voucher to PAID only when exactly one
+ * settled outgoing payment matches:
+ *   - direction SEND, status SUCCESS/ALREADY_PAID, voucher wallet currency
+ *   - memo equals the exact memo the redemption callback wrote for this
+ *     voucher (lib/voucher-memo.ts)
+ *   - settlementFee is present (fails closed otherwise)
+ *   - BTC: principal |settlementAmount| - |settlementFee| equals the face
+ *     value. Blink debits principal + fee on external sends, and
+ *     settlementAmount is signed (credit - debit).
+ *   - USD: no amount check. The callback pays a fixed-sats invoice from the
+ *     USD wallet, so the cents debited follow the rate at redemption, not
+ *     usd_amount_cents; the exact memo carries the voucher's amounts instead.
  *   - transaction time within 2 minutes before / 30 minutes after claimed_at
  *
  * Zero or multiple candidates leave the voucher CLAIMED, so it stays counted
- * in the liability aggregate (the conservative direction). Dry-run by
- * default; pass --apply to write. Run migration 029 first (PAID is rejected
- * by the pre-029 status constraint).
+ * in the liability aggregate (the conservative direction). A payment that
+ * also matches any other claimed voucher of the wallet (CLAIMED or PAID, of
+ * any age) is contested and credited to none. Dry-run by default; pass
+ * --apply to write. Run migration 029 first (PAID is rejected by the pre-029
+ * status constraint).
  *
  * Usage:
  *   node scripts/reconcile-voucher-claims.js [options]
@@ -48,10 +57,10 @@ const API_URLS = {
 }
 
 const TRANSACTIONS_QUERY = `
-  query VoucherReconciliationList($first: Int!, $after: String) {
+  query VoucherReconciliationList($first: Int!, $after: String, $walletIds: [WalletId]) {
     me {
       defaultAccount {
-        transactions(first: $first, after: $after) {
+        transactions(first: $first, after: $after, walletIds: $walletIds) {
           edges {
             cursor
             node {
@@ -59,6 +68,7 @@ const TRANSACTIONS_QUERY = `
               direction
               status
               settlementAmount
+              settlementFee
               settlementCurrency
               createdAt
               memo
@@ -122,37 +132,72 @@ function isSettledOutgoing(tx) {
   return status === "SUCCESS" || status === "ALREADY_PAID"
 }
 
-function isVoucherMemo(memo) {
-  return /^BlinkPOS (USD )?Voucher:/.test(String(memo || ""))
+/**
+ * The exact payer memo the redemption callback writes.
+ * Keep in sync with buildVoucherMemo in lib/voucher-memo.ts (parity is
+ * asserted in tests/unit/voucher-reconcile.spec.ts).
+ */
+function buildVoucherMemo(voucher) {
+  const isUsdVoucher = voucher.walletCurrency === "USD"
+
+  if (isUsdVoucher && voucher.usdAmountCents) {
+    const usdAmount = (voucher.usdAmountCents / 100).toFixed(2)
+    if (
+      voucher.displayAmount &&
+      voucher.displayCurrency &&
+      voucher.displayCurrency !== "USD"
+    ) {
+      if (voucher.commissionPercent && voucher.commissionPercent > 0) {
+        return `BlinkPOS USD Voucher: ${voucher.displayCurrency} ${voucher.displayAmount} (${voucher.commissionPercent}% commission) = $${usdAmount} USD`
+      }
+      return `BlinkPOS USD Voucher: ${voucher.displayCurrency} ${voucher.displayAmount} = $${usdAmount} USD`
+    }
+    return `BlinkPOS USD Voucher: $${usdAmount} USD = ${voucher.amount} sats`
+  }
+
+  if (voucher.displayAmount && voucher.displayCurrency) {
+    if (voucher.commissionPercent && voucher.commissionPercent > 0) {
+      return `BlinkPOS Voucher: ${voucher.displayCurrency} ${voucher.displayAmount} (${voucher.commissionPercent}% commission) = ${voucher.amount} sats`
+    }
+    return `BlinkPOS Voucher: ${voucher.displayCurrency} ${voucher.displayAmount} = ${voucher.amount} sats`
+  }
+
+  return `BlinkPOS Voucher: ${voucher.amount} sats`
 }
 
 /**
- * Candidate settled payments for one CLAIMED voucher. Callers must require
+ * Candidate settled payments for one claimed voucher. Callers must require
  * exactly one candidate before treating the voucher as settled.
  */
 function matchRedemptionCandidates(voucher, transactions) {
   const claimedAt = Number(voucher.claimedAt)
   const currency = String(voucher.walletCurrency || "BTC").toUpperCase()
-  const rawMinor = currency === "USD" ? voucher.usdAmountCents : voucher.amount
-  if (rawMinor === null || rawMinor === undefined) return []
-  const expectedMinor = Number(rawMinor)
-
-  if (!Number.isFinite(claimedAt) || !Number.isFinite(expectedMinor)) return []
+  const faceSats = Number(voucher.amount)
+  if (!Number.isFinite(claimedAt) || !Number.isFinite(faceSats)) return []
+  const expectedMemo = buildVoucherMemo(voucher)
 
   return transactions.filter((tx) => {
-    if (!isSettledOutgoing(tx) || !isVoucherMemo(tx.memo)) return false
+    if (!isSettledOutgoing(tx) || tx.memo !== expectedMemo) return false
 
     const at = createdAtMs(tx)
     if (!(at >= claimedAt - WINDOW_BEFORE_MS && at <= claimedAt + WINDOW_AFTER_MS)) {
       return false
     }
 
-    const txCurrency = String(tx.settlementCurrency || "").toUpperCase()
-    if (txCurrency && txCurrency !== currency) return false
+    if (String(tx.settlementCurrency || "").toUpperCase() !== currency) return false
 
-    // settlementAmount is signed (credit - debit): outgoing payments are
-    // negative in Blink's ledger. Compare magnitude in minor units (sats/cents).
-    return Math.abs(Number(tx.settlementAmount)) === expectedMinor
+    // Fail closed: without the fee the principal cannot be derived.
+    if (tx.settlementFee === null || tx.settlementFee === undefined) return false
+    const fee = Math.abs(Number(tx.settlementFee))
+    const gross = Math.abs(Number(tx.settlementAmount))
+    if (!Number.isFinite(fee) || !Number.isFinite(gross)) return false
+
+    // USD: cents follow the redemption-time rate; the exact memo is the key.
+    if (currency === "USD") return true
+
+    // BTC: settlementAmount is signed (credit - debit) and includes the fee
+    // on external sends; compare the principal to the face value.
+    return gross - fee === faceSats
   })
 }
 
@@ -171,13 +216,15 @@ async function fetchTransactions(apiKey, environment, options = {}) {
   const transactions = []
   let after = null
 
+  const walletIds = options.walletId ? [options.walletId] : null
+
   for (let page = 0; page < maxPages; page++) {
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-API-KEY": apiKey },
       body: JSON.stringify({
         query: TRANSACTIONS_QUERY,
-        variables: { first, after },
+        variables: { first, after, walletIds },
       }),
       signal: AbortSignal.timeout(20000),
     })
@@ -220,16 +267,22 @@ async function reconcileClaimedVouchers(deps) {
     log = console.log,
   } = deps
 
-  const params = [now - minAgeMinutes * 60 * 1000]
-  let where = "status = 'CLAIMED' AND claimed_at IS NOT NULL AND claimed_at < $1"
+  const cutoff = now - minAgeMinutes * 60 * 1000
+  const params = []
+  // Every claimed voucher (CLAIMED or PAID, any age) is loaded: targets are
+  // old-enough CLAIMED rows, but all of them compete for ledger payments so a
+  // payment that belongs to a recent or already-settled voucher can never be
+  // credited to a legacy claim.
+  let where = "status IN ('CLAIMED', 'PAID') AND claimed_at IS NOT NULL"
   if (walletId) {
     params.push(walletId)
-    where += " AND wallet_id = $2"
+    where += " AND wallet_id = $1"
   }
 
   const { rows } = await pool.query(
-    `SELECT id, amount_sats, usd_amount_cents, wallet_id, api_key_encrypted,
-            claimed_at, environment, wallet_currency
+    `SELECT id, status, amount_sats, usd_amount_cents, wallet_id, api_key_encrypted,
+            claimed_at, environment, wallet_currency, display_amount,
+            display_currency, commission_percent
      FROM vouchers
      WHERE ${where}
      ORDER BY wallet_id, claimed_at`,
@@ -237,27 +290,42 @@ async function reconcileClaimedVouchers(deps) {
   )
 
   const groups = new Map()
+  let checked = 0
   for (const row of rows) {
     const key = `${row.wallet_id}\u0000${row.environment || "production"}`
     if (!groups.has(key)) {
       groups.set(key, {
         walletId: row.wallet_id,
         environment: row.environment || "production",
-        apiKeyEncrypted: row.api_key_encrypted,
+        apiKeyEncrypted: null,
         vouchers: [],
       })
     }
-    groups.get(key).vouchers.push({
+    const group = groups.get(key)
+    const claimedAt = Number(row.claimed_at)
+    const isTarget = row.status === "CLAIMED" && claimedAt < cutoff
+    if (isTarget) checked++
+    if (isTarget && !group.apiKeyEncrypted) group.apiKeyEncrypted = row.api_key_encrypted
+    // Same field mapping as VoucherStore._rowToVoucher, so the rebuilt memo
+    // is byte-identical to the one the callback sent.
+    group.vouchers.push({
       id: row.id,
-      amount: Number(row.amount_sats),
-      usdAmountCents: row.usd_amount_cents === null ? null : Number(row.usd_amount_cents),
+      isTarget,
+      amount: parseInt(row.amount_sats, 10),
+      usdAmountCents: row.usd_amount_cents ? parseInt(row.usd_amount_cents, 10) : null,
       walletCurrency: row.wallet_currency || "BTC",
-      claimedAt: Number(row.claimed_at),
+      displayAmount: row.display_amount,
+      displayCurrency: row.display_currency,
+      commissionPercent: parseFloat(row.commission_percent) || 0,
+      claimedAt,
     })
+  }
+  for (const [key, group] of groups) {
+    if (!group.vouchers.some((v) => v.isTarget)) groups.delete(key)
   }
 
   const summary = {
-    checked: rows.length,
+    checked,
     matched: 0,
     applied: 0,
     ambiguous: 0,
@@ -273,11 +341,13 @@ async function reconcileClaimedVouchers(deps) {
       continue
     }
 
-    const earliestClaim = Math.min(...group.vouchers.map((v) => v.claimedAt))
+    const targets = group.vouchers.filter((v) => v.isTarget)
+    const earliestClaim = Math.min(...targets.map((v) => v.claimedAt))
     let transactions
     try {
       transactions = await fetchTransactionsImpl(apiKey, group.environment, {
         maxPages,
+        walletId: group.walletId,
         untilMs: earliestClaim - WINDOW_BEFORE_MS,
       })
     } catch (err) {
@@ -286,37 +356,30 @@ async function reconcileClaimedVouchers(deps) {
       continue
     }
 
-    // Classify every voucher first, then refuse to credit the same payment to
-    // two vouchers: a nearby claim (same amount, inside the window) must not
-    // inherit another voucher's settled payout. Contested matches stay
-    // CLAIMED — conservative, never over-releases liability.
-    const classifications = group.vouchers.map((voucher) => ({
-      voucher,
-      result: classifyVoucher(voucher, transactions),
-    }))
+    // Refuse to credit the same payment to two vouchers: a nearby claim
+    // (same memo, inside the window) must not inherit another voucher's
+    // settled payout. Every claimed voucher of the wallet competes, including
+    // recent and already-PAID ones; only targets are written. Contested
+    // matches stay CLAIMED — conservative, never over-releases liability.
     const claimants = new Map()
-    for (const { voucher, result } of classifications) {
-      if (result.outcome !== "matched") continue
-      const txId = result.transaction.id
-      if (!claimants.has(txId)) claimants.set(txId, [])
-      claimants.get(txId).push(voucher.id)
-    }
-    const contested = new Set()
-    for (const [txId, ids] of claimants) {
-      if (ids.length > 1) {
-        for (const id of ids) contested.add(id)
-        log(`[contested] tx ${txId} matches ${ids.length} vouchers — left CLAIMED`)
+    for (const voucher of group.vouchers) {
+      for (const candidate of matchRedemptionCandidates(voucher, transactions)) {
+        if (!claimants.has(candidate.id)) claimants.set(candidate.id, [])
+        claimants.get(candidate.id).push(voucher.id)
       }
     }
 
-    for (const { voucher, result } of classifications) {
+    for (const voucher of targets) {
+      const result = classifyVoucher(voucher, transactions)
       const label = voucher.id.substring(0, 8)
       const amountLabel =
         voucher.walletCurrency === "USD"
           ? `${voucher.usdAmountCents} cents`
           : `${voucher.amount} sats`
+      const rivals =
+        result.outcome === "matched" ? claimants.get(result.transaction.id).length : 0
 
-      if (result.outcome === "matched" && !contested.has(voucher.id)) {
+      if (result.outcome === "matched" && rivals === 1) {
         summary.matched++
         if (apply) {
           const update = await pool.query(MARK_PAID_SQL, [voucher.id])
@@ -331,6 +394,9 @@ async function reconcileClaimedVouchers(deps) {
         }
       } else if (result.outcome === "matched") {
         summary.ambiguous++
+        log(
+          `[contested] ${label}: tx ${result.transaction.id} also matches ${rivals - 1} other voucher(s) — left CLAIMED`,
+        )
       } else if (result.outcome === "ambiguous") {
         summary.ambiguous++
         log(
@@ -437,6 +503,7 @@ async function main() {
 }
 
 module.exports = {
+  buildVoucherMemo,
   matchRedemptionCandidates,
   classifyVoucher,
   reconcileClaimedVouchers,
