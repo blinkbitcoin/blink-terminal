@@ -487,15 +487,10 @@ ssh ${PROD_USER}@${PROD_SERVER} bash <<EOF
         
         echo "✅ Migration 008 applied successfully"
         
-        # Run one-time voucher migration from JSON to PostgreSQL
-        echo ""
-        echo "🔄 Checking for vouchers to migrate from JSON..."
-        if docker-compose -f docker-compose.prod.yml exec -T app sh -c "test -f .voucher-store.json && echo 'exists'" | grep -q 'exists'; then
-            echo "📦 Found .voucher-store.json, migrating vouchers to PostgreSQL..."
-            docker-compose -f docker-compose.prod.yml exec -T app node scripts/migrate-vouchers-to-postgres.js || echo "⚠️  Voucher migration encountered issues (non-fatal)"
-        else
-            echo "✅ No JSON voucher store found (fresh installation or already migrated)"
-        fi
+        # The one-time JSON -> PostgreSQL voucher migration script was retired
+        # (blink-wip#1587): it wrote unrotatable CryptoJS ciphertext with a
+        # hardcoded fallback key. Secrets are now written only through
+        # lib/crypto/keyring.js.
     else
         echo "✅ Migration 008 already applied (skipping)"
     fi
