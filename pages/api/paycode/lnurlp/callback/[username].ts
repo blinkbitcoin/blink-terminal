@@ -12,6 +12,10 @@
 
 import type { NextApiRequest, NextApiResponse } from "next"
 
+import {
+  isValidBlinkUsername,
+  parseMillisatAmount,
+} from "../../../../../lib/paycode-lnurl"
 import { withRateLimit, RATE_LIMIT_PUBLIC } from "../../../../../lib/rate-limit"
 
 async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -34,24 +38,32 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
   try {
     const { username, amount, comment, nostr } = req.query as {
-      username: string
-      amount: string
-      comment?: string
-      nostr?: string
+      username?: string | string[]
+      amount?: string | string[]
+      comment?: string | string[]
+      nostr?: string | string[]
     }
 
-    if (!username) {
+    // Strict validation before anything is interpolated into the upstream
+    // URL (blink-wip#1690 item 2): the username is a path segment and the
+    // amount a query value on pay.blink.sv; neither may carry traversal or
+    // extra parameters.
+    if (!isValidBlinkUsername(username)) {
       return res.status(200).json({
         status: "ERROR",
         reason: "Username required",
       })
     }
 
-    if (!amount) {
+    const amountMsat = parseMillisatAmount(amount)
+    if (amountMsat === null) {
       return res.status(200).json({
         status: "ERROR",
         reason: "Amount required",
       })
+    }
+    if (Array.isArray(comment) || Array.isArray(nostr)) {
+      return res.status(200).json({ status: "ERROR", reason: "Invalid parameters" })
     }
 
     console.log("[paycode/callback] Request:", {
@@ -61,16 +73,13 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       nostr: !!nostr,
     })
 
-    // Build Blink callback URL with all parameters
-    let blinkCallbackUrl = `https://pay.blink.sv/lnurlp/${username}/callback?amount=${amount}`
-
-    if (comment) {
-      blinkCallbackUrl += `&comment=${encodeURIComponent(comment)}`
-    }
-
-    if (nostr) {
-      blinkCallbackUrl += `&nostr=${encodeURIComponent(nostr)}`
-    }
+    // Build Blink callback URL: validated path segment, encoded query
+    const blinkCallbackUrl = new URL(
+      `https://pay.blink.sv/lnurlp/${encodeURIComponent(username)}/callback`,
+    )
+    blinkCallbackUrl.searchParams.set("amount", String(amountMsat))
+    if (comment) blinkCallbackUrl.searchParams.set("comment", comment)
+    if (nostr) blinkCallbackUrl.searchParams.set("nostr", nostr)
 
     // Proxy to Blink's callback
     const blinkResponse = await fetch(blinkCallbackUrl)
