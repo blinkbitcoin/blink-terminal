@@ -19,7 +19,10 @@
  *    the interval). The deadline aborts the in-flight Blink lookup via
  *    AbortSignal and the pass stops before its next row, so a slow or
  *    non-terminating upstream cannot hold the lock, the pool client, or the
- *    next tick. Rows not reached are examined on a later pass.
+ *    next tick. Selection is never-checked first, then least recently
+ *    checked (last_checked_at, migration 031), so a stuck prefix cannot
+ *    starve later rows: the whole backlog is covered in ceil(backlog/batch)
+ *    passes.
  * 3. Log unresolved rows older than BOLTCARD_WITHDRAWAL_STALE_MINUTES
  *    (default 15) with their payment hashes — the ops signal for a payment
  *    Blink still has not reported either way.
@@ -95,11 +98,17 @@ const withDeadline = <T>(
  * had the lock.
  */
 export async function reconcileTick(): Promise<{
+  /** Rows examined this pass. */
   checked: number
   resolved: number
   restored: number
+  /** Rows selected for this pass but not reached because of the deadline. */
   skipped: number
   timedOut: boolean
+  /** Unresolved rows in total (from the database, not from the batch). */
+  backlog: number
+  /** backlog - checked: rows left for later passes. */
+  deferred: number
   stale: number
   durationMs: number
 } | null> {
@@ -141,7 +150,10 @@ export async function reconcileTick(): Promise<{
       )
     }
 
-    const stale = await boltcardStore.getStaleWithdrawals(config.staleMinutes * 60_000)
+    const [backlog, stale] = await Promise.all([
+      boltcardStore.countPendingWithdrawals(),
+      boltcardStore.getStaleWithdrawals(config.staleMinutes * 60_000),
+    ])
     if (stale.length > 0) {
       logger.warn(
         {
@@ -165,10 +177,12 @@ export async function reconcileTick(): Promise<{
       restored: result.restored,
       skipped: result.skipped ?? 0,
       timedOut,
+      backlog,
+      deferred: Math.max(0, backlog - result.checked),
       stale: stale.length,
       durationMs: Date.now() - started,
     }
-    if (result.checked > 0 || stale.length > 0 || timedOut) {
+    if (result.checked > 0 || backlog > 0 || timedOut) {
       logger.info(summary, "Bolt Card withdrawal reconciliation tick")
     }
     return summary

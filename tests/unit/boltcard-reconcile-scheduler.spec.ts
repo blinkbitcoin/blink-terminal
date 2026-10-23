@@ -21,9 +21,13 @@ jest.mock("../../lib/boltcard/lnurlw", () => ({
 }))
 
 const mockStale = jest.fn()
+const mockCount = jest.fn()
 jest.mock("../../lib/boltcard/store", () => ({
   __esModule: true,
-  default: { getStaleWithdrawals: (...args: unknown[]) => mockStale(...args) },
+  default: {
+    getStaleWithdrawals: (...args: unknown[]) => mockStale(...args),
+    countPendingWithdrawals: (...args: unknown[]) => mockCount(...args),
+  },
 }))
 
 const logs: Record<string, unknown[][]> = { info: [], warn: [], error: [], debug: [] }
@@ -62,6 +66,7 @@ beforeEach(() => {
   mockRelease.mockReset()
   mockReconcile.mockReset().mockResolvedValue({ checked: 0, resolved: 0, restored: 0 })
   mockStale.mockReset().mockResolvedValue([])
+  mockCount.mockReset().mockResolvedValue(0)
   for (const k of Object.keys(logs)) logs[k] = []
   delete process.env.BOLTCARD_RECONCILE_INTERVAL_MS
   delete process.env.BOLTCARD_WITHDRAWAL_STALE_MINUTES
@@ -77,6 +82,7 @@ afterEach(() => {
 describe("reconcileTick", () => {
   it("runs reconciliation under the advisory lock and releases it", async () => {
     mockReconcile.mockResolvedValue({ checked: 3, resolved: 1, restored: 1 })
+    mockCount.mockResolvedValue(3)
     const summary = await reconcileTick()
 
     expect(summary).toMatchObject({
@@ -85,6 +91,8 @@ describe("reconcileTick", () => {
       restored: 1,
       skipped: 0,
       timedOut: false,
+      backlog: 3,
+      deferred: 0,
       stale: 0,
     })
     const sql = mockClientQuery.mock.calls.map((c) => String(c[0]))
@@ -181,16 +189,21 @@ describe("pass deadline (a slow or non-terminating Blink must not wedge the sche
     expect(mockRelease).toHaveBeenCalledTimes(2)
   })
 
-  it("a backlog larger than the pass allows is reported as skipped, not stuck", async () => {
-    mockReconcile.mockResolvedValue({
-      checked: 100,
-      resolved: 10,
-      restored: 0,
-      aborted: true,
-      skipped: 250,
-    })
+  it("a backlog larger than one pass is reported from the database, not the batch", async () => {
+    // 350 unresolved rows, batch 100: the pass examines 100 (the batch is
+    // all it ever sees) and the summary says how many remain for later
+    // passes — which the fair selection order (migration 031) guarantees are
+    // reached, two more passes here.
+    mockReconcile.mockResolvedValue({ checked: 100, resolved: 10, restored: 0 })
+    mockCount.mockResolvedValue(350)
     const summary = await reconcileTick()
-    expect(summary).toMatchObject({ checked: 100, skipped: 250 })
+    expect(summary).toMatchObject({
+      checked: 100,
+      backlog: 350,
+      deferred: 250,
+      skipped: 0,
+    })
+    expect(mockCount).toHaveBeenCalledTimes(1)
   })
 
   it("pass timeout and batch come from the env, timeout clamped below the interval", async () => {

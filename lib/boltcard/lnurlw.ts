@@ -730,8 +730,10 @@ function parseInvoiceAmount(invoice: string): InvoiceAmount | null {
  * by lib/boltcard/reconcile-scheduler.ts (blink-wip#1619), which runs it
  * under a deadline: `signal` aborts the in-flight Blink lookup and stops the
  * pass before the next row (reported as aborted/skipped), `limit` caps the
- * rows one pass takes from the backlog (oldest first). Rows not reached are
- * simply examined on a later pass.
+ * rows one pass takes from the backlog. Each examined row is stamped
+ * (last_checked_at) and selection is never-checked first, then least
+ * recently checked, so a stuck prefix cannot starve later rows: every
+ * unresolved row is reached within ceil(backlog / limit) passes.
  */
 /** A CLAIMED row younger than this is a payment attempt still in flight. */
 const CLAIMED_UNSEEN_GRACE_MS = 2 * 60 * 1000
@@ -762,6 +764,10 @@ async function reconcilePendingWithdrawals(
     if (signal?.aborted) break
     examined++
     try {
+      // Stamp first: a row whose lookup hangs past the deadline still moves
+      // to the back of the selection order (migration 031).
+      await boltcardStore.markWithdrawalChecked(item.paymentHash)
+
       const card = (await boltcardStore.getCard(item.cardId, true)) as BoltcardCard | null
       if (!card || card.status === CardStatus.WIPED) {
         // Card gone: nothing to restore, close it out (one-shot resolve)

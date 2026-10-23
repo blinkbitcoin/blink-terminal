@@ -255,6 +255,22 @@ const CARD_ACTIVATION_FAILED = "Failed to activate card"
 export const CONSUMED_HASH_SQLSTATE = "BC409"
 
 /**
+ * Reconciliation selection: unresolved rows, never-checked first, then least
+ * recently checked, then oldest (migration 031). $1 = card id or NULL,
+ * $2 = row cap or NULL. Exported so the PGlite spec runs the exact statement.
+ */
+export const PENDING_WITHDRAWALS_SQL = `SELECT payment_hash, card_id, amount, created_at, kind, attempt
+   FROM boltcard_pending_withdrawals
+   WHERE resolved_at IS NULL AND ($1::text IS NULL OR card_id = $1)
+   ORDER BY last_checked_at ASC NULLS FIRST, created_at ASC
+   LIMIT COALESCE($2::int, 2147483647)`
+
+/** $1 = payment hash, $2 = now (ms). */
+export const MARK_WITHDRAWAL_CHECKED_SQL = `UPDATE boltcard_pending_withdrawals
+   SET last_checked_at = $2
+   WHERE payment_hash = $1 AND resolved_at IS NULL`
+
+/**
  * Unresolved withdrawals created before $1 (ms), optionally only for the
  * cards in $2 (text[]; NULL = all). Oldest first.
  */
@@ -2017,16 +2033,13 @@ class BoltcardStore {
       attempt: number
     }>
   > {
-    // Oldest first; an optional cap bounds one reconciliation pass over a
-    // backlog (blink-wip#1619 review). NULL = no cap.
-    const result: QueryResult<DbRow> = await query(
-      `SELECT payment_hash, card_id, amount, created_at, kind, attempt
-       FROM boltcard_pending_withdrawals
-       WHERE resolved_at IS NULL AND ($1::text IS NULL OR card_id = $1)
-       ORDER BY created_at ASC
-       LIMIT COALESCE($2::int, 2147483647)`,
-      [cardId ?? null, limit ?? null],
-    )
+    // Never-checked rows first, then least recently checked (migration 031):
+    // with a per-pass cap, ordering by created_at alone would re-select a
+    // stuck oldest prefix forever and starve every later row. NULL = no cap.
+    const result: QueryResult<DbRow> = await query(PENDING_WITHDRAWALS_SQL, [
+      cardId ?? null,
+      limit ?? null,
+    ])
     return result.rows.map((row: DbRow) => ({
       paymentHash: row.payment_hash as string,
       cardId: row.card_id as string,
@@ -2035,6 +2048,28 @@ class BoltcardStore {
       kind: String(row.kind),
       attempt: parseInt(String(row.attempt), 10),
     }))
+  }
+
+  /**
+   * Record that a reconciliation pass examined this row (before its Blink
+   * lookup, so a row whose lookup hangs still rotates to the back of the
+   * selection order). No-op once resolved.
+   */
+  async markWithdrawalChecked(
+    paymentHash: string,
+    now: number = Date.now(),
+  ): Promise<void> {
+    await query(MARK_WITHDRAWAL_CHECKED_SQL, [paymentHash, now])
+  }
+
+  /** Total unresolved withdrawals (the reconciliation backlog). */
+  async countPendingWithdrawals(cardId?: string): Promise<number> {
+    const result: QueryResult<DbRow> = await query(
+      `SELECT COUNT(*)::int AS n FROM boltcard_pending_withdrawals
+       WHERE resolved_at IS NULL AND ($1::text IS NULL OR card_id = $1)`,
+      [cardId ?? null],
+    )
+    return parseInt(String(result.rows[0]?.n ?? 0), 10)
   }
 
   /**

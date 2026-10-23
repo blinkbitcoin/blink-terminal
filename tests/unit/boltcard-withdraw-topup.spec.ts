@@ -886,6 +886,7 @@ describe("reconcilePendingWithdrawals", () => {
       ])
     mockStore.rollbackSpend = jest.fn().mockResolvedValue(true)
     mockStore.resolvePendingWithdrawalFailed = jest.fn().mockResolvedValue(true)
+    mockStore.markWithdrawalChecked = jest.fn().mockResolvedValue(undefined)
     mockStore.getPendingWithdrawals = jest.fn().mockResolvedValue([
       {
         paymentHash: "h1",
@@ -901,6 +902,26 @@ describe("reconcilePendingWithdrawals", () => {
   // blink-wip#1619 review: a pass run by the scheduler is bounded — the
   // abort signal reaches the Blink lookup, the loop stops before the next row
   // when aborted, and `limit` caps the rows one pass takes.
+  it("stamps each examined row before its Blink lookup (fair batching, migration 031)", async () => {
+    const order: string[] = []
+    mockStore.markWithdrawalChecked = jest.fn(async (hash: string) => {
+      order.push(`stamp:${hash}`)
+    })
+    global.fetch = jest.fn().mockImplementation(async () => {
+      order.push("lookup")
+      return {
+        ok: true,
+        json: async () => ({
+          data: {
+            me: { defaultAccount: { walletById: { transactionsByPaymentHash: [] } } },
+          },
+        }),
+      }
+    }) as unknown as typeof fetch
+    await reconcilePendingWithdrawals(CARD_ID)
+    expect(order).toEqual(["stamp:h1", "lookup"])
+  })
+
   it("forwards the abort signal to the Blink lookup and caps the batch", async () => {
     blinkStatus([{ status: "SUCCESS", direction: "SEND", settlementAmount: 1000 }])
     const controller = new AbortController()
@@ -945,6 +966,9 @@ describe("reconcilePendingWithdrawals", () => {
     expect(global.fetch).toHaveBeenCalledTimes(1) // h2, h3 never looked up
     expect(mockStore.resolvePendingWithdrawal).not.toHaveBeenCalled()
     expect(mockStore.resolvePendingWithdrawalFailed).not.toHaveBeenCalled()
+    // The hung row was stamped before its lookup, so the next pass starts elsewhere
+    expect(mockStore.markWithdrawalChecked).toHaveBeenCalledTimes(1)
+    expect(mockStore.markWithdrawalChecked).toHaveBeenCalledWith("h1")
   })
 
   it("SEND/SUCCESS -> resolved SUCCESS, deduction untouched", async () => {

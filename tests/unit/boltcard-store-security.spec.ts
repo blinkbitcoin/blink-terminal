@@ -647,7 +647,7 @@ describe("review states (pending withdrawals, top-up flags)", () => {
     // An optional cap bounds one reconciliation pass (oldest first)
     await store().getPendingWithdrawals(undefined, 50)
     expect(String(mockPoolQuery.mock.calls[2][0])).toMatch(
-      /ORDER BY created_at ASC\s+LIMIT/,
+      /ORDER BY last_checked_at ASC NULLS FIRST, created_at ASC\s+LIMIT/, // fair order (migration 031)
     )
     expect(mockPoolQuery.mock.calls[2][1]).toEqual([null, 50])
   })

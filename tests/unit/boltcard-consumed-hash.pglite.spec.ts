@@ -28,6 +28,8 @@ jest.mock("../../lib/db", () => ({
 import {
   CLAIM_WITHDRAWAL_INSERT_SQL,
   CONSUMED_HASH_SQLSTATE,
+  MARK_WITHDRAWAL_CHECKED_SQL,
+  PENDING_WITHDRAWALS_SQL,
   STALE_WITHDRAWALS_SQL,
 } from "../../lib/boltcard/store"
 
@@ -47,7 +49,8 @@ const DDL = [
      outcome TEXT,
      daily_window_reset_at BIGINT,
      kind TEXT NOT NULL DEFAULT 'PENDING',
-     attempt BIGINT NOT NULL DEFAULT 1
+     attempt BIGINT NOT NULL DEFAULT 1,
+     last_checked_at BIGINT
    )`,
   `CREATE TABLE boltcard_consumed_payment_hashes (
      payment_hash VARCHAR(64) PRIMARY KEY,
@@ -197,5 +200,88 @@ describe("stale withdrawals query (PGlite)", () => {
     expect(
       JSON.parse(scoped.stdout).rows.map((r: { payment_hash: string }) => r.payment_hash),
     ).toEqual(["01".repeat(32), "03".repeat(32)])
+  })
+})
+
+/**
+ * Fair batched selection (migration 031; blink-wip#1619 review): with a
+ * per-pass cap, ordering by created_at alone re-selects a stuck oldest prefix
+ * forever. The exact selection and stamp SQL on real Postgres, batch = 2:
+ * A and B (oldest) stay unresolved across passes; C must still be selected.
+ */
+describe("fair batched reconciliation order (PGlite)", () => {
+  const MIN = 60_000
+  const unresolved = (hash: string, createdAt: number): [string, unknown[]] => [
+    `INSERT INTO boltcard_pending_withdrawals
+       (payment_hash, card_id, amount, balance_after, created_at, kind)
+     VALUES ($1, 'card-a', 1000, 0, $2, 'UNKNOWN')`,
+    [hash, createdAt],
+  ]
+  const A = "0a".repeat(32)
+  const B = "0b".repeat(32)
+  const C = "0c".repeat(32)
+  const seeds: Array<[string, unknown[]]> = [
+    ["INSERT INTO boltcards (id) VALUES ('card-a')", []],
+    unresolved(A, NOW - 30 * MIN),
+    unresolved(B, NOW - 20 * MIN),
+    unresolved(C, NOW - 10 * MIN), // newest; terminal at Blink, needs its restore
+  ]
+  const stamp = (hash: string, at: number): [string, unknown[]] => [
+    MARK_WITHDRAWAL_CHECKED_SQL,
+    [hash, at],
+  ]
+  const selected = (extra: Array<[string, unknown[]]>) => {
+    const result = run([...seeds, ...extra], PENDING_WITHDRAWALS_SQL, [null, 2])
+    expect(result.status).toBe(0)
+    return JSON.parse(result.stdout).rows.map(
+      (r: { payment_hash: string }) => r.payment_hash,
+    )
+  }
+
+  it("pass 1 takes the never-checked oldest two", () => {
+    expect(selected([])).toEqual([A, B])
+  })
+
+  it("pass 2 reaches C even though A and B are still unresolved", () => {
+    // Pass 1 examined A and B (stamped before their lookups); nothing resolved.
+    expect(selected([stamp(A, NOW), stamp(B, NOW + 1)])).toEqual([C, A])
+  })
+
+  it("pass 3 rotates: least recently checked first", () => {
+    expect(selected([stamp(A, NOW), stamp(B, NOW + 1), stamp(C, NOW + 2)])).toEqual([
+      A,
+      B,
+    ])
+  })
+
+  it("the whole backlog is covered within ceil(backlog / batch) passes", () => {
+    // Simulate passes: select 2, stamp them, repeat; every row seen by pass 2.
+    const seen = new Set<string>()
+    let stamps: Array<[string, unknown[]]> = []
+    for (let pass = 0; pass < 2; pass++) {
+      const batch = selected(stamps)
+      for (const h of batch) seen.add(h)
+      stamps = [
+        ...stamps,
+        ...batch.map((h: string, i: number) => stamp(h, NOW + pass * 10 + i)),
+      ]
+    }
+    expect([...seen].sort()).toEqual([A, B, C].sort())
+  })
+
+  it("the stamp is a no-op once resolved", () => {
+    const result = run(
+      [
+        ...seeds,
+        [
+          "UPDATE boltcard_pending_withdrawals SET resolved_at = $1 WHERE payment_hash = $2",
+          [NOW, A],
+        ],
+        stamp(A, NOW + 5),
+      ],
+      "SELECT last_checked_at FROM boltcard_pending_withdrawals WHERE payment_hash = $1",
+      [A],
+    )
+    expect(JSON.parse(result.stdout).rows[0]).toEqual({ last_checked_at: null })
   })
 })
