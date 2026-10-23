@@ -6,6 +6,7 @@
 
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 
+import { ExpiryBadge } from "../../../components/ExpirySelector"
 import VoucherManager from "../../../components/VoucherManager"
 
 jest.mock("react-qr-code", () => ({
@@ -184,5 +185,36 @@ describe("VoucherManager", () => {
     rerender(<VoucherManager {...props(null)} />)
     await screen.findByText("No vouchers yet")
     expect(screen.queryByText("EEEEEEEE")).toBeNull()
+  })
+
+  it("treats settled PAID vouchers as redeemed in the Claimed tab", async () => {
+    const claimedAt = Date.now() - 60_000
+    fetchMock.mockImplementation(() =>
+      ok({
+        ...listBody([]),
+        vouchers: [
+          { ...listed("p".repeat(32)), status: "PAID", claimed: true, claimedAt },
+          { ...listed("c".repeat(32)), status: "CLAIMED", claimed: true, claimedAt },
+          listed("f".repeat(32)),
+        ],
+      }),
+    )
+
+    render(<VoucherManager {...props({ apiKey: "blink_owner" })} />)
+    await screen.findByText("PPPPPPPP")
+    fireEvent.click(screen.getByRole("button", { name: "Claimed" }))
+
+    expect(screen.getByText("PPPPPPPP")).toBeTruthy()
+    expect(screen.getByText("CCCCCCCC")).toBeTruthy()
+    expect(screen.queryByText("FFFFFFFF")).toBeNull()
+    expect(screen.getByText("PAID").className).toContain("text-green-600")
+  })
+})
+
+describe("ExpiryBadge", () => {
+  it("labels a settled voucher Paid, never by its (past) expiry", () => {
+    render(<ExpiryBadge expiresAt={Date.now() - 1000} status="PAID" />)
+    expect(screen.getByText("Paid")).toBeTruthy()
+    expect(screen.queryByText("Expired")).toBeNull()
   })
 })

@@ -388,6 +388,24 @@ describe("voucher list: current wallet owner only", () => {
     expect(res.headers["cache-control"]).toBe("no-store")
   })
 
+  it("?status=PAID returns settled rows; ?status=CLAIMED covers CLAIMED + PAID", async () => {
+    mockStore.getVouchersByWalletIds.mockResolvedValue([
+      voucher({ id: "p".repeat(32), status: "PAID", claimed: true }),
+      voucher({ id: "c".repeat(32), status: "CLAIMED", claimed: true }),
+      voucher({ id: "1".repeat(32) }),
+    ])
+    const ids = async (status: string) =>
+      (
+        (await list({ [VOUCHER_API_KEY_HEADER]: OWNER_KEY }, { status })).body as {
+          vouchers: Array<{ id: string; status: string }>
+        }
+      ).vouchers.map((v) => `${v.id[0]}:${v.status}`)
+
+    expect(await ids("PAID")).toEqual(["p:PAID"])
+    expect(await ids("claimed")).toEqual(["p:PAID", "c:CLAIMED"])
+    expect(await ids("ACTIVE")).toEqual(["1:ACTIVE"])
+  })
+
   it("answers 503 (not 401) when Blink is unavailable", async () => {
     blinkDown = true
     const res = await list({ [VOUCHER_API_KEY_HEADER]: OWNER_KEY })

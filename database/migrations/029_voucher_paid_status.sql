@@ -13,6 +13,13 @@
 -- Date: 2026-10-22
 -- ============================================
 
+-- One transaction: the chart's migration runner (psql -v ON_ERROR_STOP=1)
+-- applies files statement by statement, so without it a failure after the
+-- DROP CONSTRAINT would leave vouchers with no status constraint while the
+-- previous pod keeps serving, and a failure later in the file could still
+-- record schema_version 29.
+BEGIN;
+
 -- ============================================
 -- STATUS CONSTRAINT: allow PAID
 -- ============================================
@@ -105,6 +112,8 @@ VALUES (
     'version',
     '{"description": "Voucher CLAIMED -> PAID settlement transition; PAID added to valid_voucher_status and claimed retention; voucher_stats claimed bucket includes PAID", "date": "2026-10-22"}'
 );
+
+COMMIT;
 
 DO $$
 BEGIN

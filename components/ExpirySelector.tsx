@@ -146,7 +146,7 @@ export default function ExpirySelector({
  * ExpiryBadge - Display expiry status as a colored badge
  */
 
-type VoucherStatus = "ACTIVE" | "CLAIMED" | "CANCELLED" | "EXPIRED"
+type VoucherStatus = "ACTIVE" | "CLAIMED" | "PAID" | "CANCELLED" | "EXPIRED"
 
 interface ExpiryBadgeProps {
   expiresAt: number
@@ -162,7 +162,10 @@ export function ExpiryBadge({ expiresAt, status, compact = false }: ExpiryBadgeP
   let badgeColor = "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400"
   let label = ""
 
-  if (status === "CLAIMED") {
+  if (status === "PAID") {
+    badgeColor = "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400"
+    label = "Paid"
+  } else if (status === "CLAIMED") {
     badgeColor = "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400"
     label = "Claimed"
   } else if (status === "CANCELLED") {

@@ -11,9 +11,17 @@ interface ExpiryPreset {
   ms: number
 }
 
-type VoucherStatusString = "NOT_FOUND" | "CLAIMED" | "CANCELLED" | "EXPIRED" | "ACTIVE"
+type VoucherStatusString =
+  | "NOT_FOUND"
+  | "CLAIMED"
+  | "PAID"
+  | "CANCELLED"
+  | "EXPIRED"
+  | "ACTIVE"
 
 interface VoucherForStatus {
+  /** Persisted DB status; only the terminal PAID value is trusted as-is. */
+  status?: string | null
   claimed?: boolean
   cancelledAt?: number | null
   expiresAt?: number | null
@@ -107,16 +115,25 @@ function formatExpiryDate(expiresAt: number | null | undefined): string {
 /**
  * Get voucher status based on its state
  * @param voucher - Voucher object
- * @returns Status: ACTIVE, CLAIMED, CANCELLED, EXPIRED, NOT_FOUND
+ * @returns Status: ACTIVE, CLAIMED, PAID, CANCELLED, EXPIRED, NOT_FOUND
+ *
+ * PAID (settled redemption) is terminal and persisted, so it wins over the
+ * claimed flag; CLAIMED means the payout is still in flight or unresolved.
  */
 function getVoucherStatus(
   voucher: VoucherForStatus | null | undefined,
 ): VoucherStatusString {
   if (!voucher) return "NOT_FOUND"
+  if (voucher.status === "PAID") return "PAID"
   if (voucher.claimed) return "CLAIMED"
   if (voucher.cancelledAt) return "CANCELLED"
   if (voucher.expiresAt && voucher.expiresAt < Date.now()) return "EXPIRED"
   return "ACTIVE"
+}
+
+/** Redeemed = claimed (payout in flight/unresolved) or paid (settled). */
+function isRedeemedStatus(status: string | null | undefined): boolean {
+  return status === "CLAIMED" || status === "PAID"
 }
 
 export {
@@ -132,6 +149,7 @@ export {
   isValidExpiryId,
   formatExpiryDate,
   getVoucherStatus,
+  isRedeemedStatus,
 }
 
 export type { ExpiryPreset, VoucherStatusString, VoucherForStatus }

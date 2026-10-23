@@ -7,6 +7,7 @@
  *
  *   {
  *     "ddl": ["CREATE TABLE ...", ...],          // run once
+ *     "exec": ["BEGIN; ...; COMMIT;", ...],      // multi-statement scripts
  *     "seeds": [["INSERT ...", [params]], ...],  // run in order
  *     "query": "SELECT ...",                     // the probed statement
  *     "params": [...]                            // its parameters
@@ -24,6 +25,10 @@ const db = new PGlite()
 try {
   for (const ddl of program.ddl ?? []) {
     await db.query(ddl)
+  }
+  // Multi-statement scripts (e.g. a whole migration file)
+  for (const script of program.exec ?? []) {
+    await db.exec(script)
   }
   for (const [sql, params] of program.seeds ?? []) {
     await db.query(sql, params)

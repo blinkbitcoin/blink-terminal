@@ -462,3 +462,51 @@ describe("migration 029 voucher_stats view (PGlite)", () => {
     expect(Number(result.rows[0].claimed)).toBe(2)
   })
 })
+
+/**
+ * The whole migration file as the chart's runner applies it, on the 008-era
+ * schema: every statement succeeds inside its transaction, schema_version
+ * reaches 29, and the production settlement update then works.
+ */
+describe("migration 029 full file (PGlite)", () => {
+  it("applies on the 008-era schema and enables CLAIMED -> PAID", () => {
+    const { status, stdout, stderr } = runProgram({
+      ddl: [
+        DDL,
+        `CREATE TABLE system_metrics (
+           id BIGSERIAL PRIMARY KEY,
+           metric_name VARCHAR(255) NOT NULL,
+           metric_value DECIMAL(20, 4),
+           metric_unit VARCHAR(50),
+           tags JSONB
+         )`,
+      ],
+      exec: [MIGRATION_029],
+      seeds: [
+        seedRow("v1", "w1", 500, null, {
+          status: "CLAIMED",
+          claimed: true,
+          claimedAt: NOW,
+        }),
+        [MARK_VOUCHER_PAID_SQL, ["v1"]],
+      ],
+      query: `SELECT
+                (SELECT status FROM vouchers WHERE id = 'v1') AS status,
+                (SELECT MAX(metric_value)::int FROM system_metrics
+                  WHERE metric_name = 'schema_version') AS version,
+                (SELECT claimed FROM voucher_stats)::int AS claimed`,
+      params: [],
+    })
+    if (status !== 0) throw new Error(`PGlite probe failed: ${stderr}`)
+    const result = JSON.parse(stdout) as ProbeResult
+    expect(result.rows[0]).toEqual({ status: "PAID", version: 29, claimed: 1 })
+  })
+
+  it("runs in a single transaction", () => {
+    const statements = MIGRATION_029.replace(/^--.*$/gm, "").trim()
+    expect(statements.startsWith("BEGIN;")).toBe(true)
+    expect(MIGRATION_029.indexOf("COMMIT;")).toBeGreaterThan(
+      MIGRATION_029.indexOf("'schema_version'"),
+    )
+  })
+})

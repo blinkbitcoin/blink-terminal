@@ -98,6 +98,25 @@ describe("getVouchersByWalletIds", () => {
     const [voucher] = await store().getVouchersByWalletIds(["w1"], "production")
     expect(voucher.status).toBe("EXPIRED")
   })
+
+  it("keeps a persisted PAID status; an unresolved claim stays CLAIMED", async () => {
+    const claimedAt = String(Date.now() - 60_000)
+    mockPoolQuery.mockResolvedValueOnce({
+      rows: [
+        // Settled redemption: claimed stays true, status is terminal PAID
+        row({ id: "p".repeat(32), status: "PAID", claimed: true, claimed_at: claimedAt }),
+        // Payout still in flight / unresolved
+        row({
+          id: "c".repeat(32),
+          status: "CLAIMED",
+          claimed: true,
+          claimed_at: claimedAt,
+        }),
+      ],
+    })
+    const vouchers = await store().getVouchersByWalletIds(["w1"], "production")
+    expect(vouchers.map((v) => v.status)).toEqual(["PAID", "CLAIMED"])
+  })
 })
 
 describe("getVoucherStatsByWalletIds", () => {
