@@ -552,6 +552,8 @@ export function useBoltcards(ownerPubkey: string | null | undefined): UseBoltcar
     try {
       const response = await fetch(`/api/boltcard/cards/${cardId}`, {
         method: "DELETE",
+        // The mutation guard requires the JSON content type even without a body
+        headers: { "Content-Type": "application/json" },
       })
 
       const data: ApiResponse = await response.json()

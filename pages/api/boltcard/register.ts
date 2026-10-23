@@ -1,5 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
+import { requireTrustedMutation } from "../../../lib/auth/mutation-guard"
 import * as boltcardCrypto from "../../../lib/boltcard/crypto"
 import * as lnurlp from "../../../lib/boltcard/lnurlp"
 import * as lnurlw from "../../../lib/boltcard/lnurlw"
@@ -56,6 +57,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   // The owner is the authenticated Nostr session, never a request field.
   const ownerPubkey = requireSessionPubkey(req, res)
   if (!ownerPubkey) return
+  // Cookie-authenticated mutation: same CSRF boundary as the network routes
+  if (!requireTrustedMutation(req, res)) return
 
   try {
     const {
