@@ -22,6 +22,7 @@ import type { QueryResult } from "pg"
 
 import AuthManager from "./auth"
 import { getSharedPool } from "./db"
+import { shortId } from "./log-redact"
 import {
   MAX_UNCLAIMED_PER_WALLET,
   getExpiryMs,
@@ -462,7 +463,7 @@ class VoucherStore {
           ? ` [USD: $${((usdAmountCents as number) / 100).toFixed(2)}]`
           : ""
       console.log(
-        `[VoucherStore] Created voucher: ${chargeId} for ${amount} sats${currencyInfo}, expires: ${expiryDate}${options.commissionPercent ? ` (${options.commissionPercent}% commission)` : ""}${environment !== "production" ? ` [${environment}]` : ""}`,
+        `[VoucherStore] Created voucher: ${shortId(chargeId)} for ${amount} sats${currencyInfo}, expires: ${expiryDate}${options.commissionPercent ? ` (${options.commissionPercent}% commission)` : ""}${environment !== "production" ? ` [${environment}]` : ""}`,
       )
 
       return voucher
@@ -533,7 +534,9 @@ class VoucherStore {
       )
 
       if (result.rows.length === 0) {
-        console.log(`[VoucherStore] Voucher not found or not active: ${chargeId}`)
+        console.log(
+          `[VoucherStore] Voucher not found or not active: ${shortId(chargeId)}`,
+        )
         return null
       }
 
@@ -590,11 +593,11 @@ class VoucherStore {
       ])
 
       if (result.rowCount === 0) {
-        console.log(`[VoucherStore] Cannot claim voucher: ${chargeId}`)
+        console.log(`[VoucherStore] Cannot claim voucher: ${shortId(chargeId)}`)
         return false
       }
 
-      console.log(`[VoucherStore] Voucher claimed: ${chargeId}`)
+      console.log(`[VoucherStore] Voucher claimed: ${shortId(chargeId)}`)
       return true
     } catch (err: unknown) {
       console.error("[VoucherStore] claimVoucher error:", (err as Error).message)
@@ -625,12 +628,12 @@ class VoucherStore {
       if (outcome !== "lock-timeout") return outcome
       if (attempt > MARK_PAID_LOCK_RETRIES) {
         console.error(
-          `[VoucherStore] markVoucherPaid gave up after ${attempt} lock timeouts: ${chargeId}`,
+          `[VoucherStore] markVoucherPaid gave up after ${attempt} lock timeouts: ${shortId(chargeId)}`,
         )
         return false
       }
       console.warn(
-        `[VoucherStore] markVoucherPaid lock timeout (attempt ${attempt}), retrying: ${chargeId}`,
+        `[VoucherStore] markVoucherPaid lock timeout (attempt ${attempt}), retrying: ${shortId(chargeId)}`,
       )
       await new Promise((resolve) => setTimeout(resolve, MARK_PAID_RETRY_DELAY_MS))
     }
@@ -648,7 +651,9 @@ class VoucherStore {
       const walletId: string | undefined = owner.rows[0]?.wallet_id
       if (!walletId) {
         await client.query("ROLLBACK")
-        console.error(`[VoucherStore] Cannot mark voucher paid (not found): ${chargeId}`)
+        console.error(
+          `[VoucherStore] Cannot mark voucher paid (not found): ${shortId(chargeId)}`,
+        )
         return false
       }
       await client.query(WALLET_LOCK_SQL, [walletId])
@@ -658,12 +663,12 @@ class VoucherStore {
 
       if (result.rowCount === 0) {
         console.error(
-          `[VoucherStore] Cannot mark voucher paid (not CLAIMED): ${chargeId}`,
+          `[VoucherStore] Cannot mark voucher paid (not CLAIMED): ${shortId(chargeId)}`,
         )
         return false
       }
 
-      console.log(`[VoucherStore] Voucher paid: ${chargeId}`)
+      console.log(`[VoucherStore] Voucher paid: ${shortId(chargeId)}`)
       return true
     } catch (err: unknown) {
       await client.query("ROLLBACK").catch(() => {})
@@ -696,11 +701,13 @@ class VoucherStore {
       )
 
       if (result.rowCount === 0) {
-        console.log(`[VoucherStore] Cannot unclaim voucher: ${chargeId}`)
+        console.log(`[VoucherStore] Cannot unclaim voucher: ${shortId(chargeId)}`)
         return false
       }
 
-      console.log(`[VoucherStore] Voucher unclaimed (payment failed): ${chargeId}`)
+      console.log(
+        `[VoucherStore] Voucher unclaimed (payment failed): ${shortId(chargeId)}`,
+      )
       return true
     } catch (err: unknown) {
       console.error("[VoucherStore] unclaimVoucher error:", (err as Error).message)
@@ -728,11 +735,11 @@ class VoucherStore {
       )
 
       if (result.rowCount === 0) {
-        console.log(`[VoucherStore] Cannot cancel voucher: ${chargeId}`)
+        console.log(`[VoucherStore] Cannot cancel voucher: ${shortId(chargeId)}`)
         return false
       }
 
-      console.log(`[VoucherStore] Voucher cancelled: ${chargeId}`)
+      console.log(`[VoucherStore] Voucher cancelled: ${shortId(chargeId)}`)
       return true
     } catch (err: unknown) {
       console.error("[VoucherStore] cancelVoucher error:", (err as Error).message)

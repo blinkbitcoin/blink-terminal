@@ -78,11 +78,12 @@ async function handleWithdrawGet(
       return res.redirect(302, `/boltcard-balance/${cardId}?p=${piccData}&c=${sunMac}`)
     }
 
-    // Enhanced logging for debugging card tap issues
+    // The tap's p (encrypted PICCData) and c (SunMAC) are its authorization:
+    // log presence and length only, never the values or the raw URL
+    // (blink-wip#1590).
     console.log(`[LNURLW] Card tap request for: ${cardId}`)
-    console.log(`[LNURLW] Full URL: ${req.url}`)
     console.log(
-      `[LNURLW] Query params: p=${piccData ? (piccData as string).substring(0, 16) + "..." : "MISSING"} (${(piccData as string)?.length || 0} chars), c=${sunMac || "MISSING"} (${(sunMac as string)?.length || 0} chars)`,
+      `[LNURLW] Tap params: p=${piccData ? "present" : "MISSING"} (${(piccData as string)?.length || 0} chars), c=${sunMac ? "present" : "MISSING"} (${(sunMac as string)?.length || 0} chars)`,
     )
 
     // If no p/c params, this might be a balance check or info request
@@ -118,7 +119,7 @@ async function handleWithdrawGet(
     // Validate parameter formats with helpful error messages
     if (!/^[0-9a-fA-F]{32}$/.test(piccData as string)) {
       console.log(
-        `[LNURLW] ERROR: Invalid PICCData format. Expected 32 hex chars, got ${(piccData as string).length}: ${(piccData as string).substring(0, 50)}...`,
+        `[LNURLW] ERROR: Invalid PICCData format. Expected 32 hex chars, got ${(piccData as string).length}`,
       )
       return res.status(400).json({
         status: "ERROR",
@@ -128,7 +129,7 @@ async function handleWithdrawGet(
 
     if (!/^[0-9a-fA-F]{16}$/.test(sunMac as string)) {
       console.log(
-        `[LNURLW] ERROR: Invalid SunMAC format. Expected 16 hex chars, got ${(sunMac as string).length}: ${sunMac}`,
+        `[LNURLW] ERROR: Invalid SunMAC format. Expected 16 hex chars, got ${(sunMac as string).length}`,
       )
       return res.status(400).json({
         status: "ERROR",

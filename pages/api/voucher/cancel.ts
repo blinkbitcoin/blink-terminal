@@ -1,5 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
+import { shortId } from "../../../lib/log-redact"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
 import {
   getOwnedWallets,
@@ -92,7 +93,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       })
     }
 
-    console.log("🚫 Voucher cancelled via API:", chargeId)
+    console.log("🚫 Voucher cancelled via API:", shortId(chargeId))
 
     res.status(200).json({
       success: true,
