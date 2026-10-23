@@ -42,6 +42,12 @@ jest.mock("../../lib/voucher-store", () => ({
   default: { getStats: async () => ({ total: 0 }) },
 }))
 
+const staleWithdrawals = jest.fn(async (_olderThanMs: number) => [] as unknown[])
+jest.mock("../../lib/boltcard/store", () => ({
+  __esModule: true,
+  default: { getStaleWithdrawals: (ms: number) => staleWithdrawals(ms) },
+}))
+
 jest.mock("../../lib/logger", () => ({
   __esModule: true,
   baseLogger: { child: () => ({ error: jest.fn(), info: jest.fn(), warn: jest.fn() }) },
@@ -249,6 +255,49 @@ describe("GET /api/health Redis reporting", () => {
       } finally {
         process.env.HEALTH_TOKEN = saved
       }
+    })
+  })
+
+  // blink-wip#1619: in-flight Bolt Card withdrawals, detailed view only
+  describe("Bolt Card withdrawals", () => {
+    beforeEach(() => {
+      healthCheck.mockResolvedValue({ redis: true, redisWritable: true, postgres: true })
+      staleWithdrawals.mockReset()
+    })
+
+    it("reports in-flight and stale counts; stale degrades", async () => {
+      staleWithdrawals.mockImplementation(async (olderThanMs: number) =>
+        olderThanMs === 0 ? [{}, {}, {}] : [{}],
+      )
+      const res = await callHealth()
+      expect(res.statusCode).toBe(200)
+      expect(res.body.status).toBe("degraded")
+      expect((res.body.checks as Record<string, unknown>).boltcardWithdrawals).toEqual({
+        status: "degraded",
+        inFlight: 3,
+        stale: 1,
+      })
+      expect(staleWithdrawals).toHaveBeenCalledWith(15 * 60_000)
+    })
+
+    it("in flight but none stale stays healthy", async () => {
+      staleWithdrawals.mockImplementation(async (olderThanMs: number) =>
+        olderThanMs === 0 ? [{}] : [],
+      )
+      const res = await callHealth()
+      expect(res.body.status).toBe("healthy")
+      expect((res.body.checks as Record<string, unknown>).boltcardWithdrawals).toEqual({
+        status: "up",
+        inFlight: 1,
+        stale: 0,
+      })
+    })
+
+    it("is not consulted for the public view", async () => {
+      staleWithdrawals.mockResolvedValue([{}])
+      const res = await callPublic()
+      expect(Object.keys(res.body).sort()).toEqual(["status", "timestamp"])
+      expect(staleWithdrawals).not.toHaveBeenCalled()
     })
   })
 })

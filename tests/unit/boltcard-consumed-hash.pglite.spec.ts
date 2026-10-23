@@ -28,6 +28,7 @@ jest.mock("../../lib/db", () => ({
 import {
   CLAIM_WITHDRAWAL_INSERT_SQL,
   CONSUMED_HASH_SQLSTATE,
+  STALE_WITHDRAWALS_SQL,
 } from "../../lib/boltcard/store"
 
 const NOW = Date.now()
@@ -152,5 +153,49 @@ describe("consumed payment hash on real Postgres (PGlite)", () => {
     )
     expect(result.status).toBe(0)
     expect(JSON.parse(result.stdout).rows[0]).toEqual({ n: 1 })
+  })
+})
+
+/**
+ * getStaleWithdrawals (blink-wip#1619): the exact SQL on real Postgres —
+ * only unresolved rows older than the cutoff, optionally scoped to card ids
+ * (text[] parameter; NULL = all), oldest first.
+ */
+describe("stale withdrawals query (PGlite)", () => {
+  const MIN = 60_000
+  const row = (
+    hash: string,
+    cardId: string,
+    createdAt: number,
+    resolved = false,
+  ): [string, unknown[]] => [
+    `INSERT INTO boltcard_pending_withdrawals
+       (payment_hash, card_id, amount, balance_after, created_at, kind, resolved_at)
+     VALUES ($1, $2, 1000, 0, $3, 'UNKNOWN', $4)`,
+    [hash, cardId, createdAt, resolved ? createdAt + 1000 : null],
+  ]
+  const seeds: Array<[string, unknown[]]> = [
+    ["INSERT INTO boltcards (id) VALUES ('card-a'), ('card-b')", []],
+    row("01".repeat(32), "card-a", NOW - 40 * MIN), // stale
+    row("02".repeat(32), "card-b", NOW - 20 * MIN), // stale, other card
+    row("03".repeat(32), "card-a", NOW - 5 * MIN), // young
+    row("04".repeat(32), "card-a", NOW - 50 * MIN, true), // old but resolved
+  ]
+
+  it("returns unresolved rows older than the cutoff, oldest first", () => {
+    const result = run(seeds, STALE_WITHDRAWALS_SQL, [NOW - 15 * MIN, null])
+    expect(result.status).toBe(0)
+    expect(
+      JSON.parse(result.stdout).rows.map((r: { payment_hash: string }) => r.payment_hash),
+    ).toEqual(["01".repeat(32), "02".repeat(32)])
+  })
+
+  it("cutoff 0-age (now) lists everything in flight; card scoping applies", () => {
+    const all = run(seeds, STALE_WITHDRAWALS_SQL, [NOW + 1, null])
+    expect(JSON.parse(all.stdout).rows).toHaveLength(3)
+    const scoped = run(seeds, STALE_WITHDRAWALS_SQL, [NOW + 1, ["card-a"]])
+    expect(
+      JSON.parse(scoped.stdout).rows.map((r: { payment_hash: string }) => r.payment_hash),
+    ).toEqual(["01".repeat(32), "03".repeat(32)])
   })
 })

@@ -12,6 +12,10 @@ import { withRateLimit, RATE_LIMIT_READ } from "../../../lib/rate-limit"
  * Returns statistics about the authenticated owner's cards only (Nostr
  * session required). Aggregates across other owners are never exposed.
  */
+/** Same default as the reconcile scheduler's ops log. */
+const WITHDRAWAL_STALE_MINUTES =
+  Number(process.env.BOLTCARD_WITHDRAWAL_STALE_MINUTES) || 15
+
 async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "GET") {
     return res.status(405).json({ error: "Method not allowed" })
@@ -42,6 +46,19 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     const needingReview = (await boltcard.store.getTopUpsNeedingReview()).filter(
       (topUp) => cardIds.has(topUp.cardId),
     )
+    // Card payments still in flight (deduction kept, Blink outcome not yet
+    // final) and the ones unresolved past the ops threshold (blink-wip#1619)
+    const ownerCardIds = [...cardIds]
+    const [inFlight, stale] =
+      ownerCardIds.length > 0
+        ? await Promise.all([
+            boltcard.store.getStaleWithdrawals(0, ownerCardIds),
+            boltcard.store.getStaleWithdrawals(
+              WITHDRAWAL_STALE_MINUTES * 60_000,
+              ownerCardIds,
+            ),
+          ])
+        : [[], []]
 
     res.status(200).json({
       success: true,
@@ -58,6 +75,14 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
         pendingRegistrations: pendingRegistrations.length,
         pendingTopUps: pendingTopUps.length,
         topUpsNeedingReview: needingReview.length,
+        withdrawalsInFlight: inFlight.length,
+        withdrawalsStale: stale.map((w) => ({
+          paymentHash: w.paymentHash,
+          cardId: w.cardId,
+          amount: w.amount,
+          kind: w.kind,
+          ageMinutes: Math.floor(w.ageMs / 60_000),
+        })),
       },
       timestamp: Date.now(),
     })
