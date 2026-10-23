@@ -6,16 +6,21 @@
 --              1. Allow the PAID status. Migration 008's constraint predates
 --                 it; without the ALTER every CLAIMED -> PAID update fails
 --                 with SQLSTATE 23514.
---              2. cleanup_old_vouchers(): PAID (settled) rows follow the
---                 30-day retention policy; CLAIMED rows are NEVER aged out.
---                 A CLAIMED row is an unresolved liability (paid or not is
---                 only decidable against Blink's ledger, see
+--              2. cleanup_old_vouchers(): redeemed rows (CLAIMED, PAID)
+--                 are NEVER deleted. CLAIMED is an unresolved liability
+--                 (paid or not is only decidable against Blink's ledger, see
 --                 scripts/reconcile-voucher-claims.js); only reconciliation
 --                 (-> PAID), a definite-failure unclaim (-> ACTIVE) or an
---                 explicit cancel may change it. Migration 008 listed CLAIMED
---                 for deletion but its retention arithmetic overflowed int4,
---                 so that delete never ran — which is the only reason the
---                 legacy claims still exist to be reconciled.
+--                 explicit cancel may change it. PAID rows are the
+--                 reconciler's COMPETITOR evidence: a settled voucher's
+--                 payment must never be credited to a stuck claim with the
+--                 same wallet/memo/amount and an overlapping window, so the
+--                 row must outlive the claims it competes with. 30 days
+--                 after settlement only the secret (api_key_encrypted) is
+--                 scrubbed; every matching field stays. Migration 008 listed
+--                 CLAIMED for deletion but its retention arithmetic
+--                 overflowed int4, so that delete never ran — the only
+--                 reason the legacy claims still exist to be reconciled.
 --              3. voucher_stats keeps counting PAID as redeemed: the
 --                 "claimed" bucket becomes CLAIMED + PAID.
 -- Date: 2026-10-22
@@ -40,15 +45,20 @@ ALTER TABLE vouchers
 -- MIGRATION-029:STATUS-CONSTRAINT:END
 
 -- ============================================
--- CLEANUP FUNCTION: PAID follows the 30-day retention policy; CLAIMED never
+-- CLEANUP FUNCTION: scrub PAID secrets after 30 days; never delete redeemed rows
 -- ============================================
--- Settled rows (including api_key_encrypted and voucher metadata) must not be
--- retained forever, so PAID is deleted 30 days after claimed_at. CLAIMED is
--- deliberately NOT deleted: it is an unresolved liability that only
--- reconciliation, unclaim or cancel may resolve; deleting it would drop a
--- liability and the encrypted key reconciliation needs. The original 008
--- retention expression (30 * 24 * 60 * 60 * 1000) overflowed int4 at
--- invocation with "integer out of range"; the ::BIGINT casts fix that.
+-- CLAIMED is never deleted: an unresolved liability that only reconciliation,
+-- unclaim or cancel may resolve; deleting it would drop a liability and the
+-- encrypted key reconciliation needs. PAID is never deleted either: the
+-- reconciler loads every CLAIMED and PAID row of a wallet as competitors for
+-- a ledger payment, so deleting a settled competitor would let its payment
+-- look unique and settle a stuck, unpaid claim. The only sensitive field,
+-- api_key_encrypted, is scrubbed to '' 30 days after settlement (the column
+-- is NOT NULL; '' decrypts to null in AuthManager); the matching fields
+-- (wallet, environment, amounts, currency, display, commission, claimed_at)
+-- stay. The original 008 retention expression (30 * 24 * 60 * 60 * 1000)
+-- overflowed int4 at invocation with "integer out of range"; the ::BIGINT
+-- casts fix that.
 -- MIGRATION-029:CLEANUP-FUNCTION:BEGIN
 CREATE OR REPLACE FUNCTION cleanup_old_vouchers()
 RETURNS INTEGER AS $$
@@ -56,20 +66,21 @@ DECLARE
     deleted_count INTEGER := 0;
     tmp_count INTEGER;
     now_ms BIGINT;
-    paid_retention_ms BIGINT := 30::BIGINT * 24 * 60 * 60 * 1000;       -- 30 days
+    paid_secret_retention_ms BIGINT := 30::BIGINT * 24 * 60 * 60 * 1000; -- 30 days
     cancelled_retention_ms BIGINT := 30::BIGINT * 24 * 60 * 60 * 1000;  -- 30 days
     expired_retention_ms BIGINT := 7::BIGINT * 24 * 60 * 60 * 1000;     -- 7 days
 BEGIN
     now_ms := (EXTRACT(EPOCH FROM NOW()) * 1000)::BIGINT;
 
-    -- Delete old settled vouchers. CLAIMED is never deleted (unresolved).
-    DELETE FROM vouchers
+    -- Scrub the secret from old settled vouchers; keep the row as competitor
+    -- evidence for reconciliation. Redeemed rows (CLAIMED, PAID) are never
+    -- deleted here. (Not counted in the return value: nothing was deleted.)
+    UPDATE vouchers
+    SET api_key_encrypted = ''
     WHERE status = 'PAID'
+      AND api_key_encrypted <> ''
       AND claimed_at IS NOT NULL
-      AND (now_ms - claimed_at) > paid_retention_ms;
-
-    GET DIAGNOSTICS tmp_count = ROW_COUNT;
-    deleted_count := deleted_count + tmp_count;
+      AND (now_ms - claimed_at) > paid_secret_retention_ms;
 
     -- Delete old cancelled vouchers
     DELETE FROM vouchers
@@ -120,12 +131,12 @@ VALUES (
     'schema_version',
     29,
     'version',
-    '{"description": "Voucher CLAIMED -> PAID settlement transition; PAID added to valid_voucher_status; PAID follows 30-day retention, CLAIMED never aged out; voucher_stats claimed bucket includes PAID", "date": "2026-10-22"}'
+    '{"description": "Voucher CLAIMED -> PAID settlement transition; PAID added to valid_voucher_status; PAID secrets scrubbed after 30 days, redeemed rows never deleted; voucher_stats claimed bucket includes PAID", "date": "2026-10-22"}'
 );
 
 COMMIT;
 
 DO $$
 BEGIN
-    RAISE NOTICE 'Migration 029 completed: PAID status allowed, 30-day PAID retention, CLAIMED never aged out, counted in voucher_stats';
+    RAISE NOTICE 'Migration 029 completed: PAID status allowed, PAID secrets scrubbed after 30 days, redeemed rows never deleted, counted in voucher_stats';
 END $$;

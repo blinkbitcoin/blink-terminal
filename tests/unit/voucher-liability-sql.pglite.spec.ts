@@ -54,6 +54,11 @@ const DDL = `CREATE TABLE vouchers (
   claimed_at BIGINT,
   cancelled_at BIGINT,
   wallet_currency VARCHAR(3) NOT NULL DEFAULT 'BTC',
+  api_key_encrypted TEXT NOT NULL DEFAULT 'enc',
+  environment VARCHAR(20) DEFAULT 'production',
+  display_amount VARCHAR(50),
+  display_currency VARCHAR(10),
+  commission_percent DECIMAL(5, 2) DEFAULT 0,
   CONSTRAINT valid_voucher_status CHECK (status IN ('ACTIVE', 'CLAIMED', 'CANCELLED', 'EXPIRED'))
 )`
 
@@ -394,7 +399,7 @@ describe("voucher lifecycle vs the liability aggregate (PGlite)", () => {
 describe("migration 029 cleanup_old_vouchers (PGlite)", () => {
   const cleanupSeeds: Array<[string, unknown[]]> = [
     // Old CLAIMED (31 days): RETAINED — unresolved, reconciliation needs it.
-    // Old PAID (31 days): deleted.
+    // Old PAID (31 days): RETAINED as competitor evidence, secret scrubbed.
     [
       `INSERT INTO vouchers (id, amount_sats, wallet_id, status, expires_at, claimed_at, claimed)
        VALUES ($1, 500, 'w1', 'CLAIMED', $2, $3, true)`,
@@ -427,18 +432,20 @@ describe("migration 029 cleanup_old_vouchers (PGlite)", () => {
     seedRow("active", "w1", 500, null),
   ]
 
-  it("deletes old PAID rows, never CLAIMED, and keeps fresh ones", () => {
+  it("never deletes redeemed rows; scrubs only the old PAID secret", () => {
     const result = probe(
       [...cleanupSeeds, ["SELECT cleanup_old_vouchers()", []]],
-      "SELECT id FROM vouchers ORDER BY id",
+      "SELECT id, api_key_encrypted AS key FROM vouchers ORDER BY id",
       [],
       { extraDdl: [CLEANUP_FUNCTION_SQL] },
     )
-    expect(result.rows.map((r) => r.id)).toEqual([
-      "active",
-      "new-claimed",
-      "new-paid",
-      "old-claimed", // legacy unresolved claim survives cleanup
+    expect(result.rows).toEqual([
+      { id: "active", key: "enc" },
+      { id: "new-claimed", key: "enc" },
+      { id: "new-paid", key: "enc" }, // fresh: secret kept
+      { id: "old-claimed", key: "enc" }, // unresolved: untouched
+      { id: "old-paid", key: "" }, // settled 31 days ago: secret scrubbed, row kept
+      // old-cancelled: deleted (unchanged policy)
     ])
   })
 
@@ -556,5 +563,129 @@ describe("wallet lock statements (PGlite)", () => {
       [],
     )
     expect(result.rows).toEqual([{ status: "PAID" }])
+  })
+})
+
+/**
+ * Cleanup + reconciliation together (the reviewer's cross-component case):
+ * a settled PAID voucher is the competitor that stops its payment from being
+ * credited to a stuck CLAIMED claim with the same wallet/memo/amount and an
+ * overlapping window. Cleanup must therefore keep the PAID row (secret
+ * scrubbed) — the control run shows that deleting it would settle the unpaid
+ * claim.
+ */
+describe("cleanup keeps the PAID competitor reconciliation needs (PGlite + script)", () => {
+  /* eslint-disable @typescript-eslint/no-require-imports */
+  const { reconcileClaimedVouchers } = require("../../scripts/reconcile-voucher-claims")
+  const { encode: encodeInvoice, sign: signInvoice } = require("bolt11")
+  /* eslint-enable @typescript-eslint/no-require-imports */
+
+  const PRIVKEY = "e126f68f7eafcc8b74f54d269fe206be715000f94dac067d1c04a8ca3b2db734"
+  const HASH = "ab".repeat(32)
+  const MINUTE = 60_000
+  // Both claimed 31 days ago, 5 minutes apart: B's payment falls inside A's
+  // [-2 min, +30 min] window.
+  const A_CLAIMED_AT = NOW - 31 * DAY_MS
+  const B_CLAIMED_AT = A_CLAIMED_AT + 5 * MINUTE
+
+  const redeemed = (
+    id: string,
+    status: string,
+    claimedAt: number,
+  ): [string, unknown[]] => [
+    `INSERT INTO vouchers (id, amount_sats, wallet_id, status, expires_at, claimed, claimed_at, api_key_encrypted)
+     VALUES ($1, 500, 'w1', $2, $3, true, $4, 'enc')`,
+    [id, status, claimedAt + DAY_MS, claimedAt],
+  ]
+
+  const paymentOfB = () => {
+    const encoded = encodeInvoice({
+      satoshis: 500,
+      timestamp: Math.floor(B_CLAIMED_AT / 1000),
+      tags: [
+        { tagName: "payment_hash", data: HASH },
+        { tagName: "payment_secret", data: "11".repeat(32) },
+        { tagName: "description", data: "voucher" },
+      ],
+    })
+    return {
+      id: "tx-b",
+      direction: "SEND",
+      status: "SUCCESS",
+      settlementAmount: -500,
+      settlementFee: 0,
+      settlementCurrency: "BTC",
+      createdAt: Math.floor(B_CLAIMED_AT / 1000),
+      memo: "BlinkPOS Voucher: 500 sats",
+      initiationVia: {
+        __typename: "InitiationViaLn",
+        paymentHash: HASH,
+        paymentRequest: signInvoice(encoded, PRIVKEY).paymentRequest,
+      },
+    }
+  }
+
+  /** Rows as the script's SELECT would see them after `afterCleanup` ran. */
+  const survivingRows = (afterCleanup: Array<[string, unknown[]]>) =>
+    probe(
+      [
+        redeemed("a-stuck", "CLAIMED", A_CLAIMED_AT),
+        redeemed("b-settled", "PAID", B_CLAIMED_AT),
+        ...afterCleanup,
+      ],
+      `SELECT id, status, amount_sats, usd_amount_cents, wallet_id, api_key_encrypted,
+              claimed_at, environment, wallet_currency, display_amount,
+              display_currency, commission_percent
+       FROM vouchers WHERE status IN ('CLAIMED', 'PAID') ORDER BY wallet_id, claimed_at`,
+      [],
+      { extraDdl: [CLEANUP_FUNCTION_SQL] },
+    ).rows
+
+  const reconcile = async (rows: Array<Record<string, unknown>>) => {
+    const updates: unknown[][] = []
+    const client = {
+      query: jest.fn(async (text: string, params: unknown[]) => {
+        if (text.startsWith("UPDATE")) {
+          updates.push(params)
+          return { rows: [{ id: params[0] }], rowCount: 1 }
+        }
+        return { rows: [] }
+      }),
+      release: jest.fn(),
+    }
+    const pool = {
+      query: jest.fn(async () => ({ rows })),
+      connect: jest.fn(async () => client),
+    }
+    const summary = await reconcileClaimedVouchers({
+      pool,
+      fetchTransactions: async () => ({ transactions: [paymentOfB()], complete: true }),
+      decryptApiKey: () => "key",
+      apply: true,
+      now: NOW,
+      log: () => {},
+    })
+    return { summary, updates }
+  }
+
+  it("after cleanup, the scrubbed PAID competitor still blocks the stuck claim", async () => {
+    const rows = survivingRows([["SELECT cleanup_old_vouchers()", []]])
+    expect(rows.map((r) => [r.id, r.api_key_encrypted])).toEqual([
+      ["a-stuck", "enc"],
+      ["b-settled", ""], // kept, secret scrubbed
+    ])
+
+    const { summary, updates } = await reconcile(rows)
+    expect(summary).toMatchObject({ checked: 1, matched: 0, ambiguous: 1, applied: 0 })
+    expect(updates).toEqual([]) // A stays CLAIMED — still a liability
+  })
+
+  it("control: had cleanup deleted the PAID row, the unpaid claim would be settled", async () => {
+    const rows = survivingRows([["DELETE FROM vouchers WHERE id = 'b-settled'", []]])
+    expect(rows.map((r) => r.id)).toEqual(["a-stuck"])
+
+    const { summary, updates } = await reconcile(rows)
+    expect(summary).toMatchObject({ matched: 1, applied: 1 })
+    expect(updates).toEqual([["a-stuck"]]) // the unsafe outcome the scrub prevents
   })
 })
