@@ -2,6 +2,7 @@ import type { NextApiRequest, NextApiResponse } from "next"
 
 import { BlinkAPI } from "../../../lib/blink-api"
 import { getApiUrlForEnvironment, type EnvironmentName } from "../../../lib/config/api"
+import { shortId } from "../../../lib/log-redact"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
 import {
   getOwnedWallets,
@@ -307,7 +308,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     })
 
     console.log("✅ Voucher created successfully:", {
-      chargeId: voucher.id,
+      chargeId: shortId(voucher.id),
       amount: voucher.amount,
       walletCurrency: voucher.walletCurrency,
       usdAmountCents: voucher.usdAmountCents,

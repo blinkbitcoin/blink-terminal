@@ -2,6 +2,7 @@ import type { NextApiRequest, NextApiResponse } from "next"
 
 import BlinkAPI, { BlinkAuthError, PaymentRejectedError } from "../../../lib/blink-api"
 import { getApiUrlForEnvironment, type EnvironmentName } from "../../../lib/config/api"
+import { shortId } from "../../../lib/log-redact"
 import { verifyForwardInvoice } from "../../../lib/payout-guard"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
 import { buildVoucherMemo } from "../../../lib/voucher-memo"
@@ -69,7 +70,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     const voucher = await voucherStore.getVoucher(chargeId)
 
     if (!voucher) {
-      console.error("❌ Voucher not found or expired:", chargeId)
+      console.error("❌ Voucher not found or expired:", shortId(chargeId))
       return res.status(200).json({
         status: "ERROR",
         reason: "Voucher not found or expired",
@@ -78,7 +79,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
     // Check if already claimed
     if (voucher.claimed) {
-      console.error("❌ Voucher already claimed:", chargeId)
+      console.error("❌ Voucher already claimed:", shortId(chargeId))
       return res.status(200).json({
         status: "ERROR",
         reason: "Voucher has already been claimed",
@@ -134,7 +135,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     // Mark as claimed BEFORE paying to prevent double-spend
     const claimed = await voucherStore.claimVoucher(chargeId)
     if (!claimed) {
-      console.error("❌ Failed to claim voucher:", chargeId)
+      console.error("❌ Failed to claim voucher:", shortId(chargeId))
       return res.status(200).json({
         status: "ERROR",
         reason: "Failed to claim voucher - may already be in use",
