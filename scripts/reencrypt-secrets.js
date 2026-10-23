@@ -18,6 +18,18 @@
  * conflict; re-run to pick it up). Values that cannot be decrypted are left
  * untouched and listed (table, key, column), never overwritten.
  *
+ * Strictness: in a dedicated *_encrypted column every non-empty value must be
+ * ciphertext (plaintext or a damaged prefix is listed as undecryptable; ''
+ * is the scrub marker and is ignored). In JSONB, the known secret paths
+ * (JSON_TARGETS[].secretPaths) are held to the same rule, except where the
+ * app itself still reads raw plaintext (metadata.userApiKey): a raw value of
+ * the expected shape is migrated (encrypted), anything else is listed.
+ * Ciphertext found at any other JSON path is rotated too.
+ *
+ * --apply and --check require ENCRYPTION_WRITE_FORMAT=v2: in the
+ * rollback-safe phase (legacy writes) rewriting to v2 would strand the data
+ * if the image were rolled back. A dry run works in either phase.
+ *
  * Usage:
  *   node scripts/reencrypt-secrets.js            dry run: report only
  *   node scripts/reencrypt-secrets.js --apply    rewrite
@@ -57,9 +69,37 @@ const COLUMN_TARGETS = [
 ]
 
 /** JSONB columns whose nested string values may be ciphertext. */
+/**
+ * JSONB columns whose nested string values may be ciphertext. `secretPaths`
+ * are where the app stores secrets ("*" = any array index); `raw` is the
+ * shape of a legacy plaintext value the app still accepts at that path
+ * (migrated rather than rejected), or null when plaintext is never valid.
+ */
+const BLINK_API_KEY = /^blink_[A-Za-z0-9_]+$/
 const JSON_TARGETS = [
-  { table: "user_records", key: "user_hash", column: "data" },
-  { table: "payment_splits", key: "id", column: "metadata" },
+  {
+    table: "user_records",
+    key: "user_hash",
+    column: "data",
+    // writers/readers: lib/storage.ts, pages/api/user/sync.ts
+    secretPaths: [
+      { path: ["apiKey"], raw: null },
+      { path: ["blinkApiAccounts", "*", "apiKey"], raw: null },
+      { path: ["nwcConnections", "*", "uri"], raw: null },
+      { path: ["voucherWallet", "apiKey"], raw: null },
+    ],
+  },
+  {
+    table: "payment_splits",
+    key: "id",
+    column: "metadata",
+    // writer: lib/storage/hybrid-store.ts storeTipData; readers: hybrid-store
+    // (userApiKey, raw fallback for pre-encryption rows), webhook (NWC URI)
+    secretPaths: [
+      { path: ["userApiKey"], raw: BLINK_API_KEY },
+      { path: ["nwcConnectionUri"], raw: null },
+    ],
+  },
 ]
 
 const BATCH = 500
@@ -68,9 +108,41 @@ const BATCH = 500
  * Rewrite `value` if it needs it. Returns the new ciphertext, or null when
  * nothing should change; records the outcome in `tally`.
  */
-function rewrite(value, keyring, tally, where) {
+/**
+ * In a dry run (`apply` false) nothing is encrypted: a value that would be
+ * rewritten is counted and returned unchanged (non-null = "would change").
+ */
+function rewrite(
+  value,
+  keyring,
+  tally,
+  where,
+  { strict = false, raw = null, apply = true } = {},
+) {
+  if (value === null || value === undefined) return null
   const { status, plaintext } = keyring.inspect(value)
-  if (status === "not-ciphertext") return null
+  if (status === "not-ciphertext") {
+    if (!strict || value === "") return null // '' = scrub marker / empty field
+    if (raw && typeof value === "string" && raw.test(value)) {
+      // Legacy plaintext the app still accepts here: encrypt it.
+      if (!apply) {
+        tally.pending++
+        tally.plaintextMigrated = (tally.plaintextMigrated || 0) + 1
+        return value
+      }
+      const next = keyring.encrypt(value)
+      const check = keyring.inspect(next)
+      if (check.status !== "current" || check.plaintext !== value) {
+        throw new Error(`plaintext migration verification failed at ${where}`)
+      }
+      tally.pending++
+      tally.plaintextMigrated = (tally.plaintextMigrated || 0) + 1
+      return next
+    }
+    // Plaintext or a damaged ciphertext where only ciphertext is valid.
+    tally.undecryptable.push(where)
+    return null
+  }
   if (status === "undecryptable") {
     // Includes a value under the current key id that fails authentication
     // (tampered, or written by a different key): never counted as current.
@@ -81,6 +153,10 @@ function rewrite(value, keyring, tally, where) {
     tally.current++
     return null
   }
+  if (!apply) {
+    tally.pending++
+    return value
+  }
   const next = keyring.encrypt(plaintext)
   const check = keyring.inspect(next)
   if (check.status !== "current" || check.plaintext !== plaintext) {
@@ -90,10 +166,41 @@ function rewrite(value, keyring, tally, where) {
   return next
 }
 
-/** Recursively rewrite ciphertext strings inside a JSON value. */
-function rewriteJson(node, keyring, tally, where) {
+/** The secretPaths entry matching `keys` (array indices as "*"), or null. */
+function secretPathFor(secretPaths, keys) {
+  return (
+    (secretPaths || []).find(
+      ({ path }) => path.length === keys.length && path.every((p, i) => p === keys[i]),
+    ) || null
+  )
+}
+
+/**
+ * Recursively rewrite ciphertext strings inside a JSON value; known secret
+ * paths are held to the strict rule (see header).
+ */
+function rewriteJson(
+  node,
+  keyring,
+  tally,
+  where,
+  secretPaths = [],
+  keys = [],
+  apply = true,
+) {
+  const secret = secretPathFor(secretPaths, keys)
+  if (secret && node !== null && node !== undefined && typeof node !== "string") {
+    tally.undecryptable.push(where) // a secret path holding a non-string
+    return { value: node, changed: false }
+  }
   if (typeof node === "string") {
-    const next = rewrite(node, keyring, tally, where)
+    const next = rewrite(
+      node,
+      keyring,
+      tally,
+      where,
+      secret ? { strict: true, raw: secret.raw, apply } : { apply },
+    )
     return next === null
       ? { value: node, changed: false }
       : { value: next, changed: true }
@@ -101,7 +208,15 @@ function rewriteJson(node, keyring, tally, where) {
   if (Array.isArray(node)) {
     let changed = false
     const value = node.map((item, i) => {
-      const r = rewriteJson(item, keyring, tally, `${where}[${i}]`)
+      const r = rewriteJson(
+        item,
+        keyring,
+        tally,
+        `${where}[${i}]`,
+        secretPaths,
+        [...keys, "*"],
+        apply,
+      )
       changed = changed || r.changed
       return r.value
     })
@@ -111,7 +226,15 @@ function rewriteJson(node, keyring, tally, where) {
     let changed = false
     const value = {}
     for (const [k, v] of Object.entries(node)) {
-      const r = rewriteJson(v, keyring, tally, `${where}.${k}`)
+      const r = rewriteJson(
+        v,
+        keyring,
+        tally,
+        `${where}.${k}`,
+        secretPaths,
+        [...keys, k],
+        apply,
+      )
       changed = changed || r.changed
       value[k] = r.value
     }
@@ -155,6 +278,11 @@ async function reencryptSecrets({
   log = console.log,
 }) {
   if (!keyring.currentKeyId()) throw new Error("ENCRYPTION_KEY is required")
+  if (apply && keyring.writeFormat() !== "v2") {
+    throw new Error(
+      "--apply requires ENCRYPTION_WRITE_FORMAT=v2 (in the rollback-safe phase, rewriting to v2 would strand data if the image were rolled back)",
+    )
+  }
   const total = { current: 0, pending: 0, rewritten: 0, conflicts: 0, undecryptable: [] }
   const targets = []
 
@@ -169,7 +297,10 @@ async function reencryptSecrets({
         undecryptable: [],
       }
       for await (const row of rows(pool, table, key, `${column} AS value`)) {
-        const next = rewrite(row.value, keyring, tally, `${table}[${row.pk}].${column}`)
+        const next = rewrite(row.value, keyring, tally, `${table}[${row.pk}].${column}`, {
+          strict: true,
+          apply,
+        })
         if (next === null || !apply) continue
         const res = await pool.query(
           `UPDATE ${table} SET ${column} = $3 WHERE ${key}::text = $1 AND ${column} = $2`,
@@ -182,7 +313,7 @@ async function reencryptSecrets({
     }
   }
 
-  for (const { table, key, column } of JSON_TARGETS) {
+  for (const { table, key, column, secretPaths } of JSON_TARGETS) {
     if (!(await tableExists(pool, table))) continue
     const tally = {
       current: 0,
@@ -194,7 +325,15 @@ async function reencryptSecrets({
     for await (const row of rows(pool, table, key, `${column} AS value`)) {
       if (row.value === null || row.value === undefined) continue
       const before = tally.pending
-      const r = rewriteJson(row.value, keyring, tally, `${table}[${row.pk}].${column}`)
+      const r = rewriteJson(
+        row.value,
+        keyring,
+        tally,
+        `${table}[${row.pk}].${column}`,
+        secretPaths,
+        [],
+        apply,
+      )
       const values = tally.pending - before // counts are per secret, not per row
       if (!r.changed || !apply) continue
       const res = await pool.query(
@@ -256,6 +395,11 @@ async function main() {
   }
   if (args.apply && args.check) throw new Error("--apply and --check are exclusive")
   const keyring = envKeyring()
+  if (args.check && keyring.writeFormat() !== "v2") {
+    throw new Error(
+      "--check requires ENCRYPTION_WRITE_FORMAT=v2: in the rollback-safe phase values are still written in the legacy format",
+    )
+  }
   const pool = createPool()
   try {
     console.log(

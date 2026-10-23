@@ -32,15 +32,19 @@ const K2 = "rotation-new-key-0123456789abcdef"
 const COMMUNITY = "a1b2c3d4-e5f6-7890-abcd-ef1234567001" // seeded by migration 003
 
 const legacy = (plaintext: string) => CryptoJS.AES.encrypt(plaintext, K1).toString()
-const v2K1 = (plaintext: string) => createKeyring({ current: K1 }).encrypt(plaintext)
-const v2K2 = (plaintext: string) => createKeyring({ current: K2 }).encrypt(plaintext)
-const unknownKey = createKeyring({ current: "some-lost-key" }).encrypt("lost")
+const v2K1 = (plaintext: string) =>
+  createKeyring({ current: K1, writeFormat: "v2" }).encrypt(plaintext)
+const v2K2 = (plaintext: string) =>
+  createKeyring({ current: K2, writeFormat: "v2" }).encrypt(plaintext)
+const unknownKey = createKeyring({ current: "some-lost-key", writeFormat: "v2" }).encrypt(
+  "lost",
+)
 
 describePg("reencrypt-secrets on real Postgres", () => {
   let db: TestDatabase
   let sql: Client
   let pool: Pool
-  const rotated = createKeyring({ current: K2, previous: K1 })
+  const rotated = createKeyring({ current: K2, previous: K1, writeFormat: "v2" })
 
   beforeAll(async () => {
     db = await setupTestDatabase("reencrypt")
@@ -172,7 +176,7 @@ describePg("reencrypt-secrets on real Postgres", () => {
       expect(v.split(".")[1]).toBe(newKid)
       expect(rotated.decrypt(v)).toBe(plaintext)
       // ...and decryptable without the previous key once rotation completes
-      expect(createKeyring({ current: K2 }).decrypt(v)).toBe(plaintext)
+      expect(createKeyring({ current: K2, writeFormat: "v2" }).decrypt(v)).toBe(plaintext)
     }
     await check(
       "SELECT api_key_encrypted AS v FROM vouchers WHERE id = 'v-legacy'",
@@ -280,6 +284,7 @@ describePg("reencrypt-secrets on real Postgres", () => {
             DATABASE_URL: db.url,
             ENCRYPTION_KEY: K2,
             ENCRYPTION_KEY_PREVIOUS: K1,
+            ENCRYPTION_WRITE_FORMAT: "v2",
           },
           encoding: "utf8",
           timeout: 30_000,
@@ -356,6 +361,7 @@ describePg("reencrypt-secrets on real Postgres", () => {
           DATABASE_URL: db.url,
           ENCRYPTION_KEY: K2,
           ENCRYPTION_KEY_PREVIOUS: K1,
+          ENCRYPTION_WRITE_FORMAT: "v2",
         },
         encoding: "utf8",
         timeout: 30_000,
@@ -373,6 +379,173 @@ describePg("reencrypt-secrets on real Postgres", () => {
         )
       ).rows[0].v,
     ).toBe(tampered) // left untouched
+  })
+
+  describe("strict gate: plaintext and damaged ciphertext where only ciphertext is valid", () => {
+    const cli = (...args: string[]) =>
+      spawnSync(
+        process.execPath,
+        [path.join(process.cwd(), "scripts", "reencrypt-secrets.js"), ...args],
+        {
+          env: {
+            ...process.env,
+            DATABASE_URL: db.url,
+            ENCRYPTION_KEY: K2,
+            ENCRYPTION_KEY_PREVIOUS: K1,
+            ENCRYPTION_WRITE_FORMAT: "v2",
+          },
+          encoding: "utf8",
+          timeout: 30_000,
+        },
+      )
+    const insertVoucher = async (id: string, apiKeyEncrypted: string) => {
+      const now = Date.now()
+      await sql.query(
+        `INSERT INTO vouchers (id, amount_sats, wallet_id, api_key_encrypted, status, claimed,
+                               created_at, expires_at, expiry_id, wallet_currency)
+         VALUES ($1, 500, 'w1', $2, 'PAID', true, $3, $4, '24h', 'BTC')`,
+        [id, apiKeyEncrypted, now, now + 3_600_000],
+      )
+    }
+    const damagedPrefix = (ct: string) => `x${ct.substring(1)}` // "v2." -> "x2."
+
+    beforeEach(async () => {
+      await sql.query("DELETE FROM vouchers WHERE id = 'v-lost'")
+      await reencryptSecrets({ pool, keyring: rotated, apply: true, log: () => {} })
+    })
+
+    it("scalar column: plaintext and a damaged prefix are undecryptable and fail --check; '' is ignored", async () => {
+      await insertVoucher("v-plain", "blink_plaintext_in_encrypted_column")
+      await insertVoucher("v-prefix", damagedPrefix(v2K2("blink_damaged")))
+      await insertVoucher("v-scrubbed", "") // #100 scrub marker for old PAID rows
+
+      const r = await reencryptSecrets({
+        pool,
+        keyring: rotated,
+        apply: false,
+        log: () => {},
+      })
+      expect(r.undecryptable.sort()).toEqual([
+        "vouchers[v-plain].api_key_encrypted",
+        "vouchers[v-prefix].api_key_encrypted",
+      ])
+      const check = cli("--check")
+      expect(check.status).toBe(1)
+      expect(check.stdout).toContain("CHECK FAILED")
+      expect(check.stdout).not.toContain("blink_plaintext_in_encrypted_column")
+      expect(check.stdout).not.toContain("v-scrubbed")
+    })
+
+    it("known JSON secret paths: plaintext / damaged values are undecryptable; unknown paths are not secrets", async () => {
+      await sql.query(
+        `INSERT INTO user_records (user_hash, data) VALUES ($1, $2::jsonb)`,
+        [
+          "f".repeat(64),
+          JSON.stringify({
+            apiKey: "blink_raw_top_level",
+            blinkApiAccounts: [{ apiKey: damagedPrefix(v2K2("blink_acc")) }],
+            nwcConnections: [{ uri: "nostr+walletconnect://raw-secret" }],
+            voucherWallet: { apiKey: 12345 },
+            preferences: { note: "plain text, not a secret path" },
+          }),
+        ],
+      )
+      await sql.query(
+        `INSERT INTO payment_splits (payment_hash, user_api_key_hash, user_wallet_id, total_amount,
+                                     base_amount, tip_amount, metadata, expires_at)
+         VALUES ($1, 'h', 'w1', 100, 100, 0, $2::jsonb, NOW() + interval '1 hour')`,
+        [
+          "a".repeat(64),
+          JSON.stringify({ nwcConnectionUri: "nostr+walletconnect://raw" }),
+        ],
+      )
+      const r = await reencryptSecrets({
+        pool,
+        keyring: rotated,
+        apply: false,
+        log: () => {},
+      })
+      const pk = (
+        await sql.query("SELECT id FROM payment_splits WHERE payment_hash = $1", [
+          "a".repeat(64),
+        ])
+      ).rows[0].id
+      expect(r.undecryptable.sort()).toEqual(
+        [
+          `payment_splits[${pk}].metadata.nwcConnectionUri`,
+          `user_records[${"f".repeat(64)}].data.apiKey`,
+          `user_records[${"f".repeat(64)}].data.blinkApiAccounts[0].apiKey`,
+          `user_records[${"f".repeat(64)}].data.nwcConnections[0].uri`,
+          `user_records[${"f".repeat(64)}].data.voucherWallet.apiKey`,
+        ].sort(),
+      )
+      expect(cli("--check").status).toBe(1)
+    })
+
+    it("metadata.userApiKey: a raw Blink key (still accepted by the app) is migrated; other raw values are not", async () => {
+      await sql.query(
+        `INSERT INTO payment_splits (payment_hash, user_api_key_hash, user_wallet_id, total_amount,
+                                     base_amount, tip_amount, metadata, expires_at)
+         VALUES ($1, 'h', 'w1', 100, 100, 0, $2::jsonb, NOW() + interval '1 hour'),
+                ($3, 'h', 'w1', 100, 100, 0, $4::jsonb, NOW() + interval '1 hour')`,
+        [
+          "b".repeat(64),
+          JSON.stringify({ userApiKey: "blink_rawPreEncryptionKey123" }),
+          "c".repeat(64),
+          JSON.stringify({ userApiKey: "x2.notablinkkey" }),
+        ],
+      )
+      const applied = cli("--apply")
+      expect(applied.status).toBe(1) // the malformed one is undecryptable
+      const migrated = (
+        await sql.query(
+          "SELECT metadata->>'userApiKey' AS v FROM payment_splits WHERE payment_hash = $1",
+          ["b".repeat(64)],
+        )
+      ).rows[0].v as string
+      expect(migrated.split(".")[1]).toBe(keyId(K2))
+      expect(rotated.decrypt(migrated)).toBe("blink_rawPreEncryptionKey123")
+      const malformed = (
+        await sql.query(
+          "SELECT metadata->>'userApiKey' AS v FROM payment_splits WHERE payment_hash = $1",
+          ["c".repeat(64)],
+        )
+      ).rows[0].v
+      expect(malformed).toBe("x2.notablinkkey") // left untouched, listed
+      expect(applied.stdout).toContain("].metadata.userApiKey — left untouched")
+      expect(applied.stdout).not.toContain("blink_rawPreEncryptionKey123")
+    })
+  })
+
+  it("rollback-safe phase: --apply and --check refuse without ENCRYPTION_WRITE_FORMAT=v2", async () => {
+    const legacyRing = createKeyring({ current: K1 }) // phase 1 default
+    await expect(
+      reencryptSecrets({ pool, keyring: legacyRing, apply: true, log: () => {} }),
+    ).rejects.toThrow("--apply requires ENCRYPTION_WRITE_FORMAT=v2")
+    // a dry run is allowed (reporting only)
+    await expect(
+      reencryptSecrets({ pool, keyring: legacyRing, apply: false, log: () => {} }),
+    ).resolves.toBeTruthy()
+    const run = (arg: string) =>
+      spawnSync(
+        process.execPath,
+        [path.join(process.cwd(), "scripts", "reencrypt-secrets.js"), arg],
+        {
+          env: {
+            ...process.env,
+            DATABASE_URL: db.url,
+            ENCRYPTION_KEY: K1,
+            ENCRYPTION_WRITE_FORMAT: "",
+          },
+          encoding: "utf8",
+          timeout: 30_000,
+        },
+      )
+    for (const arg of ["--apply", "--check"]) {
+      const out = run(arg)
+      expect(out.status).toBe(1)
+      expect(out.stderr).toContain("requires ENCRYPTION_WRITE_FORMAT=v2")
+    }
   })
 
   it("refuses to run without a current key", async () => {
