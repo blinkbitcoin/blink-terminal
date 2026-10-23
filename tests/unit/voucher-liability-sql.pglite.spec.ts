@@ -31,7 +31,9 @@ import {
   ACTIVE_LIABILITY_SUM_SQL_BTC,
   ACTIVE_LIABILITY_SUM_SQL_USD,
   CLAIM_VOUCHER_SQL,
+  LOCK_TIMEOUT_SQL,
   MARK_VOUCHER_PAID_SQL,
+  WALLET_LOCK_SQL,
 } from "../../lib/voucher-store"
 
 const NOW = Date.now()
@@ -508,5 +510,33 @@ describe("migration 029 full file (PGlite)", () => {
     expect(MIGRATION_029.indexOf("COMMIT;")).toBeGreaterThan(
       MIGRATION_029.indexOf("'schema_version'"),
     )
+  })
+})
+
+/**
+ * The per-wallet lock statements markVoucherPaid and the locked create run
+ * (BACKING INVARIANT). PGlite is single-connection, so contention cannot be
+ * exercised here; this proves the exact statements are valid Postgres and
+ * that the settlement transition works inside the locked transaction.
+ */
+describe("wallet lock statements (PGlite)", () => {
+  it("lock_timeout + advisory lock + CLAIMED -> PAID run in one transaction", () => {
+    const result = probe(
+      [
+        seedRow("v1", "w1", 500, null, {
+          status: "CLAIMED",
+          claimed: true,
+          claimedAt: NOW,
+        }),
+        ["BEGIN", []],
+        [LOCK_TIMEOUT_SQL, []],
+        [WALLET_LOCK_SQL, ["w1"]],
+        [MARK_VOUCHER_PAID_SQL, ["v1"]],
+        ["COMMIT", []],
+      ],
+      "SELECT status FROM vouchers WHERE id = 'v1'",
+      [],
+    )
+    expect(result.rows).toEqual([{ status: "PAID" }])
   })
 })

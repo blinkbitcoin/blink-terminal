@@ -196,12 +196,13 @@ describe("createVoucher liability ceiling", () => {
     expect(voucher.amount).toBe(400)
     const sql = queries()
     expect(sql[0]).toBe("BEGIN")
-    expect(sql[1]).toContain("pg_advisory_xact_lock")
-    expect(sql[2]).toContain("COALESCE(SUM(amount_sats)")
-    expect(sql[3]).toContain("INSERT INTO vouchers")
-    expect(sql[4]).toBe("COMMIT")
+    expect(sql[1]).toContain("lock_timeout") // bounded wait
+    expect(sql[2]).toContain("pg_advisory_xact_lock")
+    expect(sql[3]).toContain("COALESCE(SUM(amount_sats)")
+    expect(sql[4]).toContain("INSERT INTO vouchers")
+    expect(sql[5]).toBe("COMMIT")
     // The lock is taken on the wallet id
-    expect(mockClientQuery.mock.calls[1][1]).toEqual(["w1"])
+    expect(mockClientQuery.mock.calls[2][1]).toEqual(["w1"])
     expect(mockClientRelease).toHaveBeenCalled()
   })
 
@@ -222,13 +223,13 @@ describe("createVoucher liability ceiling", () => {
       usdAmount: 100,
       usdCentsPerSat: 0.05,
     })
-    const sumQuery = queries()[2]
+    const sumQuery = queries()[3]
     // Existing USD vouchers are re-rated conservatively: only the smaller
     // display cents are persisted, so the aggregate must use
     // max(stored cents, ceil(sats * current rate)) (PR #94 review).
     expect(sumQuery).toContain("GREATEST")
     expect(sumQuery).toContain("CEIL(amount_sats * $3::numeric)")
-    expect(mockClientQuery.mock.calls[2][1]).toEqual(["w1", expect.any(Number), 0.05])
+    expect(mockClientQuery.mock.calls[3][1]).toEqual(["w1", expect.any(Number), 0.05])
   })
 
   it("fails closed when a USD ceiling check has no rate", async () => {
@@ -270,7 +271,7 @@ describe("createVoucher liability ceiling", () => {
     // Expiry applies only to ACTIVE: a CLAIMED voucher past expires_at may
     // still settle and debit the wallet.
     await create(400, { maxLiabilityMinor: 1000 })
-    expect(queries()[2]).toContain(
+    expect(queries()[3]).toContain(
       "(status = 'CLAIMED' OR (status = 'ACTIVE' AND expires_at > $2))",
     )
 
@@ -281,7 +282,7 @@ describe("createVoucher liability ceiling", () => {
       usdAmount: 100,
       usdCentsPerSat: 0.05,
     })
-    expect(queries()[2]).toContain(
+    expect(queries()[3]).toContain(
       "(status = 'CLAIMED' OR (status = 'ACTIVE' AND expires_at > $2))",
     )
   })
@@ -302,6 +303,74 @@ describe("createVoucher liability ceiling", () => {
     await expect(create(400, { maxLiabilityMinor: 1000 })).resolves.toBeTruthy()
   })
 
+  describe("backing() runs under the wallet lock (BACKING INVARIANT)", () => {
+    it("is called after the lock and before the liability sum; its ceiling is used", async () => {
+      const order: string[] = []
+      mockPoolQuery.mockResolvedValue({ rows: [{ count: "0" }] })
+      mockClientQuery.mockImplementation(async (text: string) => {
+        order.push(text.split(/[(\n]/)[0].trim())
+        if (text.includes("SUM(")) return { rows: [{ total: "600" }] }
+        if (text.startsWith("INSERT")) return { rows: [row({ amount_sats: "400" })] }
+        return { rows: [] }
+      })
+      const backing = jest.fn(async () => {
+        order.push("backing()")
+        return { maxLiabilityMinor: 1000, liabilityMinor: 400 }
+      })
+      await store().createVoucher(400, "blink_key", "w1", { backing })
+
+      expect(order).toEqual([
+        "BEGIN",
+        "SET LOCAL lock_timeout = '15s'",
+        "SELECT pg_advisory_xact_lock",
+        "backing()",
+        "SELECT COALESCE",
+        "INSERT INTO vouchers",
+        "COMMIT",
+      ])
+      expect(backing).toHaveBeenCalledTimes(1)
+    })
+
+    it("the reviewer's interleaving: a settlement that lands before the locked read is seen", async () => {
+      // Wallet 1000 sats, one 600-sat CLAIMED voucher. A redemption settles
+      // (wallet -> 400, voucher -> PAID) while the create waits for the lock.
+      // Because the balance is read under the lock, backing() returns 400
+      // and the SUM (now 0) + 1000 is refused. The old code read 1000 before
+      // the lock and would have accepted 1000 against 400.
+      await expect(
+        create(
+          1000,
+          { backing: async () => ({ maxLiabilityMinor: 400, liabilityMinor: 1000 }) },
+          "0",
+        ),
+      ).rejects.toThrow("exceeds the wallet balance")
+      expect(queries().some((q) => q.startsWith("INSERT"))).toBe(false)
+      expect(queries()).toContain("ROLLBACK")
+    })
+
+    it("a throw inside backing() rolls back and inserts nothing", async () => {
+      await expect(
+        create(400, {
+          backing: async () => {
+            throw new Error("Blink balance timed out")
+          },
+        }),
+      ).rejects.toThrow("Blink balance timed out")
+      expect(queries().some((q) => q.startsWith("INSERT"))).toBe(false)
+      expect(queries()).toContain("ROLLBACK")
+      expect(mockClientRelease).toHaveBeenCalled()
+    })
+
+    it("backing() takes precedence over a pre-computed ceiling", async () => {
+      await expect(
+        create(400, {
+          maxLiabilityMinor: 10_000, // stale, pre-lock value: must be ignored
+          backing: async () => ({ maxLiabilityMinor: 900, liabilityMinor: 400 }),
+        }),
+      ).rejects.toThrow("exceeds the wallet balance") // 600 + 400 > 900
+    })
+  })
+
   it("without a ceiling, no transaction client is acquired", async () => {
     mockPoolQuery.mockImplementation(async (text: string) =>
       text.startsWith("INSERT")
@@ -315,17 +384,54 @@ describe("createVoucher liability ceiling", () => {
 })
 
 describe("markVoucherPaid", () => {
-  it("transitions only CLAIMED -> PAID", async () => {
-    mockPoolQuery.mockResolvedValue({ rows: [{ id: "v1" }], rowCount: 1 })
-    await expect(store().markVoucherPaid("v1")).resolves.toBe(true)
-    const [sql, params] = mockPoolQuery.mock.calls[0] as [string, unknown[]]
-    expect(sql).toContain("SET status = 'PAID'")
-    expect(sql).toContain("status = 'CLAIMED'")
-    expect(params).toEqual(["v1"])
+  const paid = (updateResult: { rows: unknown[]; rowCount: number }) => {
+    mockClientQuery.mockImplementation(async (text: string) => {
+      if (text.startsWith("SELECT wallet_id")) return { rows: [{ wallet_id: "w1" }] }
+      if (text.startsWith("UPDATE")) return updateResult
+      return { rows: [] }
+    })
+    return store().markVoucherPaid("v1")
+  }
+  const sql = () => mockClientQuery.mock.calls.map((c) => c[0] as string)
+
+  it("transitions only CLAIMED -> PAID, under the wallet lock", async () => {
+    await expect(paid({ rows: [{ id: "v1" }], rowCount: 1 })).resolves.toBe(true)
+    // BACKING INVARIANT: the post-debit liability removal must serialize
+    // with a creation's balance read + liability sum on the same wallet.
+    const q = sql()
+    expect(q[0]).toBe("BEGIN")
+    expect(q[1]).toContain("lock_timeout")
+    expect(q[2]).toContain("SELECT wallet_id")
+    expect(q[3]).toContain("pg_advisory_xact_lock")
+    expect(mockClientQuery.mock.calls[3][1]).toEqual(["w1"])
+    expect(q[4]).toContain("SET status = 'PAID'")
+    expect(q[4]).toContain("status = 'CLAIMED'")
+    expect(mockClientQuery.mock.calls[4][1]).toEqual(["v1"])
+    expect(q[5]).toBe("COMMIT")
+    expect(mockPoolQuery).not.toHaveBeenCalled()
+    expect(mockClientRelease).toHaveBeenCalled()
   })
 
   it("returns false when the voucher is not CLAIMED", async () => {
-    mockPoolQuery.mockResolvedValue({ rows: [], rowCount: 0 })
+    await expect(paid({ rows: [], rowCount: 0 })).resolves.toBe(false)
+  })
+
+  it("returns false (rolled back) when the voucher does not exist", async () => {
+    mockClientQuery.mockResolvedValue({ rows: [] })
+    await expect(store().markVoucherPaid("missing")).resolves.toBe(false)
+    expect(sql()).toContain("ROLLBACK")
+    expect(sql().some((q) => q.startsWith("UPDATE"))).toBe(false)
+  })
+
+  it("returns false and rolls back on a lock timeout", async () => {
+    mockClientQuery.mockImplementation(async (text: string) => {
+      if (text.startsWith("SELECT wallet_id")) return { rows: [{ wallet_id: "w1" }] }
+      if (text.includes("pg_advisory_xact_lock"))
+        throw new Error("canceling statement due to lock timeout")
+      return { rows: [] }
+    })
     await expect(store().markVoucherPaid("v1")).resolves.toBe(false)
+    expect(sql()).toContain("ROLLBACK")
+    expect(mockClientRelease).toHaveBeenCalled()
   })
 })

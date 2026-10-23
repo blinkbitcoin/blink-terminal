@@ -9,7 +9,7 @@ import {
   toEnvironment,
 } from "../../../lib/voucher-auth"
 import { isValidExpiryId, DEFAULT_EXPIRY_ID } from "../../../lib/voucher-expiry"
-import voucherStore from "../../../lib/voucher-store"
+import voucherStore, { type BackingInputs } from "../../../lib/voucher-store"
 
 /**
  * Tolerance for rate drift between the client's quote and the server-side
@@ -20,6 +20,39 @@ import voucherStore from "../../../lib/voucher-store"
  */
 const USD_PAIR_TOLERANCE = 0.02
 const USD_PAIR_QUANTIZATION_CENTS = 1
+
+/**
+ * The backing inputs are fetched from Blink while the per-wallet lock is held
+ * (see BACKING INVARIANT in voucher-store.ts), so the wait is bounded: a slow
+ * Blink call fails closed (503) instead of holding the wallet lock and a pool
+ * connection.
+ */
+const BACKING_FETCH_TIMEOUT_MS = 10_000
+
+/** A refusal decided inside the locked backing fetch; mapped to a response. */
+class BackingRefusal extends Error {
+  constructor(
+    readonly status: number,
+    readonly body: Record<string, unknown>,
+  ) {
+    super(String(body.error ?? "backing refused"))
+  }
+}
+
+const withTimeout = <T>(promise: Promise<T>, ms: number, label: string): Promise<T> =>
+  new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out`)), ms)
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (err) => {
+        clearTimeout(timer)
+        reject(err)
+      },
+    )
+  })
 
 /**
  * USD cents per sat at the server-side rate, fetched with the caller's own
@@ -164,18 +197,47 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     }
 
     // Backing check (blink-wip#1665): the wallet must fund this voucher on
-    // top of its existing ACTIVE liabilities. The own-balance fast-fail is
-    // here; the aggregate is enforced atomically per wallet inside the
-    // store's insert (maxLiabilityMinor/liabilityMinor).
-    let maxLiabilityMinor: number
-    let liabilityMinor: number
-    let centsPerSat: number | null = null
+    // top of its existing unsettled liabilities. The balance (and, for USD,
+    // the rate) is fetched INSIDE the store's per-wallet lock, right before
+    // the liability sum: read before the lock, a settlement (CLAIMED -> PAID)
+    // could debit the wallet and leave the aggregate between the balance
+    // read and the sum, and a stale balance would back a new voucher.
+    const usdCents = actualWalletCurrency === "USD" ? parseInt(String(usdAmount)) : 0
+    const backing = async (): Promise<BackingInputs> => {
+      const live = await withTimeout(
+        getOwnedWallets(apiKey, environment),
+        BACKING_FETCH_TIMEOUT_MS,
+        "Blink balance",
+      )
+      if (!live.ok) {
+        throw new BackingRefusal(
+          live.reason === "invalid" ? 403 : OWNERSHIP_UNAVAILABLE.status,
+          live.reason === "invalid"
+            ? { error: "API key is not valid for this wallet" }
+            : OWNERSHIP_UNAVAILABLE.body,
+        )
+      }
+      const wallet = live.wallets.get(walletId)
+      if (!wallet || wallet.walletCurrency !== actualWalletCurrency) {
+        throw new BackingRefusal(403, { error: "API key is not valid for this wallet" })
+      }
 
-    if (actualWalletCurrency === "USD") {
-      const usdCents = parseInt(String(usdAmount))
-      centsPerSat = await getUsdCentsPerSat(apiKey, environment)
+      if (actualWalletCurrency !== "USD") {
+        if (amountNum > wallet.balance) {
+          throw new BackingRefusal(400, {
+            error: "Amount is more than the wallet balance",
+          })
+        }
+        return { maxLiabilityMinor: wallet.balance, liabilityMinor: amountNum }
+      }
+
+      const centsPerSat = await withTimeout(
+        getUsdCentsPerSat(apiKey, environment),
+        BACKING_FETCH_TIMEOUT_MS,
+        "Blink rate",
+      )
       if (centsPerSat === null) {
-        return res.status(503).json({
+        throw new BackingRefusal(503, {
           error: "Could not verify the exchange rate right now, please retry",
         })
       }
@@ -186,24 +248,22 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       const impliedCents = amountNum * centsPerSat
       const toleranceCents = USD_PAIR_QUANTIZATION_CENTS + USD_PAIR_TOLERANCE * usdCents
       if (Math.abs(impliedCents - usdCents) > toleranceCents) {
-        return res.status(400).json({
+        throw new BackingRefusal(400, {
           error: "amount does not match usdAmount at the current exchange rate",
         })
       }
 
       // Conservative backing: the sats actually paid at redemption must be
       // fundable even at the tolerant edge of the pair check.
-      liabilityMinor = Math.max(usdCents, Math.ceil(impliedCents))
-      maxLiabilityMinor = ownedWallet.balance
-    } else {
-      liabilityMinor = amountNum
-      maxLiabilityMinor = ownedWallet.balance
-    }
-
-    if (liabilityMinor > maxLiabilityMinor) {
-      return res.status(400).json({
-        error: "Amount is more than the wallet balance",
-      })
+      const liabilityMinor = Math.max(usdCents, Math.ceil(impliedCents))
+      if (liabilityMinor > wallet.balance) {
+        throw new BackingRefusal(400, { error: "Amount is more than the wallet balance" })
+      }
+      return {
+        maxLiabilityMinor: wallet.balance,
+        liabilityMinor,
+        usdCentsPerSat: centsPerSat,
+      }
     }
 
     // Validate expiryId if provided
@@ -218,11 +278,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       displayCurrency: displayCurrency || undefined,
       environment: environment,
       walletCurrency: actualWalletCurrency,
-      usdAmount: actualWalletCurrency === "USD" ? parseInt(String(usdAmount)) : undefined,
-      maxLiabilityMinor,
-      liabilityMinor,
-      usdCentsPerSat:
-        actualWalletCurrency === "USD" ? (centsPerSat ?? undefined) : undefined,
+      usdAmount: actualWalletCurrency === "USD" ? usdCents : undefined,
+      backing,
     })
 
     console.log("✅ Voucher created successfully:", {
@@ -251,8 +308,16 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       },
     })
   } catch (error: unknown) {
+    if (error instanceof BackingRefusal) {
+      return res.status(error.status).json(error.body)
+    }
+
     const message = error instanceof Error ? error.message : "Unknown error"
     console.error("❌ Voucher creation error:", error)
+
+    if (message.endsWith("timed out")) {
+      return res.status(OWNERSHIP_UNAVAILABLE.status).json(OWNERSHIP_UNAVAILABLE.body)
+    }
 
     // Check for wallet limit / backing errors
     if (

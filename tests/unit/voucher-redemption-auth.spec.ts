@@ -533,14 +533,28 @@ describe("voucher create: live ownership + confirmed wallet currency", () => {
       body: { amount: 500, apiKey: OWNER_KEY, walletId: "wallet-1", ...body },
     })
 
+  // What the store's locked transaction received from the route's backing()
+  // callback (balance ceiling, liability, rate) — or null if it threw.
+  let lastBacking: Record<string, unknown> | null = null
+  let insertedCount = 0
+  const inserted = () => insertedCount
+
   beforeEach(() => {
-    mockStore.createVoucher.mockImplementation(async (amount, _key, walletId, opts) => ({
-      ...voucher({ amount, walletId }),
-      walletCurrency: opts.walletCurrency,
-      usdAmountCents: opts.usdAmount ?? null,
-      expiryId: "24h",
-      commissionPercent: 0,
-    }))
+    lastBacking = null
+    insertedCount = 0
+    // Behaves like the store: runs backing() under its (mocked) wallet lock,
+    // propagates a refusal thrown there, inserts otherwise.
+    mockStore.createVoucher.mockImplementation(async (amount, _key, walletId, opts) => {
+      lastBacking = await opts.backing()
+      insertedCount++
+      return {
+        ...voucher({ amount, walletId }),
+        walletCurrency: opts.walletCurrency,
+        usdAmountCents: opts.usdAmount ?? null,
+        expiryId: "24h",
+        commissionPercent: 0,
+      }
+    })
   })
 
   it("rejects a key that does not own the wallet", async () => {
@@ -563,7 +577,8 @@ describe("voucher create: live ownership + confirmed wallet currency", () => {
   it("re-checks with Blink on every create (no revocation window)", async () => {
     expect((await create()).statusCode).toBe(200)
     expect((await create()).statusCode).toBe(200)
-    expect(mockGetWalletInfo).toHaveBeenCalledTimes(2)
+    // Pre-check + the locked balance read, per create
+    expect(mockGetWalletInfo).toHaveBeenCalledTimes(4)
 
     delete blinkAccounts[OWNER_KEY] // key revoked mid-batch
     expect((await create()).statusCode).toBe(403)
@@ -622,12 +637,41 @@ describe("voucher create: live ownership + confirmed wallet currency", () => {
       const res = await create({ amount: 1001 }) // BTC wallet has 1000 sats
       expect(res.statusCode).toBe(400)
       expect(res.body).toEqual({ error: "Amount is more than the wallet balance" })
-      expect(mockStore.createVoucher).not.toHaveBeenCalled()
+      expect(inserted()).toBe(0)
     })
 
     it("accepts a voucher at exactly the wallet balance", async () => {
       expect((await create({ amount: 1000 })).statusCode).toBe(200)
-      expect(mockStore.createVoucher).toHaveBeenCalled()
+      expect(inserted()).toBe(1)
+      expect(lastBacking).toEqual({ maxLiabilityMinor: 1000, liabilityMinor: 1000 })
+    })
+
+    it("the ceiling is the balance read under the wallet lock, not the pre-check's", async () => {
+      // The reviewer's race: between the route's pre-check and the locked
+      // liability sum, a redemption settles (CLAIMED -> PAID) and debits the
+      // wallet 1000 -> 400. The ceiling handed to the locked check must be
+      // the post-debit 400, so a 1000-sat voucher is refused even though the
+      // settled voucher has already left the liability aggregate.
+      let reads = 0
+      mockGetWalletInfo.mockImplementation(async () => {
+        reads++
+        return [{ ...BTC_WALLET, balance: reads === 1 ? 1000 : 400 }]
+      })
+      const res = await create({ amount: 1000 })
+      expect(reads).toBe(2) // pre-check, then under the lock
+      expect(res.statusCode).toBe(400)
+      expect(res.body).toEqual({ error: "Amount is more than the wallet balance" })
+      expect(inserted()).toBe(0)
+    })
+
+    it("fails closed (503) when the locked balance read is unavailable", async () => {
+      let reads = 0
+      mockGetWalletInfo.mockImplementation(async () => {
+        if (++reads > 1) throw new Error("Blink API returned non-JSON response (502)")
+        return [BTC_WALLET, USD_WALLET]
+      })
+      expect((await create({ amount: 500 })).statusCode).toBe(503)
+      expect(inserted()).toBe(0)
     })
 
     it("rejects a USD voucher above the wallet balance (cents vs cents)", async () => {
@@ -641,7 +685,7 @@ describe("voucher create: live ownership + confirmed wallet currency", () => {
       })
       expect(res.statusCode).toBe(400)
       expect(res.body).toEqual({ error: "Amount is more than the wallet balance" })
-      expect(mockStore.createVoucher).not.toHaveBeenCalled()
+      expect(inserted()).toBe(0)
     })
 
     it("fails closed (503) when Blink omits the balance", async () => {
@@ -651,7 +695,7 @@ describe("voucher create: live ownership + confirmed wallet currency", () => {
         },
       })
       expect((await create()).statusCode).toBe(503)
-      expect(mockStore.createVoucher).not.toHaveBeenCalled()
+      expect(inserted()).toBe(0)
     })
   })
 
@@ -668,14 +712,14 @@ describe("voucher create: live ownership + confirmed wallet currency", () => {
       expect(res.body).toEqual({
         error: "amount does not match usdAmount at the current exchange rate",
       })
-      expect(mockStore.createVoucher).not.toHaveBeenCalled()
+      expect(inserted()).toBe(0)
     })
 
     it("rejects the inverse: sats far below the USD amount", async () => {
       // 500 cents = 10000 sats at the mocked rate; 100 sats is way off.
       const res = await usd({ amount: 100, usdAmount: 500 })
       expect(res.statusCode).toBe(400)
-      expect(mockStore.createVoucher).not.toHaveBeenCalled()
+      expect(inserted()).toBe(0)
     })
 
     it("accepts a pair within tolerance (±1 cent quantization + 2% drift)", async () => {
@@ -688,7 +732,7 @@ describe("voucher create: live ownership + confirmed wallet currency", () => {
     it("rejects a pair just outside the tolerance", async () => {
       // 2061 sats implies 103.05 cents — beyond the 3 cent allowance.
       expect((await usd({ amount: 2061, usdAmount: 100 })).statusCode).toBe(400)
-      expect(mockStore.createVoucher).not.toHaveBeenCalled()
+      expect(inserted()).toBe(0)
     })
 
     it("applies the tolerance in the negative direction too", async () => {
@@ -714,13 +758,13 @@ describe("voucher create: live ownership + confirmed wallet currency", () => {
       const res = await usd({ amount: 2039, usdAmount: 100 })
       expect(res.statusCode).toBe(400)
       expect(res.body).toEqual({ error: "Amount is more than the wallet balance" })
-      expect(mockStore.createVoucher).not.toHaveBeenCalled()
+      expect(inserted()).toBe(0)
     })
 
     it("fails closed (503) when the rate cannot be verified", async () => {
       mockGetExchangeRate.mockRejectedValueOnce(new Error("rate unavailable"))
       expect((await usd({ amount: 2000, usdAmount: 100 })).statusCode).toBe(503)
-      expect(mockStore.createVoucher).not.toHaveBeenCalled()
+      expect(inserted()).toBe(0)
     })
 
     it("fails closed (503) on a malformed rate payload", async () => {
@@ -761,13 +805,14 @@ describe("voucher create: live ownership + confirmed wallet currency", () => {
         2060,
         OWNER_KEY,
         "wallet-usd",
-        expect.objectContaining({
-          usdAmount: 100,
-          liabilityMinor: 103,
-          maxLiabilityMinor: 500,
-          usdCentsPerSat: 0.05,
-        }),
+        expect.objectContaining({ usdAmount: 100, backing: expect.any(Function) }),
       )
+      // ...delivered through the locked backing() callback
+      expect(lastBacking).toEqual({
+        liabilityMinor: 103,
+        maxLiabilityMinor: 500,
+        usdCentsPerSat: 0.05,
+      })
     })
 
     it("maps the store's aggregate-liability refusal to 400", async () => {
