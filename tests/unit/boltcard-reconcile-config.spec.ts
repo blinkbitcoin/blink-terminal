@@ -24,6 +24,7 @@ import {
   DEFAULT_INTERVAL_MS,
   DEFAULT_PASS_TIMEOUT_MS,
   DEFAULT_STALE_MINUTES,
+  MIN_INTERVAL_MS,
   getReconcileConfig,
 } from "../../lib/boltcard/reconcile-config"
 
@@ -91,6 +92,46 @@ describe("getReconcileConfig", () => {
         BOLTCARD_RECONCILE_PASS_TIMEOUT_MS: "20000",
       }),
     ).toMatchObject({ staleMinutes: 30, batch: 10, passTimeoutMs: 20_000 })
+  })
+
+  it("non-zero intervals below the minimum are raised; the timeout stays strictly below", () => {
+    for (const raw of ["1", "500", "999"]) {
+      mockWarn.mockClear()
+      const config = getReconcileConfig({
+        BOLTCARD_RECONCILE_INTERVAL_MS: raw,
+        BOLTCARD_RECONCILE_PASS_TIMEOUT_MS: "45000",
+      })
+      expect(config.intervalMs).toBe(MIN_INTERVAL_MS)
+      expect(config.passTimeoutMs).toBeLessThan(config.intervalMs)
+      expect(config.passTimeoutMs).toBeGreaterThan(0)
+      expect(mockWarn).toHaveBeenCalledWith(
+        expect.objectContaining({ intervalMs: Number(raw), minimum: MIN_INTERVAL_MS }),
+        expect.stringContaining("raised"),
+      )
+    }
+    // Exactly the minimum is accepted as is
+    mockWarn.mockClear()
+    const atMin = getReconcileConfig({ BOLTCARD_RECONCILE_INTERVAL_MS: "1000" })
+    expect(atMin.intervalMs).toBe(1000)
+    expect(atMin.passTimeoutMs).toBe(750)
+    expect(atMin.passTimeoutMs).toBeLessThan(atMin.intervalMs)
+    // 0 is still "disabled", not "below minimum"
+    mockWarn.mockClear()
+    expect(getReconcileConfig({ BOLTCARD_RECONCILE_INTERVAL_MS: "0" }).intervalMs).toBe(0)
+    expect(mockWarn).not.toHaveBeenCalled()
+  })
+
+  it("the invariant passTimeoutMs < intervalMs holds for every enabled interval", () => {
+    for (const interval of [1, 2, 999, 1000, 1001, 1333, 10_000, 60_000, 3_600_000]) {
+      for (const timeout of ["1", "750", "45000", "3600000"]) {
+        const config = getReconcileConfig({
+          BOLTCARD_RECONCILE_INTERVAL_MS: String(interval),
+          BOLTCARD_RECONCILE_PASS_TIMEOUT_MS: timeout,
+        })
+        expect(config.passTimeoutMs).toBeLessThan(config.intervalMs)
+        expect(config.passTimeoutMs).toBeGreaterThan(0)
+      }
+    }
   })
 
   it("clamps the pass timeout below the interval so ticks cannot queue", () => {
