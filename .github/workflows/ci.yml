@@ -35,6 +35,22 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      # Real-Postgres suites (tests/unit/pg, blink-wip#1616): concurrent
+      # transactions, advisory locks, lock_timeout and index use cannot be
+      # exercised against mocked pools or single-connection PGlite. Each
+      # suite creates and migrates its own database on this server.
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
 
     steps:
       - name: Checkout repository
@@ -58,7 +74,10 @@ jobs:
           # Opts the real-Redis concurrency suite in; it is skipped otherwise.
           NIP46_REDIS_TEST: '1'
           REDIS_HOST: localhost
-          REDIS_PORT: '6379' 
+          REDIS_PORT: '6379'
+          # Opts the real-Postgres suites in (admin URL; each suite creates
+          # its own database); they are skipped otherwise.
+          PG_TEST_URL: postgres://postgres:postgres@localhost:5432/postgres
 
       - name: Generate test summary
         if: always()

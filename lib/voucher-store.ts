@@ -109,6 +109,17 @@ export const CLAIM_VOUCHER_SQL = `UPDATE vouchers
      AND expires_at > $2
    RETURNING id`
 
+/**
+ * Owner-scoped listing. Shaped for idx_vouchers_env_wallet_created
+ * (migration 021); exported so the Postgres suite can EXPLAIN the exact
+ * statement. $1 = wallet ids (text[]), $2 = environment, $3 = limit.
+ */
+export const OWNER_LISTING_SQL = `SELECT * FROM vouchers
+   WHERE COALESCE(environment, 'production') = $2
+     AND wallet_id = ANY($1)
+   ORDER BY created_at DESC
+   LIMIT $3`
+
 export const MARK_VOUCHER_PAID_SQL = `UPDATE vouchers
    SET status = 'PAID'
    WHERE id = $1 AND status = 'CLAIMED'
@@ -746,14 +757,11 @@ class VoucherStore {
     try {
       await this.lazyCleanup()
 
-      const result: QueryResult<VoucherRow> = await query(
-        `SELECT * FROM vouchers
-         WHERE COALESCE(environment, 'production') = $2
-           AND wallet_id = ANY($1)
-         ORDER BY created_at DESC
-         LIMIT $3`,
-        [walletIds, environment, Math.min(Math.max(1, limit), OWNER_LIST_LIMIT)],
-      )
+      const result: QueryResult<VoucherRow> = await query(OWNER_LISTING_SQL, [
+        walletIds,
+        environment,
+        Math.min(Math.max(1, limit), OWNER_LIST_LIMIT),
+      ])
 
       return result.rows.map((row: VoucherRow) => {
         const voucher: Voucher = this._rowToVoucher(row, null, false) as Voucher
