@@ -641,9 +641,15 @@ describe("review states (pending withdrawals, top-up flags)", () => {
     await store().getPendingWithdrawals("c1")
     const [sql, params] = mockPoolQuery.mock.calls[0]
     expect(String(sql)).toMatch(/WHERE resolved_at IS NULL/)
-    expect(params).toEqual(["c1"])
+    expect(params).toEqual(["c1", null]) // no cap
     await store().getPendingWithdrawals()
-    expect(mockPoolQuery.mock.calls[1][1]).toEqual([null])
+    expect(mockPoolQuery.mock.calls[1][1]).toEqual([null, null])
+    // An optional cap bounds one reconciliation pass (oldest first)
+    await store().getPendingWithdrawals(undefined, 50)
+    expect(String(mockPoolQuery.mock.calls[2][0])).toMatch(
+      /ORDER BY created_at ASC\s+LIMIT/,
+    )
+    expect(mockPoolQuery.mock.calls[2][1]).toEqual([null, 50])
   })
 
   it("resolvePendingWithdrawal is one-shot", async () => {

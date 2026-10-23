@@ -40,6 +40,10 @@ jest.mock("../../lib/logger", () => ({
 }))
 
 import {
+  DEFAULT_BATCH,
+  DEFAULT_PASS_TIMEOUT_MS,
+} from "../../lib/boltcard/reconcile-config"
+import {
   DEFAULT_INTERVAL_MS,
   RECONCILE_LOCK_KEY,
   reconcileTick,
@@ -61,6 +65,8 @@ beforeEach(() => {
   for (const k of Object.keys(logs)) logs[k] = []
   delete process.env.BOLTCARD_RECONCILE_INTERVAL_MS
   delete process.env.BOLTCARD_WITHDRAWAL_STALE_MINUTES
+  delete process.env.BOLTCARD_RECONCILE_PASS_TIMEOUT_MS
+  delete process.env.BOLTCARD_RECONCILE_BATCH
   lockAnswer(true)
 })
 afterEach(() => {
@@ -73,12 +79,23 @@ describe("reconcileTick", () => {
     mockReconcile.mockResolvedValue({ checked: 3, resolved: 1, restored: 1 })
     const summary = await reconcileTick()
 
-    expect(summary).toMatchObject({ checked: 3, resolved: 1, restored: 1, stale: 0 })
+    expect(summary).toMatchObject({
+      checked: 3,
+      resolved: 1,
+      restored: 1,
+      skipped: 0,
+      timedOut: false,
+      stale: 0,
+    })
     const sql = mockClientQuery.mock.calls.map((c) => String(c[0]))
     expect(sql[0]).toContain("pg_try_advisory_lock")
     expect(mockClientQuery.mock.calls[0][1]).toEqual([RECONCILE_LOCK_KEY])
     expect(sql[sql.length - 1]).toContain("pg_advisory_unlock")
-    expect(mockReconcile).toHaveBeenCalledWith() // all cards
+    // All cards, bounded: a batch cap and the pass deadline's abort signal
+    expect(mockReconcile).toHaveBeenCalledWith(undefined, {
+      signal: expect.any(AbortSignal),
+      limit: DEFAULT_BATCH,
+    })
     expect(mockRelease).toHaveBeenCalledTimes(1)
   })
 
@@ -126,6 +143,65 @@ describe("reconcileTick", () => {
     const sql = mockClientQuery.mock.calls.map((c) => String(c[0]))
     expect(sql[sql.length - 1]).toContain("pg_advisory_unlock")
     expect(mockRelease).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe("pass deadline (a slow or non-terminating Blink must not wedge the scheduler)", () => {
+  it("a reconciliation that never settles ends at the deadline: signal aborted, lock and client released", async () => {
+    let seenSignal: AbortSignal | undefined
+    mockReconcile.mockImplementation(
+      (_cardId: unknown, opts: { signal: AbortSignal }) =>
+        new Promise(() => {
+          seenSignal = opts.signal // never settles (hung upstream)
+        }),
+    )
+    const pending = reconcileTick()
+    await jest.advanceTimersByTimeAsync(DEFAULT_PASS_TIMEOUT_MS)
+    const summary = await pending
+
+    expect(seenSignal?.aborted).toBe(true) // the in-flight fetch is cancelled
+    expect(summary).toMatchObject({ timedOut: true, checked: 0 })
+    const sql = mockClientQuery.mock.calls.map((c) => String(c[0]))
+    expect(sql[sql.length - 1]).toContain("pg_advisory_unlock")
+    expect(mockRelease).toHaveBeenCalledTimes(1)
+    expect(logs.warn.some((l) => String(l[1]).includes("hit its deadline"))).toBe(true)
+  })
+
+  it("after a timed-out pass the next tick still runs", async () => {
+    mockReconcile
+      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockResolvedValue({ checked: 1, resolved: 1, restored: 0 })
+    startBoltcardReconcileScheduler()
+    await jest.advanceTimersByTimeAsync(5_000) // first pass starts, hangs
+    await jest.advanceTimersByTimeAsync(DEFAULT_PASS_TIMEOUT_MS) // deadline
+    expect(mockReconcile).toHaveBeenCalledTimes(1)
+    expect(mockRelease).toHaveBeenCalledTimes(1)
+    await jest.advanceTimersByTimeAsync(DEFAULT_INTERVAL_MS) // re-armed
+    expect(mockReconcile).toHaveBeenCalledTimes(2)
+    expect(mockRelease).toHaveBeenCalledTimes(2)
+  })
+
+  it("a backlog larger than the pass allows is reported as skipped, not stuck", async () => {
+    mockReconcile.mockResolvedValue({
+      checked: 100,
+      resolved: 10,
+      restored: 0,
+      aborted: true,
+      skipped: 250,
+    })
+    const summary = await reconcileTick()
+    expect(summary).toMatchObject({ checked: 100, skipped: 250 })
+  })
+
+  it("pass timeout and batch come from the env, timeout clamped below the interval", async () => {
+    process.env.BOLTCARD_RECONCILE_PASS_TIMEOUT_MS = "90000" // > 60 s interval
+    process.env.BOLTCARD_RECONCILE_BATCH = "7"
+    mockReconcile.mockImplementation(() => new Promise(() => {}))
+    const pending = reconcileTick()
+    await jest.advanceTimersByTimeAsync(45_000) // clamped to 75% of the interval
+    const summary = await pending
+    expect(summary).toMatchObject({ timedOut: true })
+    expect(mockReconcile.mock.calls[0][1]).toMatchObject({ limit: 7 })
   })
 })
 

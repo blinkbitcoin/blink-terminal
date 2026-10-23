@@ -13,13 +13,23 @@
  *    Non-blocking: if another replica holds it, skip this tick. The chart
  *    runs one replica today; this keeps a scale-out from running N
  *    reconciliations (and N x the Blink calls) against the same rows.
- * 2. reconcilePendingWithdrawals() over every card.
+ * 2. reconcilePendingWithdrawals() over every card, bounded end to end:
+ *    at most BOLTCARD_RECONCILE_BATCH rows (oldest first), under a pass
+ *    deadline (BOLTCARD_RECONCILE_PASS_TIMEOUT_MS, default 45s, always below
+ *    the interval). The deadline aborts the in-flight Blink lookup via
+ *    AbortSignal and the pass stops before its next row, so a slow or
+ *    non-terminating upstream cannot hold the lock, the pool client, or the
+ *    next tick. Rows not reached are examined on a later pass.
  * 3. Log unresolved rows older than BOLTCARD_WITHDRAWAL_STALE_MINUTES
  *    (default 15) with their payment hashes — the ops signal for a payment
  *    Blink still has not reported either way.
  * 4. Release the lock, re-arm the timer. Completion-based (setTimeout after
  *    the tick settles), not setInterval, so a slow Blink stretches the gap
  *    instead of stacking ticks. Errors are logged; the loop keeps running.
+ *
+ * Deadlines, outermost first: interval (60s) > pass timeout (45s) > each
+ * Blink fetch (aborted by the pass signal). Settings come from
+ * lib/boltcard/reconcile-config.ts.
  *
  * Runs regardless of BOLTCARD_SPEND_ENABLED: the rows to settle may predate
  * the flag. Started from instrumentation.node.ts; stopped via lib/shutdown.
@@ -31,12 +41,12 @@ import { getClient } from "../db"
 import { baseLogger } from "../logger"
 
 import * as lnurlw from "./lnurlw"
+import { getReconcileConfig } from "./reconcile-config"
 import boltcardStore from "./store"
 
 const logger = baseLogger.child({ module: "boltcard-reconcile" })
 
-export const DEFAULT_INTERVAL_MS = 60_000
-export const DEFAULT_STALE_MINUTES = 15
+export { DEFAULT_INTERVAL_MS, DEFAULT_STALE_MINUTES } from "./reconcile-config"
 /** hashtext('boltcard-reconcile') would do; a literal keeps it greppable. */
 export const RECONCILE_LOCK_KEY = 7_201_619
 
@@ -46,17 +56,38 @@ const globalState = globalThis as typeof globalThis & {
   __boltcardReconcileStarted?: boolean
 }
 
-function intervalMs(): number {
-  const raw = process.env.BOLTCARD_RECONCILE_INTERVAL_MS
-  if (raw === undefined || raw === "") return DEFAULT_INTERVAL_MS
-  const n = Number(raw)
-  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_INTERVAL_MS
+/**
+ * Run `work` under one deadline. The signal is aborted when the deadline
+ * passes (cancelling the in-flight Blink fetch) and the returned promise
+ * rejects with PassTimeoutError, so a hung await can never outlive it.
+ */
+class PassTimeoutError extends Error {
+  constructor(ms: number) {
+    super(`reconciliation pass exceeded ${ms} ms`)
+    this.name = "PassTimeoutError"
+  }
 }
-
-function staleMinutes(): number {
-  const n = Number(process.env.BOLTCARD_WITHDRAWAL_STALE_MINUTES)
-  return Number.isFinite(n) && n > 0 ? n : DEFAULT_STALE_MINUTES
-}
+const withDeadline = <T>(
+  work: (signal: AbortSignal) => Promise<T>,
+  ms: number,
+): Promise<T> =>
+  new Promise<T>((resolve, reject) => {
+    const controller = new AbortController()
+    const timer = setTimeout(() => {
+      controller.abort()
+      reject(new PassTimeoutError(ms))
+    }, ms)
+    work(controller.signal).then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (err) => {
+        clearTimeout(timer)
+        reject(err)
+      },
+    )
+  })
 
 /**
  * One reconciliation pass under the advisory lock. Exported for tests and
@@ -67,10 +98,13 @@ export async function reconcileTick(): Promise<{
   checked: number
   resolved: number
   restored: number
+  skipped: number
+  timedOut: boolean
   stale: number
   durationMs: number
 } | null> {
   const started = Date.now()
+  const config = getReconcileConfig()
   let client: PoolClient | null = null
   try {
     client = await getClient()
@@ -83,13 +117,35 @@ export async function reconcileTick(): Promise<{
       return null
     }
 
-    const result = await lnurlw.reconcilePendingWithdrawals()
+    let result: Awaited<ReturnType<typeof lnurlw.reconcilePendingWithdrawals>> = {
+      checked: 0,
+      resolved: 0,
+      restored: 0,
+    }
+    let timedOut = false
+    try {
+      result = await withDeadline(
+        (signal) =>
+          lnurlw.reconcilePendingWithdrawals(undefined, { signal, limit: config.batch }),
+        config.passTimeoutMs,
+      )
+    } catch (err: unknown) {
+      if (!(err instanceof PassTimeoutError)) throw err
+      // The signal has aborted the in-flight lookup; whatever the pass did
+      // before the deadline is committed row by row. Nothing is lost: the
+      // rows not reached are examined on the next tick.
+      timedOut = true
+      logger.warn(
+        { passTimeoutMs: config.passTimeoutMs, batch: config.batch },
+        "Reconciliation pass hit its deadline; remaining rows deferred to the next tick",
+      )
+    }
 
-    const stale = await boltcardStore.getStaleWithdrawals(staleMinutes() * 60_000)
+    const stale = await boltcardStore.getStaleWithdrawals(config.staleMinutes * 60_000)
     if (stale.length > 0) {
       logger.warn(
         {
-          staleMinutes: staleMinutes(),
+          staleMinutes: config.staleMinutes,
           withdrawals: stale.map((w) => ({
             paymentHash: w.paymentHash,
             cardId: w.cardId,
@@ -99,16 +155,20 @@ export async function reconcileTick(): Promise<{
             ageMinutes: Math.floor(w.ageMs / 60_000),
           })),
         },
-        `${stale.length} Bolt Card withdrawal(s) unresolved for more than ${staleMinutes()} min`,
+        `${stale.length} Bolt Card withdrawal(s) unresolved for more than ${config.staleMinutes} min`,
       )
     }
 
     const summary = {
-      ...result,
+      checked: result.checked,
+      resolved: result.resolved,
+      restored: result.restored,
+      skipped: result.skipped ?? 0,
+      timedOut,
       stale: stale.length,
       durationMs: Date.now() - started,
     }
-    if (result.checked > 0 || stale.length > 0) {
+    if (result.checked > 0 || stale.length > 0 || timedOut) {
       logger.info(summary, "Bolt Card withdrawal reconciliation tick")
     }
     return summary
@@ -130,7 +190,7 @@ function arm(delayMs: number): void {
     } catch (err: unknown) {
       logger.error({ err }, "Bolt Card withdrawal reconciliation tick failed")
     }
-    if (globalState.__boltcardReconcileStarted) arm(intervalMs())
+    if (globalState.__boltcardReconcileStarted) arm(getReconcileConfig().intervalMs)
   }, delayMs)
   timer.unref?.()
   globalState.__boltcardReconcileTimer = timer
@@ -142,20 +202,17 @@ function arm(delayMs: number): void {
  */
 export function startBoltcardReconcileScheduler(): void {
   if (globalState.__boltcardReconcileStarted) return
-  const interval = intervalMs()
-  if (interval === 0) {
+  const config = getReconcileConfig()
+  if (config.intervalMs === 0) {
     logger.info(
       "BOLTCARD_RECONCILE_INTERVAL_MS=0 — withdrawal reconciliation scheduler disabled",
     )
     return
   }
   globalState.__boltcardReconcileStarted = true
-  logger.info(
-    { intervalMs: interval, staleMinutes: staleMinutes() },
-    "Bolt Card withdrawal reconciliation scheduler started",
-  )
+  logger.info(config, "Bolt Card withdrawal reconciliation scheduler started")
   // First pass shortly after boot (let the pool come up), then every interval.
-  arm(Math.min(interval, 5_000))
+  arm(Math.min(config.intervalMs, 5_000))
 }
 
 export function stopBoltcardReconcileScheduler(): void {

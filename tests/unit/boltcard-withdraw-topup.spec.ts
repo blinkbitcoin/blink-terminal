@@ -898,6 +898,55 @@ describe("reconcilePendingWithdrawals", () => {
     ])
   })
 
+  // blink-wip#1619 review: a pass run by the scheduler is bounded — the
+  // abort signal reaches the Blink lookup, the loop stops before the next row
+  // when aborted, and `limit` caps the rows one pass takes.
+  it("forwards the abort signal to the Blink lookup and caps the batch", async () => {
+    blinkStatus([{ status: "SUCCESS", direction: "SEND", settlementAmount: 1000 }])
+    const controller = new AbortController()
+    await reconcilePendingWithdrawals(undefined, { signal: controller.signal, limit: 25 })
+    expect(mockStore.getPendingWithdrawals).toHaveBeenCalledWith(undefined, 25)
+    const init = (global.fetch as jest.Mock).mock.calls[0][1] as RequestInit
+    expect(init.signal).toBe(controller.signal)
+  })
+
+  it("stops before the next row once aborted; rows not reached are reported as skipped", async () => {
+    const rows = ["h1", "h2", "h3"].map((paymentHash) => ({
+      paymentHash,
+      cardId: CARD_ID,
+      amount: 1000,
+      createdAt: 1,
+      kind: "PENDING",
+      attempt: 1,
+    }))
+    mockStore.getPendingWithdrawals = jest.fn().mockResolvedValue(rows)
+    const controller = new AbortController()
+    // The first lookup "hangs" until the deadline aborts it
+    global.fetch = jest.fn().mockImplementation(
+      (_url: string, init: RequestInit) =>
+        new Promise((_resolve, reject) => {
+          init.signal?.addEventListener("abort", () =>
+            reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+          )
+          controller.abort()
+        }),
+    ) as unknown as typeof fetch
+
+    const res = await reconcilePendingWithdrawals(undefined, {
+      signal: controller.signal,
+    })
+    expect(res).toEqual({
+      checked: 1,
+      resolved: 0,
+      restored: 0,
+      aborted: true,
+      skipped: 2,
+    })
+    expect(global.fetch).toHaveBeenCalledTimes(1) // h2, h3 never looked up
+    expect(mockStore.resolvePendingWithdrawal).not.toHaveBeenCalled()
+    expect(mockStore.resolvePendingWithdrawalFailed).not.toHaveBeenCalled()
+  })
+
   it("SEND/SUCCESS -> resolved SUCCESS, deduction untouched", async () => {
     blinkStatus([{ status: "SUCCESS", direction: "SEND", settlementAmount: 1000 }])
     const res = await reconcilePendingWithdrawals(CARD_ID)

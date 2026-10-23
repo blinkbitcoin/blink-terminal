@@ -2004,7 +2004,10 @@ class BoltcardStore {
    * Unresolved pending withdrawals (optionally for one card): in-flight or
    * unknown-outcome payments awaiting reconciliation.
    */
-  async getPendingWithdrawals(cardId?: string): Promise<
+  async getPendingWithdrawals(
+    cardId?: string,
+    limit?: number,
+  ): Promise<
     Array<{
       paymentHash: string
       cardId: string
@@ -2014,12 +2017,15 @@ class BoltcardStore {
       attempt: number
     }>
   > {
+    // Oldest first; an optional cap bounds one reconciliation pass over a
+    // backlog (blink-wip#1619 review). NULL = no cap.
     const result: QueryResult<DbRow> = await query(
       `SELECT payment_hash, card_id, amount, created_at, kind, attempt
        FROM boltcard_pending_withdrawals
        WHERE resolved_at IS NULL AND ($1::text IS NULL OR card_id = $1)
-       ORDER BY created_at ASC`,
-      [cardId ?? null],
+       ORDER BY created_at ASC
+       LIMIT COALESCE($2::int, 2147483647)`,
+      [cardId ?? null, limit ?? null],
     )
     return result.rows.map((row: DbRow) => ({
       paymentHash: row.payment_hash as string,

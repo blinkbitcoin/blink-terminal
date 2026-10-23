@@ -726,22 +726,41 @@ function parseInvoiceAmount(invoice: string): InvoiceAmount | null {
  * that still sees CLAIMED and a stamp older than the grace. A row handed to
  * pay (UNKNOWN) is not restored. An in-flight SEND stays for the next pass.
  *
- * Triggered from the balance check (the owner's tap) and available for ops.
- * A global scheduler is blink-wip#1619.
+ * Triggered from the balance check (the owner's tap) and, for every card,
+ * by lib/boltcard/reconcile-scheduler.ts (blink-wip#1619), which runs it
+ * under a deadline: `signal` aborts the in-flight Blink lookup and stops the
+ * pass before the next row (reported as aborted/skipped), `limit` caps the
+ * rows one pass takes from the backlog (oldest first). Rows not reached are
+ * simply examined on a later pass.
  */
 /** A CLAIMED row younger than this is a payment attempt still in flight. */
 const CLAIMED_UNSEEN_GRACE_MS = 2 * 60 * 1000
 
-async function reconcilePendingWithdrawals(cardId?: string): Promise<{
+interface ReconcileOptions {
+  signal?: AbortSignal
+  limit?: number
+}
+
+async function reconcilePendingWithdrawals(
+  cardId?: string,
+  options: ReconcileOptions = {},
+): Promise<{
   checked: number
   resolved: number
   restored: number
+  /** Present only when the pass was cut short by `signal`. */
+  aborted?: true
+  skipped?: number
 }> {
-  const pending = await boltcardStore.getPendingWithdrawals(cardId)
+  const { signal, limit } = options
+  const pending = await boltcardStore.getPendingWithdrawals(cardId, limit)
   let resolved = 0
   let restored = 0
+  let examined = 0
 
   for (const item of pending) {
+    if (signal?.aborted) break
+    examined++
     try {
       const card = (await boltcardStore.getCard(item.cardId, true)) as BoltcardCard | null
       if (!card || card.status === CardStatus.WIPED) {
@@ -767,6 +786,7 @@ async function reconcilePendingWithdrawals(cardId?: string): Promise<{
         getApiUrlForEnvironment(card.environment as EnvironmentName),
         card.walletId,
         "SEND",
+        signal,
       )
 
       if (status === "PAID") {
@@ -824,7 +844,13 @@ async function reconcilePendingWithdrawals(cardId?: string): Promise<{
     }
   }
 
-  return { checked: pending.length, resolved, restored }
+  const skipped = pending.length - examined
+  return {
+    checked: examined,
+    resolved,
+    restored,
+    ...(signal?.aborted ? { aborted: true as const, skipped } : {}),
+  }
 }
 
 // ============================================================================
