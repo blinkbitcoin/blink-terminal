@@ -1,5 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
+import { requireTrustedMutation } from "../../../lib/auth/mutation-guard"
 import * as boltcard from "../../../lib/boltcard"
 import { requireSessionPubkey } from "../../../lib/boltcard/owner-auth"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
@@ -36,6 +37,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     // Owner session required
     const userPubkey = requireSessionPubkey(req, res)
     if (!userPubkey) return
+    // Cookie-authenticated mutation (returns card secrets): CSRF boundary
+    if (!requireTrustedMutation(req, res)) return
     const { uid, version = 1 } = req.body as { uid?: string; version?: number }
 
     // Validate UID format

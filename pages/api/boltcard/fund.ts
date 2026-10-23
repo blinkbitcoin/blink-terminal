@@ -1,5 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
+import { requireTrustedMutation } from "../../../lib/auth/mutation-guard"
 import BlinkAPI from "../../../lib/blink-api"
 import * as boltcard from "../../../lib/boltcard"
 import { requireOwnedCard } from "../../../lib/boltcard/owner-auth"
@@ -56,6 +57,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     // Owner only (card loaded with its API key for the Blink balance check)
     const owned = await requireOwnedCard(req, res, cardId, { includeKeys: true })
     if (!owned) return
+    // Cookie-authenticated mutation: same CSRF boundary as the network routes
+    if (!requireTrustedMutation(req, res)) return
     const { card } = owned
 
     // Check card status

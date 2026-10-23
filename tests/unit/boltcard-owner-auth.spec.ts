@@ -115,6 +115,18 @@ const card = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 })
 
+/**
+ * The exact headers the browser client sends on mutations (useBoltcards.ts,
+ * BoltcardDetails.tsx, BoltcardRecovery.tsx): JSON content type plus the
+ * same-origin Origin the browser attaches. Passed explicitly per test — the
+ * call() helper must not inject them, or client/guard drift goes unnoticed
+ * (PR #92: a bodyless DELETE without Content-Type shipped that way).
+ */
+const CLIENT_MUTATION_HEADERS = {
+  "content-type": "application/json",
+  "origin": "https://terminal.example",
+}
+
 const call = async (
   handler: Handler,
   {
@@ -283,6 +295,7 @@ describe("fund: owner only", () => {
     call(fundHandler as Handler, {
       token,
       method: "POST",
+      headers: CLIENT_MUTATION_HEADERS,
       body: { cardId: card().id, mode: "set", newBalance: 1_000_000_000 },
     })
 
@@ -301,6 +314,7 @@ describe("fund: owner only", () => {
     const res = await call(fundHandler as Handler, {
       token: "token-owner",
       method: "POST",
+      headers: CLIENT_MUTATION_HEADERS,
       body: { cardId: card().id, amount: 100 },
     })
     expect(res.statusCode).toBe(400)
@@ -316,6 +330,7 @@ describe("fund: owner only", () => {
     const res = await call(fundHandler as Handler, {
       token: "token-owner",
       method: "POST",
+      headers: CLIENT_MUTATION_HEADERS,
       body: { cardId: card().id, amount: 100 },
     })
     expect(res.statusCode).toBe(200)
@@ -328,6 +343,7 @@ describe("register: session owner + live wallet ownership", () => {
     call(registerHandler as Handler, {
       token,
       method: "POST",
+      headers: CLIENT_MUTATION_HEADERS,
       body: {
         walletId: "wallet-btc",
         apiKey: "blink_owner_key",
@@ -614,5 +630,124 @@ describe("reset: tap-verified, then a short confirm window", () => {
       cardId,
       10 * 60 * 1000,
     )
+  })
+})
+
+/**
+ * Cookie-authenticated Bolt Card mutations carry ambient session authority,
+ * so they get the same CSRF boundary as the network routes (PR #92's
+ * lib/auth/mutation-guard.ts): JSON content type + same-origin Origin. The
+ * guard runs after session/ownership, so 401/404 answers are unchanged.
+ */
+describe("mutation guard on cookie-authenticated Bolt Card routes", () => {
+  const cardId = card().id
+  const mutations: Array<
+    [string, Handler, string, Record<string, unknown>, Record<string, unknown>, string[]]
+  > = [
+    [
+      "cards PUT",
+      cardHandler as Handler,
+      "PUT",
+      { cardId },
+      { name: "x" },
+      ["updateCard"],
+    ],
+    ["cards DELETE", cardHandler as Handler, "DELETE", { cardId }, {}, ["wipeCard"]],
+    [
+      "cards POST adjust",
+      cardHandler as Handler,
+      "POST",
+      { cardId },
+      { action: "adjust", amount: "1000" },
+      ["updateCardBalance"],
+    ],
+    [
+      "fund",
+      fundHandler as Handler,
+      "POST",
+      {},
+      { cardId, amount: 100 },
+      ["updateCardBalance"],
+    ],
+    [
+      "register",
+      registerHandler as Handler,
+      "POST",
+      {},
+      { walletId: "wallet-btc", apiKey: "blink_owner_key", walletCurrency: "BTC" },
+      ["createPendingRegistration"],
+    ],
+    [
+      "recover-keys",
+      recoverKeysHandler as Handler,
+      "POST",
+      {},
+      { uid: "04a39493cc8680" },
+      ["getIssuerKey"],
+    ],
+  ]
+
+  beforeEach(() => {
+    mockGetWalletInfo.mockResolvedValue([
+      { id: "wallet-btc", walletCurrency: "BTC", balance: 100000 },
+    ])
+  })
+
+  describe.each(mutations)("%s", (_name, handler, method, query, body, untouched) => {
+    const run = (headers: Record<string, string>) =>
+      call(handler, { token: "token-owner", method, query, body, headers })
+
+    it("form post -> 415", async () => {
+      const res = await run({
+        "content-type": "application/x-www-form-urlencoded",
+        "origin": "https://terminal.example",
+      })
+      expect(res.statusCode).toBe(415)
+      for (const fn of untouched) expect(mockStore[fn]).not.toHaveBeenCalled()
+    })
+
+    it("cross-origin JSON -> 403", async () => {
+      const res = await run({
+        "content-type": "application/json",
+        "origin": "https://evil.example",
+      })
+      expect(res.statusCode).toBe(403)
+      expect(res.body).toEqual({ success: false, error: "Untrusted request origin" })
+      for (const fn of untouched) expect(mockStore[fn]).not.toHaveBeenCalled()
+    })
+
+    it("missing Origin -> 403", async () => {
+      const res = await run({ "content-type": "application/json" })
+      expect(res.statusCode).toBe(403)
+      for (const fn of untouched) expect(mockStore[fn]).not.toHaveBeenCalled()
+    })
+
+    it("no session is still 401, before the guard", async () => {
+      const res = await call(handler, { method, query, body, headers: {} })
+      expect(res.statusCode).toBe(401)
+    })
+  })
+
+  it("the browser client's bodyless DELETE (JSON content type, no body) passes the guard", async () => {
+    // useBoltcards.ts deleteCard sends exactly this shape
+    mockStore.wipeCard = jest.fn().mockResolvedValue(true)
+    const res = await call(cardHandler as Handler, {
+      token: "token-owner",
+      method: "DELETE",
+      query: { cardId },
+      body: undefined,
+      headers: CLIENT_MUTATION_HEADERS,
+    })
+    expect(res.statusCode).not.toBe(415)
+    expect(res.statusCode).not.toBe(403)
+  })
+
+  it("GET card details needs no mutation headers", async () => {
+    mockStore.getCardTransactions = jest.fn().mockResolvedValue([])
+    const res = await call(cardHandler as Handler, {
+      token: "token-owner",
+      query: { cardId },
+    })
+    expect(res.statusCode).toBe(200)
   })
 })

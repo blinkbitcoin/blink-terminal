@@ -1,5 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
+import { requireTrustedMutation } from "../../../../lib/auth/mutation-guard"
 import * as boltcard from "../../../../lib/boltcard"
 import { requireOwnedCard } from "../../../../lib/boltcard/owner-auth"
 import { withRateLimit, RATE_LIMIT_READ } from "../../../../lib/rate-limit"
@@ -39,6 +40,10 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     console.error("❌ Card ownership check error:", error)
     return res.status(500).json({ error: "Failed to load card" })
   }
+
+  // Cookie-authenticated mutations need the same CSRF boundary as the
+  // network routes (PR #92): JSON content type + same-origin Origin.
+  if (req.method !== "GET" && !requireTrustedMutation(req, res)) return
 
   switch (req.method) {
     case "GET":
