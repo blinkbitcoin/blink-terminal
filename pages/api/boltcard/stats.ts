@@ -2,6 +2,7 @@ import type { NextApiRequest, NextApiResponse } from "next"
 
 import * as boltcard from "../../../lib/boltcard"
 import { requireSessionPubkey } from "../../../lib/boltcard/owner-auth"
+import { getReconcileConfig } from "../../../lib/boltcard/reconcile-config"
 import { withRateLimit, RATE_LIMIT_READ } from "../../../lib/rate-limit"
 
 /**
@@ -42,6 +43,19 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     const needingReview = (await boltcard.store.getTopUpsNeedingReview()).filter(
       (topUp) => cardIds.has(topUp.cardId),
     )
+    // Card payments still in flight (deduction kept, Blink outcome not yet
+    // final) and the ones unresolved past the ops threshold (blink-wip#1619)
+    const ownerCardIds = [...cardIds]
+    const [inFlight, stale] =
+      ownerCardIds.length > 0
+        ? await Promise.all([
+            boltcard.store.getStaleWithdrawals(0, ownerCardIds),
+            boltcard.store.getStaleWithdrawals(
+              getReconcileConfig().staleMinutes * 60_000,
+              ownerCardIds,
+            ),
+          ])
+        : [[], []]
 
     res.status(200).json({
       success: true,
@@ -58,6 +72,14 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
         pendingRegistrations: pendingRegistrations.length,
         pendingTopUps: pendingTopUps.length,
         topUpsNeedingReview: needingReview.length,
+        withdrawalsInFlight: inFlight.length,
+        withdrawalsStale: stale.map((w) => ({
+          paymentHash: w.paymentHash,
+          cardId: w.cardId,
+          amount: w.amount,
+          kind: w.kind,
+          ageMinutes: Math.floor(w.ageMs / 60_000),
+        })),
       },
       timestamp: Date.now(),
     })

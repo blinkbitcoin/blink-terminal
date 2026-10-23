@@ -738,6 +738,7 @@ async function fetchInvoiceReceipt(
   apiUrl: string,
   walletId: string,
   direction: "RECEIVE" | "SEND" = "RECEIVE",
+  signal?: AbortSignal,
 ): Promise<InvoiceReceipt> {
   const query = `
     query GetTransactionsByPaymentHash($paymentHash: PaymentHash!, $walletId: WalletId!) {
@@ -768,6 +769,10 @@ async function fetchInvoiceReceipt(
         query,
         variables: { paymentHash, walletId },
       }),
+      // Callers running under a deadline (the reconcile scheduler) abort a
+      // slow lookup instead of waiting on it; an abort is reported as ERROR
+      // ("try again next pass"), never as a payment outcome.
+      ...(signal ? { signal } : {}),
     })
 
     if (!response.ok) {
@@ -845,9 +850,11 @@ async function checkInvoiceStatus(
   apiUrl: string,
   walletId: string,
   direction?: "RECEIVE" | "SEND",
+  signal?: AbortSignal,
 ): Promise<InvoiceStatus> {
-  return (await fetchInvoiceReceipt(paymentHash, apiKey, apiUrl, walletId, direction))
-    .status
+  return (
+    await fetchInvoiceReceipt(paymentHash, apiKey, apiUrl, walletId, direction, signal)
+  ).status
 }
 
 /**

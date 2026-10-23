@@ -255,6 +255,33 @@ const CARD_ACTIVATION_FAILED = "Failed to activate card"
 export const CONSUMED_HASH_SQLSTATE = "BC409"
 
 /**
+ * Reconciliation selection: unresolved rows, never-checked first, then least
+ * recently checked, then oldest (migration 031). $1 = card id or NULL,
+ * $2 = row cap or NULL. Exported so the PGlite spec runs the exact statement.
+ */
+export const PENDING_WITHDRAWALS_SQL = `SELECT payment_hash, card_id, amount, created_at, kind, attempt
+   FROM boltcard_pending_withdrawals
+   WHERE resolved_at IS NULL AND ($1::text IS NULL OR card_id = $1)
+   ORDER BY last_checked_at ASC NULLS FIRST, created_at ASC
+   LIMIT COALESCE($2::int, 2147483647)`
+
+/** $1 = payment hash, $2 = now (ms). */
+export const MARK_WITHDRAWAL_CHECKED_SQL = `UPDATE boltcard_pending_withdrawals
+   SET last_checked_at = $2
+   WHERE payment_hash = $1 AND resolved_at IS NULL`
+
+/**
+ * Unresolved withdrawals created before $1 (ms), optionally only for the
+ * cards in $2 (text[]; NULL = all). Oldest first.
+ */
+export const STALE_WITHDRAWALS_SQL = `SELECT payment_hash, card_id, amount, created_at, kind, attempt
+   FROM boltcard_pending_withdrawals
+   WHERE resolved_at IS NULL
+     AND created_at < $1
+     AND ($2::text[] IS NULL OR card_id = ANY($2::text[]))
+   ORDER BY created_at ASC`
+
+/**
  * The claim insert of claimAndDeductWithdrawal, exported so the PGlite spec
  * runs the exact statement against migration 030's trigger.
  * $1 = payment hash, $2 = card id, $3 = amount, $4 = now (ms).
@@ -1993,7 +2020,10 @@ class BoltcardStore {
    * Unresolved pending withdrawals (optionally for one card): in-flight or
    * unknown-outcome payments awaiting reconciliation.
    */
-  async getPendingWithdrawals(cardId?: string): Promise<
+  async getPendingWithdrawals(
+    cardId?: string,
+    limit?: number,
+  ): Promise<
     Array<{
       paymentHash: string
       cardId: string
@@ -2003,13 +2033,13 @@ class BoltcardStore {
       attempt: number
     }>
   > {
-    const result: QueryResult<DbRow> = await query(
-      `SELECT payment_hash, card_id, amount, created_at, kind, attempt
-       FROM boltcard_pending_withdrawals
-       WHERE resolved_at IS NULL AND ($1::text IS NULL OR card_id = $1)
-       ORDER BY created_at ASC`,
-      [cardId ?? null],
-    )
+    // Never-checked rows first, then least recently checked (migration 031):
+    // with a per-pass cap, ordering by created_at alone would re-select a
+    // stuck oldest prefix forever and starve every later row. NULL = no cap.
+    const result: QueryResult<DbRow> = await query(PENDING_WITHDRAWALS_SQL, [
+      cardId ?? null,
+      limit ?? null,
+    ])
     return result.rows.map((row: DbRow) => ({
       paymentHash: row.payment_hash as string,
       cardId: row.card_id as string,
@@ -2018,6 +2048,67 @@ class BoltcardStore {
       kind: String(row.kind),
       attempt: parseInt(String(row.attempt), 10),
     }))
+  }
+
+  /**
+   * Record that a reconciliation pass examined this row (before its Blink
+   * lookup, so a row whose lookup hangs still rotates to the back of the
+   * selection order). No-op once resolved.
+   */
+  async markWithdrawalChecked(
+    paymentHash: string,
+    now: number = Date.now(),
+  ): Promise<void> {
+    await query(MARK_WITHDRAWAL_CHECKED_SQL, [paymentHash, now])
+  }
+
+  /** Total unresolved withdrawals (the reconciliation backlog). */
+  async countPendingWithdrawals(cardId?: string): Promise<number> {
+    const result: QueryResult<DbRow> = await query(
+      `SELECT COUNT(*)::int AS n FROM boltcard_pending_withdrawals
+       WHERE resolved_at IS NULL AND ($1::text IS NULL OR card_id = $1)`,
+      [cardId ?? null],
+    )
+    return parseInt(String(result.rows[0]?.n ?? 0), 10)
+  }
+
+  /**
+   * Unresolved withdrawals older than `olderThanMs`, for ops (blink-wip#1619):
+   * rows reconciliation has not been able to settle. UNKNOWN = handed to
+   * Blink, no transaction seen yet; PENDING = Blink reported in flight.
+   * Exported SQL so the PGlite spec runs the exact statement.
+   */
+  async getStaleWithdrawals(
+    olderThanMs: number,
+    cardIds?: string[],
+  ): Promise<
+    Array<{
+      paymentHash: string
+      cardId: string
+      amount: number
+      kind: string
+      attempt: number
+      createdAt: number
+      ageMs: number
+    }>
+  > {
+    const now = Date.now()
+    const result: QueryResult<DbRow> = await query(STALE_WITHDRAWALS_SQL, [
+      now - olderThanMs,
+      cardIds ?? null,
+    ])
+    return result.rows.map((row: DbRow) => {
+      const createdAt = parseInt(String(row.created_at), 10)
+      return {
+        paymentHash: row.payment_hash as string,
+        cardId: row.card_id as string,
+        amount: parseInt(String(row.amount), 10),
+        kind: String(row.kind),
+        attempt: parseInt(String(row.attempt), 10),
+        createdAt,
+        ageMs: now - createdAt,
+      }
+    })
   }
 
   /**

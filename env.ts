@@ -33,6 +33,15 @@ export const env = createEnv({
     // Unlocks the detailed /api/health view (X-Health-Token). Unset: public
     // body only (blink-wip#1690 item 3).
     HEALTH_TOKEN: z.string().min(16).optional(),
+    // Bolt Card withdrawal reconciliation (blink-wip#1619): tick cadence
+    // (ms; 0 disables), per-pass deadline (ms, kept below the interval), rows
+    // per pass, and the age after which an unresolved withdrawal is reported.
+    // Runtime consumers read these through lib/boltcard/reconcile-config.ts,
+    // which falls back to defaults on invalid values instead of failing boot.
+    BOLTCARD_RECONCILE_INTERVAL_MS: z.coerce.number().int().nonnegative().optional(),
+    BOLTCARD_RECONCILE_PASS_TIMEOUT_MS: z.coerce.number().int().positive().optional(),
+    BOLTCARD_RECONCILE_BATCH: z.coerce.number().int().positive().optional(),
+    BOLTCARD_WITHDRAWAL_STALE_MINUTES: z.coerce.number().int().positive().optional(),
 
     // --- Database (PostgreSQL) ---
     DATABASE_URL: z.string().url().optional(),
@@ -93,6 +102,10 @@ export const env = createEnv({
     BLINK_WEBHOOK_SECRET: process.env.BLINK_WEBHOOK_SECRET,
     BLINK_STAGING_WEBHOOK_SECRET: process.env.BLINK_STAGING_WEBHOOK_SECRET,
     HEALTH_TOKEN: process.env.HEALTH_TOKEN,
+    BOLTCARD_RECONCILE_INTERVAL_MS: process.env.BOLTCARD_RECONCILE_INTERVAL_MS,
+    BOLTCARD_RECONCILE_PASS_TIMEOUT_MS: process.env.BOLTCARD_RECONCILE_PASS_TIMEOUT_MS,
+    BOLTCARD_RECONCILE_BATCH: process.env.BOLTCARD_RECONCILE_BATCH,
+    BOLTCARD_WITHDRAWAL_STALE_MINUTES: process.env.BOLTCARD_WITHDRAWAL_STALE_MINUTES,
 
     // Database
     DATABASE_URL: process.env.DATABASE_URL,

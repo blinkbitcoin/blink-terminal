@@ -83,6 +83,25 @@ import("./lib/rate-providers/poller")
   )
 
 /**
+ * Start the Bolt Card withdrawal reconciliation scheduler: settles PENDING /
+ * unknown-outcome card payments against Blink on a fixed cadence and logs
+ * rows that stay unresolved (blink-wip#1619). Stops on shutdown.
+ */
+import("./lib/boltcard/reconcile-scheduler")
+  .then(({ startBoltcardReconcileScheduler, stopBoltcardReconcileScheduler }) => {
+    startBoltcardReconcileScheduler()
+    return import("./lib/shutdown").then(({ onShutdown }) =>
+      onShutdown("boltcard-reconcile-scheduler", async () =>
+        stopBoltcardReconcileScheduler(),
+      ),
+    )
+  })
+  .catch((err: unknown) =>
+    // eslint-disable-next-line no-console
+    console.warn("[boltcard-reconcile] failed to start:", err),
+  )
+
+/**
  * Export the SDK instance so lib/shutdown.ts can call sdk.shutdown()
  * during graceful shutdown. May be undefined when tracing is disabled.
  */

@@ -20,6 +20,8 @@ import { timingSafeEqual } from "crypto"
 
 import type { NextApiRequest, NextApiResponse } from "next"
 
+import { getReconcileConfig } from "../../lib/boltcard/reconcile-config"
+import boltcardStore from "../../lib/boltcard/store"
 import { getSharedPool } from "../../lib/db"
 import { baseLogger } from "../../lib/logger"
 import { getHybridStore } from "../../lib/storage/hybrid-store"
@@ -35,6 +37,10 @@ interface CheckResult {
   error?: string
   storage?: string
   stats?: unknown
+  /** Bolt Card withdrawals: deduction kept, Blink outcome not yet final. */
+  inFlight?: number
+  /** ...of which unresolved longer than the ops threshold. */
+  stale?: number
   apiKey?: string
   walletId?: string
   latencyMs?: number
@@ -170,6 +176,32 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       // Voucher store failure degrades but doesn't fully break service
       if (health.status === "healthy") {
         health.status = "degraded"
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // Bolt Card withdrawals still in flight (blink-wip#1619). Stale rows
+    // degrade: a payment Blink has not reported either way for too long is
+    // something an operator should look at. Detailed view only.
+    // ------------------------------------------------------------------
+    if (detailed) {
+      try {
+        const { staleMinutes } = getReconcileConfig()
+        const [inFlight, stale] = await Promise.all([
+          boltcardStore.getStaleWithdrawals(0),
+          boltcardStore.getStaleWithdrawals(staleMinutes * 60_000),
+        ])
+        health.checks.boltcardWithdrawals = {
+          status: stale.length > 0 ? "degraded" : "up",
+          inFlight: inFlight.length,
+          stale: stale.length,
+        }
+        if (stale.length > 0 && health.status === "healthy") {
+          health.status = "degraded"
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : "Unknown error"
+        health.checks.boltcardWithdrawals = { status: "down", error: message }
       }
     }
 

@@ -184,6 +184,7 @@ beforeEach(() => {
   consoleLog.mockClear()
   mockStore.getCard = jest.fn(async (id: string) => (id === card().id ? card() : null))
   mockStore.getTopUpsNeedingReview = jest.fn().mockResolvedValue([])
+  mockStore.getStaleWithdrawals = jest.fn().mockResolvedValue([])
 })
 
 describe("getSessionPubkey", () => {
@@ -441,6 +442,44 @@ describe("stats: owner-scoped", () => {
       totalBtcBalanceSats: 1000,
       totalUsdBalanceCents: 50,
       pendingTopUps: 1,
+    })
+  })
+
+  it("reports in-flight and stale withdrawals for the session's cards only (blink-wip#1619)", async () => {
+    const mine = card().id
+    mockStore.getCardsByOwner = jest.fn().mockResolvedValue([card()])
+    mockStore.getPendingRegistrationsByOwner = jest.fn().mockResolvedValue([])
+    mockStore.getAllPendingTopUps = jest.fn().mockResolvedValue([])
+    const stale = {
+      paymentHash: "ab".repeat(32),
+      cardId: mine,
+      amount: 1000,
+      kind: "UNKNOWN",
+      attempt: 1,
+      createdAt: 0,
+      ageMs: 42 * 60_000,
+    }
+    mockStore.getStaleWithdrawals = jest.fn(async (olderThanMs: number) =>
+      olderThanMs === 0
+        ? [stale, { ...stale, paymentHash: "cd".repeat(32), ageMs: 60_000 }]
+        : [stale],
+    )
+    const res = await call(statsHandler as Handler, { token: "token-owner" })
+    expect(res.statusCode).toBe(200)
+    // Scoped to the owner's card ids, both for the in-flight count and the stale list
+    expect(mockStore.getStaleWithdrawals).toHaveBeenCalledWith(0, [mine])
+    expect(mockStore.getStaleWithdrawals).toHaveBeenCalledWith(15 * 60_000, [mine])
+    expect((res.body as { stats: Record<string, unknown> }).stats).toMatchObject({
+      withdrawalsInFlight: 2,
+      withdrawalsStale: [
+        {
+          paymentHash: "ab".repeat(32),
+          cardId: mine,
+          amount: 1000,
+          kind: "UNKNOWN",
+          ageMinutes: 42,
+        },
+      ],
     })
   })
 })
