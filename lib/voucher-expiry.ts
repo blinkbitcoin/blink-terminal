@@ -49,7 +49,8 @@ const DEFAULT_EXPIRY_ID: string = "24h"
 // Maximum unclaimed vouchers per wallet (prevents runaway creation)
 const MAX_UNCLAIMED_PER_WALLET: number = 1000
 
-// How long to keep claimed vouchers in history (30 days)
+// How long to keep settled (PAID) vouchers in history (30 days). CLAIMED
+// rows are never aged out: they are unresolved liabilities (migration 029).
 const CLAIMED_RETENTION_MS: number = 30 * 24 * 60 * 60 * 1000
 
 // How long to keep cancelled vouchers in history (30 days)

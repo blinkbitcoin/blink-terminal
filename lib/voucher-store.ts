@@ -50,6 +50,19 @@ import {
  */
 export const WALLET_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext($1))"
 export const LOCK_TIMEOUT_SQL = "SET LOCAL lock_timeout = '15s'"
+/**
+ * markVoucherPaid retries on lock timeout: a create's locked section is
+ * bounded by its 8 s backing deadline (pages/api/voucher/create.ts), so a
+ * settlement that loses one lock wait almost always wins the next.
+ */
+const MARK_PAID_LOCK_RETRIES = 2
+const MARK_PAID_RETRY_DELAY_MS = 500
+
+/** Postgres lock_timeout: SQLSTATE 55P03 (lock_not_available). */
+function isLockTimeout(err: unknown): boolean {
+  const e = err as { code?: string; message?: string } | null
+  return e?.code === "55P03" || /lock timeout/i.test(e?.message ?? "")
+}
 
 /**
  * Aggregate liabilities of unsettled vouchers for one wallet, in the wallet's
@@ -61,9 +74,10 @@ export const LOCK_TIMEOUT_SQL = "SET LOCAL lock_timeout = '15s'"
  * redeemed. CLAIMED is counted regardless of expiry because claim happens
  * BEFORE the payment round trip (callback.ts): a voucher claimed just before
  * expiry may still settle (PENDING/unknown outcome) and debit the wallet.
- * Settlement (PAID), cancellation, definite-failure unclaim (CLAIMED ->
- * ACTIVE, which then expires normally) and the 30-day claimed-retention
- * cleanup exit the set (blink-wip#1665).
+ * Settlement (PAID), cancellation and definite-failure unclaim (CLAIMED ->
+ * ACTIVE, which then expires normally) exit the set (blink-wip#1665). CLAIMED
+ * is never aged out by cleanup: an unresolved claim stays a liability until
+ * reconciliation, unclaim or cancel resolves it (migration 029).
  *
  * $1 = walletId, $2 = now (ms). USD also takes $3 = server cents-per-sat rate
  * (cast to numeric: amount_sats is BIGINT, and an uncast "0.05" parameter would
@@ -591,7 +605,28 @@ class VoucherStore {
   async markVoucherPaid(chargeId: string): Promise<boolean> {
     // Under the wallet lock (BACKING INVARIANT): this removes a liability
     // after a debit, so it must not land between a creation's balance read
-    // and its liability sum.
+    // and its liability sum. The payment has already executed, so losing the
+    // lock race to a (bounded) create must not lose the settlement: retry a
+    // few times on lock timeout before giving up (the voucher then stays
+    // CLAIMED — counted — until reconciliation).
+    for (let attempt = 1; ; attempt++) {
+      const outcome = await this.tryMarkVoucherPaid(chargeId)
+      if (outcome !== "lock-timeout") return outcome
+      if (attempt > MARK_PAID_LOCK_RETRIES) {
+        console.error(
+          `[VoucherStore] markVoucherPaid gave up after ${attempt} lock timeouts: ${chargeId}`,
+        )
+        return false
+      }
+      console.warn(
+        `[VoucherStore] markVoucherPaid lock timeout (attempt ${attempt}), retrying: ${chargeId}`,
+      )
+      await new Promise((resolve) => setTimeout(resolve, MARK_PAID_RETRY_DELAY_MS))
+    }
+  }
+
+  /** One locked CLAIMED -> PAID attempt. */
+  private async tryMarkVoucherPaid(chargeId: string): Promise<boolean | "lock-timeout"> {
     const client = await getPool().connect()
     try {
       await client.query("BEGIN")
@@ -621,6 +656,7 @@ class VoucherStore {
       return true
     } catch (err: unknown) {
       await client.query("ROLLBACK").catch(() => {})
+      if (isLockTimeout(err)) return "lock-timeout"
       console.error("[VoucherStore] markVoucherPaid error:", (err as Error).message)
       return false
     } finally {

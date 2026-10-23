@@ -6,8 +6,16 @@
 --              1. Allow the PAID status. Migration 008's constraint predates
 --                 it; without the ALTER every CLAIMED -> PAID update fails
 --                 with SQLSTATE 23514.
---              2. Settled rows follow the 30-day claimed retention policy
---                 in cleanup_old_vouchers().
+--              2. cleanup_old_vouchers(): PAID (settled) rows follow the
+--                 30-day retention policy; CLAIMED rows are NEVER aged out.
+--                 A CLAIMED row is an unresolved liability (paid or not is
+--                 only decidable against Blink's ledger, see
+--                 scripts/reconcile-voucher-claims.js); only reconciliation
+--                 (-> PAID), a definite-failure unclaim (-> ACTIVE) or an
+--                 explicit cancel may change it. Migration 008 listed CLAIMED
+--                 for deletion but its retention arithmetic overflowed int4,
+--                 so that delete never ran — which is the only reason the
+--                 legacy claims still exist to be reconciled.
 --              3. voucher_stats keeps counting PAID as redeemed: the
 --                 "claimed" bucket becomes CLAIMED + PAID.
 -- Date: 2026-10-22
@@ -32,13 +40,15 @@ ALTER TABLE vouchers
 -- MIGRATION-029:STATUS-CONSTRAINT:END
 
 -- ============================================
--- CLEANUP FUNCTION: PAID follows the claimed retention policy
+-- CLEANUP FUNCTION: PAID follows the 30-day retention policy; CLAIMED never
 -- ============================================
--- Migration 008 only deleted status = 'CLAIMED', so once PAID is reachable
--- settled rows (including api_key_encrypted and voucher metadata) would be
--- retained forever. The original retention expression
--- (30 * 24 * 60 * 60 * 1000) also overflows int4 at invocation with
--- "integer out of range"; the ::BIGINT casts make the arithmetic BIGINT.
+-- Settled rows (including api_key_encrypted and voucher metadata) must not be
+-- retained forever, so PAID is deleted 30 days after claimed_at. CLAIMED is
+-- deliberately NOT deleted: it is an unresolved liability that only
+-- reconciliation, unclaim or cancel may resolve; deleting it would drop a
+-- liability and the encrypted key reconciliation needs. The original 008
+-- retention expression (30 * 24 * 60 * 60 * 1000) overflowed int4 at
+-- invocation with "integer out of range"; the ::BIGINT casts fix that.
 -- MIGRATION-029:CLEANUP-FUNCTION:BEGIN
 CREATE OR REPLACE FUNCTION cleanup_old_vouchers()
 RETURNS INTEGER AS $$
@@ -46,17 +56,17 @@ DECLARE
     deleted_count INTEGER := 0;
     tmp_count INTEGER;
     now_ms BIGINT;
-    claimed_retention_ms BIGINT := 30::BIGINT * 24 * 60 * 60 * 1000;    -- 30 days
+    paid_retention_ms BIGINT := 30::BIGINT * 24 * 60 * 60 * 1000;       -- 30 days
     cancelled_retention_ms BIGINT := 30::BIGINT * 24 * 60 * 60 * 1000;  -- 30 days
     expired_retention_ms BIGINT := 7::BIGINT * 24 * 60 * 60 * 1000;     -- 7 days
 BEGIN
     now_ms := (EXTRACT(EPOCH FROM NOW()) * 1000)::BIGINT;
 
-    -- Delete old claimed/settled vouchers (both were redeemed)
+    -- Delete old settled vouchers. CLAIMED is never deleted (unresolved).
     DELETE FROM vouchers
-    WHERE status IN ('CLAIMED', 'PAID')
+    WHERE status = 'PAID'
       AND claimed_at IS NOT NULL
-      AND (now_ms - claimed_at) > claimed_retention_ms;
+      AND (now_ms - claimed_at) > paid_retention_ms;
 
     GET DIAGNOSTICS tmp_count = ROW_COUNT;
     deleted_count := deleted_count + tmp_count;
@@ -110,12 +120,12 @@ VALUES (
     'schema_version',
     29,
     'version',
-    '{"description": "Voucher CLAIMED -> PAID settlement transition; PAID added to valid_voucher_status and claimed retention; voucher_stats claimed bucket includes PAID", "date": "2026-10-22"}'
+    '{"description": "Voucher CLAIMED -> PAID settlement transition; PAID added to valid_voucher_status; PAID follows 30-day retention, CLAIMED never aged out; voucher_stats claimed bucket includes PAID", "date": "2026-10-22"}'
 );
 
 COMMIT;
 
 DO $$
 BEGIN
-    RAISE NOTICE 'Migration 029 completed: PAID status allowed, retained under claimed policy, counted in voucher_stats';
+    RAISE NOTICE 'Migration 029 completed: PAID status allowed, 30-day PAID retention, CLAIMED never aged out, counted in voucher_stats';
 END $$;

@@ -386,12 +386,15 @@ describe("voucher lifecycle vs the liability aggregate (PGlite)", () => {
 })
 
 /**
- * Migration 029's cleanup_old_vouchers(): PAID follows the claimed 30-day
- * retention policy, and the retention arithmetic must not overflow int4.
+ * Migration 029's cleanup_old_vouchers(): PAID follows the 30-day retention
+ * policy, CLAIMED is never aged out (an unresolved liability that only
+ * reconciliation/unclaim/cancel may change), and the retention arithmetic
+ * must not overflow int4.
  */
 describe("migration 029 cleanup_old_vouchers (PGlite)", () => {
   const cleanupSeeds: Array<[string, unknown[]]> = [
-    // Old redeemed rows (31 days): deleted
+    // Old CLAIMED (31 days): RETAINED — unresolved, reconciliation needs it.
+    // Old PAID (31 days): deleted.
     [
       `INSERT INTO vouchers (id, amount_sats, wallet_id, status, expires_at, claimed_at, claimed)
        VALUES ($1, 500, 'w1', 'CLAIMED', $2, $3, true)`,
@@ -424,18 +427,33 @@ describe("migration 029 cleanup_old_vouchers (PGlite)", () => {
     seedRow("active", "w1", 500, null),
   ]
 
-  it("deletes old CLAIMED and PAID rows and keeps fresh ones", () => {
+  it("deletes old PAID rows, never CLAIMED, and keeps fresh ones", () => {
     const result = probe(
       [...cleanupSeeds, ["SELECT cleanup_old_vouchers()", []]],
-      "SELECT status, COUNT(*)::int AS n FROM vouchers GROUP BY status ORDER BY status",
+      "SELECT id FROM vouchers ORDER BY id",
       [],
       { extraDdl: [CLEANUP_FUNCTION_SQL] },
     )
-    expect(result.rows).toEqual([
-      { status: "ACTIVE", n: 1 },
-      { status: "CLAIMED", n: 1 },
-      { status: "PAID", n: 1 },
+    expect(result.rows.map((r) => r.id)).toEqual([
+      "active",
+      "new-claimed",
+      "new-paid",
+      "old-claimed", // legacy unresolved claim survives cleanup
     ])
+  })
+
+  it("a legacy CLAIMED row still counts as a liability after cleanup", () => {
+    // The reviewer's scenario: production applies 029, the first voucher read
+    // runs lazy cleanup, and only then is the reconcile script run. The
+    // 31-day-old claim must still be there — and still counted.
+    const result = probe(
+      [...cleanupSeeds, ["SELECT cleanup_old_vouchers()", []]],
+      ACTIVE_LIABILITY_SUM_SQL_BTC,
+      ["w1", NOW],
+      { extraDdl: [CLEANUP_FUNCTION_SQL] },
+    )
+    // active (500) + new-claimed (500) + old-claimed (500); PAID rows excluded
+    expect(parseInt(String(result.rows[0].total), 10)).toBe(1500)
   })
 })
 
