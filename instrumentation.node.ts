@@ -26,6 +26,8 @@ import { BatchSpanProcessor } from "@opentelemetry/sdk-trace-node"
 import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions"
 import { WebSocket as WsWebSocket } from "ws"
 
+import { scrubSpanUrlAttributes } from "./lib/tracing-scrub"
+
 const serviceName = process.env.TRACING_SERVICE_NAME || "bbt"
 const otlpEndpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT
 
@@ -60,7 +62,13 @@ if (otlpEndpoint) {
     spanProcessor: new BatchSpanProcessor(
       new OTLPTraceExporter({ url: `${otlpEndpoint}/v1/traces` }),
     ),
-    instrumentations: [new NetInstrumentation(), new HttpInstrumentation()],
+    instrumentations: [
+      new NetInstrumentation(),
+      // Query strings carry bearer secrets on several routes (voucher k1,
+      // Bolt Card tap p/c): keep only the path on span URL attributes
+      // (blink-wip#1590).
+      new HttpInstrumentation({ requestHook: (span) => scrubSpanUrlAttributes(span) }),
+    ],
   })
 
   sdk.start()
