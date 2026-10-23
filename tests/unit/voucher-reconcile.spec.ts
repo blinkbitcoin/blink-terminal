@@ -15,7 +15,11 @@ jest.mock("../../lib/db", () => ({ getSharedPool: () => ({ query: jest.fn() }) }
 import { encode as encodeInvoice, sign as signInvoice } from "bolt11"
 
 import { buildVoucherMemo as callbackMemo } from "../../lib/voucher-memo"
-import { MARK_VOUCHER_PAID_SQL } from "../../lib/voucher-store"
+import {
+  LOCK_TIMEOUT_SQL as STORE_LOCK_TIMEOUT_SQL,
+  MARK_VOUCHER_PAID_SQL,
+  WALLET_LOCK_SQL as STORE_WALLET_LOCK_SQL,
+} from "../../lib/voucher-store"
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const {
@@ -27,6 +31,8 @@ const {
   reconcileClaimedVouchers,
   parseArgs,
   MARK_PAID_SQL,
+  WALLET_LOCK_SQL,
+  LOCK_TIMEOUT_SQL,
 } = require("../../scripts/reconcile-voucher-claims")
 
 const NOW = 1_760_000_000_000
@@ -414,15 +420,21 @@ describe("reconcileClaimedVouchers", () => {
   })
 
   const setup = (rows: Array<Record<string, unknown>>) => {
+    // Every statement, from the pool (the SELECT) and from the transaction
+    // client (--apply writes), in order.
     const queries: Array<[string, unknown[]]> = []
-    const pool = {
-      query: jest.fn(async (text: string, params: unknown[]) => {
-        queries.push([text, params])
-        if (text.startsWith("SELECT")) return { rows }
-        return { rows: [{ id: params[0] }], rowCount: 1 }
-      }),
+    const record = async (text: string, params: unknown[]) => {
+      queries.push([text, params])
+      if (text.startsWith("SELECT id, status")) return { rows }
+      if (text.startsWith("UPDATE")) return { rows: [{ id: params[0] }], rowCount: 1 }
+      return { rows: [] }
     }
-    return { pool, queries }
+    const release = jest.fn()
+    const pool = {
+      query: jest.fn(record),
+      connect: jest.fn(async () => ({ query: jest.fn(record), release })),
+    }
+    return { pool, queries, release }
   }
 
   it("reports matches in dry-run without writing", async () => {
@@ -459,6 +471,30 @@ describe("reconcileClaimedVouchers", () => {
     expect(updates).toHaveLength(1)
     expect(updates[0][1]).toEqual(["matched"])
     expect(MARK_PAID_SQL).toContain("status = 'CLAIMED'")
+  })
+
+  it("--apply writes under the wallet lock (BACKING INVARIANT)", async () => {
+    const { pool, queries, release } = setup([row()])
+    await reconcileClaimedVouchers({
+      pool,
+      fetchTransactions: jest.fn(async () => [settledTx()]),
+      decryptApiKey: () => "key",
+      apply: true,
+      now: NOW,
+      log: () => {},
+    })
+    const texts = queries.map(([t]) => t)
+    const begin = texts.indexOf("BEGIN")
+    expect(begin).toBeGreaterThan(0)
+    expect(texts.slice(begin)).toEqual([
+      "BEGIN",
+      LOCK_TIMEOUT_SQL,
+      WALLET_LOCK_SQL,
+      MARK_PAID_SQL,
+      "COMMIT",
+    ])
+    expect(queries[begin + 2][1]).toEqual(["w1"]) // lock on the voucher's wallet
+    expect(release).toHaveBeenCalledTimes(1)
   })
 
   it("leaves ambiguous vouchers CLAIMED", async () => {
@@ -774,9 +810,11 @@ describe("parity with the callback and the store", () => {
     }
   })
 
-  it("marks PAID with the same SQL as the store", () => {
+  it("marks PAID with the same SQL and lock statements as the store", () => {
     const normalize = (sql: string) => sql.replace(/\s+/g, " ").trim()
     expect(normalize(MARK_PAID_SQL)).toBe(normalize(MARK_VOUCHER_PAID_SQL))
+    expect(WALLET_LOCK_SQL).toBe(STORE_WALLET_LOCK_SQL)
+    expect(LOCK_TIMEOUT_SQL).toBe(STORE_LOCK_TIMEOUT_SQL)
   })
 })
 

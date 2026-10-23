@@ -108,11 +108,37 @@ const TRANSACTIONS_QUERY = `
 const WINDOW_BEFORE_MS = 2 * 60 * 1000
 const WINDOW_AFTER_MS = 30 * 60 * 1000
 
-// Keep in sync with MARK_VOUCHER_PAID_SQL in lib/voucher-store.ts.
+// Keep in sync with MARK_VOUCHER_PAID_SQL / WALLET_LOCK_SQL / LOCK_TIMEOUT_SQL
+// in lib/voucher-store.ts (parity asserted in tests/unit/voucher-reconcile.spec.ts).
 const MARK_PAID_SQL = `UPDATE vouchers
    SET status = 'PAID'
    WHERE id = $1 AND status = 'CLAIMED'
    RETURNING id`
+const WALLET_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext($1))"
+const LOCK_TIMEOUT_SQL = "SET LOCAL lock_timeout = '15s'"
+
+/**
+ * CLAIMED -> PAID under the per-wallet lock, like VoucherStore.markVoucherPaid
+ * (BACKING INVARIANT in lib/voucher-store.ts): the debit happened long ago,
+ * but removing the liability must still not interleave with a live create's
+ * balance read + liability sum on the same wallet.
+ */
+async function markPaidLocked(pool, walletId, voucherId) {
+  const client = await pool.connect()
+  try {
+    await client.query("BEGIN")
+    await client.query(LOCK_TIMEOUT_SQL)
+    await client.query(WALLET_LOCK_SQL, [walletId])
+    const update = await client.query(MARK_PAID_SQL, [voucherId])
+    await client.query("COMMIT")
+    return update.rowCount === 1
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {})
+    throw err
+  } finally {
+    client.release()
+  }
+}
 
 function loadEnv() {
   const envPath = path.join(__dirname, "../.env")
@@ -497,8 +523,8 @@ async function reconcileClaimedVouchers(deps) {
             `[match:unverified] ${label} ${amountLabel} -> tx ${result.transaction.id} (incomplete scan)`,
           )
         } else if (apply) {
-          const update = await pool.query(MARK_PAID_SQL, [voucher.id])
-          if (update.rowCount === 1) {
+          const updated = await markPaidLocked(pool, group.walletId, voucher.id)
+          if (updated) {
             summary.applied++
             log(`[paid] ${label} ${amountLabel} -> tx ${result.transaction.id}`)
           } else {
@@ -633,6 +659,8 @@ module.exports = {
   fetchTransactions,
   parseArgs,
   MARK_PAID_SQL,
+  WALLET_LOCK_SQL,
+  LOCK_TIMEOUT_SQL,
 }
 
 if (require.main === module) {

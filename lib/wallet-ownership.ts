@@ -40,12 +40,13 @@ export interface OwnedWallet {
 export async function getOwnedWallets(
   apiKey: string,
   environment: EnvironmentName,
+  signal?: AbortSignal,
 ): Promise<OwnedWalletsResult> {
   try {
     const wallets = await new BlinkAPI(
       apiKey,
       getApiUrlForEnvironment(environment),
-    ).getWalletInfo()
+    ).getWalletInfo(signal)
     if (!Array.isArray(wallets)) return { ok: false, reason: "unavailable" }
     const owned = new Map<string, OwnedWallet>()
     for (const wallet of wallets as {

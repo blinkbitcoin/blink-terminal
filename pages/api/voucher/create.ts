@@ -23,11 +23,14 @@ const USD_PAIR_QUANTIZATION_CENTS = 1
 
 /**
  * The backing inputs are fetched from Blink while the per-wallet lock is held
- * (see BACKING INVARIANT in voucher-store.ts), so the wait is bounded: a slow
- * Blink call fails closed (503) instead of holding the wallet lock and a pool
- * connection.
+ * (see BACKING INVARIANT in voucher-store.ts), so the whole fetch runs under
+ * ONE deadline and the requests are aborted (not just abandoned) when it
+ * passes: fail closed (503) rather than hold the wallet lock and a pool
+ * connection. The deadline must stay well below the store's lock_timeout
+ * (15 s), or a concurrent settlement (markVoucherPaid) waiting for the same
+ * lock could time out behind a slow but still-valid create.
  */
-const BACKING_FETCH_TIMEOUT_MS = 10_000
+const BACKING_DEADLINE_MS = 8_000
 
 /** A refusal decided inside the locked backing fetch; mapped to a response. */
 class BackingRefusal extends Error {
@@ -39,10 +42,23 @@ class BackingRefusal extends Error {
   }
 }
 
-const withTimeout = <T>(promise: Promise<T>, ms: number, label: string): Promise<T> =>
+/**
+ * Run `work` under one deadline: the AbortSignal passed in is aborted when
+ * the deadline passes, so in-flight upstream requests are cancelled, and the
+ * returned promise rejects with "<label> timed out".
+ */
+const withDeadline = <T>(
+  work: (signal: AbortSignal) => Promise<T>,
+  ms: number,
+  label: string,
+): Promise<T> =>
   new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${label} timed out`)), ms)
-    promise.then(
+    const controller = new AbortController()
+    const timer = setTimeout(() => {
+      controller.abort()
+      reject(new Error(`${label} timed out`))
+    }, ms)
+    work(controller.signal).then(
       (value) => {
         clearTimeout(timer)
         resolve(value)
@@ -62,12 +78,13 @@ const withTimeout = <T>(promise: Promise<T>, ms: number, label: string): Promise
 async function getUsdCentsPerSat(
   apiKey: string,
   environment: EnvironmentName,
+  signal?: AbortSignal,
 ): Promise<number | null> {
   try {
     const rate = await new BlinkAPI(
       apiKey,
       getApiUrlForEnvironment(environment),
-    ).getExchangeRate("USD")
+    ).getExchangeRate("USD", signal)
     const centsPerSat = rate.satPriceInCurrency
     if (
       typeof centsPerSat !== "number" ||
@@ -204,10 +221,19 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     // read and the sum, and a stale balance would back a new voucher.
     const usdCents = actualWalletCurrency === "USD" ? parseInt(String(usdAmount)) : 0
     const backing = async (): Promise<BackingInputs> => {
-      const live = await withTimeout(
-        getOwnedWallets(apiKey, environment),
-        BACKING_FETCH_TIMEOUT_MS,
-        "Blink balance",
+      // Balance and (for USD) rate are independent: fetch them concurrently
+      // under the single deadline so the locked critical section is bounded
+      // by one round trip, not two.
+      const [live, centsPerSat] = await withDeadline(
+        (signal) =>
+          Promise.all([
+            getOwnedWallets(apiKey, environment, signal),
+            actualWalletCurrency === "USD"
+              ? getUsdCentsPerSat(apiKey, environment, signal)
+              : Promise.resolve(null),
+          ]),
+        BACKING_DEADLINE_MS,
+        "Blink backing fetch",
       )
       if (!live.ok) {
         throw new BackingRefusal(
@@ -231,11 +257,6 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
         return { maxLiabilityMinor: wallet.balance, liabilityMinor: amountNum }
       }
 
-      const centsPerSat = await withTimeout(
-        getUsdCentsPerSat(apiKey, environment),
-        BACKING_FETCH_TIMEOUT_MS,
-        "Blink rate",
-      )
       if (centsPerSat === null) {
         throw new BackingRefusal(503, {
           error: "Could not verify the exchange rate right now, please retry",

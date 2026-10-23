@@ -164,10 +164,14 @@ class BlinkAPI {
     this.baseUrl = apiUrl || getApiUrlFromConfig()
   }
 
-  // Make GraphQL request to Blink API
+  // Make GraphQL request to Blink API. An optional AbortSignal cancels the
+  // underlying request (used by callers that run under a deadline, e.g. the
+  // locked voucher backing fetch); never pass one for payments, whose
+  // outcome must not become unknown by our own cancellation.
   async query(
     query: string,
     variables: Record<string, unknown> = {},
+    signal?: AbortSignal,
   ): Promise<GraphQLData> {
     // Extract operation name from "query Foo" or "mutation Foo" for span naming
     const operationName = query.match(/(?:query|mutation)\s+(\w+)/)?.[1] || "anonymous"
@@ -191,6 +195,7 @@ class BlinkAPI {
           method: "POST",
           headers,
           body: JSON.stringify({ query, variables }),
+          ...(signal ? { signal } : {}),
         })
 
         span.setAttribute("http.status_code", response.status)
@@ -268,7 +273,7 @@ class BlinkAPI {
   }
 
   // Get exchange rate for a currency
-  async getExchangeRate(currency: string): Promise<ExchangeRate> {
+  async getExchangeRate(currency: string, signal?: AbortSignal): Promise<ExchangeRate> {
     if (currency === "BTC") {
       return { satPriceInCurrency: 1 } // 1 sat = 1 sat
     }
@@ -288,7 +293,7 @@ class BlinkAPI {
       currency: currency.toUpperCase(),
     }
 
-    const data = await this.query(query, variables)
+    const data = await this.query(query, variables, signal)
 
     if (!data.realtimePrice || !data.realtimePrice.btcSatPrice) {
       throw new Error(`Exchange rate not available for ${currency}`)
@@ -550,7 +555,7 @@ class BlinkAPI {
   }
 
   // Get wallet IDs and currencies
-  async getWalletInfo(): Promise<Wallet[]> {
+  async getWalletInfo(signal?: AbortSignal): Promise<Wallet[]> {
     const query = `
       query {
         me {
@@ -565,7 +570,7 @@ class BlinkAPI {
       }
     `
 
-    const data = await this.query(query)
+    const data = await this.query(query, {}, signal)
     return data.me?.defaultAccount?.wallets || []
   }
 

@@ -423,15 +423,60 @@ describe("markVoucherPaid", () => {
     expect(sql().some((q) => q.startsWith("UPDATE"))).toBe(false)
   })
 
-  it("returns false and rolls back on a lock timeout", async () => {
-    mockClientQuery.mockImplementation(async (text: string) => {
-      if (text.startsWith("SELECT wallet_id")) return { rows: [{ wallet_id: "w1" }] }
-      if (text.includes("pg_advisory_xact_lock"))
-        throw new Error("canceling statement due to lock timeout")
-      return { rows: [] }
+  describe("lock timeout (a create holds the wallet lock)", () => {
+    const lockTimeout = () =>
+      Object.assign(new Error("canceling statement due to lock timeout"), {
+        code: "55P03",
+      })
+    const lockFailsFirst = (failures: number) => {
+      let lockAttempts = 0
+      mockClientQuery.mockImplementation(async (text: string) => {
+        if (text.startsWith("SELECT wallet_id")) return { rows: [{ wallet_id: "w1" }] }
+        if (text.includes("pg_advisory_xact_lock")) {
+          if (++lockAttempts <= failures) throw lockTimeout()
+          return { rows: [] }
+        }
+        if (text.startsWith("UPDATE")) return { rows: [{ id: "v1" }], rowCount: 1 }
+        return { rows: [] }
+      })
+      return () => lockAttempts
+    }
+
+    beforeEach(() => {
+      jest.useFakeTimers()
+      jest.spyOn(console, "warn").mockImplementation(() => {})
     })
-    await expect(store().markVoucherPaid("v1")).resolves.toBe(false)
-    expect(sql()).toContain("ROLLBACK")
-    expect(mockClientRelease).toHaveBeenCalled()
+    afterEach(() => jest.useRealTimers())
+
+    it("retries and settles once the lock frees up (payment already executed)", async () => {
+      const attempts = lockFailsFirst(1)
+      const result = store().markVoucherPaid("v1")
+      await jest.advanceTimersByTimeAsync(600)
+      await expect(result).resolves.toBe(true)
+      expect(attempts()).toBe(2)
+      expect(sql().filter((q) => q.startsWith("UPDATE"))).toHaveLength(1)
+      expect(sql().filter((q) => q === "ROLLBACK")).toHaveLength(1)
+      expect(sql().filter((q) => q === "COMMIT")).toHaveLength(1)
+    })
+
+    it("gives up after bounded retries, rolled back, voucher stays CLAIMED", async () => {
+      const attempts = lockFailsFirst(99)
+      const result = store().markVoucherPaid("v1")
+      await jest.advanceTimersByTimeAsync(5_000)
+      await expect(result).resolves.toBe(false)
+      expect(attempts()).toBe(3) // 1 + MARK_PAID_LOCK_RETRIES
+      expect(sql().some((q) => q.startsWith("UPDATE"))).toBe(false)
+      expect(mockClientRelease).toHaveBeenCalledTimes(3)
+    })
+
+    it("does not retry on other errors", async () => {
+      mockClientQuery.mockImplementation(async (text: string) => {
+        if (text.startsWith("SELECT wallet_id")) return { rows: [{ wallet_id: "w1" }] }
+        if (text.includes("pg_advisory_xact_lock")) throw new Error("connection reset")
+        return { rows: [] }
+      })
+      await expect(store().markVoucherPaid("v1")).resolves.toBe(false)
+      expect(mockClientRelease).toHaveBeenCalledTimes(1)
+    })
   })
 })

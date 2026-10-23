@@ -58,8 +58,14 @@ jest.mock("../../lib/blink-api", () => {
   class BlinkAuthError extends Error {}
   const BlinkAPI = jest.fn().mockImplementation((apiKey: string, apiUrl: string) => ({
     payLnInvoice: (...args: unknown[]) => mockPayLnInvoice(...args),
-    getWalletInfo: () => mockGetWalletInfo(apiKey, apiUrl),
-    getExchangeRate: (currency: string) => mockGetExchangeRate(apiKey, apiUrl, currency),
+    getWalletInfo: (signal?: AbortSignal) =>
+      signal
+        ? mockGetWalletInfo(apiKey, apiUrl, signal)
+        : mockGetWalletInfo(apiKey, apiUrl),
+    getExchangeRate: (currency: string, signal?: AbortSignal) =>
+      signal
+        ? mockGetExchangeRate(apiKey, apiUrl, currency, signal)
+        : mockGetExchangeRate(apiKey, apiUrl, currency),
   }))
   return {
     __esModule: true,
@@ -664,6 +670,59 @@ describe("voucher create: live ownership + confirmed wallet currency", () => {
       expect(inserted()).toBe(0)
     })
 
+    describe("the locked critical section is bounded by ONE deadline", () => {
+      // The store's lock_timeout is 15 s; a create must never hold the lock
+      // longer than a concurrent settlement (markVoucherPaid) will wait.
+      afterEach(() => jest.useRealTimers())
+
+      it("fetches balance and rate concurrently (one round trip, not two)", async () => {
+        let inFlight = 0
+        let maxInFlight = 0
+        const track = async <T>(value: T): Promise<T> => {
+          maxInFlight = Math.max(maxInFlight, ++inFlight)
+          await new Promise((r) => setTimeout(r, 5))
+          inFlight--
+          return value
+        }
+        let walletReads = 0
+        mockGetWalletInfo.mockImplementation(async () =>
+          ++walletReads === 1
+            ? [BTC_WALLET, USD_WALLET]
+            : track([BTC_WALLET, USD_WALLET]),
+        )
+        mockGetExchangeRate.mockImplementation(() =>
+          track({ satPriceInCurrency: 0.05, currency: "USD" }),
+        )
+        const res = await create({
+          walletId: "wallet-usd",
+          walletCurrency: "USD",
+          usdAmount: 100,
+          amount: 2000,
+        })
+        expect(res.statusCode).toBe(200)
+        expect(maxInFlight).toBe(2)
+      })
+
+      it("aborts the upstream requests and answers 503 when the deadline passes", async () => {
+        jest.useFakeTimers()
+        let walletReads = 0
+        let lockedSignal: AbortSignal | undefined
+        mockGetWalletInfo.mockImplementation(
+          (_k: string, _u: string, signal?: AbortSignal) => {
+            if (++walletReads === 1) return Promise.resolve([BTC_WALLET, USD_WALLET])
+            lockedSignal = signal
+            return new Promise(() => {}) // Blink hangs
+          },
+        )
+        const pending = create({ amount: 500 })
+        await jest.advanceTimersByTimeAsync(8_000)
+        const res = await pending
+        expect(res.statusCode).toBe(503)
+        expect(lockedSignal?.aborted).toBe(true)
+        expect(inserted()).toBe(0)
+      })
+    })
+
     it("fails closed (503) when the locked balance read is unavailable", async () => {
       let reads = 0
       mockGetWalletInfo.mockImplementation(async () => {
@@ -791,7 +850,13 @@ describe("voucher create: live ownership + confirmed wallet currency", () => {
         environment: "staging",
       })
       expect(res.statusCode).toBe(200)
-      expect(mockGetExchangeRate).toHaveBeenCalledWith(OWNER_KEY, STAGING, "USD")
+      // ...under the locked backing deadline's abort signal
+      expect(mockGetExchangeRate).toHaveBeenCalledWith(
+        OWNER_KEY,
+        STAGING,
+        "USD",
+        expect.any(AbortSignal),
+      )
     })
 
     it("passes the conservative liability AND the rate to the store, so the next voucher re-rates this one", async () => {
