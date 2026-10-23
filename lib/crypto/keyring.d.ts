@@ -5,7 +5,13 @@ export type InspectStatus = "current" | "stale" | "undecryptable" | "not-ciphert
 export interface Keyring {
   /** Fingerprint of the current key (null when none is configured). */
   currentKeyId(): string | null
-  /** v2 ciphertext under the current key. Throws when no key is configured. */
+  /** "legacy" (default, rollback-safe) or "v2"; null when the setting is invalid. */
+  writeFormat(): "legacy" | "v2" | null
+  /**
+   * Ciphertext under the current key, in the configured write format. Throws
+   * when no key is configured, the format is invalid, or legacy writes are
+   * requested during a rotation.
+   */
   encrypt(plaintext: string): string
   /** Plaintext, or null (not ours / unknown key / failed authentication). Never throws. */
   decrypt(value: unknown): string | null
@@ -25,6 +31,8 @@ export interface Keyring {
 export function createKeyring(keys?: {
   current?: string | null
   previous?: string | string[] | null
+  /** "legacy" (default) | "v2" — ENCRYPTION_WRITE_FORMAT. */
+  writeFormat?: string | null
   /** Test-only: override the key-id function to simulate collisions. */
   _keyId?: (passphrase: string) => string
 }): Keyring

@@ -1332,8 +1332,12 @@ describe("stored API keys decrypt through the app keyring (blink-wip#1587)", () 
     const CryptoJS = (await import("crypto-js")).default
     const { createKeyring } = await import("../../lib/crypto/keyring")
     const legacy = CryptoJS.AES.encrypt("blink_legacy", "old-key").toString()
-    const v2Old = createKeyring({ current: "old-key" }).encrypt("blink_v2_old")
-    const v2New = createKeyring({ current: "new-key" }).encrypt("blink_v2_new")
+    const v2Old = createKeyring({ current: "old-key", writeFormat: "v2" }).encrypt(
+      "blink_v2_old",
+    )
+    const v2New = createKeyring({ current: "new-key", writeFormat: "v2" }).encrypt(
+      "blink_v2_new",
+    )
 
     process.env.ENCRYPTION_KEY = "new-key"
     process.env.ENCRYPTION_KEY_PREVIOUS = "old-key"

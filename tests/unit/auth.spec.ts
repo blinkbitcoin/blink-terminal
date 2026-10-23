@@ -40,8 +40,15 @@ describe("AuthManager.encryptApiKey / decryptApiKey", () => {
     expect(typeof encrypted).toBe("string")
   })
 
-  it("produces authenticated v2 ciphertext tagged with the current key id (blink-wip#1587)", () => {
+  it("by default writes legacy ciphertext the previous release can read (rollback-safe)", () => {
     const encrypted = AuthManager.encryptApiKey(sampleApiKey)
+    expect(encrypted.startsWith("U2FsdGVkX1")).toBe(true)
+  })
+
+  it("produces authenticated v2 ciphertext once ENCRYPTION_WRITE_FORMAT=v2 (blink-wip#1587)", () => {
+    process.env.ENCRYPTION_WRITE_FORMAT = "v2"
+    const encrypted = AuthManager.encryptApiKey(sampleApiKey)
+    delete process.env.ENCRYPTION_WRITE_FORMAT
     expect(encrypted).toMatch(/^v2\.[0-9a-f]{16}\.[A-Za-z0-9+/=]+$/)
   })
 
@@ -124,7 +131,9 @@ describe("AuthManager.encryptApiKey backward compatibility", () => {
 
   it("plaintext API keys that start with blink_ are distinguishable from ciphertext", () => {
     const plaintext = "blink_testkey123"
+    process.env.ENCRYPTION_WRITE_FORMAT = "v2"
     const encrypted = AuthManager.encryptApiKey(plaintext)
+    delete process.env.ENCRYPTION_WRITE_FORMAT
     // Plaintext starts with "blink_", ciphertext starts with "v2."
     expect(plaintext.startsWith("blink_")).toBe(true)
     expect(encrypted.startsWith("v2.")).toBe(true)
