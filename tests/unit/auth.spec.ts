@@ -40,10 +40,20 @@ describe("AuthManager.encryptApiKey / decryptApiKey", () => {
     expect(typeof encrypted).toBe("string")
   })
 
-  it("produces CryptoJS AES ciphertext starting with U2FsdGVkX1", () => {
+  it("produces authenticated v2 ciphertext tagged with the current key id (blink-wip#1587)", () => {
     const encrypted = AuthManager.encryptApiKey(sampleApiKey)
-    // CryptoJS AES with passphrase prepends "Salted__" which base64-encodes to "U2FsdGVkX1"
-    expect(encrypted.startsWith("U2FsdGVkX1")).toBe(true)
+    expect(encrypted).toMatch(/^v2\.[0-9a-f]{8}\.[A-Za-z0-9+/=]+$/)
+  })
+
+  it("still decrypts legacy CryptoJS ciphertext written before the keyring", async () => {
+    // Exactly what encryptApiKey produced before blink-wip#1587
+    const CryptoJS = (await import("crypto-js")).default
+    const legacy = CryptoJS.AES.encrypt(
+      sampleApiKey,
+      process.env.ENCRYPTION_KEY as string,
+    ).toString()
+    expect(legacy.startsWith("U2FsdGVkX1")).toBe(true)
+    expect(AuthManager.decryptApiKey(legacy)).toBe(sampleApiKey)
   })
 
   it("decrypts back to the original API key", () => {
@@ -115,10 +125,10 @@ describe("AuthManager.encryptApiKey backward compatibility", () => {
   it("plaintext API keys that start with blink_ are distinguishable from ciphertext", () => {
     const plaintext = "blink_testkey123"
     const encrypted = AuthManager.encryptApiKey(plaintext)
-    // Plaintext starts with "blink_", ciphertext starts with "U2FsdGVkX1"
+    // Plaintext starts with "blink_", ciphertext starts with "v2."
     expect(plaintext.startsWith("blink_")).toBe(true)
-    expect(encrypted.startsWith("U2FsdGVkX1")).toBe(true)
-    expect(plaintext.startsWith("U2FsdGVkX1")).toBe(false)
+    expect(encrypted.startsWith("v2.")).toBe(true)
+    expect(plaintext.startsWith("v2.")).toBe(false)
   })
 
   it("decrypting a plaintext API key returns null (graceful failure)", () => {
