@@ -69,7 +69,8 @@
  *   --max-pages <n>         Transaction pages to scan per wallet (default: 5)
  *   --help                  Show this help
  *
- * Requires ENCRYPTION_KEY (voucher API keys) and the usual database env vars.
+ * Requires ENCRYPTION_KEY (plus ENCRYPTION_KEY_PREVIOUS during a key
+ * rotation) to decrypt voucher API keys, and the usual database env vars.
  *
  * Known bound: every retained CLAIMED/PAID row of a wallet is loaded as a
  * competitor. If that grows large, narrow the competitor query to rows whose
@@ -81,8 +82,9 @@ const fs = require("fs")
 const path = require("path")
 
 const bolt11 = require("bolt11")
-const CryptoJS = require("crypto-js")
 const { Pool } = require("pg")
+
+const { envKeyring } = require("../lib/crypto/keyring")
 
 const API_URLS = {
   production: "https://api.blink.sv/graphql",
@@ -186,13 +188,9 @@ function loadEnv() {
     })
 }
 
-function decryptApiKey(encrypted, key) {
-  try {
-    const decrypted = CryptoJS.AES.decrypt(encrypted, key).toString(CryptoJS.enc.Utf8)
-    return decrypted || null
-  } catch (_err) {
-    return null
-  }
+/** Stored API keys: the app's keyring (v2 or legacy ciphertext, any configured key). */
+function decryptApiKey(encrypted) {
+  return envKeyring().decrypt(encrypted)
 }
 
 function createdAtMs(tx) {
@@ -700,8 +698,7 @@ async function main() {
     return
   }
 
-  const encryptionKey = process.env.ENCRYPTION_KEY
-  if (!encryptionKey) {
+  if (!process.env.ENCRYPTION_KEY) {
     throw new Error("ENCRYPTION_KEY is required to decrypt voucher API keys")
   }
 
@@ -710,7 +707,7 @@ async function main() {
     const summary = await reconcileClaimedVouchers({
       pool,
       fetchTransactions,
-      decryptApiKey: (encrypted) => decryptApiKey(encrypted, encryptionKey),
+      decryptApiKey,
       apply: args.apply,
       walletId: args.walletId,
       minAgeMinutes: args.minAgeMinutes,
@@ -746,6 +743,7 @@ async function main() {
 
 module.exports = {
   buildVoucherMemo,
+  decryptApiKey,
   invoicePrincipalSats,
   matchRedemptionCandidates,
   classifyVoucher,
