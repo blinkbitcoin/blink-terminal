@@ -31,6 +31,7 @@ const {
   isAuthFailure,
   MIN_APPLY_AGE_MINUTES,
   WINDOW_AFTER_MS,
+  WINDOW_BEFORE_MS,
   reconcileClaimedVouchers,
   parseArgs,
   MARK_PAID_SQL,
@@ -702,9 +703,49 @@ describe("reconcileClaimedVouchers", () => {
       return { pool, queries, ledger }
     }
 
-    it("floor = match window + 1 minute", () => {
-      expect(MIN_APPLY_AGE_MINUTES).toBe(WINDOW_AFTER_MS / MINUTE + 1)
-      expect(MIN_APPLY_AGE_MINUTES).toBe(31)
+    it("floor = post-claim window + pre-claim skew tolerance + 1 minute", () => {
+      expect(MIN_APPLY_AGE_MINUTES).toBe(
+        (WINDOW_AFTER_MS + WINDOW_BEFORE_MS) / MINUTE + 1,
+      )
+      expect(MIN_APPLY_AGE_MINUTES).toBe(33)
+    })
+
+    it("boundary: a skewed-back post-snapshot payment still reaches a 31-minute-old target", async () => {
+      // Target A is 31 min old (the previous floor). B is claimed right
+      // after the snapshot; Blink stamps its payment 1 min 59 s earlier than
+      // the app clock (within the matcher's pre-claim tolerance), so the
+      // timestamp lands ~29 min after A's claim — inside A's window.
+      const aClaimedAt = NOW - 31 * MINUTE - 1000 // just past the 31-minute cutoff
+      const bPaymentTs = NOW - (2 * MINUTE - 1000) // 1 min 59 s before B's claim (~now)
+      const { pool, queries } = setup([row({ id: "a", claimed_at: aClaimedAt })])
+      const summary = await reconcileClaimedVouchers({
+        pool,
+        fetchTransactions: async () => ({
+          transactions: [
+            settledTx({ id: "tx-b", createdAt: Math.floor(bPaymentTs / 1000) }),
+          ],
+          complete: true,
+        }),
+        decryptApiKey: () => "key",
+        apply: false,
+        minAgeMinutes: 31,
+        now: NOW,
+        log: () => {},
+      })
+      // Unique match for A — the unsafe outcome; 31 is therefore below the floor
+      expect(summary).toMatchObject({ checked: 1, matched: 1, unverified: 1, applied: 0 })
+      expect(queries.filter(([t]) => t.startsWith("UPDATE"))).toEqual([])
+      await expect(
+        reconcileClaimedVouchers({
+          pool,
+          fetchTransactions: async () => ({ transactions: [], complete: true }),
+          decryptApiKey: () => "key",
+          apply: true,
+          minAgeMinutes: 31,
+          now: NOW,
+          log: () => {},
+        }),
+      ).rejects.toThrow("--apply requires --min-age-minutes >= 33")
     })
 
     it("dry run below the floor shows the unsafe unique match — flagged unverified", async () => {
@@ -738,7 +779,7 @@ describe("reconcileClaimedVouchers", () => {
           now: NOW,
           log: () => {},
         }),
-      ).rejects.toThrow("--apply requires --min-age-minutes >= 31")
+      ).rejects.toThrow("--apply requires --min-age-minutes >= 33")
       expect(queries).toEqual([])
       expect(ledger).not.toHaveBeenCalled()
     })
@@ -793,6 +834,75 @@ describe("reconcileClaimedVouchers", () => {
       expect(ledger.mock.calls[0][0]).toBe("valid")
       expect(summary).toMatchObject({ checked: 2, skippedWallets: 0, ambiguous: 2 })
       expect(queries.filter(([t]) => t.startsWith("UPDATE"))).toEqual([])
+    })
+
+    it.each([
+      [
+        "an unscrubbed PAID row",
+        row({
+          id: "paid",
+          status: "PAID",
+          api_key_encrypted: "enc-valid",
+          claimed_at: NOW - 5 * MINUTE,
+        }),
+      ],
+      [
+        "a recent non-target CLAIMED row",
+        row({
+          id: "young",
+          status: "CLAIMED",
+          api_key_encrypted: "enc-valid",
+          claimed_at: NOW - 5 * MINUTE,
+        }),
+      ],
+    ])("uses the rotated key found on %s", async (_name, keyRow) => {
+      // The only target holds the revoked key; the valid replacement sits on
+      // a row that is loaded as a competitor but is not a target.
+      const { pool } = setup([
+        row({ id: "old", api_key_encrypted: "enc-revoked" }),
+        keyRow,
+      ])
+      const ledger = jest.fn(async (apiKey: string) => {
+        if (apiKey === "revoked") throw AUTH_401()
+        return { transactions: [], complete: true }
+      })
+      const summary = await reconcileClaimedVouchers({
+        pool,
+        fetchTransactions: ledger,
+        decryptApiKey: (enc: string) => enc.replace("enc-", ""),
+        now: NOW,
+        log: () => {},
+      })
+      expect(ledger.mock.calls.map((c) => c[0])).toEqual(["valid"]) // newest first
+      expect(summary).toMatchObject({ checked: 1, skippedWallets: 0, unmatched: 1 })
+    })
+
+    it("a scrubbed PAID row contributes no key", async () => {
+      const { pool } = setup([
+        row({ id: "old", api_key_encrypted: "enc-revoked" }),
+        row({
+          id: "paid",
+          status: "PAID",
+          api_key_encrypted: "",
+          claimed_at: NOW - 5 * MINUTE,
+        }),
+      ])
+      const ledger = jest.fn(async (_apiKey: string) => {
+        throw AUTH_401()
+      })
+      const logs: string[] = []
+      const summary = await reconcileClaimedVouchers({
+        pool,
+        fetchTransactions: ledger,
+        decryptApiKey: (enc: string) => enc.replace("enc-", ""),
+        now: NOW,
+        log: (m: string) => logs.push(m),
+      })
+      expect(ledger.mock.calls.map((c) => c[0])).toEqual(["revoked"])
+      expect(summary).toMatchObject({ skippedWallets: 1 })
+      expect(logs.find((l) => l.startsWith("[skip] wallet w1"))).toContain(
+        "1 key(s) tried",
+      )
     })
 
     it("falls over to the next key on an auth rejection", async () => {
@@ -1004,9 +1114,12 @@ describe("parseArgs", () => {
 
   it("refuses --apply below the match-window floor at the CLI", () => {
     expect(() => parseArgs(["--apply", "--min-age-minutes", "15"])).toThrow(
-      "--apply requires --min-age-minutes >= 31",
+      "--apply requires --min-age-minutes >= 33",
     )
-    expect(parseArgs(["--apply", "--min-age-minutes", "31"]).minAgeMinutes).toBe(31)
+    expect(() => parseArgs(["--apply", "--min-age-minutes", "32"])).toThrow(
+      "--apply requires --min-age-minutes >= 33",
+    )
+    expect(parseArgs(["--apply", "--min-age-minutes", "33"]).minAgeMinutes).toBe(33)
     expect(parseArgs(["--apply"]).minAgeMinutes).toBe(60) // default unchanged
   })
 

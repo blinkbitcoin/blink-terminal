@@ -35,12 +35,15 @@
  *
  * Competitors are snapshotted (one SELECT) BEFORE the ledger is read, so a
  * voucher claimed and paid after the snapshot is not in the competitor map.
- * Its payment can still be credited to a target whose +30-minute window is
- * still open — unless every target's window has already closed at snapshot
- * time, in which case any payment that could fall in a target's window
- * already exists and so does its voucher. Hence --apply requires
- * --min-age-minutes >= MIN_APPLY_AGE_MINUTES (window + 1); dry runs may use
- * smaller ages but their matches are reported as unverified.
+ * Its payment can still be credited to a target whose window is still open
+ * — unless every target's window has already closed at snapshot time, in
+ * which case any payment that could fall in a target's window already exists
+ * and so does its voucher. The matcher accepts ledger timestamps up to
+ * WINDOW_BEFORE_MS before a claim (clock skew), so a post-snapshot payment
+ * can carry a timestamp up to that much earlier than its claim: the floor
+ * covers both windows. Hence --apply requires --min-age-minutes >=
+ * MIN_APPLY_AGE_MINUTES (after + before + 1 = 33); dry runs may use smaller
+ * ages but their matches are reported as unverified.
  *
  * Zero or multiple candidates leave the voucher CLAIMED, so it stays counted
  * in the liability aggregate (the conservative direction). A payment that
@@ -62,7 +65,7 @@
  *   --apply                 Write CLAIMED -> PAID (default: dry run)
  *   --wallet <id>           Only reconcile one Blink wallet id
  *   --min-age-minutes <n>   Only claims older than n minutes (default: 60;
- *                           --apply requires >= 31, see below)
+ *                           --apply requires >= 33, see below)
  *   --max-pages <n>         Transaction pages to scan per wallet (default: 5)
  *   --help                  Show this help
  *
@@ -125,10 +128,11 @@ const TRANSACTIONS_QUERY = `
 const WINDOW_BEFORE_MS = 2 * 60 * 1000
 const WINDOW_AFTER_MS = 30 * 60 * 1000
 /**
- * Smallest --min-age-minutes --apply accepts: a target's match window must
- * have closed before the competitor snapshot (see header).
+ * Smallest --min-age-minutes --apply accepts: a target's whole match window,
+ * including the pre-claim skew tolerance a post-snapshot payment's timestamp
+ * may carry, must have closed before the competitor snapshot (see header).
  */
-const MIN_APPLY_AGE_MINUTES = WINDOW_AFTER_MS / 60000 + 1
+const MIN_APPLY_AGE_MINUTES = (WINDOW_AFTER_MS + WINDOW_BEFORE_MS) / 60000 + 1
 
 // Keep in sync with MARK_VOUCHER_PAID_SQL / WALLET_LOCK_SQL / LOCK_TIMEOUT_SQL
 // in lib/voucher-store.ts (parity asserted in tests/unit/voucher-reconcile.spec.ts).
@@ -425,9 +429,10 @@ async function reconcileClaimedVouchers(deps) {
   if (apply && minAgeMinutes < MIN_APPLY_AGE_MINUTES) {
     throw new Error(
       `--apply requires --min-age-minutes >= ${MIN_APPLY_AGE_MINUTES}: a target's ` +
-        `${WINDOW_AFTER_MS / 60000}-minute match window must have closed before the ` +
-        `competitor snapshot, or a voucher claimed and paid after the snapshot could ` +
-        `settle it (two liabilities cleared for one payment)`,
+        `match window (+${WINDOW_AFTER_MS / 60000} min, and ${WINDOW_BEFORE_MS / 60000} min ` +
+        `of pre-claim timestamp tolerance) must have closed before the competitor ` +
+        `snapshot, or a voucher claimed and paid after the snapshot could settle it ` +
+        `(two liabilities cleared for one payment)`,
     )
   }
   const windowOpen = minAgeMinutes < MIN_APPLY_AGE_MINUTES
@@ -468,8 +473,11 @@ async function reconcileClaimedVouchers(deps) {
       groups.set(key, {
         walletId: row.wallet_id,
         environment: row.environment || "production",
-        // Distinct stored credentials of the targets, newest claim first
-        // (most likely still valid): tried in turn until one scans.
+        // Distinct stored credentials from EVERY loaded row of the wallet
+        // (CLAIMED and PAID, any age), newest claim first — a rotated key
+        // most likely sits on a recent redemption, which with the PAID
+        // lifecycle is usually not a target. Scrubbed ('') keys are skipped.
+        // Tried in turn until one scans.
         apiKeysEncrypted: [],
         vouchers: [],
       })
@@ -479,7 +487,6 @@ async function reconcileClaimedVouchers(deps) {
     const isTarget = row.status === "CLAIMED" && claimedAt < cutoff
     if (isTarget) checked++
     if (
-      isTarget &&
       row.api_key_encrypted &&
       !group.apiKeysEncrypted.includes(row.api_key_encrypted)
     ) {
@@ -748,6 +755,7 @@ module.exports = {
   parseArgs,
   MIN_APPLY_AGE_MINUTES,
   WINDOW_AFTER_MS,
+  WINDOW_BEFORE_MS,
   MARK_PAID_SQL,
   WALLET_LOCK_SQL,
   LOCK_TIMEOUT_SQL,
