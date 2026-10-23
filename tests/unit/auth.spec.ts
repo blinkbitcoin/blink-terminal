@@ -42,7 +42,7 @@ describe("AuthManager.encryptApiKey / decryptApiKey", () => {
 
   it("produces authenticated v2 ciphertext tagged with the current key id (blink-wip#1587)", () => {
     const encrypted = AuthManager.encryptApiKey(sampleApiKey)
-    expect(encrypted).toMatch(/^v2\.[0-9a-f]{8}\.[A-Za-z0-9+/=]+$/)
+    expect(encrypted).toMatch(/^v2\.[0-9a-f]{16}\.[A-Za-z0-9+/=]+$/)
   })
 
   it("still decrypts legacy CryptoJS ciphertext written before the keyring", async () => {

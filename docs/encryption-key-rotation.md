@@ -14,7 +14,7 @@
 
 All of it goes through `lib/crypto/keyring.js`:
 
-- **Writes** are `v2.<kid>.<…>` — AES-256-GCM under the current `ENCRYPTION_KEY`, tagged with that key's id.
+- **Writes** are `v2.<kid>.<…>` — AES-256-GCM under the current `ENCRYPTION_KEY`, tagged with that key's 64-bit id. Two different configured keys with the same id are refused at startup.
 - **Reads** of v2 use the key whose id matches, among `ENCRYPTION_KEY` and `ENCRYPTION_KEY_PREVIOUS` (comma-separated, newest first).
 - **Legacy values** (CryptoJS, written before #1587, starting `U2FsdGVkX1`) are read with the **oldest** configured key — the key that was in use before the first rotation. They are never tried against several keys (no integrity check), so they must be re-encrypted before a second rotation.
 
@@ -36,7 +36,7 @@ kubectl exec -n <ns> <blink-terminal pod> -- node scripts/reencrypt-secrets.js -
 
 1. Generate a new key (`openssl rand -hex 32`).
 2. Set `ENCRYPTION_KEY=<new>` and `ENCRYPTION_KEY_PREVIOUS=<old>` in the chart secret; deploy. Existing values keep decrypting (by key id); new writes use the new key.
-3. `--apply`, then `--check` until it exits 0. Rows that changed while the script ran are reported as conflicts — re-run. Values listed as *undecryptable* are left untouched: investigate them (they cannot be read by the app either).
+3. `--apply`, then `--check` until it exits 0. `--check` authenticates every value: a value counts as current only when the current key decrypts it, never by its key id alone. Rows that changed while the script ran are reported as conflicts — re-run. Values listed as *undecryptable* are left untouched: investigate them (they cannot be read by the app either).
 4. Wait at least the longest lifetime of a value that is not in Postgres (Redis payment metadata: the invoice expiry), then remove `ENCRYPTION_KEY_PREVIOUS`; deploy.
 
 Never remove the previous key before step 3 passes: values still under it become unreadable.

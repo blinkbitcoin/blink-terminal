@@ -122,6 +122,73 @@ describe("non-ciphertext input is null, deterministically", () => {
   })
 })
 
+describe("inspect: authenticated, never trusts the key id alone", () => {
+  const tamper = (ct: string) => {
+    const [v, kid, payload] = ct.split(".")
+    const bytes = Buffer.from(payload, "base64")
+    bytes[12] ^= 0x01 // flip a bit in the GCM tag
+    return `${v}.${kid}.${bytes.toString("base64")}`
+  }
+
+  it("classifies current, stale (previous key / legacy), undecryptable, not-ciphertext", () => {
+    const ring = createKeyring({ current: K2, previous: K1 })
+    expect(ring.inspect(ring.encrypt(SECRET))).toEqual({
+      status: "current",
+      plaintext: SECRET,
+    })
+    expect(ring.inspect(createKeyring({ current: K1 }).encrypt(SECRET))).toEqual({
+      status: "stale",
+      plaintext: SECRET,
+    })
+    expect(ring.inspect(legacy(SECRET, K1))).toEqual({
+      status: "stale",
+      plaintext: SECRET,
+    })
+    expect(ring.inspect(createKeyring({ current: "lost-key" }).encrypt(SECRET))).toEqual({
+      status: "undecryptable",
+    })
+    expect(ring.inspect("blink_plain")).toEqual({ status: "not-ciphertext" })
+  })
+
+  it("a tampered value under the CURRENT key id is undecryptable, not current", () => {
+    // The reviewer's probe: kid matches the current key, tag modified.
+    const ring = createKeyring({ current: K1 })
+    const bad = tamper(ring.encrypt(SECRET))
+    expect(bad.split(".")[1]).toBe(ring.currentKeyId())
+    expect(ring.inspect(bad)).toEqual({ status: "undecryptable" })
+    expect(ring.decrypt(bad)).toBeNull()
+    expect(ring.needsReencrypt(bad)).toBe(false) // cannot be re-encrypted either
+  })
+
+  it("key-id collision: a value written by another key with the current id is undecryptable", () => {
+    // Simulated 64-bit collision: every key maps to the same id.
+    const sameId = () => "00000000000000aa"
+    const writtenByA = createKeyring({ current: "key-A", _keyId: sameId }).encrypt(SECRET)
+    const currentB = createKeyring({ current: "key-B", _keyId: sameId })
+    expect(writtenByA.split(".")[1]).toBe(currentB.currentKeyId())
+    expect(currentB.inspect(writtenByA)).toEqual({ status: "undecryptable" })
+    expect(currentB.needsReencrypt(writtenByA)).toBe(false)
+  })
+
+  it("rejects two distinct configured keys that share a key id", () => {
+    const sameId = () => "00000000000000aa"
+    expect(() =>
+      createKeyring({ current: "key-B", previous: "key-A", _keyId: sameId }),
+    ).toThrow("share key id 00000000000000aa")
+  })
+
+  it("the same key listed twice is de-duplicated, not an error", () => {
+    const ring = createKeyring({ current: K1, previous: `${K1},${K0}` })
+    expect(ring.inspect(ring.encrypt(SECRET)).status).toBe("current")
+    // oldest is still K0 (the duplicate of K1 does not change the order)
+    expect(ring.decrypt(legacy(SECRET, K0))).toBe(SECRET)
+  })
+
+  it("uses a 64-bit key id", () => {
+    expect(keyId(K1)).toMatch(/^[0-9a-f]{16}$/)
+  })
+})
+
 describe("needsReencrypt / isCiphertext", () => {
   const ring = createKeyring({ current: K2, previous: K1 })
   it("is true for legacy and for v2 under a non-current key, false under the current key", () => {

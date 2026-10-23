@@ -319,6 +319,62 @@ describePg("reencrypt-secrets on real Postgres", () => {
     }
   })
 
+  it("a tampered value under the CURRENT key id is reported undecryptable and fails --check", async () => {
+    // The reviewer's probe: kid = current key id, GCM tag modified.
+    const good = v2K2("blink_tampered")
+    const [v, kid, payload] = good.split(".")
+    const bytes = Buffer.from(payload, "base64")
+    bytes[12] ^= 0x01
+    const tampered = `${v}.${kid}.${bytes.toString("base64")}`
+    await sql.query("DELETE FROM vouchers WHERE id = 'v-lost'")
+    const now = Date.now()
+    await sql.query(
+      `INSERT INTO vouchers (id, amount_sats, wallet_id, api_key_encrypted, status, claimed,
+                             created_at, expires_at, expiry_id, wallet_currency)
+       VALUES ('v-tampered', 500, 'w1', $1, 'ACTIVE', false, $2, $3, '24h', 'BTC')`,
+      [tampered, now, now + 3_600_000],
+    )
+    await reencryptSecrets({ pool, keyring: rotated, apply: true, log: () => {} })
+
+    const r = await reencryptSecrets({
+      pool,
+      keyring: rotated,
+      apply: false,
+      log: () => {},
+    })
+    expect(r.pending).toBe(0)
+    expect(r.undecryptable).toEqual(["vouchers[v-tampered].api_key_encrypted"])
+    // never counted as current: only the 3 genuinely current + 11 rewritten
+    expect(r.current).toBe(14)
+
+    const check = spawnSync(
+      process.execPath,
+      [path.join(process.cwd(), "scripts", "reencrypt-secrets.js"), "--check"],
+      {
+        env: {
+          ...process.env,
+          DATABASE_URL: db.url,
+          ENCRYPTION_KEY: K2,
+          ENCRYPTION_KEY_PREVIOUS: K1,
+        },
+        encoding: "utf8",
+        timeout: 30_000,
+      },
+    )
+    expect(check.status).toBe(1)
+    expect(check.stdout).toContain("CHECK FAILED")
+    expect(check.stdout).toContain(
+      "[undecryptable] vouchers[v-tampered].api_key_encrypted",
+    )
+    expect(
+      (
+        await sql.query(
+          "SELECT api_key_encrypted AS v FROM vouchers WHERE id = 'v-tampered'",
+        )
+      ).rows[0].v,
+    ).toBe(tampered) // left untouched
+  })
+
   it("refuses to run without a current key", async () => {
     await expect(
       reencryptSecrets({ pool, keyring: createKeyring({ previous: K1 }), log: () => {} }),

@@ -7,8 +7,10 @@
  * docs/encryption-key-rotation.md.
  *
  * Finds every value written by lib/crypto/keyring.js — legacy CryptoJS or v2
- * — in the known encrypted columns and in nested JSONB fields, and rewrites
- * those that are legacy or under a non-current key:
+ * — in the known encrypted columns and in nested JSONB fields, authenticates
+ * each one (keyring.inspect: a value counts as current only when the current
+ * key authenticates it, never by its key id alone), and rewrites those that
+ * are legacy or authenticated by a previous key:
  *   decrypt (keyring: ENCRYPTION_KEY + ENCRYPTION_KEY_PREVIOUS)
  *   -> encrypt under the current key -> verify it decrypts to the same
  *   plaintext -> UPDATE ... WHERE <pk> = $1 AND <col> = <old value>
@@ -67,18 +69,21 @@ const BATCH = 500
  * nothing should change; records the outcome in `tally`.
  */
 function rewrite(value, keyring, tally, where) {
-  if (!keyring.isCiphertext(value)) return null
-  if (!keyring.needsReencrypt(value)) {
-    tally.current++
-    return null
-  }
-  const plaintext = keyring.decrypt(value)
-  if (plaintext === null) {
+  const { status, plaintext } = keyring.inspect(value)
+  if (status === "not-ciphertext") return null
+  if (status === "undecryptable") {
+    // Includes a value under the current key id that fails authentication
+    // (tampered, or written by a different key): never counted as current.
     tally.undecryptable.push(where)
     return null
   }
+  if (status === "current") {
+    tally.current++
+    return null
+  }
   const next = keyring.encrypt(plaintext)
-  if (keyring.decrypt(next) !== plaintext) {
+  const check = keyring.inspect(next)
+  if (check.status !== "current" || check.plaintext !== plaintext) {
     throw new Error(`re-encryption verification failed at ${where}`)
   }
   tally.pending++
