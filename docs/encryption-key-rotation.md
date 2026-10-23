@@ -22,8 +22,10 @@ All of it goes through `lib/crypto/keyring.js`:
 
 ## Prerequisites (deployment plumbing)
 
-- **charts**: blinkbitcoin/charts#9563 — maps `ENCRYPTION_KEY_PREVIOUS` (secret key `encryption-key-previous`, optional) and `ENCRYPTION_WRITE_FORMAT` (`blinkTerminal.encryptionWriteFormat`) into the pod.
-- **blink-deployments**: blinkbitcoin/blink-deployments#10595 — sources `encryption-key-previous` from the environment's secrets (`blink_terminal_encryption_key_previous`, only when present) and the write format from `blink_terminal_encryption_write_format`.
+- **charts**: blinkbitcoin/charts#9563 — maps `ENCRYPTION_KEY_PREVIOUS` (secret key `encryption-key-previous`, optional) and `ENCRYPTION_WRITE_FORMAT` (`blinkTerminal.encryptionWriteFormat`) into the pod, and **rolls the pod when its secret changes** (`secretVersion` annotation).
+- **blink-deployments**: blinkbitcoin/blink-deployments#10595 — sources `encryption-key-previous` from the environment's secrets (`blink_terminal_encryption_key_previous`, only when present), the write format from `blink_terminal_encryption_write_format`, and passes the Secret's `resourceVersion` as `secretVersion` so `apply` rolls the pod and waits for it.
+
+**Why the restart matters:** environment variables are read when a pod starts. A pod that has not restarted after a key change still runs with the old keys — the re-encryption script run inside it would report old-key values as current, and the next restart (kube-monkey kills blink-terminal pods at random) would then lose access to them. Every step below therefore verifies the rollout and the key ids the pod actually runs with.
 
 Phase 1 needs neither. Phase 2 needs the write-format plumbing; a rotation needs both.
 
@@ -33,30 +35,55 @@ Deploy the release containing the keyring with **no configuration change**. It r
 
 `scripts/reencrypt-secrets.js` may be run as a dry run; `--apply` and `--check` refuse to run in this phase.
 
+## Checking what a pod runs with
+
+```bash
+NS=<namespace>
+kubectl -n $NS rollout status deploy/blink-terminal
+kubectl -n $NS exec deploy/blink-terminal -c blink-terminal -- node scripts/reencrypt-secrets.js
+# first line: Keys: current=<kid> previous=[<kid>,…] writeFormat=<legacy|v2>
+```
+
+Key ids are fingerprints, not secrets. To get the id of a key without putting it on a command line:
+
+```bash
+printf '%s' "$NEW_KEY" | kubectl -n $NS exec -i deploy/blink-terminal -c blink-terminal -- \
+  node scripts/reencrypt-secrets.js --key-id-of-stdin
+```
+
+`--expect-key-id <kid>` makes any run refuse unless the pod's current key id is `<kid>`.
+
 ## Phase 2 — switch writes to v2
 
 Once phase 1 is fully deployed in the environment:
 
-1. Set `blink_terminal_encryption_write_format = "v2"` (blink-deployments) and apply. New writes are v2.
-2. **From now on the minimum rollback version is the keyring release** — earlier images cannot read v2. Do not roll back past it.
-3. Re-encrypt existing values (in an app pod, which has the database URL and keys):
+1. Set `blink_terminal_encryption_write_format = "v2"` (blink-deployments) and apply. The value is an env var in the pod template, so the pod rolls; `kubectl rollout status` must report success.
+2. Confirm the pod runs with `writeFormat=v2` (see above). **From now on the minimum rollback version is the keyring release** — earlier images cannot read v2. Do not roll back past it.
+3. Re-encrypt existing values:
 
    ```bash
-   kubectl exec -n <ns> deploy/blink-terminal -c blink-terminal -- node scripts/reencrypt-secrets.js           # dry run
-   kubectl exec -n <ns> deploy/blink-terminal -c blink-terminal -- node scripts/reencrypt-secrets.js --apply
-   kubectl exec -n <ns> deploy/blink-terminal -c blink-terminal -- node scripts/reencrypt-secrets.js --check   # exit 0 = all current
+   kubectl -n $NS exec deploy/blink-terminal -c blink-terminal -- node scripts/reencrypt-secrets.js           # dry run
+   kubectl -n $NS exec deploy/blink-terminal -c blink-terminal -- node scripts/reencrypt-secrets.js --apply
+   kubectl -n $NS exec deploy/blink-terminal -c blink-terminal -- node scripts/reencrypt-secrets.js --check   # exit 0 = all current
    ```
 
-   `--check` authenticates every value: a value is current only when the current key decrypts it. It **fails** on anything unreadable — ciphertext no configured key authenticates, plaintext or damaged values in an encrypted column, plaintext at a known JSON secret path — listing table, key and column (never plaintext). The one exception is `payment_splits.metadata.userApiKey`, which the app still reads raw for pre-encryption rows: a raw `blink_…` key there is encrypted by `--apply`. Conflicts (rows changed meanwhile): re-run.
+   `--check` authenticates every value: a value is current only when the current key decrypts it. It **fails** on anything unreadable — ciphertext no configured key authenticates, plaintext or damaged values in an encrypted column, plaintext at a known JSON secret path — listing table, key and column (never plaintext). The one exception is `payment_splits.metadata.userApiKey`, which the app still reads raw for pre-encryption rows: a raw `blink_…` / `galoy_staging_…` key there is encrypted by `--apply`. Conflicts (rows changed meanwhile): re-run.
 
 ## Rotation (phase 2 only)
 
 Legacy writes during a rotation are refused by the app, so rotate only after phase 2.
 
-1. Generate a new key (`openssl rand -hex 32`).
-2. In the environment's secrets set `blink_terminal_encryption_key = <new>` and `blink_terminal_encryption_key_previous = <old>`; apply. Existing values keep decrypting (by key id); new writes use the new key.
-3. `--apply`, then `--check` until it exits 0. Investigate anything listed as undecryptable — the app cannot read it either.
-4. Wait at least the longest lifetime of a value outside Postgres (Redis payment metadata: the invoice expiry), then remove `blink_terminal_encryption_key_previous`; apply.
+1. Generate a new key (`openssl rand -hex 32`) and compute its id with `--key-id-of-stdin` (above). Note the current id too (the first line of a dry run).
+2. In the environment's secrets set `blink_terminal_encryption_key = <new>` and `blink_terminal_encryption_key_previous = <old>`; apply. The Secret changes, so the pod rolls and `apply` waits for it. Confirm with `kubectl rollout status`, then a dry run must print `current=<new id> previous=[<old id>]`.
+3. Re-encrypt, pinned to the new key so a stale pod cannot run it:
+
+   ```bash
+   kubectl -n $NS exec deploy/blink-terminal -c blink-terminal -- node scripts/reencrypt-secrets.js --apply --expect-key-id <new id>
+   kubectl -n $NS exec deploy/blink-terminal -c blink-terminal -- node scripts/reencrypt-secrets.js --check --expect-key-id <new id>
+   ```
+
+   Repeat `--check` until it exits 0. Investigate anything listed as undecryptable — the app cannot read it either.
+4. Wait at least the longest lifetime of a value outside Postgres (Redis payment metadata: the invoice expiry), then remove `blink_terminal_encryption_key_previous`; apply. The pod rolls again: confirm `kubectl rollout status`, a dry run printing `current=<new id> previous=[]`, and `--check --expect-key-id <new id>` still exiting 0 **in the new pod**.
 
 Never remove the previous key before step 3 passes: values still under it become unreadable.
 
