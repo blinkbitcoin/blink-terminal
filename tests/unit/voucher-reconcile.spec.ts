@@ -473,6 +473,50 @@ describe("reconcileClaimedVouchers", () => {
     expect(MARK_PAID_SQL).toContain("status = 'CLAIMED'")
   })
 
+  it("--apply skips a voucher whose wallet lock times out and continues", async () => {
+    // A live create holds w1's lock past lock_timeout: nothing is written for
+    // that voucher, the run goes on, and the summary says to re-run.
+    const { pool, queries } = setup([
+      row({ id: "busy" }),
+      row({ id: "free", wallet_id: "w2" }),
+    ])
+    const original = pool.connect.getMockImplementation() as () => Promise<{
+      query: jest.Mock
+      release: jest.Mock
+    }>
+    pool.connect.mockImplementation(async () => {
+      const client = await original()
+      const inner = client.query.getMockImplementation() as (
+        t: string,
+        p: unknown[],
+      ) => Promise<unknown>
+      client.query.mockImplementation(async (text: string, params: unknown[]) => {
+        if (text.includes("pg_advisory_xact_lock") && params[0] === "w1") {
+          queries.push([text, params])
+          throw Object.assign(new Error("canceling statement due to lock timeout"), {
+            code: "55P03",
+          })
+        }
+        return inner(text, params)
+      })
+      return client
+    })
+
+    const summary = await reconcileClaimedVouchers({
+      pool,
+      fetchTransactions: jest.fn(async () => [settledTx()]),
+      decryptApiKey: () => "key",
+      apply: true,
+      now: NOW,
+      log: () => {},
+    })
+
+    expect(summary).toMatchObject({ checked: 2, matched: 2, applied: 1, lockTimeouts: 1 })
+    const updates = queries.filter(([text]) => text.startsWith("UPDATE"))
+    expect(updates.map(([, p]) => p)).toEqual([["free"]])
+    expect(queries.filter(([t]) => t === "ROLLBACK")).toHaveLength(1)
+  })
+
   it("--apply writes under the wallet lock (BACKING INVARIANT)", async () => {
     const { pool, queries, release } = setup([row()])
     await reconcileClaimedVouchers({

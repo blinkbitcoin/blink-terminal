@@ -28,6 +28,11 @@ const mockStore = {
 }
 jest.mock("../../lib/voucher-store", () => ({
   __esModule: true,
+  // Pure helper, kept real: the route maps SQLSTATE 55P03 to 503 with it.
+  isLockTimeout: (err: unknown) => {
+    const e = err as { code?: string; message?: string } | null
+    return e?.code === "55P03" || /lock timeout/i.test(e?.message ?? "")
+  },
   default: new Proxy(
     {},
     {
@@ -878,6 +883,19 @@ describe("voucher create: live ownership + confirmed wallet currency", () => {
         maxLiabilityMinor: 500,
         usdCentsPerSat: 0.05,
       })
+    })
+
+    it("maps a wallet-lock timeout (SQLSTATE 55P03) to a retryable 503, not 500", async () => {
+      // Several slow same-wallet creates queued past lock_timeout: the store
+      // rolled back safely, so the client should simply retry.
+      mockStore.createVoucher.mockRejectedValueOnce(
+        Object.assign(new Error("canceling statement due to lock timeout"), {
+          code: "55P03",
+        }),
+      )
+      const res = await create({ amount: 500 })
+      expect(res.statusCode).toBe(503)
+      expect(res.body).toEqual(expect.objectContaining({ error: expect.any(String) }))
     })
 
     it("maps the store's aggregate-liability refusal to 400", async () => {

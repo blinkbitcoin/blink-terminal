@@ -36,7 +36,9 @@
  * Zero or multiple candidates leave the voucher CLAIMED, so it stays counted
  * in the liability aggregate (the conservative direction). A payment that
  * also matches any other claimed voucher of the wallet (CLAIMED or PAID, of
- * any age) is contested and credited to none. Uniqueness is only meaningful
+ * any age) is contested and credited to none — which is why cleanup never
+ * deletes redeemed rows (migration 029): a PAID row is competitor evidence,
+ * and only its secret is scrubbed after 30 days. Uniqueness is only meaningful
  * over a COMPLETE scan: if --max-pages is hit before the ledger has been read
  * back past the earliest target's window, nothing is written for that wallet
  * (a rival candidate could sit in the unscanned part) and the run reports
@@ -131,9 +133,14 @@ async function markPaidLocked(pool, walletId, voucherId) {
     await client.query(WALLET_LOCK_SQL, [walletId])
     const update = await client.query(MARK_PAID_SQL, [voucherId])
     await client.query("COMMIT")
-    return update.rowCount === 1
+    return update.rowCount === 1 ? "paid" : "not-claimed"
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {})
+    // Postgres lock_timeout (SQLSTATE 55P03): a live create holds the wallet
+    // lock. Nothing was written; the voucher stays CLAIMED for a re-run.
+    if (err && (err.code === "55P03" || /lock timeout/i.test(err.message || ""))) {
+      return "lock-timeout"
+    }
     throw err
   } finally {
     client.release()
@@ -454,6 +461,7 @@ async function reconcileClaimedVouchers(deps) {
     skippedWallets: 0,
     incompleteWallets: 0,
     unverified: 0,
+    lockTimeouts: 0,
   }
 
   for (const group of groups.values()) {
@@ -523,10 +531,13 @@ async function reconcileClaimedVouchers(deps) {
             `[match:unverified] ${label} ${amountLabel} -> tx ${result.transaction.id} (incomplete scan)`,
           )
         } else if (apply) {
-          const updated = await markPaidLocked(pool, group.walletId, voucher.id)
-          if (updated) {
+          const outcome = await markPaidLocked(pool, group.walletId, voucher.id)
+          if (outcome === "paid") {
             summary.applied++
             log(`[paid] ${label} ${amountLabel} -> tx ${result.transaction.id}`)
+          } else if (outcome === "lock-timeout") {
+            summary.lockTimeouts++
+            log(`[skip] ${label}: wallet busy (lock timeout), left CLAIMED — re-run`)
           } else {
             log(`[skip] ${label}: no longer CLAIMED at write time`)
           }
@@ -634,8 +645,14 @@ async function main() {
       `Summary: checked=${summary.checked} matched=${summary.matched} ` +
         `applied=${summary.applied} ambiguous=${summary.ambiguous} ` +
         `unmatched=${summary.unmatched} skippedWallets=${summary.skippedWallets} ` +
-        `incompleteWallets=${summary.incompleteWallets} unverified=${summary.unverified}`,
+        `incompleteWallets=${summary.incompleteWallets} unverified=${summary.unverified} ` +
+        `lockTimeouts=${summary.lockTimeouts}`,
     )
+    if (summary.lockTimeouts > 0) {
+      console.log(
+        `${summary.lockTimeouts} voucher(s) skipped because the wallet was busy; re-run to settle them.`,
+      )
+    }
     if (summary.incompleteWallets > 0) {
       console.log(
         `${summary.incompleteWallets} wallet(s) hit --max-pages before their window was covered: ` +

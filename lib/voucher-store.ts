@@ -59,7 +59,7 @@ const MARK_PAID_LOCK_RETRIES = 2
 const MARK_PAID_RETRY_DELAY_MS = 500
 
 /** Postgres lock_timeout: SQLSTATE 55P03 (lock_not_available). */
-function isLockTimeout(err: unknown): boolean {
+export function isLockTimeout(err: unknown): boolean {
   const e = err as { code?: string; message?: string } | null
   return e?.code === "55P03" || /lock timeout/i.test(e?.message ?? "")
 }

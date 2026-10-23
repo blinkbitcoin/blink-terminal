@@ -9,7 +9,10 @@ import {
   toEnvironment,
 } from "../../../lib/voucher-auth"
 import { isValidExpiryId, DEFAULT_EXPIRY_ID } from "../../../lib/voucher-expiry"
-import voucherStore, { type BackingInputs } from "../../../lib/voucher-store"
+import voucherStore, {
+  type BackingInputs,
+  isLockTimeout,
+} from "../../../lib/voucher-store"
 
 /**
  * Tolerance for rate drift between the client's quote and the server-side
@@ -336,7 +339,9 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     const message = error instanceof Error ? error.message : "Unknown error"
     console.error("❌ Voucher creation error:", error)
 
-    if (message.endsWith("timed out")) {
+    // Backing fetch deadline, or the wallet lock wait (SQLSTATE 55P03) when
+    // same-wallet creates queue up: both are safe rollbacks, retryable.
+    if (message.endsWith("timed out") || isLockTimeout(error)) {
       return res.status(OWNERSHIP_UNAVAILABLE.status).json(OWNERSHIP_UNAVAILABLE.body)
     }
 
