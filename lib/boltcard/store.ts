@@ -255,6 +255,17 @@ const CARD_ACTIVATION_FAILED = "Failed to activate card"
 export const CONSUMED_HASH_SQLSTATE = "BC409"
 
 /**
+ * Unresolved withdrawals created before $1 (ms), optionally only for the
+ * cards in $2 (text[]; NULL = all). Oldest first.
+ */
+export const STALE_WITHDRAWALS_SQL = `SELECT payment_hash, card_id, amount, created_at, kind, attempt
+   FROM boltcard_pending_withdrawals
+   WHERE resolved_at IS NULL
+     AND created_at < $1
+     AND ($2::text[] IS NULL OR card_id = ANY($2::text[]))
+   ORDER BY created_at ASC`
+
+/**
  * The claim insert of claimAndDeductWithdrawal, exported so the PGlite spec
  * runs the exact statement against migration 030's trigger.
  * $1 = payment hash, $2 = card id, $3 = amount, $4 = now (ms).
@@ -2018,6 +2029,45 @@ class BoltcardStore {
       kind: String(row.kind),
       attempt: parseInt(String(row.attempt), 10),
     }))
+  }
+
+  /**
+   * Unresolved withdrawals older than `olderThanMs`, for ops (blink-wip#1619):
+   * rows reconciliation has not been able to settle. UNKNOWN = handed to
+   * Blink, no transaction seen yet; PENDING = Blink reported in flight.
+   * Exported SQL so the PGlite spec runs the exact statement.
+   */
+  async getStaleWithdrawals(
+    olderThanMs: number,
+    cardIds?: string[],
+  ): Promise<
+    Array<{
+      paymentHash: string
+      cardId: string
+      amount: number
+      kind: string
+      attempt: number
+      createdAt: number
+      ageMs: number
+    }>
+  > {
+    const now = Date.now()
+    const result: QueryResult<DbRow> = await query(STALE_WITHDRAWALS_SQL, [
+      now - olderThanMs,
+      cardIds ?? null,
+    ])
+    return result.rows.map((row: DbRow) => {
+      const createdAt = parseInt(String(row.created_at), 10)
+      return {
+        paymentHash: row.payment_hash as string,
+        cardId: row.card_id as string,
+        amount: parseInt(String(row.amount), 10),
+        kind: String(row.kind),
+        attempt: parseInt(String(row.attempt), 10),
+        createdAt,
+        ageMs: now - createdAt,
+      }
+    })
   }
 
   /**
