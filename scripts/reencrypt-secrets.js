@@ -35,6 +35,16 @@
  *   node scripts/reencrypt-secrets.js --apply    rewrite
  *   node scripts/reencrypt-secrets.js --check    exit 1 unless every value is
  *                                                under the current key
+ *   ... --expect-key-id <kid>   refuse to run unless this process's current
+ *                               key id is <kid> (guards against a pod that
+ *                               has not restarted onto the new key yet)
+ *   node scripts/reencrypt-secrets.js --key-id-of-stdin
+ *                               print the key id of a key read from stdin
+ *                               (no database; the key never appears in argv)
+ *
+ * Every run prints the key ids (fingerprints, not secrets) and write format
+ * the process is actually running with: environment variables are read when
+ * a pod starts, so after changing keys, confirm these before --apply.
  *
  * Requires ENCRYPTION_KEY (and ENCRYPTION_KEY_PREVIOUS while rotating), and
  * DATABASE_URL or POSTGRES_* for the database.
@@ -42,7 +52,7 @@
 
 const { Pool } = require("pg")
 
-const { envKeyring } = require("../lib/crypto/keyring")
+const { envKeyring, keyId } = require("../lib/crypto/keyring")
 
 /** Plain text columns holding one ciphertext each. */
 const COLUMN_TARGETS = [
@@ -75,7 +85,9 @@ const COLUMN_TARGETS = [
  * shape of a legacy plaintext value the app still accepts at that path
  * (migrated rather than rejected), or null when plaintext is never valid.
  */
-const BLINK_API_KEY = /^blink_[A-Za-z0-9_]+$/
+// The API key formats the app accepts (pages/api/network/consent.ts):
+// "blink_…" (mainnet) and "galoy_staging_…" (staging/signet).
+const BLINK_API_KEY = /^(blink|galoy_staging)_[A-Za-z0-9_]+$/
 const JSON_TARGETS = [
   {
     table: "user_records",
@@ -367,11 +379,30 @@ async function reencryptSecrets({
 }
 
 function parseArgs(argv) {
+  const at = argv.indexOf("--expect-key-id")
+  const expectKeyId = at === -1 ? null : argv[at + 1] || ""
+  if (at !== -1 && !/^[0-9a-f]{16}$/.test(expectKeyId)) {
+    throw new Error("--expect-key-id needs a 16-hex-character key id")
+  }
   return {
     apply: argv.includes("--apply"),
     check: argv.includes("--check"),
+    keyIdOfStdin: argv.includes("--key-id-of-stdin"),
+    expectKeyId,
     help: argv.includes("--help") || argv.includes("-h"),
   }
+}
+
+/** One line describing the key configuration this process runs with. */
+function describeKeys(keyring) {
+  const { current, previous } = keyring.configuredKeyIds()
+  return `Keys: current=${current} previous=[${previous.join(",")}] writeFormat=${keyring.writeFormat()}`
+}
+
+async function readStdin() {
+  const chunks = []
+  for await (const chunk of process.stdin) chunks.push(chunk)
+  return Buffer.concat(chunks).toString("utf8").trim()
 }
 
 function createPool() {
@@ -390,11 +421,27 @@ function createPool() {
 async function main() {
   const args = parseArgs(process.argv.slice(2))
   if (args.help) {
-    console.log("Usage: node scripts/reencrypt-secrets.js [--apply | --check]")
+    console.log(
+      "Usage: node scripts/reencrypt-secrets.js [--apply | --check] [--expect-key-id <kid>]\n" +
+        "       node scripts/reencrypt-secrets.js --key-id-of-stdin",
+    )
+    return 0
+  }
+  if (args.keyIdOfStdin) {
+    const key = await readStdin()
+    if (!key) throw new Error("no key on stdin")
+    console.log(keyId(key))
     return 0
   }
   if (args.apply && args.check) throw new Error("--apply and --check are exclusive")
   const keyring = envKeyring()
+  console.log(describeKeys(keyring))
+  if (args.expectKeyId && keyring.currentKeyId() !== args.expectKeyId) {
+    throw new Error(
+      `this process runs with current key id ${keyring.currentKeyId()}, expected ${args.expectKeyId}: ` +
+        "the pod has not restarted onto the new key yet (wait for the rollout)",
+    )
+  }
   if (args.check && keyring.writeFormat() !== "v2") {
     throw new Error(
       "--check requires ENCRYPTION_WRITE_FORMAT=v2: in the rollback-safe phase values are still written in the legacy format",

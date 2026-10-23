@@ -482,6 +482,24 @@ describePg("reencrypt-secrets on real Postgres", () => {
       expect(cli("--check").status).toBe(1)
     })
 
+    it("metadata.userApiKey: a raw staging key (galoy_staging_…, accepted by the app) is migrated too", async () => {
+      await sql.query(
+        `INSERT INTO payment_splits (payment_hash, user_api_key_hash, user_wallet_id, total_amount,
+                                     base_amount, tip_amount, metadata, expires_at)
+         VALUES ($1, 'h', 'w1', 100, 100, 0, $2::jsonb, NOW() + interval '1 hour')`,
+        ["d".repeat(64), JSON.stringify({ userApiKey: "galoy_staging_example_123" })],
+      )
+      expect(cli("--apply").status).toBe(0)
+      const v = (
+        await sql.query(
+          "SELECT metadata->>'userApiKey' AS v FROM payment_splits WHERE payment_hash = $1",
+          ["d".repeat(64)],
+        )
+      ).rows[0].v as string
+      expect(rotated.decrypt(v)).toBe("galoy_staging_example_123")
+      expect(cli("--check").status).toBe(0)
+    })
+
     it("metadata.userApiKey: a raw Blink key (still accepted by the app) is migrated; other raw values are not", async () => {
       await sql.query(
         `INSERT INTO payment_splits (payment_hash, user_api_key_hash, user_wallet_id, total_amount,
@@ -546,6 +564,75 @@ describePg("reencrypt-secrets on real Postgres", () => {
       expect(out.status).toBe(1)
       expect(out.stderr).toContain("requires ENCRYPTION_WRITE_FORMAT=v2")
     }
+  })
+
+  describe("key configuration is visible and stale pods are refused", () => {
+    const run = (args: string[], env: Record<string, string>, input?: string) =>
+      spawnSync(
+        process.execPath,
+        [path.join(process.cwd(), "scripts", "reencrypt-secrets.js"), ...args],
+        {
+          env: { ...process.env, DATABASE_URL: db.url, ...env },
+          encoding: "utf8",
+          timeout: 30_000,
+          input,
+        },
+      )
+    const rotatedEnv = {
+      ENCRYPTION_KEY: K2,
+      ENCRYPTION_KEY_PREVIOUS: K1,
+      ENCRYPTION_WRITE_FORMAT: "v2",
+    }
+
+    it("every run prints the key ids and write format it runs with", () => {
+      const out = run([], rotatedEnv)
+      expect(out.status).toBe(1) // v-lost is undecryptable in the seed
+      expect(out.stdout).toContain(
+        `Keys: current=${keyId(K2)} previous=[${keyId(K1)}] writeFormat=v2`,
+      )
+      expect(out.stdout).not.toContain(K1)
+      expect(out.stdout).not.toContain(K2)
+    })
+
+    it("--expect-key-id refuses to run in a pod still on the old key (no writes)", async () => {
+      const before = await value(
+        "SELECT api_key_encrypted AS v FROM vouchers WHERE id = 'v-legacy'",
+      )
+      // the pod has not restarted: still only the old key
+      const stale = run(["--apply", "--expect-key-id", keyId(K2)], {
+        ENCRYPTION_KEY: K1,
+        ENCRYPTION_WRITE_FORMAT: "v2",
+      })
+      expect(stale.status).toBe(1)
+      expect(stale.stderr).toContain(
+        `runs with current key id ${keyId(K1)}, expected ${keyId(K2)}`,
+      )
+      expect(stale.stderr).toContain("has not restarted")
+      expect(
+        await value("SELECT api_key_encrypted AS v FROM vouchers WHERE id = 'v-legacy'"),
+      ).toBe(before)
+
+      await sql.query("DELETE FROM vouchers WHERE id = 'v-lost'")
+      const fresh = run(["--apply", "--expect-key-id", keyId(K2)], rotatedEnv)
+      expect(fresh.status).toBe(0)
+      expect(fresh.stdout).toContain("rewritten=11")
+    })
+
+    it("--key-id-of-stdin prints a key's id without a database or the key in argv", () => {
+      const out = run(
+        ["--key-id-of-stdin"],
+        { DATABASE_URL: "postgres://unused" },
+        `${K2}\n`,
+      )
+      expect(out.status).toBe(0)
+      expect(out.stdout.trim()).toBe(keyId(K2))
+    })
+
+    it("--expect-key-id validates its argument", () => {
+      const out = run(["--check", "--expect-key-id", "nothex"], rotatedEnv)
+      expect(out.status).toBe(1)
+      expect(out.stderr).toContain("16-hex-character key id")
+    })
   })
 
   it("refuses to run without a current key", async () => {

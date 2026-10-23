@@ -188,6 +188,19 @@ describe("inspect: authenticated, never trusts the key id alone", () => {
     expect(ring.decrypt(legacy(SECRET, K0))).toBe(SECRET)
   })
 
+  it("reports the configured key ids (fingerprints) the process runs with", () => {
+    expect(
+      v2Ring({ current: K2, previous: `${K1},${K0},${K2}` }).configuredKeyIds(),
+    ).toEqual({
+      current: keyId(K2),
+      previous: [keyId(K1), keyId(K0)],
+    })
+    expect(v2Ring({ current: K1 }).configuredKeyIds()).toEqual({
+      current: keyId(K1),
+      previous: [],
+    })
+  })
+
   it("uses a 64-bit key id", () => {
     expect(keyId(K1)).toMatch(/^[0-9a-f]{16}$/)
   })

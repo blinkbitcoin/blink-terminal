@@ -5,6 +5,8 @@ export type InspectStatus = "current" | "stale" | "undecryptable" | "not-ciphert
 export interface Keyring {
   /** Fingerprint of the current key (null when none is configured). */
   currentKeyId(): string | null
+  /** Fingerprints of every configured key (non-secret). */
+  configuredKeyIds(): { current: string | null; previous: string[] }
   /** "legacy" (default, rollback-safe) or "v2"; null when the setting is invalid. */
   writeFormat(): "legacy" | "v2" | null
   /**
