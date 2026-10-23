@@ -2,6 +2,7 @@ import type { NextApiRequest, NextApiResponse } from "next"
 
 import * as boltcard from "../../../lib/boltcard"
 import { requireSessionPubkey } from "../../../lib/boltcard/owner-auth"
+import { getReconcileConfig } from "../../../lib/boltcard/reconcile-config"
 import { withRateLimit, RATE_LIMIT_READ } from "../../../lib/rate-limit"
 
 /**
@@ -12,10 +13,6 @@ import { withRateLimit, RATE_LIMIT_READ } from "../../../lib/rate-limit"
  * Returns statistics about the authenticated owner's cards only (Nostr
  * session required). Aggregates across other owners are never exposed.
  */
-/** Same default as the reconcile scheduler's ops log. */
-const WITHDRAWAL_STALE_MINUTES =
-  Number(process.env.BOLTCARD_WITHDRAWAL_STALE_MINUTES) || 15
-
 async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "GET") {
     return res.status(405).json({ error: "Method not allowed" })
@@ -54,7 +51,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
         ? await Promise.all([
             boltcard.store.getStaleWithdrawals(0, ownerCardIds),
             boltcard.store.getStaleWithdrawals(
-              WITHDRAWAL_STALE_MINUTES * 60_000,
+              getReconcileConfig().staleMinutes * 60_000,
               ownerCardIds,
             ),
           ])

@@ -20,6 +20,7 @@ import { timingSafeEqual } from "crypto"
 
 import type { NextApiRequest, NextApiResponse } from "next"
 
+import { getReconcileConfig } from "../../lib/boltcard/reconcile-config"
 import boltcardStore from "../../lib/boltcard/store"
 import { getSharedPool } from "../../lib/db"
 import { baseLogger } from "../../lib/logger"
@@ -185,7 +186,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     // ------------------------------------------------------------------
     if (detailed) {
       try {
-        const staleMinutes = Number(process.env.BOLTCARD_WITHDRAWAL_STALE_MINUTES) || 15
+        const { staleMinutes } = getReconcileConfig()
         const [inFlight, stale] = await Promise.all([
           boltcardStore.getStaleWithdrawals(0),
           boltcardStore.getStaleWithdrawals(staleMinutes * 60_000),
