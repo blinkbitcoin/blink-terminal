@@ -36,7 +36,11 @@
  * Zero or multiple candidates leave the voucher CLAIMED, so it stays counted
  * in the liability aggregate (the conservative direction). A payment that
  * also matches any other claimed voucher of the wallet (CLAIMED or PAID, of
- * any age) is contested and credited to none. Dry-run by default; pass
+ * any age) is contested and credited to none. Uniqueness is only meaningful
+ * over a COMPLETE scan: if --max-pages is hit before the ledger has been read
+ * back past the earliest target's window, nothing is written for that wallet
+ * (a rival candidate could sit in the unscanned part) and the run reports
+ * that --max-pages must be raised. Dry-run by default; pass
  * --apply to write. Run migration 029 first (PAID is rejected by the pre-029
  * status constraint).
  *
@@ -283,6 +287,13 @@ function classifyVoucher(voucher, transactions) {
   return { outcome: "unmatched" }
 }
 
+/**
+ * Settled-side ledger scan, newest first. Resolves to
+ * { transactions, complete, pages }: `complete` is true only when the scan
+ * reached the end of the history or read back past `untilMs`, i.e. every
+ * transaction that could fall in the callers' windows has been seen. A scan
+ * cut short by `maxPages` is incomplete and must not drive writes.
+ */
 async function fetchTransactions(apiKey, environment, options = {}) {
   const url = API_URLS[environment] || API_URLS.production
   const first = 100
@@ -290,6 +301,8 @@ async function fetchTransactions(apiKey, environment, options = {}) {
   const untilMs = options.untilMs || 0
   const transactions = []
   let after = null
+  let complete = false
+  let pages = 0
 
   const walletIds = options.walletId ? [options.walletId] : null
 
@@ -315,14 +328,21 @@ async function fetchTransactions(apiKey, environment, options = {}) {
     const edges = connection?.edges || []
     for (const edge of edges) transactions.push(edge.node)
 
+    pages++
     const oldest = edges.length > 0 ? createdAtMs(edges[edges.length - 1].node) : NaN
-    if (!connection?.pageInfo?.hasNextPage) break
-    if (Number.isFinite(oldest) && untilMs && oldest < untilMs) break
+    if (!connection?.pageInfo?.hasNextPage) {
+      complete = true // end of history
+      break
+    }
+    if (Number.isFinite(oldest) && untilMs && oldest < untilMs) {
+      complete = true // read back past the earliest window
+      break
+    }
     after = connection.pageInfo.endCursor
-    if (!after) break
+    if (!after) break // no cursor to continue: incomplete
   }
 
-  return transactions
+  return { transactions, complete, pages }
 }
 
 /**
@@ -406,6 +426,8 @@ async function reconcileClaimedVouchers(deps) {
     ambiguous: 0,
     unmatched: 0,
     skippedWallets: 0,
+    incompleteWallets: 0,
+    unverified: 0,
   }
 
   for (const group of groups.values()) {
@@ -419,16 +441,29 @@ async function reconcileClaimedVouchers(deps) {
     const targets = group.vouchers.filter((v) => v.isTarget)
     const earliestClaim = Math.min(...targets.map((v) => v.claimedAt))
     let transactions
+    let complete
     try {
-      transactions = await fetchTransactionsImpl(apiKey, group.environment, {
+      const scan = await fetchTransactionsImpl(apiKey, group.environment, {
         maxPages,
         walletId: group.walletId,
         untilMs: earliestClaim - WINDOW_BEFORE_MS,
       })
+      // Tolerate a bare array (older callers/tests): treat it as complete.
+      transactions = Array.isArray(scan) ? scan : scan.transactions
+      complete = Array.isArray(scan) ? true : scan.complete === true
     } catch (err) {
       summary.skippedWallets++
       log(`[skip] wallet ${group.walletId}: ${err.message}`)
       continue
+    }
+    // An incomplete scan cannot prove uniqueness: a rival candidate may sit
+    // in the unscanned part of the window. Report, never write.
+    if (!complete) {
+      summary.incompleteWallets++
+      log(
+        `[incomplete] wallet ${group.walletId}: --max-pages ${maxPages} reached before ` +
+          `the earliest target window — matches below are unverified, nothing is written; raise --max-pages`,
+      )
     }
 
     // Refuse to credit the same payment to two vouchers: a nearby claim
@@ -456,7 +491,12 @@ async function reconcileClaimedVouchers(deps) {
 
       if (result.outcome === "matched" && rivals === 1) {
         summary.matched++
-        if (apply) {
+        if (!complete) {
+          summary.unverified++
+          log(
+            `[match:unverified] ${label} ${amountLabel} -> tx ${result.transaction.id} (incomplete scan)`,
+          )
+        } else if (apply) {
           const update = await pool.query(MARK_PAID_SQL, [voucher.id])
           if (update.rowCount === 1) {
             summary.applied++
@@ -567,8 +607,15 @@ async function main() {
     console.log(
       `Summary: checked=${summary.checked} matched=${summary.matched} ` +
         `applied=${summary.applied} ambiguous=${summary.ambiguous} ` +
-        `unmatched=${summary.unmatched} skippedWallets=${summary.skippedWallets}`,
+        `unmatched=${summary.unmatched} skippedWallets=${summary.skippedWallets} ` +
+        `incompleteWallets=${summary.incompleteWallets} unverified=${summary.unverified}`,
     )
+    if (summary.incompleteWallets > 0) {
+      console.log(
+        `${summary.incompleteWallets} wallet(s) hit --max-pages before their window was covered: ` +
+          `${summary.unverified} match(es) left unwritten. Re-run with a larger --max-pages.`,
+      )
+    }
     if (!args.apply && summary.matched > 0) {
       console.log("Dry run only. Re-run with --apply to mark matched vouchers PAID.")
     }

@@ -551,6 +551,57 @@ describe("reconcileClaimedVouchers", () => {
     )
   })
 
+  it("an incomplete ledger scan never writes, even with one visible candidate", async () => {
+    // The page cap stopped the scan before the target's window was covered:
+    // the single visible candidate might be contested by a transaction in
+    // the unscanned part, so --apply must not mark PAID.
+    const { pool, queries } = setup([row()])
+    const summary = await reconcileClaimedVouchers({
+      pool,
+      fetchTransactions: jest.fn(async () => ({
+        transactions: [settledTx()],
+        complete: false,
+        pages: 5,
+      })),
+      decryptApiKey: () => "key",
+      apply: true,
+      now: NOW,
+      log: () => {},
+    })
+
+    expect(summary).toMatchObject({
+      checked: 1,
+      matched: 1,
+      applied: 0,
+      unverified: 1,
+      incompleteWallets: 1,
+    })
+    expect(queries.filter(([text]) => text.startsWith("UPDATE"))).toEqual([])
+  })
+
+  it("a complete scan ({transactions, complete: true}) writes as before", async () => {
+    const { pool, queries } = setup([row()])
+    const summary = await reconcileClaimedVouchers({
+      pool,
+      fetchTransactions: jest.fn(async () => ({
+        transactions: [settledTx()],
+        complete: true,
+        pages: 1,
+      })),
+      decryptApiKey: () => "key",
+      apply: true,
+      now: NOW,
+      log: () => {},
+    })
+    expect(summary).toMatchObject({
+      matched: 1,
+      applied: 1,
+      unverified: 0,
+      incompleteWallets: 0,
+    })
+    expect(queries.filter(([text]) => text.startsWith("UPDATE"))).toHaveLength(1)
+  })
+
   it("never credits a recent claim's payment to a legacy claim", async () => {
     // A (legacy, payout never settled) claimed 61 min ago; B (same face
     // value) claimed 40 min ago and settled — inside A's +30 min window but
@@ -770,7 +821,8 @@ describe("fetchTransactions", () => {
     fetchMock.mockResolvedValueOnce(page([at(NOW)]))
     const result = await fetchTransactions("key", "staging", { walletId: "w1" })
 
-    expect(result.map((t: { id: string }) => t.id)).toEqual([`t${NOW}`])
+    expect(result.transactions.map((t: { id: string }) => t.id)).toEqual([`t${NOW}`])
+    expect(result.complete).toBe(true) // hasNextPage=false: end of history
     const [url, init] = fetchMock.mock.calls[0]
     expect(url).toBe("https://api.staging.blink.sv/graphql")
     expect(init.headers["X-API-KEY"]).toBe("key")
@@ -800,7 +852,25 @@ describe("fetchTransactions", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(2)
     expect(bodyOf(1).variables.after).toBe("p1")
-    expect(result).toHaveLength(4)
+    expect(result.transactions).toHaveLength(4)
+    expect(result.complete).toBe(true) // read back past untilMs
+  })
+
+  it("reports an incomplete scan when the page cap stops it before untilMs", async () => {
+    fetchMock.mockResolvedValue(page([at(NOW)], { hasNextPage: true, endCursor: "next" }))
+    const capped = await fetchTransactions("key", "production", {
+      maxPages: 2,
+      untilMs: NOW - 60 * MINUTE,
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(capped).toMatchObject({ complete: false, pages: 2 })
+
+    // A missing cursor with more pages announced is incomplete too
+    fetchMock.mockReset()
+    fetchMock.mockResolvedValueOnce(
+      page([at(NOW)], { hasNextPage: true, endCursor: null }),
+    )
+    expect((await fetchTransactions("key", "production")).complete).toBe(false)
   })
 
   it("stops at maxPages, at the last page, and without a cursor", async () => {
@@ -810,7 +880,9 @@ describe("fetchTransactions", () => {
 
     fetchMock.mockReset()
     fetchMock.mockResolvedValueOnce(page([at(NOW)], { hasNextPage: false }))
-    await fetchTransactions("key", "production", { maxPages: 3 })
+    expect((await fetchTransactions("key", "production", { maxPages: 3 })).complete).toBe(
+      true,
+    )
     expect(fetchMock).toHaveBeenCalledTimes(1)
 
     fetchMock.mockReset()
