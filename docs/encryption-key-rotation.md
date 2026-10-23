@@ -27,7 +27,15 @@ All of it goes through `lib/crypto/keyring.js`:
 
 **Why the restart matters:** environment variables are read when a pod starts. A pod that has not restarted after a key change still runs with the old keys — the re-encryption script run inside it would report old-key values as current, and the next restart (kube-monkey kills blink-terminal pods at random) would then lose access to them. Every step below therefore verifies the rollout and the key ids the pod actually runs with.
 
-Phase 1 needs neither. Phase 2 needs the write-format plumbing; a rotation needs both.
+**Merge order.** blink-deployments deploys a *vendored* copy of the chart, not charts `main`:
+
+1. charts#9563 merges;
+2. the bot bumps the vendored chart on blink-deployments `main` (`chore: bump blink-terminal-chart to '<sha>'`);
+3. blink-deployments#10595 is refreshed from `main` and merged. Its Terraform precondition refuses to deploy a vendored chart without the secret-change rollout, so an out-of-order merge fails `apply` loudly rather than deploying stale pods.
+
+Before phase 2 or a rotation, confirm in blink-deployments that `modules/services/addons/vendor/blink-terminal/chart/templates/deployment.yaml` contains `blink-terminal/secret-version`.
+
+Phase 1 needs none of this. Phase 2 needs the write-format plumbing; a rotation needs all of it.
 
 ## Phase 1 — reader-first deploy (rollback-safe)
 
