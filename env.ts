@@ -60,6 +60,9 @@ export const env = createEnv({
     // --- Auth / Security ---
     JWT_SECRET: z.string().min(1),
     ENCRYPTION_KEY: z.string().min(1),
+    // Read-only keys during a rotation, comma-separated, newest first
+    // (lib/crypto/keyring.js, docs/encryption-key-rotation.md).
+    ENCRYPTION_KEY_PREVIOUS: z.string().min(1).optional(),
     NETWORK_ENCRYPTION_KEY: z.string().min(1).optional(),
 
     // --- External Services ---
@@ -124,6 +127,7 @@ export const env = createEnv({
     // Auth / Security
     JWT_SECRET: process.env.JWT_SECRET,
     ENCRYPTION_KEY: process.env.ENCRYPTION_KEY,
+    ENCRYPTION_KEY_PREVIOUS: process.env.ENCRYPTION_KEY_PREVIOUS,
     NETWORK_ENCRYPTION_KEY: process.env.NETWORK_ENCRYPTION_KEY,
 
     // External Services
