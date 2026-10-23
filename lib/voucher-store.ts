@@ -29,6 +29,91 @@ import {
   getVoucherStatus,
 } from "./voucher-expiry"
 
+/**
+ * BACKING INVARIANT (blink-wip#1665)
+ *
+ *   live Blink wallet balance >= SUM(liability of unexpired ACTIVE + CLAIMED)
+ *
+ * is enforced per wallet under pg_advisory_xact_lock(hashtext(wallet_id)).
+ * Every step that READS the balance against the sum, or REMOVES a liability
+ * after a debit, must hold that lock, or the two can interleave (a creation
+ * reading the pre-debit balance, then summing after the debited voucher left
+ * the set):
+ *   - createVoucher with `backing`: balance/rate fetch -> sum -> insert, all
+ *     inside one locked transaction (the callback runs under the lock)
+ *   - markVoucherPaid (CLAIMED -> PAID, the only post-debit removal), also
+ *     used by scripts/reconcile-voucher-claims.js via MARK_VOUCHER_PAID_SQL
+ * Transitions that remove a liability WITHOUT a debit (cancel, expiry,
+ * definite-failure unclaim) leave the balance untouched and need no lock.
+ * Lock waits are bounded (LOCK_TIMEOUT) so a slow Blink call under the lock
+ * cannot wedge the wallet or the pool.
+ */
+export const WALLET_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext($1))"
+export const LOCK_TIMEOUT_SQL = "SET LOCAL lock_timeout = '15s'"
+/**
+ * markVoucherPaid retries on lock timeout: a create's locked section is
+ * bounded by its 8 s backing deadline (pages/api/voucher/create.ts), so a
+ * settlement that loses one lock wait almost always wins the next.
+ */
+const MARK_PAID_LOCK_RETRIES = 2
+const MARK_PAID_RETRY_DELAY_MS = 500
+
+/** Postgres lock_timeout: SQLSTATE 55P03 (lock_not_available). */
+export function isLockTimeout(err: unknown): boolean {
+  const e = err as { code?: string; message?: string } | null
+  return e?.code === "55P03" || /lock timeout/i.test(e?.message ?? "")
+}
+
+/**
+ * Aggregate liabilities of unsettled vouchers for one wallet, in the wallet's
+ * minor units. Exported as constants so the PGlite spec executes the exact
+ * SQL the store runs (PR #94 review: mocked client.query let a Postgres
+ * parameter-type failure ship).
+ *
+ * Expiry only applies to ACTIVE: an unclaimed voucher past expiry can never be
+ * redeemed. CLAIMED is counted regardless of expiry because claim happens
+ * BEFORE the payment round trip (callback.ts): a voucher claimed just before
+ * expiry may still settle (PENDING/unknown outcome) and debit the wallet.
+ * Settlement (PAID), cancellation and definite-failure unclaim (CLAIMED ->
+ * ACTIVE, which then expires normally) exit the set (blink-wip#1665). CLAIMED
+ * is never aged out by cleanup: an unresolved claim stays a liability until
+ * reconciliation, unclaim or cancel resolves it (migration 029).
+ *
+ * $1 = walletId, $2 = now (ms). USD also takes $3 = server cents-per-sat rate
+ * (cast to numeric: amount_sats is BIGINT, and an uncast "0.05" parameter would
+ * be inferred as bigint and rejected).
+ */
+export const ACTIVE_LIABILITY_SUM_SQL_BTC = `SELECT COALESCE(SUM(amount_sats), 0) AS total FROM vouchers
+   WHERE wallet_id = $1 AND (status = 'CLAIMED' OR (status = 'ACTIVE' AND expires_at > $2))`
+
+export const ACTIVE_LIABILITY_SUM_SQL_USD = `SELECT COALESCE(
+     SUM(GREATEST(COALESCE(usd_amount_cents, 0), CEIL(amount_sats * $3::numeric))),
+     0
+   ) AS total FROM vouchers
+   WHERE wallet_id = $1 AND (status = 'CLAIMED' OR (status = 'ACTIVE' AND expires_at > $2))`
+
+/**
+ * Voucher redemption transitions, exported so the PGlite spec can run the
+ * exact production statements through a full lifecycle. $1 = chargeId,
+ * $2 = now (ms).
+ *
+ * CLAIMED is entered BEFORE the payment round trip and exited only by
+ * settlement (PAID, via markVoucherPaid), definite-failure unclaim (back to
+ * ACTIVE), cancellation or expiry — see the liability comment above.
+ */
+export const CLAIM_VOUCHER_SQL = `UPDATE vouchers
+   SET claimed = true, claimed_at = $2, status = 'CLAIMED'
+   WHERE id = $1
+     AND status = 'ACTIVE'
+     AND NOT claimed
+     AND expires_at > $2
+   RETURNING id`
+
+export const MARK_VOUCHER_PAID_SQL = `UPDATE vouchers
+   SET status = 'PAID'
+   WHERE id = $1 AND status = 'CLAIMED'
+   RETURNING id`
+
 interface Voucher {
   id: string
   amount: number
@@ -57,6 +142,43 @@ interface CreateVoucherOptions {
   environment?: string
   walletCurrency?: string
   usdAmount?: number
+  /**
+   * Backing ceiling in minor units (sats for BTC wallets, cents for USD).
+   * When set, the insert runs in a per-wallet transaction that sums existing
+   * unsettled voucher liabilities (unexpired ACTIVE + in-flight CLAIMED) and
+   * refuses when existing + liabilityMinor exceeds this ceiling
+   * (blink-wip#1665: each create used to check only its own amount against the
+   * live balance, so sequential/concurrent creates could aggregate beyond it).
+   */
+  maxLiabilityMinor?: number
+  /**
+   * This voucher's liability in the same minor units as maxLiabilityMinor.
+   * Defaults to the stored amount (sats) / usdAmountCents (USD).
+   */
+  liabilityMinor?: number
+  /**
+   * Server-side USD cents-per-sat rate. Required when a USD voucher is
+   * created with a backing ceiling: existing ACTIVE USD vouchers are summed
+   * at max(stored cents, ceil(amount_sats × rate)) — the same conservative
+   * formula the route applies to the new voucher — because only the smaller
+   * display cents are persisted (PR #94 review). Liabilities are evaluated at
+   * the current rate: redemption pays sats at today's value.
+   */
+  usdCentsPerSat?: number
+  /**
+   * Fetches the backing inputs UNDER the per-wallet lock (see BACKING
+   * INVARIANT). Takes precedence over maxLiabilityMinor/liabilityMinor/
+   * usdCentsPerSat: the live balance must be read after the lock is held, or
+   * a settlement (CLAIMED -> PAID) can land between the balance read and the
+   * liability sum. Throw to abort (rolled back, nothing inserted).
+   */
+  backing?: () => Promise<BackingInputs>
+}
+
+interface BackingInputs {
+  maxLiabilityMinor: number
+  liabilityMinor: number
+  usdCentsPerSat?: number
 }
 
 interface VoucherStats {
@@ -235,32 +357,92 @@ class VoucherStore {
     // Encrypt API key for storage
     const apiKeyEncrypted: string = AuthManager.encryptApiKey(apiKey)
 
-    try {
-      const result: QueryResult<VoucherRow> = await query(
-        `INSERT INTO vouchers 
+    const insertSql = `INSERT INTO vouchers
          (id, amount_sats, wallet_id, api_key_encrypted, status, claimed,
           created_at, expires_at, expiry_id, display_amount, display_currency, commission_percent, environment,
           wallet_currency, usd_amount_cents)
          VALUES ($1, $2, $3, $4, 'ACTIVE', false, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-         RETURNING *`,
-        [
-          chargeId,
-          amount,
-          walletId,
-          apiKeyEncrypted,
-          now,
-          expiresAt,
-          expiryId,
-          options.displayAmount || null,
-          options.displayCurrency || null,
-          options.commissionPercent || 0,
-          environment,
-          walletCurrency,
-          usdAmountCents,
-        ],
-      )
+         RETURNING *`
+    const insertParams = [
+      chargeId,
+      amount,
+      walletId,
+      apiKeyEncrypted,
+      now,
+      expiresAt,
+      expiryId,
+      options.displayAmount || null,
+      options.displayCurrency || null,
+      options.commissionPercent || 0,
+      environment,
+      walletCurrency,
+      usdAmountCents,
+    ]
 
-      const row: VoucherRow = result.rows[0]
+    try {
+      let row: VoucherRow
+
+      if (options.maxLiabilityMinor === undefined && !options.backing) {
+        const result: QueryResult<VoucherRow> = await query(insertSql, insertParams)
+        row = result.rows[0]
+      } else {
+        // Balance read, liability sum and insert must be atomic per wallet
+        // (BACKING INVARIANT): serialize on the wallet, then fetch the live
+        // balance and count existing liabilities inside the transaction.
+        const client = await getPool().connect()
+        try {
+          await client.query("BEGIN")
+          await client.query(LOCK_TIMEOUT_SQL)
+          await client.query(WALLET_LOCK_SQL, [walletId])
+
+          const backing: BackingInputs = options.backing
+            ? await options.backing()
+            : {
+                maxLiabilityMinor: options.maxLiabilityMinor as number,
+                liabilityMinor:
+                  options.liabilityMinor ??
+                  (walletCurrency === "USD" ? (usdAmountCents as number) : amount),
+                usdCentsPerSat: options.usdCentsPerSat,
+              }
+          const liability: number = backing.liabilityMinor
+
+          let existing: number
+          if (walletCurrency === "USD") {
+            // Only the display cents are persisted; existing USD vouchers
+            // must be re-rated conservatively or the aggregate undercounts.
+            const rate = backing.usdCentsPerSat
+            if (typeof rate !== "number" || !Number.isFinite(rate) || rate <= 0) {
+              throw new Error("USD liability check requires the current rate")
+            }
+            const existingResult = await client.query(ACTIVE_LIABILITY_SUM_SQL_USD, [
+              walletId,
+              now,
+              rate,
+            ])
+            // numeric SUM can return "103.000000"; round UP (conservative).
+            existing = Math.ceil(Number(existingResult.rows[0]?.total ?? 0))
+          } else {
+            const existingResult = await client.query(ACTIVE_LIABILITY_SUM_SQL_BTC, [
+              walletId,
+              now,
+            ])
+            existing = parseInt(String(existingResult.rows[0]?.total ?? "0"), 10)
+          }
+          if (existing + liability > backing.maxLiabilityMinor) {
+            throw new Error("Voucher amount exceeds the wallet balance")
+          }
+
+          const result = await client.query(insertSql, insertParams)
+          await client.query("COMMIT")
+          row = result.rows[0] as VoucherRow
+        } catch (txErr: unknown) {
+          await client.query("ROLLBACK").catch(() => {})
+          throw txErr
+        } finally {
+          client.release()
+        }
+      }
+
       const voucher: Voucher = this._rowToVoucher(row, apiKey) as Voucher // Pass original apiKey to avoid decryption
 
       const expiryDate: string = new Date(voucher.expiresAt).toISOString()
@@ -391,16 +573,10 @@ class VoucherStore {
       const now: number = Date.now()
 
       // Atomic update - only claims if ACTIVE and not already claimed
-      const result: QueryResult<VoucherRow> = await query(
-        `UPDATE vouchers 
-         SET claimed = true, claimed_at = $2, status = 'CLAIMED'
-         WHERE id = $1 
-           AND status = 'ACTIVE' 
-           AND NOT claimed
-           AND expires_at > $2
-         RETURNING id`,
-        [chargeId, now],
-      )
+      const result: QueryResult<VoucherRow> = await query(CLAIM_VOUCHER_SQL, [
+        chargeId,
+        now,
+      ])
 
       if (result.rowCount === 0) {
         console.log(`[VoucherStore] Cannot claim voucher: ${chargeId}`)
@@ -412,6 +588,79 @@ class VoucherStore {
     } catch (err: unknown) {
       console.error("[VoucherStore] claimVoucher error:", (err as Error).message)
       return false
+    }
+  }
+
+  /**
+   * Mark a claimed voucher paid after the redemption payment settled
+   * (SUCCESS only — ALREADY_PAID leaves no net debit). Settled vouchers must
+   * leave the liability
+   * aggregate — Blink has already debited the wallet (PR #94 review).
+   * PENDING/unknown outcomes stay CLAIMED (counted) by simply not calling
+   * this. claimed stays true: the voucher was redeemed.
+   *
+   * @param chargeId - Voucher charge ID
+   * @returns Success (false if the voucher was not CLAIMED)
+   */
+  async markVoucherPaid(chargeId: string): Promise<boolean> {
+    // Under the wallet lock (BACKING INVARIANT): this removes a liability
+    // after a debit, so it must not land between a creation's balance read
+    // and its liability sum. The payment has already executed, so losing the
+    // lock race to a (bounded) create must not lose the settlement: retry a
+    // few times on lock timeout before giving up (the voucher then stays
+    // CLAIMED — counted — until reconciliation).
+    for (let attempt = 1; ; attempt++) {
+      const outcome = await this.tryMarkVoucherPaid(chargeId)
+      if (outcome !== "lock-timeout") return outcome
+      if (attempt > MARK_PAID_LOCK_RETRIES) {
+        console.error(
+          `[VoucherStore] markVoucherPaid gave up after ${attempt} lock timeouts: ${chargeId}`,
+        )
+        return false
+      }
+      console.warn(
+        `[VoucherStore] markVoucherPaid lock timeout (attempt ${attempt}), retrying: ${chargeId}`,
+      )
+      await new Promise((resolve) => setTimeout(resolve, MARK_PAID_RETRY_DELAY_MS))
+    }
+  }
+
+  /** One locked CLAIMED -> PAID attempt. */
+  private async tryMarkVoucherPaid(chargeId: string): Promise<boolean | "lock-timeout"> {
+    const client = await getPool().connect()
+    try {
+      await client.query("BEGIN")
+      await client.query(LOCK_TIMEOUT_SQL)
+      const owner = await client.query("SELECT wallet_id FROM vouchers WHERE id = $1", [
+        chargeId,
+      ])
+      const walletId: string | undefined = owner.rows[0]?.wallet_id
+      if (!walletId) {
+        await client.query("ROLLBACK")
+        console.error(`[VoucherStore] Cannot mark voucher paid (not found): ${chargeId}`)
+        return false
+      }
+      await client.query(WALLET_LOCK_SQL, [walletId])
+
+      const result = await client.query(MARK_VOUCHER_PAID_SQL, [chargeId])
+      await client.query("COMMIT")
+
+      if (result.rowCount === 0) {
+        console.error(
+          `[VoucherStore] Cannot mark voucher paid (not CLAIMED): ${chargeId}`,
+        )
+        return false
+      }
+
+      console.log(`[VoucherStore] Voucher paid: ${chargeId}`)
+      return true
+    } catch (err: unknown) {
+      await client.query("ROLLBACK").catch(() => {})
+      if (isLockTimeout(err)) return "lock-timeout"
+      console.error("[VoucherStore] markVoucherPaid error:", (err as Error).message)
+      return false
+    } finally {
+      client.release()
     }
   }
 
@@ -669,4 +918,4 @@ const voucherStore: VoucherStore = new VoucherStore()
 export default voucherStore
 export { VoucherStore, OWNER_LIST_LIMIT }
 
-export type { Voucher, CreateVoucherOptions, VoucherStats, VoucherRow }
+export type { Voucher, CreateVoucherOptions, BackingInputs, VoucherStats, VoucherRow }

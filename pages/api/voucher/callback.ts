@@ -4,6 +4,7 @@ import BlinkAPI, { BlinkAuthError, PaymentRejectedError } from "../../../lib/bli
 import { getApiUrlForEnvironment, type EnvironmentName } from "../../../lib/config/api"
 import { verifyForwardInvoice } from "../../../lib/payout-guard"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
+import { buildVoucherMemo } from "../../../lib/voucher-memo"
 import voucherStore from "../../../lib/voucher-store"
 
 /**
@@ -154,37 +155,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
         apiUrl,
       )
 
-      // Build memo with commission and display info if available
-      let memo: string
-      const isUsdVoucher = voucher.walletCurrency === "USD"
-
-      if (isUsdVoucher && voucher.usdAmountCents) {
-        // USD voucher - show USD value prominently
-        const usdAmount = (voucher.usdAmountCents / 100).toFixed(2)
-        if (
-          voucher.displayAmount &&
-          voucher.displayCurrency &&
-          voucher.displayCurrency !== "USD"
-        ) {
-          // Display currency is different from USD (e.g., ARS)
-          if (voucher.commissionPercent && voucher.commissionPercent > 0) {
-            memo = `BlinkPOS USD Voucher: ${voucher.displayCurrency} ${voucher.displayAmount} (${voucher.commissionPercent}% commission) = $${usdAmount} USD`
-          } else {
-            memo = `BlinkPOS USD Voucher: ${voucher.displayCurrency} ${voucher.displayAmount} = $${usdAmount} USD`
-          }
-        } else {
-          memo = `BlinkPOS USD Voucher: $${usdAmount} USD = ${voucher.amount} sats`
-        }
-      } else if (voucher.displayAmount && voucher.displayCurrency) {
-        // BTC voucher with display currency
-        if (voucher.commissionPercent && voucher.commissionPercent > 0) {
-          memo = `BlinkPOS Voucher: ${voucher.displayCurrency} ${voucher.displayAmount} (${voucher.commissionPercent}% commission) = ${voucher.amount} sats`
-        } else {
-          memo = `BlinkPOS Voucher: ${voucher.displayCurrency} ${voucher.displayAmount} = ${voucher.amount} sats`
-        }
-      } else {
-        memo = `BlinkPOS Voucher: ${voucher.amount} sats`
-      }
+      // Exact memo is also the reconciliation key for legacy claims
+      const memo = buildVoucherMemo(voucher)
 
       console.log("⚡ Paying invoice from voucher wallet...", {
         walletId: voucher.walletId,
@@ -196,9 +168,29 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
       console.log("📦 Payment result:", paymentResult)
 
-      // Check for various success states
-      const isSuccess =
-        paymentResult.status === "SUCCESS" || paymentResult.status === "ALREADY_PAID"
+      // Only SUCCESS proves this wallet was debited. ALREADY_PAID never leaves
+      // a net debit in Blink: an already-paid Blink invoice is rejected at
+      // validation, the intraledger path checks isLnTxRecorded before
+      // debiting, and on the external path LND's "already paid" is settled
+      // and reversed (recordLnSendRevert). So it is "nothing sent", handled
+      // like FAILURE below (released, still counted as ACTIVE) — never PAID,
+      // which would consume the voucher and drop its liability unpaid.
+      const isSuccess = paymentResult.status === "SUCCESS"
+
+      if (isSuccess) {
+        // Settlement confirmed: the wallet has been debited, so the voucher
+        // must leave the liability aggregate (PAID exits the
+        // ACTIVE/CLAIMED set). If this write fails the voucher stays CLAIMED
+        // — a conservative over-count, never a double-pay risk — so log
+        // loudly for ops but still answer OK.
+        const marked = await voucherStore.markVoucherPaid(chargeId)
+        if (!marked) {
+          console.error(
+            "❌ Voucher settled but could not be marked PAID (stays CLAIMED):",
+            chargeId.substring(0, 8) + "...",
+          )
+        }
+      }
 
       if (!isSuccess) {
         // If payment is pending, we still return OK but log it
@@ -206,9 +198,14 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
           console.log("⏳ Payment is pending:", paymentResult)
           // For PENDING, we still return OK as the payment is in progress
           // The voucher remains claimed
-        } else if (paymentResult.status === "FAILURE") {
-          // Definite failure reported by the API: nothing was sent.
-          throw new PaymentRejectedError(`Payment failed with status: FAILURE`)
+        } else if (
+          paymentResult.status === "FAILURE" ||
+          paymentResult.status === "ALREADY_PAID"
+        ) {
+          // Definite outcome with no net debit: nothing was sent.
+          throw new PaymentRejectedError(
+            `Payment failed with status: ${paymentResult.status}`,
+          )
         } else {
           // Unknown status: outcome uncertain, keep the voucher claimed.
           throw new Error(`Payment returned unexpected status: ${paymentResult.status}`)

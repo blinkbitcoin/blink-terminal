@@ -60,10 +60,10 @@ describe("toEnvironment", () => {
 })
 
 describe("getOwnedWallets", () => {
-  it("maps wallet id -> currency from a live Blink lookup", async () => {
+  it("maps wallet id -> currency and balance from a live Blink lookup", async () => {
     mockGetWalletInfo.mockResolvedValueOnce([
-      { id: "w1", walletCurrency: "BTC" },
-      { id: "w2", walletCurrency: "USD" },
+      { id: "w1", walletCurrency: "BTC", balance: 21000 },
+      { id: "w2", walletCurrency: "USD", balance: 5000 },
     ])
 
     const result = await getOwnedWallets("blink_key", "staging")
@@ -71,14 +71,24 @@ describe("getOwnedWallets", () => {
     expect(result).toEqual({
       ok: true,
       wallets: new Map([
-        ["w1", "BTC"],
-        ["w2", "USD"],
+        ["w1", { walletCurrency: "BTC", balance: 21000 }],
+        ["w2", { walletCurrency: "USD", balance: 5000 }],
       ]),
     })
     expect(mockBlinkApiCtor).toHaveBeenCalledWith(
       "blink_key",
       "https://api.staging.blink.sv/graphql",
     )
+  })
+
+  it("fails closed when a wallet row has no finite balance", async () => {
+    mockGetWalletInfo.mockResolvedValueOnce([
+      { id: "w1", walletCurrency: "BTC" }, // balance missing
+    ])
+    await expect(getOwnedWallets("blink_key", "production")).resolves.toEqual({
+      ok: false,
+      reason: "unavailable",
+    })
   })
 
   it("reports a key Blink refuses as invalid", async () => {

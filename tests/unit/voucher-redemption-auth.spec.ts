@@ -22,11 +22,17 @@ const mockStore = {
   getVoucherStatsByWalletIds: jest.fn(),
   claimVoucher: jest.fn(),
   unclaimVoucher: jest.fn(),
+  markVoucherPaid: jest.fn(),
   cancelVoucher: jest.fn(),
   createVoucher: jest.fn(),
 }
 jest.mock("../../lib/voucher-store", () => ({
   __esModule: true,
+  // Pure helper, kept real: the route maps SQLSTATE 55P03 to 503 with it.
+  isLockTimeout: (err: unknown) => {
+    const e = err as { code?: string; message?: string } | null
+    return e?.code === "55P03" || /lock timeout/i.test(e?.message ?? "")
+  },
   default: new Proxy(
     {},
     {
@@ -45,6 +51,7 @@ jest.mock("../../lib/rate-limit", () => ({
 
 const mockPayLnInvoice = jest.fn()
 const mockGetWalletInfo = jest.fn()
+const mockGetExchangeRate = jest.fn()
 jest.mock("../../lib/blink-api", () => {
   class PaymentRejectedError extends Error {
     code?: string
@@ -56,7 +63,14 @@ jest.mock("../../lib/blink-api", () => {
   class BlinkAuthError extends Error {}
   const BlinkAPI = jest.fn().mockImplementation((apiKey: string, apiUrl: string) => ({
     payLnInvoice: (...args: unknown[]) => mockPayLnInvoice(...args),
-    getWalletInfo: () => mockGetWalletInfo(apiKey, apiUrl),
+    getWalletInfo: (signal?: AbortSignal) =>
+      signal
+        ? mockGetWalletInfo(apiKey, apiUrl, signal)
+        : mockGetWalletInfo(apiKey, apiUrl),
+    getExchangeRate: (currency: string, signal?: AbortSignal) =>
+      signal
+        ? mockGetExchangeRate(apiKey, apiUrl, currency, signal)
+        : mockGetExchangeRate(apiKey, apiUrl, currency),
   }))
   return {
     __esModule: true,
@@ -154,8 +168,12 @@ beforeEach(() => {
   jest.clearAllMocks()
   jest.spyOn(console, "log").mockImplementation(() => {})
   jest.spyOn(console, "error").mockImplementation(() => {})
+  // Server-side rate for USD pair cross-checks: 0.05 cents/sat, so
+  // 100 cents = 2000 sats.
+  mockGetExchangeRate.mockResolvedValue({ satPriceInCurrency: 0.05, currency: "USD" })
   mockStore.getVoucher.mockResolvedValue(voucher())
   mockStore.claimVoucher.mockResolvedValue(true)
+  mockStore.markVoucherPaid.mockResolvedValue(true)
   mockStore.unclaimVoucher.mockResolvedValue(true)
 })
 
@@ -187,6 +205,24 @@ describe("voucher callback: invoice must match face value", () => {
     expect(res.body).toEqual({ status: "OK" })
     expect(mockStore.claimVoucher).toHaveBeenCalledTimes(1)
     expect(mockPayLnInvoice).toHaveBeenCalledWith("wallet-1", pr, expect.any(String))
+  })
+
+  // Settled vouchers must leave the ACTIVE/CLAIMED liability aggregate —
+  // Blink has already debited the wallet (PR #94 review). PENDING and
+  // unknown outcomes stay CLAIMED (counted).
+  it("marks the voucher PAID on SUCCESS", async () => {
+    mockPayLnInvoice.mockResolvedValueOnce({ status: "SUCCESS" })
+    const chargeId = "a".repeat(32)
+
+    expect((await redeem(invoice({ sats: 500 }))).body).toEqual({ status: "OK" })
+    expect(mockStore.markVoucherPaid).toHaveBeenCalledWith(chargeId)
+  })
+
+  it("still returns OK when the PAID write fails (payment already executed)", async () => {
+    mockPayLnInvoice.mockResolvedValueOnce({ status: "SUCCESS" })
+    mockStore.markVoucherPaid.mockResolvedValueOnce(false)
+
+    expect((await redeem(invoice({ sats: 500 }))).body).toEqual({ status: "OK" })
   })
 
   it("checks USD vouchers against the sats amount fixed at issuance", async () => {
@@ -240,6 +276,19 @@ describe("voucher callback: release only when nothing was sent", () => {
     expect(mockStore.unclaimVoucher).toHaveBeenCalledTimes(1)
   })
 
+  it("ALREADY_PAID (no net debit) releases the voucher and never clears its liability", async () => {
+    // An exact-face-value invoice already paid elsewhere: Blink returns
+    // ALREADY_PAID without a net debit on the voucher wallet. The voucher
+    // must not become PAID (consumed unpaid, liability dropped); it is
+    // released to ACTIVE so its holder can retry, and stays counted.
+    mockPayLnInvoice.mockResolvedValueOnce({ status: "ALREADY_PAID" })
+    const res = await redeem(invoice({ sats: 500 }))
+
+    expect(res.body).toEqual({ status: "ERROR", reason: "Invoice has already been paid" })
+    expect(mockStore.markVoucherPaid).not.toHaveBeenCalled()
+    expect(mockStore.unclaimVoucher).toHaveBeenCalledTimes(1)
+  })
+
   it.each([
     [
       "a transport error",
@@ -261,6 +310,17 @@ describe("voucher callback: release only when nothing was sent", () => {
     mockPayLnInvoice.mockResolvedValueOnce({ status: "PENDING" })
     expect((await redeem(invoice({ sats: 500 }))).body).toEqual({ status: "OK" })
     expect(mockStore.unclaimVoucher).not.toHaveBeenCalled()
+    expect(mockStore.markVoucherPaid).not.toHaveBeenCalled()
+  })
+
+  it("never marks PAID on FAILURE, ALREADY_PAID or unknown outcomes", async () => {
+    mockPayLnInvoice.mockResolvedValueOnce({ status: "FAILURE" })
+    await redeem(invoice({ sats: 500 }))
+    mockPayLnInvoice.mockResolvedValueOnce({ status: "ALREADY_PAID" })
+    await redeem(invoice({ sats: 500 }))
+    mockPayLnInvoice.mockResolvedValueOnce({ status: "WEIRD" })
+    await redeem(invoice({ sats: 500 }))
+    expect(mockStore.markVoucherPaid).not.toHaveBeenCalled()
   })
 })
 
@@ -271,7 +331,7 @@ const STAGING = "https://api.staging.blink.sv/graphql"
 let blinkDown = false
 let blinkAccounts: Record<
   string,
-  Record<string, Array<{ id: string; walletCurrency: string }>>
+  Record<string, Array<{ id: string; walletCurrency: string; balance: number }>>
 >
 
 const setBlinkAccounts = (accounts: typeof blinkAccounts) => {
@@ -284,19 +344,20 @@ const setBlinkAccounts = (accounts: typeof blinkAccounts) => {
   })
 }
 
-const BTC_WALLET = { id: "wallet-1", walletCurrency: "BTC" }
-const USD_WALLET = { id: "wallet-usd", walletCurrency: "USD" }
+// Balances are minor units: sats for BTC wallets, cents for USD wallets.
+const BTC_WALLET = { id: "wallet-1", walletCurrency: "BTC", balance: 1000 }
+const USD_WALLET = { id: "wallet-usd", walletCurrency: "USD", balance: 500 }
 
 beforeEach(() => {
   blinkDown = false
   setBlinkAccounts({
     [OWNER_KEY]: {
       [PROD]: [BTC_WALLET, USD_WALLET],
-      [STAGING]: [{ id: "wallet-stg", walletCurrency: "BTC" }],
+      [STAGING]: [{ id: "wallet-stg", walletCurrency: "BTC", balance: 1000 }],
     },
     // A rotated replacement key for the same account
     blink_new_owner_key: { [PROD]: [BTC_WALLET, USD_WALLET] },
-    [OTHER_KEY]: { [PROD]: [{ id: "wallet-9", walletCurrency: "BTC" }] },
+    [OTHER_KEY]: { [PROD]: [{ id: "wallet-9", walletCurrency: "BTC", balance: 1000 }] },
   })
 })
 
@@ -351,6 +412,24 @@ describe("voucher list: current wallet owner only", () => {
     expect((res.body as { truncated: boolean }).truncated).toBe(false)
     expect(res.headers["access-control-allow-origin"]).toBeUndefined()
     expect(res.headers["cache-control"]).toBe("no-store")
+  })
+
+  it("?status=PAID returns settled rows; ?status=CLAIMED covers CLAIMED + PAID", async () => {
+    mockStore.getVouchersByWalletIds.mockResolvedValue([
+      voucher({ id: "p".repeat(32), status: "PAID", claimed: true }),
+      voucher({ id: "c".repeat(32), status: "CLAIMED", claimed: true }),
+      voucher({ id: "1".repeat(32) }),
+    ])
+    const ids = async (status: string) =>
+      (
+        (await list({ [VOUCHER_API_KEY_HEADER]: OWNER_KEY }, { status })).body as {
+          vouchers: Array<{ id: string; status: string }>
+        }
+      ).vouchers.map((v) => `${v.id[0]}:${v.status}`)
+
+    expect(await ids("PAID")).toEqual(["p:PAID"])
+    expect(await ids("claimed")).toEqual(["p:PAID", "c:CLAIMED"])
+    expect(await ids("ACTIVE")).toEqual(["1:ACTIVE"])
   })
 
   it("answers 503 (not 401) when Blink is unavailable", async () => {
@@ -465,14 +544,28 @@ describe("voucher create: live ownership + confirmed wallet currency", () => {
       body: { amount: 500, apiKey: OWNER_KEY, walletId: "wallet-1", ...body },
     })
 
+  // What the store's locked transaction received from the route's backing()
+  // callback (balance ceiling, liability, rate) — or null if it threw.
+  let lastBacking: Record<string, unknown> | null = null
+  let insertedCount = 0
+  const inserted = () => insertedCount
+
   beforeEach(() => {
-    mockStore.createVoucher.mockImplementation(async (amount, _key, walletId, opts) => ({
-      ...voucher({ amount, walletId }),
-      walletCurrency: opts.walletCurrency,
-      usdAmountCents: opts.usdAmount ?? null,
-      expiryId: "24h",
-      commissionPercent: 0,
-    }))
+    lastBacking = null
+    insertedCount = 0
+    // Behaves like the store: runs backing() under its (mocked) wallet lock,
+    // propagates a refusal thrown there, inserts otherwise.
+    mockStore.createVoucher.mockImplementation(async (amount, _key, walletId, opts) => {
+      lastBacking = await opts.backing()
+      insertedCount++
+      return {
+        ...voucher({ amount, walletId }),
+        walletCurrency: opts.walletCurrency,
+        usdAmountCents: opts.usdAmount ?? null,
+        expiryId: "24h",
+        commissionPercent: 0,
+      }
+    })
   })
 
   it("rejects a key that does not own the wallet", async () => {
@@ -495,7 +588,8 @@ describe("voucher create: live ownership + confirmed wallet currency", () => {
   it("re-checks with Blink on every create (no revocation window)", async () => {
     expect((await create()).statusCode).toBe(200)
     expect((await create()).statusCode).toBe(200)
-    expect(mockGetWalletInfo).toHaveBeenCalledTimes(2)
+    // Pre-check + the locked balance read, per create
+    expect(mockGetWalletInfo).toHaveBeenCalledTimes(4)
 
     delete blinkAccounts[OWNER_KEY] // key revoked mid-batch
     expect((await create()).statusCode).toBe(403)
@@ -519,11 +613,12 @@ describe("voucher create: live ownership + confirmed wallet currency", () => {
     const res = await create({
       walletId: "wallet-usd",
       walletCurrency: "USD",
-      usdAmount: 100,
+      usdAmount: 100, // 100 cents = 2000 sats at the mocked 0.05 cents/sat
+      amount: 2000,
     })
     expect(res.statusCode).toBe(200)
     expect(mockStore.createVoucher).toHaveBeenCalledWith(
-      500,
+      2000,
       OWNER_KEY,
       "wallet-usd",
       expect.objectContaining({ walletCurrency: "USD", usdAmount: 100 }),
@@ -543,5 +638,273 @@ describe("voucher create: live ownership + confirmed wallet currency", () => {
   it("normalizes an unknown environment to production", async () => {
     await create({ environment: "http://evil.example" })
     expect(mockGetWalletInfo).toHaveBeenCalledWith(OWNER_KEY, PROD)
+  })
+
+  // blink-wip#1665: the REST path must enforce the same balance check the
+  // GraphQL create-withdraw-link path does, so the service never publishes
+  // an ACTIVE voucher the wallet cannot back.
+  describe("balance check (blink-wip#1665)", () => {
+    it("rejects a BTC voucher above the wallet balance", async () => {
+      const res = await create({ amount: 1001 }) // BTC wallet has 1000 sats
+      expect(res.statusCode).toBe(400)
+      expect(res.body).toEqual({ error: "Amount is more than the wallet balance" })
+      expect(inserted()).toBe(0)
+    })
+
+    it("accepts a voucher at exactly the wallet balance", async () => {
+      expect((await create({ amount: 1000 })).statusCode).toBe(200)
+      expect(inserted()).toBe(1)
+      expect(lastBacking).toEqual({ maxLiabilityMinor: 1000, liabilityMinor: 1000 })
+    })
+
+    it("the ceiling is the balance read under the wallet lock, not the pre-check's", async () => {
+      // The reviewer's race: between the route's pre-check and the locked
+      // liability sum, a redemption settles (CLAIMED -> PAID) and debits the
+      // wallet 1000 -> 400. The ceiling handed to the locked check must be
+      // the post-debit 400, so a 1000-sat voucher is refused even though the
+      // settled voucher has already left the liability aggregate.
+      let reads = 0
+      mockGetWalletInfo.mockImplementation(async () => {
+        reads++
+        return [{ ...BTC_WALLET, balance: reads === 1 ? 1000 : 400 }]
+      })
+      const res = await create({ amount: 1000 })
+      expect(reads).toBe(2) // pre-check, then under the lock
+      expect(res.statusCode).toBe(400)
+      expect(res.body).toEqual({ error: "Amount is more than the wallet balance" })
+      expect(inserted()).toBe(0)
+    })
+
+    describe("the locked critical section is bounded by ONE deadline", () => {
+      // The store's lock_timeout is 15 s; a create must never hold the lock
+      // longer than a concurrent settlement (markVoucherPaid) will wait.
+      afterEach(() => jest.useRealTimers())
+
+      it("fetches balance and rate concurrently (one round trip, not two)", async () => {
+        let inFlight = 0
+        let maxInFlight = 0
+        const track = async <T>(value: T): Promise<T> => {
+          maxInFlight = Math.max(maxInFlight, ++inFlight)
+          await new Promise((r) => setTimeout(r, 5))
+          inFlight--
+          return value
+        }
+        let walletReads = 0
+        mockGetWalletInfo.mockImplementation(async () =>
+          ++walletReads === 1
+            ? [BTC_WALLET, USD_WALLET]
+            : track([BTC_WALLET, USD_WALLET]),
+        )
+        mockGetExchangeRate.mockImplementation(() =>
+          track({ satPriceInCurrency: 0.05, currency: "USD" }),
+        )
+        const res = await create({
+          walletId: "wallet-usd",
+          walletCurrency: "USD",
+          usdAmount: 100,
+          amount: 2000,
+        })
+        expect(res.statusCode).toBe(200)
+        expect(maxInFlight).toBe(2)
+      })
+
+      it("aborts the upstream requests and answers 503 when the deadline passes", async () => {
+        jest.useFakeTimers()
+        let walletReads = 0
+        let lockedSignal: AbortSignal | undefined
+        mockGetWalletInfo.mockImplementation(
+          (_k: string, _u: string, signal?: AbortSignal) => {
+            if (++walletReads === 1) return Promise.resolve([BTC_WALLET, USD_WALLET])
+            lockedSignal = signal
+            return new Promise(() => {}) // Blink hangs
+          },
+        )
+        const pending = create({ amount: 500 })
+        await jest.advanceTimersByTimeAsync(8_000)
+        const res = await pending
+        expect(res.statusCode).toBe(503)
+        expect(lockedSignal?.aborted).toBe(true)
+        expect(inserted()).toBe(0)
+      })
+    })
+
+    it("fails closed (503) when the locked balance read is unavailable", async () => {
+      let reads = 0
+      mockGetWalletInfo.mockImplementation(async () => {
+        if (++reads > 1) throw new Error("Blink API returned non-JSON response (502)")
+        return [BTC_WALLET, USD_WALLET]
+      })
+      expect((await create({ amount: 500 })).statusCode).toBe(503)
+      expect(inserted()).toBe(0)
+    })
+
+    it("rejects a USD voucher above the wallet balance (cents vs cents)", async () => {
+      // Consistent pair (501 cents = 10020 sats at 0.05 cents/sat), but the
+      // USD wallet holds only 500 cents.
+      const res = await create({
+        walletId: "wallet-usd",
+        walletCurrency: "USD",
+        usdAmount: 501,
+        amount: 10020,
+      })
+      expect(res.statusCode).toBe(400)
+      expect(res.body).toEqual({ error: "Amount is more than the wallet balance" })
+      expect(inserted()).toBe(0)
+    })
+
+    it("fails closed (503) when Blink omits the balance", async () => {
+      setBlinkAccounts({
+        [OWNER_KEY]: {
+          [PROD]: [{ id: "wallet-1", walletCurrency: "BTC" } as never],
+        },
+      })
+      expect((await create()).statusCode).toBe(503)
+      expect(inserted()).toBe(0)
+    })
+  })
+
+  // The client supplies both denominations; the server must tie them together
+  // with an authoritative rate, or a mismatched pair stores an ACTIVE voucher
+  // advertising a value the USD amount doesn't back.
+  describe("USD amount/sats pair cross-check", () => {
+    const usd = (body: Record<string, unknown>) =>
+      create({ walletId: "wallet-usd", walletCurrency: "USD", ...body })
+
+    it("rejects the report's pair: 1 BTC advertised for 1 cent", async () => {
+      const res = await usd({ amount: 100000000, usdAmount: 1 })
+      expect(res.statusCode).toBe(400)
+      expect(res.body).toEqual({
+        error: "amount does not match usdAmount at the current exchange rate",
+      })
+      expect(inserted()).toBe(0)
+    })
+
+    it("rejects the inverse: sats far below the USD amount", async () => {
+      // 500 cents = 10000 sats at the mocked rate; 100 sats is way off.
+      const res = await usd({ amount: 100, usdAmount: 500 })
+      expect(res.statusCode).toBe(400)
+      expect(inserted()).toBe(0)
+    })
+
+    it("accepts a pair within tolerance (±1 cent quantization + 2% drift)", async () => {
+      // 100 cents = 2000 sats expected; 2060 sats implies exactly 103 cents
+      // (the +1 cent quantization + 2% = 3 cent boundary).
+      expect((await usd({ amount: 2060, usdAmount: 100 })).statusCode).toBe(200)
+      expect(mockStore.createVoucher).toHaveBeenCalled()
+    })
+
+    it("rejects a pair just outside the tolerance", async () => {
+      // 2061 sats implies 103.05 cents — beyond the 3 cent allowance.
+      expect((await usd({ amount: 2061, usdAmount: 100 })).statusCode).toBe(400)
+      expect(inserted()).toBe(0)
+    })
+
+    it("applies the tolerance in the negative direction too", async () => {
+      // 1939 sats implies 96.95 cents — 3.05 below the supplied 100 cents.
+      expect((await usd({ amount: 1939, usdAmount: 100 })).statusCode).toBe(400)
+    })
+
+    it("accepts an honest small pair the sats-space check would quantize away", async () => {
+      // Production client formula: round(15 sats * 0.05) = 1 cent. The server
+      // must not reconstruct 1 / 0.05 = 20 sats and cry 25% drift.
+      expect((await usd({ amount: 15, usdAmount: 1 })).statusCode).toBe(200)
+      expect(mockStore.createVoucher).toHaveBeenCalled()
+    })
+
+    it("the pair tolerance cannot weaken backing", async () => {
+      // Wallet holds exactly 100 cents; 2039 sats is within pair tolerance
+      // (101.95 implied cents) but costs 102 cents at the same rate.
+      setBlinkAccounts({
+        [OWNER_KEY]: {
+          [PROD]: [{ id: "wallet-usd", walletCurrency: "USD", balance: 100 }],
+        },
+      })
+      const res = await usd({ amount: 2039, usdAmount: 100 })
+      expect(res.statusCode).toBe(400)
+      expect(res.body).toEqual({ error: "Amount is more than the wallet balance" })
+      expect(inserted()).toBe(0)
+    })
+
+    it("fails closed (503) when the rate cannot be verified", async () => {
+      mockGetExchangeRate.mockRejectedValueOnce(new Error("rate unavailable"))
+      expect((await usd({ amount: 2000, usdAmount: 100 })).statusCode).toBe(503)
+      expect(inserted()).toBe(0)
+    })
+
+    it("fails closed (503) on a malformed rate payload", async () => {
+      mockGetExchangeRate.mockResolvedValueOnce({ satPriceInCurrency: 0 })
+      expect((await usd({ amount: 2000, usdAmount: 100 })).statusCode).toBe(503)
+    })
+
+    it("never consults the rate for BTC vouchers", async () => {
+      expect((await create({ amount: 500 })).statusCode).toBe(200)
+      expect(mockGetExchangeRate).not.toHaveBeenCalled()
+    })
+
+    it("fetches the rate for the voucher's environment (staging)", async () => {
+      setBlinkAccounts({
+        [OWNER_KEY]: {
+          [STAGING]: [{ id: "wallet-stg-usd", walletCurrency: "USD", balance: 1000 }],
+        },
+      })
+      const res = await create({
+        walletId: "wallet-stg-usd",
+        walletCurrency: "USD",
+        usdAmount: 100,
+        amount: 2000,
+        environment: "staging",
+      })
+      expect(res.statusCode).toBe(200)
+      // ...under the locked backing deadline's abort signal
+      expect(mockGetExchangeRate).toHaveBeenCalledWith(
+        OWNER_KEY,
+        STAGING,
+        "USD",
+        expect.any(AbortSignal),
+      )
+    })
+
+    it("passes the conservative liability AND the rate to the store, so the next voucher re-rates this one", async () => {
+      // 2060 sats at 0.05 cents/sat: stored display value is 100 cents, but
+      // the conservative liability is 103 cents. The store must receive both
+      // the override and the rate, or the next create would sum the smaller
+      // persisted cents and undercount the aggregate (PR #94 re-review).
+      const res = await usd({ amount: 2060, usdAmount: 100 })
+      expect(res.statusCode).toBe(200)
+      expect(mockStore.createVoucher).toHaveBeenCalledWith(
+        2060,
+        OWNER_KEY,
+        "wallet-usd",
+        expect.objectContaining({ usdAmount: 100, backing: expect.any(Function) }),
+      )
+      // ...delivered through the locked backing() callback
+      expect(lastBacking).toEqual({
+        liabilityMinor: 103,
+        maxLiabilityMinor: 500,
+        usdCentsPerSat: 0.05,
+      })
+    })
+
+    it("maps a wallet-lock timeout (SQLSTATE 55P03) to a retryable 503, not 500", async () => {
+      // Several slow same-wallet creates queued past lock_timeout: the store
+      // rolled back safely, so the client should simply retry.
+      mockStore.createVoucher.mockRejectedValueOnce(
+        Object.assign(new Error("canceling statement due to lock timeout"), {
+          code: "55P03",
+        }),
+      )
+      const res = await create({ amount: 500 })
+      expect(res.statusCode).toBe(503)
+      expect(res.body).toEqual(expect.objectContaining({ error: expect.any(String) }))
+    })
+
+    it("maps the store's aggregate-liability refusal to 400", async () => {
+      // Sequential create: the first voucher's liabilities already consumed
+      // the balance, the locked aggregate check refuses the second.
+      mockStore.createVoucher.mockRejectedValueOnce(
+        new Error("Voucher amount exceeds the wallet balance"),
+      )
+      expect((await create({ amount: 900 })).statusCode).toBe(400)
+    })
   })
 })

@@ -7,6 +7,7 @@ import {
   OWNERSHIP_UNAVAILABLE,
   toEnvironment,
 } from "../../../lib/voucher-auth"
+import { isRedeemedStatus } from "../../../lib/voucher-expiry"
 import voucherStore, { OWNER_LIST_LIMIT } from "../../../lib/voucher-store"
 
 /** Shape of a voucher record from the store */
@@ -34,13 +35,14 @@ interface VoucherRecord {
  * Header: x-voucher-api-key: <voucher wallet API key>
  * Returns the vouchers drawn from wallets the key's account currently owns
  * (checked live against Blink), with status information (ACTIVE, CLAIMED,
- * CANCELLED, EXPIRED). Voucher ids are LNURL-withdraw redemption secrets, so
+ * PAID, CANCELLED, EXPIRED). Voucher ids are LNURL-withdraw redemption secrets, so
  * they are never returned to anyone but the current owner. Same-origin only.
  *
  * Query params:
  * - environment: 'production' (default) or 'staging'
- * - status: Filter by status (optional): 'ACTIVE', 'CLAIMED', 'CANCELLED', 'EXPIRED', 'all'
- *   Default: returns all vouchers
+ * - status: Filter by status (optional): 'ACTIVE', 'CLAIMED', 'PAID', 'CANCELLED',
+ *   'EXPIRED', 'all'. CLAIMED is the redeemed bucket (CLAIMED + PAID); PAID
+ *   alone is settled redemptions only. Default: returns all vouchers
  */
 async function handler(req: NextApiRequest, res: NextApiResponse) {
   res.setHeader("Cache-Control", "no-store")
@@ -105,11 +107,17 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
     // Filter by status if requested
     if (filterStatus && filterStatus !== "all") {
-      const validStatuses = ["ACTIVE", "CLAIMED", "CANCELLED", "EXPIRED"]
+      const validStatuses = ["ACTIVE", "CLAIMED", "PAID", "CANCELLED", "EXPIRED"]
       const normalizedFilter = filterStatus.toUpperCase()
 
       if (validStatuses.includes(normalizedFilter)) {
-        vouchers = vouchers.filter((v: VoucherRecord) => v.status === normalizedFilter)
+        // PAID is terminal CLAIMED: the redeemed bucket covers both, matching
+        // voucher_stats and the dashboard UI.
+        vouchers = vouchers.filter((v: VoucherRecord) =>
+          normalizedFilter === "CLAIMED"
+            ? isRedeemedStatus(v.status)
+            : v.status === normalizedFilter,
+        )
       }
     }
 

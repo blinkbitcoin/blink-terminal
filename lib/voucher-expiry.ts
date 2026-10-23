@@ -11,9 +11,17 @@ interface ExpiryPreset {
   ms: number
 }
 
-type VoucherStatusString = "NOT_FOUND" | "CLAIMED" | "CANCELLED" | "EXPIRED" | "ACTIVE"
+type VoucherStatusString =
+  | "NOT_FOUND"
+  | "CLAIMED"
+  | "PAID"
+  | "CANCELLED"
+  | "EXPIRED"
+  | "ACTIVE"
 
 interface VoucherForStatus {
+  /** Persisted DB status; only the terminal PAID value is trusted as-is. */
+  status?: string | null
   claimed?: boolean
   cancelledAt?: number | null
   expiresAt?: number | null
@@ -41,7 +49,10 @@ const DEFAULT_EXPIRY_ID: string = "24h"
 // Maximum unclaimed vouchers per wallet (prevents runaway creation)
 const MAX_UNCLAIMED_PER_WALLET: number = 1000
 
-// How long to keep claimed vouchers in history (30 days)
+// How long a settled (PAID) voucher keeps its encrypted API key (30 days);
+// after that the secret is scrubbed but the row stays as reconciliation
+// competitor evidence. Redeemed rows (CLAIMED, PAID) are never deleted
+// (migration 029).
 const CLAIMED_RETENTION_MS: number = 30 * 24 * 60 * 60 * 1000
 
 // How long to keep cancelled vouchers in history (30 days)
@@ -107,16 +118,25 @@ function formatExpiryDate(expiresAt: number | null | undefined): string {
 /**
  * Get voucher status based on its state
  * @param voucher - Voucher object
- * @returns Status: ACTIVE, CLAIMED, CANCELLED, EXPIRED, NOT_FOUND
+ * @returns Status: ACTIVE, CLAIMED, PAID, CANCELLED, EXPIRED, NOT_FOUND
+ *
+ * PAID (settled redemption) is terminal and persisted, so it wins over the
+ * claimed flag; CLAIMED means the payout is still in flight or unresolved.
  */
 function getVoucherStatus(
   voucher: VoucherForStatus | null | undefined,
 ): VoucherStatusString {
   if (!voucher) return "NOT_FOUND"
+  if (voucher.status === "PAID") return "PAID"
   if (voucher.claimed) return "CLAIMED"
   if (voucher.cancelledAt) return "CANCELLED"
   if (voucher.expiresAt && voucher.expiresAt < Date.now()) return "EXPIRED"
   return "ACTIVE"
+}
+
+/** Redeemed = claimed (payout in flight/unresolved) or paid (settled). */
+function isRedeemedStatus(status: string | null | undefined): boolean {
+  return status === "CLAIMED" || status === "PAID"
 }
 
 export {
@@ -132,6 +152,7 @@ export {
   isValidExpiryId,
   formatExpiryDate,
   getVoucherStatus,
+  isRedeemedStatus,
 }
 
 export type { ExpiryPreset, VoucherStatusString, VoucherForStatus }

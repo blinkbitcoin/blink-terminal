@@ -16,6 +16,7 @@ import {
   isBitcoinCurrency,
   CurrencyMetadata,
 } from "../lib/currency-utils"
+import { isRedeemedStatus } from "../lib/voucher-expiry"
 
 import { ExpiryBadge, formatExpiryDate } from "./ExpirySelector"
 
@@ -23,7 +24,7 @@ import { ExpiryBadge, formatExpiryDate } from "./ExpirySelector"
 // Types
 // =============================================================================
 
-type VoucherStatus = "ACTIVE" | "CLAIMED" | "CANCELLED" | "EXPIRED"
+type VoucherStatus = "ACTIVE" | "CLAIMED" | "PAID" | "CANCELLED" | "EXPIRED"
 type StatusFilter = "all" | "active" | "expiring" | "claimed" | "cancelled" | "expired"
 type CurrencyFilterType = "all" | "BTC" | "USD"
 
@@ -502,7 +503,7 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
 
     // Get status color classes
     const getStatusColor = (voucher: VoucherData): string => {
-      if (voucher.status === "CLAIMED") return "text-green-600 dark:text-green-400"
+      if (isRedeemedStatus(voucher.status)) return "text-green-600 dark:text-green-400"
       if (voucher.status === "CANCELLED") return "text-gray-500 dark:text-gray-500"
       if (voucher.status === "EXPIRED") return "text-red-600 dark:text-red-400"
 
@@ -518,7 +519,7 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
 
     // Get status indicator color
     const getStatusDotColor = (voucher: VoucherData): string => {
-      if (voucher.status === "CLAIMED") return "bg-green-500"
+      if (isRedeemedStatus(voucher.status)) return "bg-green-500"
       if (voucher.status === "CANCELLED") return "bg-gray-400"
       if (voucher.status === "EXPIRED") return "bg-red-500"
 
@@ -547,7 +548,7 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
           v.timeRemaining &&
           v.timeRemaining < 24 * 60 * 60 * 1000
         )
-      if (filter === "claimed") return v.status === "CLAIMED"
+      if (filter === "claimed") return isRedeemedStatus(v.status)
       if (filter === "cancelled") return v.status === "CANCELLED"
       if (filter === "expired") return v.status === "EXPIRED"
       return true
@@ -560,7 +561,7 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
       // For non-active: use the timestamp when the status changed (most recent first)
       // For active: use expiresAt (soonest expiry first)
       const getActivityTime = (v: VoucherData): number | null => {
-        if (v.status === "CLAIMED" && v.claimedAt) return v.claimedAt
+        if (isRedeemedStatus(v.status) && v.claimedAt) return v.claimedAt
         if (v.status === "CANCELLED" && v.cancelledAt) return v.cancelledAt
         if (v.status === "EXPIRED" && v.expiresAt) return v.expiresAt
         // For ACTIVE, we'll handle separately
@@ -1143,7 +1144,7 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
                       <div className="text-xs text-gray-500 dark:text-gray-400">
                         {voucher.status === "ACTIVE" && voucher.timeRemaining
                           ? formatTimeRemaining(voucher.timeRemaining)
-                          : voucher.status === "CLAIMED" && voucher.claimedAt
+                          : isRedeemedStatus(voucher.status) && voucher.claimedAt
                             ? formatDate(voucher.claimedAt)
                             : formatDate(voucher.createdAt)}
                       </div>

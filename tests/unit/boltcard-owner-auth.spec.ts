@@ -338,8 +338,8 @@ describe("register: session owner + live wallet ownership", () => {
 
   beforeEach(() => {
     mockGetWalletInfo.mockResolvedValue([
-      { id: "wallet-btc", walletCurrency: "BTC" },
-      { id: "wallet-usd", walletCurrency: "USD" },
+      { id: "wallet-btc", walletCurrency: "BTC", balance: 100000 },
+      { id: "wallet-usd", walletCurrency: "USD", balance: 100000 },
     ])
     mockStore.createPendingRegistration = jest.fn().mockResolvedValue({
       id: "r".repeat(32),
