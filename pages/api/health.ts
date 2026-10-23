@@ -2,11 +2,21 @@
  * Health Check Endpoint
  *
  * Used by Docker and monitoring systems to verify service health.
- * Supports `?verbose=true` for detailed pool stats.
  *
  * Deep checks: PostgreSQL connectivity (via shared pool), Redis (via hybrid
  * store), voucher store, and Blink API credential presence.
+ *
+ * Two views (blink-wip#1690 item 3 — this is a public, unauthenticated URL):
+ * - Public: `{ status, timestamp }` plus the status code. That is all a
+ *   readiness/liveness probe or an uptime monitor needs.
+ * - Detailed (per-dependency checks with driver error strings, uptime,
+ *   version, credential presence, `?verbose=true` pool/voucher stats): only
+ *   with `X-Health-Token: <HEALTH_TOKEN>`. Without HEALTH_TOKEN configured
+ *   the detailed view is unavailable; the full result is still logged
+ *   server-side whenever the service is not healthy.
  */
+
+import { timingSafeEqual } from "crypto"
 
 import type { NextApiRequest, NextApiResponse } from "next"
 
@@ -35,9 +45,20 @@ interface CheckResult {
   }
 }
 
+/** Constant-time check of X-Health-Token against HEALTH_TOKEN (unset = never). */
+export function isDetailAuthorized(req: NextApiRequest): boolean {
+  const expected = process.env.HEALTH_TOKEN
+  const presented = req.headers["x-health-token"]
+  if (!expected || typeof presented !== "string") return false
+  const a = Buffer.from(expected)
+  const b = Buffer.from(presented)
+  return a.length === b.length && timingSafeEqual(a, b)
+}
+
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   const startTime = Date.now()
-  const verbose = req.query.verbose === "true"
+  const detailed = isDetailAuthorized(req)
+  const verbose = detailed && req.query.verbose === "true"
 
   const health: {
     status: string
@@ -175,15 +196,27 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const statusCode =
       health.status === "healthy" ? 200 : health.status === "degraded" ? 200 : 503
 
-    res.status(statusCode).json(health)
+    if (health.status !== "healthy") {
+      // Ops still get the full picture in the logs, whoever asked.
+      logger.warn({ health }, "Health check not healthy")
+    }
+
+    res
+      .status(statusCode)
+      .json(detailed ? health : { status: health.status, timestamp: health.timestamp })
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "Unknown error"
     logger.error({ err: error }, "Health check error")
-    res.status(503).json({
-      status: "unhealthy",
-      timestamp: new Date().toISOString(),
-      error: message,
-      responseTime: Date.now() - startTime,
-    })
+    const timestamp = new Date().toISOString()
+    res.status(503).json(
+      detailed
+        ? {
+            status: "unhealthy",
+            timestamp,
+            error: message,
+            responseTime: Date.now() - startTime,
+          }
+        : { status: "unhealthy", timestamp },
+    )
   }
 }

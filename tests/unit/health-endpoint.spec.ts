@@ -18,6 +18,7 @@
 process.env.ENABLE_HYBRID_STORAGE = "true"
 process.env.BLINKPOS_API_KEY = "test-api-key"
 process.env.BLINKPOS_BTC_WALLET_ID = "test-wallet-id"
+process.env.HEALTH_TOKEN = "test-health-token-0123456789"
 
 const healthCheck = jest.fn()
 
@@ -43,7 +44,7 @@ jest.mock("../../lib/voucher-store", () => ({
 
 jest.mock("../../lib/logger", () => ({
   __esModule: true,
-  baseLogger: { child: () => ({ error: jest.fn(), info: jest.fn() }) },
+  baseLogger: { child: () => ({ error: jest.fn(), info: jest.fn(), warn: jest.fn() }) },
 }))
 
 import handler from "../../pages/api/health"
@@ -71,14 +72,25 @@ function makeRes(): Res {
   return res
 }
 
-async function callHealth(): Promise<Res> {
+/**
+ * The existing contract tests read `checks.*`, which is the detailed view:
+ * they present the health token. `callPublic` is what a probe / anyone on the
+ * internet gets.
+ */
+async function callHealth(
+  headers: Record<string, string> = {
+    "x-health-token": process.env.HEALTH_TOKEN as string,
+  },
+  query: Record<string, string> = {},
+): Promise<Res> {
   const res = makeRes()
   await (handler as unknown as (q: unknown, s: Res) => Promise<void>)(
-    { query: {}, method: "GET" },
+    { query, method: "GET", headers },
     res,
   )
   return res
 }
+const callPublic = (query: Record<string, string> = {}) => callHealth({}, query)
 
 function redisCheck(res: Res): Record<string, unknown> {
   return (res.body.checks as Record<string, Record<string, unknown>>).redis
@@ -165,5 +177,78 @@ describe("GET /api/health Redis reporting", () => {
 
     expect(res.statusCode).toBe(503)
     expect(res.body.status).toBe("unhealthy")
+  })
+
+  // blink-wip#1690 item 3: /api/health is public. Probes need the status
+  // code and nothing else; dependency detail (driver error strings, uptime,
+  // version, credential presence, pool/voucher stats) is for operators with
+  // the token.
+  describe("public vs detailed view", () => {
+    const degradedRedis = () =>
+      healthCheck.mockResolvedValue({
+        redis: true,
+        redisWritable: false,
+        redisError: "READONLY You can't write against a read only replica.",
+        postgres: true,
+      })
+
+    it("without the token answers only status + timestamp, same status code", async () => {
+      degradedRedis()
+      const res = await callPublic()
+      expect(res.statusCode).toBe(200)
+      expect(Object.keys(res.body).sort()).toEqual(["status", "timestamp"])
+      expect(res.body.status).toBe("degraded")
+      expect(JSON.stringify(res.body)).not.toContain("read only replica")
+    })
+
+    it("ignores ?verbose=true without the token", async () => {
+      degradedRedis()
+      const res = await callPublic({ verbose: "true" })
+      expect(Object.keys(res.body).sort()).toEqual(["status", "timestamp"])
+    })
+
+    it("rejects a wrong token (public view)", async () => {
+      degradedRedis()
+      const res = await callHealth({ "x-health-token": "nope" })
+      expect(Object.keys(res.body).sort()).toEqual(["status", "timestamp"])
+    })
+
+    it("with the token returns the full detail, and ?verbose adds stats", async () => {
+      degradedRedis()
+      const res = await callHealth(
+        { "x-health-token": process.env.HEALTH_TOKEN as string },
+        { verbose: "true" },
+      )
+      expect(res.body).toMatchObject({
+        status: "degraded",
+        uptime: expect.any(Number),
+        version: expect.any(String),
+        checks: {
+          redis: { status: "degraded", error: expect.stringContaining("read only") },
+          sharedPool: { pool: { total: 1, idle: 1, waiting: 0 } },
+          vouchers: { stats: { total: 0 } },
+          blinkConfig: { apiKey: "set", walletId: "set" },
+        },
+      })
+    })
+
+    it("unhealthy keeps the 503 for the public view", async () => {
+      healthCheck.mockResolvedValue({ redis: true, redisWritable: true, postgres: false })
+      const res = await callPublic()
+      expect(res.statusCode).toBe(503)
+      expect(res.body).toEqual({ status: "unhealthy", timestamp: expect.any(String) })
+    })
+
+    it("with HEALTH_TOKEN unset, no header can unlock the detail", async () => {
+      const saved = process.env.HEALTH_TOKEN
+      delete process.env.HEALTH_TOKEN
+      try {
+        degradedRedis()
+        const res = await callHealth({ "x-health-token": "" })
+        expect(Object.keys(res.body).sort()).toEqual(["status", "timestamp"])
+      } finally {
+        process.env.HEALTH_TOKEN = saved
+      }
+    })
   })
 })

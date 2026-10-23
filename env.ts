@@ -30,6 +30,9 @@ export const env = createEnv({
     BLINKPOS_MAX_FORWARD_SATS: z.coerce.number().int().positive().optional(),
     BLINK_WEBHOOK_SECRET: z.string().min(1).optional(),
     BLINK_STAGING_WEBHOOK_SECRET: z.string().min(1).optional(),
+    // Unlocks the detailed /api/health view (X-Health-Token). Unset: public
+    // body only (blink-wip#1690 item 3).
+    HEALTH_TOKEN: z.string().min(16).optional(),
 
     // --- Database (PostgreSQL) ---
     DATABASE_URL: z.string().url().optional(),
@@ -89,6 +92,7 @@ export const env = createEnv({
     BLINKPOS_MAX_FORWARD_SATS: process.env.BLINKPOS_MAX_FORWARD_SATS,
     BLINK_WEBHOOK_SECRET: process.env.BLINK_WEBHOOK_SECRET,
     BLINK_STAGING_WEBHOOK_SECRET: process.env.BLINK_STAGING_WEBHOOK_SECRET,
+    HEALTH_TOKEN: process.env.HEALTH_TOKEN,
 
     // Database
     DATABASE_URL: process.env.DATABASE_URL,
