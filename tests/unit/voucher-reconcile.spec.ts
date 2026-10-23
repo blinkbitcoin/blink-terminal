@@ -24,6 +24,7 @@ import {
 /* eslint-disable @typescript-eslint/no-require-imports */
 const {
   buildVoucherMemo,
+  decryptApiKey,
   invoicePrincipalSats,
   matchRedemptionCandidates,
   classifyVoucher,
@@ -1314,5 +1315,35 @@ describe("fetchTransactions", () => {
     await expect(
       fetchTransactions("key", "production", { walletId: "x" }),
     ).rejects.toThrow("Invalid wallet")
+  })
+})
+
+describe("stored API keys decrypt through the app keyring (blink-wip#1587)", () => {
+  const saved = {
+    key: process.env.ENCRYPTION_KEY,
+    prev: process.env.ENCRYPTION_KEY_PREVIOUS,
+  }
+  afterEach(() => {
+    process.env.ENCRYPTION_KEY = saved.key
+    process.env.ENCRYPTION_KEY_PREVIOUS = saved.prev
+  })
+
+  it("legacy CryptoJS and v2 values, including during a rotation", async () => {
+    const CryptoJS = (await import("crypto-js")).default
+    const { createKeyring } = await import("../../lib/crypto/keyring")
+    const legacy = CryptoJS.AES.encrypt("blink_legacy", "old-key").toString()
+    const v2Old = createKeyring({ current: "old-key", writeFormat: "v2" }).encrypt(
+      "blink_v2_old",
+    )
+    const v2New = createKeyring({ current: "new-key", writeFormat: "v2" }).encrypt(
+      "blink_v2_new",
+    )
+
+    process.env.ENCRYPTION_KEY = "new-key"
+    process.env.ENCRYPTION_KEY_PREVIOUS = "old-key"
+    expect(decryptApiKey(legacy)).toBe("blink_legacy")
+    expect(decryptApiKey(v2Old)).toBe("blink_v2_old")
+    expect(decryptApiKey(v2New)).toBe("blink_v2_new")
+    expect(decryptApiKey("garbage")).toBeNull()
   })
 })

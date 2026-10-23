@@ -62,6 +62,13 @@ COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 # Copy database init script for health checks
 COPY --from=builder /app/database ./database
 
+# Operator scripts and the keyring they share with the app (blink-wip#1587),
+# so they run in the app pod with its env:
+#   kubectl exec <pod> -- node scripts/reencrypt-secrets.js --check
+# Their dependencies (pg, bolt11) are in the standalone node_modules.
+COPY --from=builder --chown=nextjs:nodejs /app/scripts/reencrypt-secrets.js /app/scripts/reconcile-voucher-claims.js ./scripts/
+COPY --from=builder --chown=nextjs:nodejs /app/lib/crypto/keyring.js ./lib/crypto/keyring.js
+
 # Create .data directory for user session storage with proper permissions
 USER root
 RUN mkdir -p /app/.data && chown -R nextjs:nodejs /app/.data
