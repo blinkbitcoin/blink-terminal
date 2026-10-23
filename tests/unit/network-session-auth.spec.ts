@@ -164,6 +164,9 @@ jest.spyOn(console, "log").mockImplementation(() => {})
 jest.spyOn(console, "warn").mockImplementation(() => {})
 jest.spyOn(console, "error").mockImplementation(() => {})
 
+/** A well-formed community id (members.ts validates before the uuid column). */
+const COMMUNITY_ID = "a1b2c3d4-e5f6-7890-abcd-ef1234567001"
+
 beforeEach(() => {
   for (const fn of Object.values(mockDbFns)) fn.mockReset()
   mockSyncCommunityTransactions.mockReset()
@@ -212,7 +215,7 @@ describe("no session -> 401 on every previously header-authenticated route", () 
   ])("%s -> 401", async (method, handler) => {
     const res = await call(handler as Handler, {
       method: method as string,
-      query: { communityId: "1" },
+      query: { communityId: COMMUNITY_ID },
       headers: {
         // Even a valid-looking super-admin header must not count as auth.
         "x-user-npub": SUPER_ADMIN_NPUB,
@@ -267,10 +270,10 @@ describe("forged X-User-Npub is ignored (regression for blink-wip#1679)", () => 
   it("members GET: leader header on someone else's session -> 403", async () => {
     mockDb.getCommunityById = jest
       .fn()
-      .mockResolvedValue({ id: "1", leader_npub: OWNER_NPUB })
+      .mockResolvedValue({ id: COMMUNITY_ID, leader_npub: OWNER_NPUB })
     const res = await call(membersHandler as Handler, {
       token: "token-other",
-      query: { communityId: "1" },
+      query: { communityId: COMMUNITY_ID },
       headers: { "x-user-npub": OWNER_NPUB },
     })
     expect(res.statusCode).toBe(403)
@@ -280,13 +283,37 @@ describe("forged X-User-Npub is ignored (regression for blink-wip#1679)", () => 
   it("members GET: the actual leader session passes", async () => {
     mockDb.getCommunityById = jest
       .fn()
-      .mockResolvedValue({ id: "1", leader_npub: OWNER_NPUB })
+      .mockResolvedValue({ id: COMMUNITY_ID, leader_npub: OWNER_NPUB })
     mockDb.getCommunityMembers = jest.fn().mockResolvedValue([])
     const res = await call(membersHandler as Handler, {
       token: "token-owner",
-      query: { communityId: "1" },
+      query: { communityId: COMMUNITY_ID },
     })
     expect(res.statusCode).toBe(200)
+  })
+
+  // blink-wip#1690 item 1: a malformed community id used to reach the uuid
+  // column and escape as a raw pg 500 before authorization.
+  it("members GET: malformed communityId -> 400 envelope, no DB lookup", async () => {
+    for (const bad of ["1", "x'--", "a1b2c3d4-e5f6-7890-abcd-ef123456700'", ""]) {
+      const res = await call(membersHandler as Handler, {
+        token: "token-owner",
+        query: { communityId: bad },
+      })
+      expect(res.statusCode).toBe(400)
+      expect(res.body).toEqual({ success: false, error: "Community ID is required" })
+    }
+    expect(mockDb.getCommunityById).not.toHaveBeenCalled()
+  })
+
+  it("members GET: a DB failure during authorization -> 500 envelope, not a raw error", async () => {
+    mockDb.getCommunityById = jest.fn().mockRejectedValue(new Error("connection reset"))
+    const res = await call(membersHandler as Handler, {
+      token: "token-owner",
+      query: { communityId: COMMUNITY_ID },
+    })
+    expect(res.statusCode).toBe(500)
+    expect(res.body).toEqual({ success: false, error: "Failed to fetch members" })
   })
 
   it("apply POST: membership is created for the session identity, both headers ignored", async () => {
@@ -438,7 +465,7 @@ describe("mutation guard (same-site CSRF boundary, PR #92 review)", () => {
       const res = await call(handler as Handler, {
         token: "token-admin",
         method: method as string,
-        query: { communityId: "1" },
+        query: { communityId: COMMUNITY_ID },
         headers: { "content-type": "application/x-www-form-urlencoded" },
         body,
       })
@@ -450,11 +477,11 @@ describe("mutation guard (same-site CSRF boundary, PR #92 review)", () => {
     // members.ts checks leadership (DB lookup) before method dispatch.
     mockDb.getCommunityById = jest
       .fn()
-      .mockResolvedValue({ id: "1", leader_npub: SUPER_ADMIN_NPUB })
+      .mockResolvedValue({ id: COMMUNITY_ID, leader_npub: SUPER_ADMIN_NPUB })
     const res = await call(membersHandler as Handler, {
       token: "token-admin",
       method: "DELETE",
-      query: { communityId: "1" },
+      query: { communityId: COMMUNITY_ID },
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: { membershipId: "5" },
     })
@@ -493,7 +520,7 @@ describe("session-bound mutations execute for the right session", () => {
     const res = await call(consentHandler as Handler, {
       token: "token-owner",
       method: "DELETE",
-      query: { communityId: "1" },
+      query: { communityId: COMMUNITY_ID },
       // components/Network.tsx revokeConsent sends Content-Type: application/json
       // and NO body. This is the request the guard must accept.
       headers: { ...CLIENT_MUTATION_HEADERS },
@@ -502,7 +529,7 @@ describe("session-bound mutations execute for the right session", () => {
     expect(mockDb.createOrUpdateConsent).toHaveBeenCalledWith(
       3,
       OWNER_NPUB,
-      "1",
+      COMMUNITY_ID,
       expect.objectContaining({ consentGiven: false }),
     )
   })
@@ -513,7 +540,7 @@ describe("session-bound mutations execute for the right session", () => {
     const res = await call(consentHandler as Handler, {
       token: "token-owner",
       method: "DELETE",
-      query: { communityId: "1" },
+      query: { communityId: COMMUNITY_ID },
       headers: { origin: "https://terminal.example" },
     })
     expect(res.statusCode).toBe(415)
@@ -523,15 +550,15 @@ describe("session-bound mutations execute for the right session", () => {
   it("members DELETE removes a member as the leader session", async () => {
     mockDb.getCommunityById = jest
       .fn()
-      .mockResolvedValue({ id: "1", leader_npub: OWNER_NPUB })
+      .mockResolvedValue({ id: COMMUNITY_ID, leader_npub: OWNER_NPUB })
     mockDb.getMembershipById = jest
       .fn()
-      .mockResolvedValue({ id: 5, community_id: "1", role: "member" })
+      .mockResolvedValue({ id: 5, community_id: COMMUNITY_ID, role: "member" })
     mockDb.removeMember = jest.fn().mockResolvedValue(undefined)
     const res = await call(membersHandler as Handler, {
       token: "token-owner",
       method: "DELETE",
-      query: { communityId: "1" },
+      query: { communityId: COMMUNITY_ID },
       headers: { ...CLIENT_MUTATION_HEADERS },
       body: { membershipId: "5" },
     })
@@ -578,7 +605,7 @@ describe("session-bound mutations execute for the right session", () => {
   it("sync POST syncs one community as its leader", async () => {
     mockDb.getCommunityById = jest
       .fn()
-      .mockResolvedValue({ id: "1", leader_npub: OWNER_NPUB })
+      .mockResolvedValue({ id: COMMUNITY_ID, leader_npub: OWNER_NPUB })
     mockSyncCommunityTransactions.mockResolvedValue({
       members_synced: 1,
       total_transactions: 2,

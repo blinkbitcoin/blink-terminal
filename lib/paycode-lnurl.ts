@@ -45,6 +45,24 @@ const LNURL_BECH32_LIMIT = 1500
 /**
  * Encode an arbitrary URL string as an uppercased bech32 LNURL.
  */
+/**
+ * Blink username charset (the server's UsernameRegex is stricter still; this
+ * is the subset safe to interpolate into an upstream URL path). Anything else
+ * — `..%2F`, slashes, query characters — must never reach pay.blink.sv
+ * (blink-wip#1690 item 2: path traversal through the 2-hop proxy).
+ */
+const USERNAME_PATH_RE = /^[a-z0-9_]{3,50}$/i
+
+export function isValidBlinkUsername(username: unknown): username is string {
+  return typeof username === "string" && USERNAME_PATH_RE.test(username)
+}
+
+/** LUD-06 `amount` is millisatoshis: a positive integer. */
+export function parseMillisatAmount(amount: unknown): number | null {
+  if (typeof amount !== "string" || !/^[1-9][0-9]{0,15}$/.test(amount)) return null
+  return Number(amount)
+}
+
 export function encodeLnurl(url: string): string {
   const words = bech32.toWords(Buffer.from(url, "utf8"))
   return bech32.encode("lnurl", words, LNURL_BECH32_LIMIT).toUpperCase()
