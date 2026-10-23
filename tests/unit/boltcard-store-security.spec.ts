@@ -20,7 +20,11 @@ jest.mock("../../lib/auth", () => ({
   default: { encryptApiKey: (k: string) => k, decryptApiKey: (k: string) => k },
 }))
 
-import { BoltcardStore, CARD_ACTIVATION_FAILED } from "../../lib/boltcard/store"
+import {
+  BoltcardStore,
+  CARD_ACTIVATION_FAILED,
+  CONSUMED_HASH_SQLSTATE,
+} from "../../lib/boltcard/store"
 
 const pendingRow = {
   id: "r".repeat(32),
@@ -528,6 +532,43 @@ describe("review states (pending withdrawals, top-up flags)", () => {
     expect(sql).toMatch(/ROLLBACK/)
     expect(sql).not.toMatch(/balance = balance -/)
     expect(sql).not.toMatch(/attempt = attempt \+ 1/)
+  })
+
+  // blink-wip#1646: claimant B passes the pre-check while A's insert is
+  // uncommitted; A commits, the card is wiped (withdrawal row cascades away,
+  // tombstone stays); B's insert trips migration 030's trigger. That is
+  // "spent", not a server fault: the callback must answer "already used".
+  it("the retention trigger's rejection (SQLSTATE BC409) is spent, nothing deducted", async () => {
+    mockPoolQuery
+      .mockResolvedValueOnce({}) // BEGIN
+      .mockResolvedValueOnce({ rowCount: 0, rows: [] }) // pre-check: not yet consumed
+      .mockRejectedValueOnce(
+        Object.assign(new Error("payment hash already consumed"), {
+          code: CONSUMED_HASH_SQLSTATE,
+        }),
+      )
+      .mockResolvedValueOnce({}) // ROLLBACK
+    await expect(store().claimAndDeductWithdrawal("h", "c1", 1000)).resolves.toEqual({
+      status: "spent",
+    })
+    const sql = sqlCalls().join(" ")
+    expect(sql).toMatch(/ROLLBACK/)
+    expect(sql).not.toMatch(/balance = balance -/)
+    expect(sql).not.toMatch(/COMMIT/)
+  })
+
+  it("any other database error still throws (the claim may have committed)", async () => {
+    mockPoolQuery
+      .mockResolvedValueOnce({}) // BEGIN
+      .mockResolvedValueOnce({ rowCount: 0, rows: [] })
+      .mockRejectedValueOnce(
+        Object.assign(new Error("deadlock detected"), { code: "40P01" }),
+      )
+      .mockResolvedValueOnce({})
+    await expect(store().claimAndDeductWithdrawal("h", "c1", 1000)).rejects.toThrow(
+      "deadlock detected",
+    )
+    expect(sqlCalls().join(" ")).toMatch(/ROLLBACK/)
   })
 
   it("beginWithdrawalSend moves only an unresolved CLAIMED row to UNKNOWN", async () => {

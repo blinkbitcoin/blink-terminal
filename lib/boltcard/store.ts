@@ -248,6 +248,24 @@ const sha256Hex = (value: string): string =>
 const CARD_ACTIVATION_FAILED = "Failed to activate card"
 
 /**
+ * SQLSTATE raised by retain_consumed_payment_hash() (migration 030) when a
+ * payment hash is already consumed and its withdrawal row is gone. Mapped to
+ * { status: "spent" } by claimAndDeductWithdrawal (blink-wip#1646).
+ */
+export const CONSUMED_HASH_SQLSTATE = "BC409"
+
+/**
+ * The claim insert of claimAndDeductWithdrawal, exported so the PGlite spec
+ * runs the exact statement against migration 030's trigger.
+ * $1 = payment hash, $2 = card id, $3 = amount, $4 = now (ms).
+ */
+export const CLAIM_WITHDRAWAL_INSERT_SQL = `INSERT INTO boltcard_pending_withdrawals
+           (payment_hash, card_id, amount, balance_after, created_at, kind, daily_window_reset_at)
+         VALUES ($1, $2, $3, 0, $4, 'CLAIMED', NULL)
+         ON CONFLICT (payment_hash) DO NOTHING
+         RETURNING attempt`
+
+/**
  * Owner pubkeys are stored and looked up lowercase (hex), matching the Nostr
  * session; migration 023 normalizes legacy rows.
  */
@@ -1820,9 +1838,14 @@ class BoltcardStore {
   /**
    * Claim this invoice hash and deduct in one transaction. A conflicting hash
    * is already taken, including one retained after the card row was deleted:
-   * that hash is spent and the wallet must present a new invoice. Zero-row deduction rolls the
-   * claim back (definite decline). A database error throws: the transaction
-   * may have committed, and callers must not treat that as a decline.
+   * that hash is spent and the wallet must present a new invoice. The
+   * retention trigger can also reject the insert (SQLSTATE
+   * CONSUMED_HASH_SQLSTATE) when a concurrent claimant consumed the hash
+   * between our pre-check and our insert and the card row was then deleted
+   * (blink-wip#1646); that is "spent" too, nothing was deducted. Zero-row
+   * deduction rolls the claim back (definite decline). Any other database
+   * error throws: the transaction may have committed, and callers must not
+   * treat that as a decline.
    */
   async claimAndDeductWithdrawal(
     paymentHash: string,
@@ -1855,11 +1878,7 @@ class BoltcardStore {
         return { status: "spent" }
       }
       const inserted: QueryResult<DbRow> = await client.query(
-        `INSERT INTO boltcard_pending_withdrawals
-           (payment_hash, card_id, amount, balance_after, created_at, kind, daily_window_reset_at)
-         VALUES ($1, $2, $3, 0, $4, 'CLAIMED', NULL)
-         ON CONFLICT (payment_hash) DO NOTHING
-         RETURNING attempt`,
+        CLAIM_WITHDRAWAL_INSERT_SQL,
         [paymentHash, cardId, amountInt, now],
       )
       if ((inserted.rowCount ?? 0) === 0) {
@@ -1921,6 +1940,9 @@ class BoltcardStore {
       }
     } catch (err: unknown) {
       await client.query("ROLLBACK").catch(() => undefined)
+      if ((err as { code?: string } | null)?.code === CONSUMED_HASH_SQLSTATE) {
+        return { status: "spent" }
+      }
       throw err
     } finally {
       client.release()
