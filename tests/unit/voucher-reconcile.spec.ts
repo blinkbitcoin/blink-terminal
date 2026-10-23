@@ -12,12 +12,15 @@ jest.mock("../../lib/auth", () => ({
 }))
 jest.mock("../../lib/db", () => ({ getSharedPool: () => ({ query: jest.fn() }) }))
 
+import { encode as encodeInvoice, sign as signInvoice } from "bolt11"
+
 import { buildVoucherMemo as callbackMemo } from "../../lib/voucher-memo"
 import { MARK_VOUCHER_PAID_SQL } from "../../lib/voucher-store"
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const {
   buildVoucherMemo,
+  invoicePrincipalSats,
   matchRedemptionCandidates,
   classifyVoucher,
   reconcileClaimedVouchers,
@@ -27,6 +30,55 @@ const {
 
 const NOW = 1_760_000_000_000
 const MINUTE = 60 * 1000
+
+const PRIVKEY = "e126f68f7eafcc8b74f54d269fe206be715000f94dac067d1c04a8ca3b2db734"
+const HASH = "ab".repeat(32)
+const REGTEST = {
+  bech32: "bcrt",
+  pubKeyHash: 0x6f,
+  scriptHash: 0xc4,
+  validWitnessVersions: [0, 1],
+}
+
+/** A signed BOLT11 invoice (cached: signing is the slow part). */
+const invoiceCache = new Map<string, string>()
+const lnInvoice = ({
+  sats,
+  millisats,
+  hash = HASH,
+  regtest = false,
+}: {
+  sats?: number
+  millisats?: string
+  hash?: string
+  regtest?: boolean
+}): string => {
+  const key = JSON.stringify({ sats, millisats, hash, regtest })
+  const cached = invoiceCache.get(key)
+  if (cached) return cached
+  const encoded = encodeInvoice({
+    ...(sats !== undefined ? { satoshis: sats } : {}),
+    ...(millisats !== undefined ? { millisatoshis: millisats } : {}),
+    ...(regtest ? { network: REGTEST } : {}),
+    timestamp: Math.floor(NOW / 1000),
+    tags: [
+      { tagName: "payment_hash", data: hash },
+      { tagName: "payment_secret", data: "11".repeat(32) },
+      { tagName: "description", data: "voucher" },
+    ],
+  })
+  const request = signInvoice(encoded, PRIVKEY).paymentRequest as string
+  invoiceCache.set(key, request)
+  return request
+}
+
+/** Blink's initiationVia for a Lightning send of `sats`. */
+const lnVia = (sats: number, overrides: Record<string, unknown> = {}) => ({
+  __typename: "InitiationViaLn",
+  paymentHash: HASH,
+  paymentRequest: lnInvoice({ sats }),
+  ...overrides,
+})
 
 const voucher = (overrides: Record<string, unknown> = {}) => ({
   id: "v1",
@@ -46,7 +98,37 @@ const tx = (overrides: Record<string, unknown> = {}) => ({
   settlementCurrency: "BTC",
   createdAt: Math.floor(NOW / 1000), // Blink Timestamp is Unix seconds
   memo: "BlinkPOS Voucher: 500 sats",
+  initiationVia: lnVia(500),
   ...overrides,
+})
+
+describe("invoicePrincipalSats", () => {
+  it("decodes the recorded invoice's amount in whole sats", () => {
+    expect(invoicePrincipalSats(tx())).toBe(500)
+    expect(invoicePrincipalSats(tx({ initiationVia: lnVia(2000) }))).toBe(2000)
+  })
+
+  it("reads regtest invoices as regtest, not mainnet", () => {
+    const via = lnVia(500, { paymentRequest: lnInvoice({ sats: 500, regtest: true }) })
+    expect(via.paymentRequest.startsWith("lnbcrt")).toBe(true)
+    expect(invoicePrincipalSats(tx({ initiationVia: via }))).toBe(500)
+  })
+
+  it("returns null when the principal cannot be established", () => {
+    const cases = [
+      undefined,
+      { __typename: "InitiationViaIntraLedger", counterPartyWalletId: "w2" },
+      lnVia(500, { paymentRequest: "" }), // Blink's resolver failure value
+      lnVia(500, { paymentRequest: "lnbc1notaninvoice" }),
+      lnVia(500, { paymentHash: "cd".repeat(32) }), // hash not bound to tx
+      lnVia(500, { paymentHash: "" }),
+      lnVia(0, { paymentRequest: lnInvoice({}) }), // amountless
+      lnVia(0, { paymentRequest: lnInvoice({ millisats: "500500" }) }), // sub-sat
+    ]
+    for (const initiationVia of cases) {
+      expect(invoicePrincipalSats(tx({ initiationVia }))).toBeNull()
+    }
+  })
 })
 
 describe("matchRedemptionCandidates", () => {
@@ -65,7 +147,7 @@ describe("matchRedemptionCandidates", () => {
     ).toHaveLength(1)
   })
 
-  it("matches a settled USD voucher by its exact memo, whatever cents were debited", () => {
+  it("matches a settled USD voucher whatever cents were debited", () => {
     // The callback pays a fixed 2000-sat invoice from the USD wallet, so the
     // cents debited follow the redemption-time rate, not usd_amount_cents.
     const usdVoucher = voucher({
@@ -78,12 +160,86 @@ describe("matchRedemptionCandidates", () => {
       settlementFee: 0,
       settlementCurrency: "USD",
       memo: "BlinkPOS USD Voucher: $1.00 USD = 2000 sats",
+      initiationVia: lnVia(2000),
     })
     expect(matchRedemptionCandidates(usdVoucher, [usdTx])).toHaveLength(1)
     // A different USD voucher's memo never matches
     expect(
       matchRedemptionCandidates(usdVoucher, [
         tx({ ...usdTx, memo: "BlinkPOS USD Voucher: $1.01 USD = 2000 sats" }),
+      ]),
+    ).toEqual([])
+  })
+
+  describe("USD principal is bound to the paid invoice, not the memo", () => {
+    const usdVoucher = voucher({
+      amount: 2000,
+      usdAmountCents: 10000,
+      walletCurrency: "USD",
+    })
+    const memo = "BlinkPOS USD Voucher: $100.00 USD = 2000 sats"
+    const usdTx = (overrides: Record<string, unknown>) =>
+      tx({ settlementCurrency: "USD", settlementFee: 0, memo, ...overrides })
+
+    it("matches the face-value invoice at any redemption-time cents", () => {
+      expect(
+        matchRedemptionCandidates(usdVoucher, [
+          usdTx({ settlementAmount: -9700, initiationVia: lnVia(2000) }),
+        ]),
+      ).toHaveLength(1)
+    })
+
+    it("rejects a tiny same-memo transaction (the reviewer's probe)", () => {
+      expect(
+        matchRedemptionCandidates(usdVoucher, [
+          // 1 cent paying a 1-sat invoice
+          usdTx({ id: "tiny-ln", settlementAmount: -1, initiationVia: lnVia(1) }),
+          // 1 cent with no Lightning invoice at all (intraledger send)
+          usdTx({
+            id: "tiny-intraledger",
+            settlementAmount: -1,
+            initiationVia: { __typename: "InitiationViaIntraLedger" },
+          }),
+          // 1 cent, invoice unresolvable
+          usdTx({ id: "tiny-no-pr", settlementAmount: -1, initiationVia: undefined }),
+        ]),
+      ).toEqual([])
+    })
+
+    it("rejects a wrong-principal same-memo transaction", () => {
+      expect(
+        matchRedemptionCandidates(usdVoucher, [
+          usdTx({ settlementAmount: -9700, initiationVia: lnVia(1999) }),
+          usdTx({ settlementAmount: -9700, initiationVia: lnVia(2001) }),
+        ]),
+      ).toEqual([])
+    })
+
+    it("rejects an invoice not bound to the transaction's payment hash", () => {
+      expect(
+        matchRedemptionCandidates(usdVoucher, [
+          usdTx({
+            settlementAmount: -9700,
+            initiationVia: lnVia(2000, { paymentHash: "cd".repeat(32) }),
+          }),
+        ]),
+      ).toEqual([])
+    })
+
+    it("rejects a face-value invoice with no principal debited", () => {
+      expect(
+        matchRedemptionCandidates(usdVoucher, [
+          usdTx({ settlementAmount: -3, settlementFee: 3, initiationVia: lnVia(2000) }),
+        ]),
+      ).toEqual([])
+    })
+  })
+
+  it("BTC requires both the invoice and the debited principal at face value", () => {
+    expect(
+      matchRedemptionCandidates(voucher(), [
+        tx({ settlementAmount: -400, initiationVia: lnVia(500) }),
+        tx({ settlementAmount: -500, initiationVia: lnVia(400) }),
       ]),
     ).toEqual([])
   })

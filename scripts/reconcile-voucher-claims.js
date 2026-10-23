@@ -14,15 +14,20 @@
  * wallet, and transitions a CLAIMED voucher to PAID only when exactly one
  * settled outgoing payment matches:
  *   - direction SEND, status SUCCESS/ALREADY_PAID, voucher wallet currency
- *   - memo equals the exact memo the redemption callback wrote for this
- *     voucher (lib/voucher-memo.ts)
+ *   - principal (authoritative, both currencies): the payment's BOLT11
+ *     invoice — InitiationViaLn.paymentRequest, which Blink resolves from its
+ *     own payment record by the transaction's payment hash — decodes to
+ *     exactly the voucher's face value in sats, and its payment hash equals
+ *     InitiationViaLn.paymentHash. The callback only pays invoices for the
+ *     exact face value (also for USD vouchers), so this binds the payout
+ *     amount independently of fees and exchange rate.
  *   - settlementFee is present (fails closed otherwise)
- *   - BTC: principal |settlementAmount| - |settlementFee| equals the face
- *     value. Blink debits principal + fee on external sends, and
- *     settlementAmount is signed (credit - debit).
- *   - USD: no amount check. The callback pays a fixed-sats invoice from the
- *     USD wallet, so the cents debited follow the rate at redemption, not
- *     usd_amount_cents; the exact memo carries the voucher's amounts instead.
+ *   - BTC: also |settlementAmount| - |settlementFee| equals the face value
+ *     (Blink debits principal + fee; settlementAmount is credit - debit).
+ *   - USD: also a positive fee-normalized debit. The cents follow the
+ *     redemption-time rate, not usd_amount_cents, so they are not compared.
+ *   - memo equals the exact memo the redemption callback wrote for this
+ *     voucher (lib/voucher-memo.ts) — defense in depth, never sufficient
  *   - transaction time within 2 minutes before / 30 minutes after claimed_at
  *
  * Zero or multiple candidates leave the voucher CLAIMED, so it stays counted
@@ -48,6 +53,7 @@
 const fs = require("fs")
 const path = require("path")
 
+const bolt11 = require("bolt11")
 const CryptoJS = require("crypto-js")
 const { Pool } = require("pg")
 
@@ -72,6 +78,13 @@ const TRANSACTIONS_QUERY = `
               settlementCurrency
               createdAt
               memo
+              initiationVia {
+                __typename
+                ... on InitiationViaLn {
+                  paymentHash
+                  paymentRequest
+                }
+              }
             }
           }
           pageInfo {
@@ -165,6 +178,59 @@ function buildVoucherMemo(voucher) {
   return `BlinkPOS Voucher: ${voucher.amount} sats`
 }
 
+const BOLT11_NETWORKS = [
+  // Longest prefix first: lnbcrt must not be read as mainnet lnbc.
+  [
+    "lnbcrt",
+    { bech32: "bcrt", pubKeyHash: 0x6f, scriptHash: 0xc4, validWitnessVersions: [0, 1] },
+  ],
+  [
+    "lnbc",
+    { bech32: "bc", pubKeyHash: 0x00, scriptHash: 0x05, validWitnessVersions: [0, 1] },
+  ],
+  [
+    "lntbs",
+    { bech32: "tbs", pubKeyHash: 0x6f, scriptHash: 0xc4, validWitnessVersions: [0, 1] },
+  ],
+  [
+    "lntb",
+    { bech32: "tb", pubKeyHash: 0x6f, scriptHash: 0xc4, validWitnessVersions: [0, 1] },
+  ],
+]
+
+/**
+ * Principal in whole sats of the Lightning invoice Blink recorded for this
+ * payment, or null when it cannot be established (not a Lightning send,
+ * empty/undecodable invoice, payment hash mismatch, amountless or
+ * sub-satoshi amount). Callers must treat null as "no match".
+ */
+function invoicePrincipalSats(tx) {
+  const via = tx.initiationVia
+  if (!via || via.__typename !== "InitiationViaLn") return null
+  const request = String(via.paymentRequest || "")
+    .trim()
+    .toLowerCase()
+  const paymentHash = String(via.paymentHash || "").toLowerCase()
+  if (!request || !paymentHash) return null
+
+  const network = BOLT11_NETWORKS.find(([prefix]) => request.startsWith(prefix))
+  if (!network) return null
+
+  let decoded
+  try {
+    decoded = bolt11.decode(request, network[1])
+  } catch (_err) {
+    return null
+  }
+  if (String(decoded.tagsObject?.payment_hash || "").toLowerCase() !== paymentHash) {
+    return null
+  }
+  if (decoded.millisatoshis === null || decoded.millisatoshis === undefined) return null
+  const msat = BigInt(decoded.millisatoshis)
+  if (msat <= 0n || msat % 1000n !== 0n) return null
+  return Number(msat / 1000n)
+}
+
 /**
  * Candidate settled payments for one claimed voucher. Callers must require
  * exactly one candidate before treating the voucher as settled.
@@ -186,17 +252,22 @@ function matchRedemptionCandidates(voucher, transactions) {
 
     if (String(tx.settlementCurrency || "").toUpperCase() !== currency) return false
 
-    // Fail closed: without the fee the principal cannot be derived.
+    // Authoritative principal: the invoice actually paid, bound to this
+    // transaction by its payment hash, must be exactly the face value.
+    if (invoicePrincipalSats(tx) !== faceSats) return false
+
+    // Fail closed: without the fee the debited principal cannot be derived.
     if (tx.settlementFee === null || tx.settlementFee === undefined) return false
     const fee = Math.abs(Number(tx.settlementFee))
     const gross = Math.abs(Number(tx.settlementAmount))
     if (!Number.isFinite(fee) || !Number.isFinite(gross)) return false
 
-    // USD: cents follow the redemption-time rate; the exact memo is the key.
-    if (currency === "USD") return true
+    // USD: the cents debited follow the redemption-time rate (fixed-sats
+    // invoice), so only require a real, positive principal debit.
+    if (currency === "USD") return gross - fee > 0
 
     // BTC: settlementAmount is signed (credit - debit) and includes the fee
-    // on external sends; compare the principal to the face value.
+    // on external sends; the debited principal must equal the face value.
     return gross - fee === faceSats
   })
 }
@@ -504,6 +575,7 @@ async function main() {
 
 module.exports = {
   buildVoucherMemo,
+  invoicePrincipalSats,
   matchRedemptionCandidates,
   classifyVoucher,
   reconcileClaimedVouchers,

@@ -1,6 +1,22 @@
 #!/bin/bash
 # ============================================================================
-# Production Deployment Script - Git-Based Workflow
+# DEPRECATED — NOT THE PRODUCTION DEPLOYMENT PATH
+# ============================================================================
+#
+# Production runs on Kubernetes: CI publishes the image and bumps it in
+# blinkbitcoin/charts (charts/blink-terminal), which blink-deployments
+# installs via Helm. Database migrations are applied there by the
+# `run-migrations` init container (charts/blink-terminal/templates/
+# deployment.yaml): every database/migrations/*.sql above the current
+# schema_version, in sorted order, with `set -euo pipefail` and
+# `psql -v ON_ERROR_STOP=1`, before the app container starts.
+#
+# This legacy docker-compose script is kept for reference only. Its explicit
+# migration chain stops at 019 and is NOT maintained; do not use it to deploy
+# or to reason about which migrations production applies.
+#
+# ============================================================================
+# Production Deployment Script - Git-Based Workflow (legacy)
 # ============================================================================
 #
 # ⚠️  IMPORTANT: This app runs via DOCKER, NOT PM2!
