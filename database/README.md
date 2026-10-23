@@ -246,3 +246,32 @@ docker volume rm bbtv2_postgres_data
 docker-compose up -d
 ```
 
+
+## Migrations in production
+
+Production applies `init.sql` (on an empty database) and then every
+`migrations/*.sql` whose number is above the current `schema_version`, in
+sorted order, from the `run-migrations` init container of the
+`blinkbitcoin/charts` `blink-terminal` chart (`psql -v ON_ERROR_STOP=1`),
+before the app container starts. `deploy-prod.sh` is deprecated and does not
+reflect that path.
+
+## Testing against real Postgres
+
+Store logic that depends on transactions, advisory locks, `lock_timeout` or
+index choice is tested in `tests/unit/pg/*.pg.spec.ts` against a real server
+(blink-wip#1616). Each suite creates a fresh database, applies `init.sql` and
+every migration in the production order (so the chain itself is tested), and
+drops it afterwards.
+
+The suites are opt-in via `PG_TEST_URL` — an admin connection string for a
+role that may `CREATE DATABASE` / `CREATE EXTENSION` — and skipped without it.
+CI runs them against a `postgres:15-alpine` service container.
+
+```bash
+docker run -d --name bt-pg -e POSTGRES_PASSWORD=postgres -p 55432:5432 postgres:15-alpine
+PG_TEST_URL=postgres://postgres:postgres@localhost:55432/postgres npx jest tests/unit/pg
+```
+
+Single-statement SQL contracts that need no concurrency can stay as PGlite
+probes (`scripts/pglite-sql-probe.mjs`), which run without a server.
