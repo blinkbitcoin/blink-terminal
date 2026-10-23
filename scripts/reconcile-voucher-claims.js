@@ -2,7 +2,10 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 
 /**
- * One-time reconciliation for CLAIMED vouchers created before PR #94.
+ * Reconciliation for CLAIMED vouchers: legacy claims from before PR #94, and
+ * any later redemption that answered PENDING and settled afterwards (the
+ * callback only marks PAID on a synchronous SUCCESS). Every CLAIMED row older
+ * than --min-age-minutes is a target, and the run is safe to repeat.
  *
  * Before this change, successful redemptions stayed CLAIMED forever: Blink
  * had already debited the wallet, but the voucher still counted as an
@@ -13,7 +16,7 @@
  * This tool asks Blink's ledger (authoritative), scoped to the voucher's
  * wallet, and transitions a CLAIMED voucher to PAID only when exactly one
  * settled outgoing payment matches:
- *   - direction SEND, status SUCCESS/ALREADY_PAID, voucher wallet currency
+ *   - direction SEND, status SUCCESS (Blink's TxStatus), voucher wallet currency
  *   - principal (authoritative, both currencies): the payment's BOLT11
  *     invoice — InitiationViaLn.paymentRequest, which Blink resolves from its
  *     own payment record by the transaction's payment hash — decodes to
@@ -139,10 +142,11 @@ function createdAtMs(tx) {
 }
 
 function isSettledOutgoing(tx) {
-  const direction = String(tx.direction || "").toUpperCase()
-  if (direction && direction !== "SEND") return false
+  // direction is non-null in Blink's schema: require it (fail closed).
+  if (String(tx.direction || "").toUpperCase() !== "SEND") return false
   const status = String(tx.status || "").toUpperCase()
-  return status === "SUCCESS" || status === "ALREADY_PAID"
+  // TxStatus is FAILURE | PENDING | SUCCESS; only SUCCESS is settled.
+  return status === "SUCCESS"
 }
 
 /**

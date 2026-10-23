@@ -23,6 +23,7 @@ const {
   invoicePrincipalSats,
   matchRedemptionCandidates,
   classifyVoucher,
+  fetchTransactions,
   reconcileClaimedVouchers,
   parseArgs,
   MARK_PAID_SQL,
@@ -33,11 +34,25 @@ const MINUTE = 60 * 1000
 
 const PRIVKEY = "e126f68f7eafcc8b74f54d269fe206be715000f94dac067d1c04a8ca3b2db734"
 const HASH = "ab".repeat(32)
-const REGTEST = {
-  bech32: "bcrt",
-  pubKeyHash: 0x6f,
-  scriptHash: 0xc4,
-  validWitnessVersions: [0, 1],
+const TEST_NETWORKS = {
+  regtest: {
+    bech32: "bcrt",
+    pubKeyHash: 0x6f,
+    scriptHash: 0xc4,
+    validWitnessVersions: [0, 1],
+  },
+  testnet: {
+    bech32: "tb",
+    pubKeyHash: 0x6f,
+    scriptHash: 0xc4,
+    validWitnessVersions: [0, 1],
+  },
+  signet: {
+    bech32: "tbs",
+    pubKeyHash: 0x6f,
+    scriptHash: 0xc4,
+    validWitnessVersions: [0, 1],
+  },
 }
 
 /** A signed BOLT11 invoice (cached: signing is the slow part). */
@@ -46,20 +61,20 @@ const lnInvoice = ({
   sats,
   millisats,
   hash = HASH,
-  regtest = false,
+  network,
 }: {
   sats?: number
   millisats?: string
   hash?: string
-  regtest?: boolean
+  network?: keyof typeof TEST_NETWORKS
 }): string => {
-  const key = JSON.stringify({ sats, millisats, hash, regtest })
+  const key = JSON.stringify({ sats, millisats, hash, network })
   const cached = invoiceCache.get(key)
   if (cached) return cached
   const encoded = encodeInvoice({
     ...(sats !== undefined ? { satoshis: sats } : {}),
     ...(millisats !== undefined ? { millisatoshis: millisats } : {}),
-    ...(regtest ? { network: REGTEST } : {}),
+    ...(network ? { network: TEST_NETWORKS[network] } : {}),
     timestamp: Math.floor(NOW / 1000),
     tags: [
       { tagName: "payment_hash", data: hash },
@@ -108,9 +123,13 @@ describe("invoicePrincipalSats", () => {
     expect(invoicePrincipalSats(tx({ initiationVia: lnVia(2000) }))).toBe(2000)
   })
 
-  it("reads regtest invoices as regtest, not mainnet", () => {
-    const via = lnVia(500, { paymentRequest: lnInvoice({ sats: 500, regtest: true }) })
-    expect(via.paymentRequest.startsWith("lnbcrt")).toBe(true)
+  it.each([
+    ["regtest", "lnbcrt"],
+    ["testnet", "lntb"],
+    ["signet", "lntbs"],
+  ] as const)("decodes %s invoices (%s)", (network, prefix) => {
+    const via = lnVia(500, { paymentRequest: lnInvoice({ sats: 500, network }) })
+    expect(via.paymentRequest.startsWith(prefix)).toBe(true)
     expect(invoicePrincipalSats(tx({ initiationVia: via }))).toBe(500)
   })
 
@@ -328,6 +347,8 @@ describe("matchRedemptionCandidates", () => {
     expect(
       matchRedemptionCandidates(voucher(), [
         tx({ direction: "RECEIVE" }),
+        tx({ direction: undefined }),
+        tx({ status: "ALREADY_PAID" }), // not a TxStatus: never settled
         tx({ status: "PENDING" }),
         tx({ status: "FAILED" }),
         tx({ memo: "BlinkPOS payment" }),
@@ -705,5 +726,114 @@ describe("parity with the callback and the store", () => {
   it("marks PAID with the same SQL as the store", () => {
     const normalize = (sql: string) => sql.replace(/\s+/g, " ").trim()
     expect(normalize(MARK_PAID_SQL)).toBe(normalize(MARK_VOUCHER_PAID_SQL))
+  })
+})
+
+describe("fetchTransactions", () => {
+  const page = (
+    nodes: Array<Record<string, unknown>>,
+    {
+      hasNextPage = false,
+      endCursor = "c",
+    }: { hasNextPage?: boolean; endCursor?: string | null } = {},
+  ) => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      data: {
+        me: {
+          defaultAccount: {
+            transactions: {
+              edges: nodes.map((node, i) => ({ cursor: `c${i}`, node })),
+              pageInfo: { hasNextPage, endCursor },
+            },
+          },
+        },
+      },
+    }),
+  })
+  const at = (ms: number) => tx({ id: `t${ms}`, createdAt: Math.floor(ms / 1000) })
+
+  const fetchMock = jest.fn()
+  const realFetch = global.fetch
+  beforeEach(() => {
+    fetchMock.mockReset()
+    global.fetch = fetchMock as unknown as typeof fetch
+  })
+  afterAll(() => {
+    global.fetch = realFetch
+  })
+
+  const bodyOf = (call: number) => JSON.parse(fetchMock.mock.calls[call][1].body)
+
+  it("scopes to the wallet and requests the invoice and fee fields", async () => {
+    fetchMock.mockResolvedValueOnce(page([at(NOW)]))
+    const result = await fetchTransactions("key", "staging", { walletId: "w1" })
+
+    expect(result.map((t: { id: string }) => t.id)).toEqual([`t${NOW}`])
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe("https://api.staging.blink.sv/graphql")
+    expect(init.headers["X-API-KEY"]).toBe("key")
+    const body = bodyOf(0)
+    expect(body.variables).toEqual({ first: 100, after: null, walletIds: ["w1"] })
+    expect(body.query).toContain("walletIds: $walletIds")
+    expect(body.query).toContain("settlementFee")
+    expect(body.query).toContain("paymentRequest")
+    expect(body.query).toContain("paymentHash")
+  })
+
+  it("follows cursors until the oldest page passes untilMs", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        page([at(NOW), at(NOW - MINUTE)], { hasNextPage: true, endCursor: "p1" }),
+      )
+      .mockResolvedValueOnce(
+        page([at(NOW - 2 * MINUTE), at(NOW - 10 * MINUTE)], {
+          hasNextPage: true,
+          endCursor: "p2",
+        }),
+      )
+    const result = await fetchTransactions("key", "production", {
+      untilMs: NOW - 5 * MINUTE,
+      maxPages: 5,
+    })
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(bodyOf(1).variables.after).toBe("p1")
+    expect(result).toHaveLength(4)
+  })
+
+  it("stops at maxPages, at the last page, and without a cursor", async () => {
+    fetchMock.mockResolvedValue(page([at(NOW)], { hasNextPage: true, endCursor: "next" }))
+    await fetchTransactions("key", "production", { maxPages: 3 })
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+
+    fetchMock.mockReset()
+    fetchMock.mockResolvedValueOnce(page([at(NOW)], { hasNextPage: false }))
+    await fetchTransactions("key", "production", { maxPages: 3 })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    fetchMock.mockReset()
+    fetchMock.mockResolvedValueOnce(
+      page([at(NOW)], { hasNextPage: true, endCursor: null }),
+    )
+    await fetchTransactions("key", "production", { maxPages: 3 })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("throws on HTTP and GraphQL errors (the wallet is then skipped)", async () => {
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 502, json: async () => ({}) })
+    await expect(fetchTransactions("key", "production")).rejects.toThrow(
+      "Blink API HTTP 502",
+    )
+
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({ errors: [{ message: "Invalid wallet" }] }),
+    })
+    await expect(
+      fetchTransactions("key", "production", { walletId: "x" }),
+    ).rejects.toThrow("Invalid wallet")
   })
 })

@@ -535,7 +535,8 @@ class VoucherStore {
 
   /**
    * Mark a claimed voucher paid after the redemption payment settled
-   * (SUCCESS / ALREADY_PAID). Settled vouchers must leave the liability
+   * (SUCCESS only — ALREADY_PAID leaves no net debit). Settled vouchers must
+   * leave the liability
    * aggregate — Blink has already debited the wallet (PR #94 review).
    * PENDING/unknown outcomes stay CLAIMED (counted) by simply not calling
    * this. claimed stays true: the voucher was redeemed.

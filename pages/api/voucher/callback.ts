@@ -168,9 +168,14 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
       console.log("📦 Payment result:", paymentResult)
 
-      // Check for various success states
-      const isSuccess =
-        paymentResult.status === "SUCCESS" || paymentResult.status === "ALREADY_PAID"
+      // Only SUCCESS proves this wallet was debited. ALREADY_PAID never leaves
+      // a net debit in Blink: an already-paid Blink invoice is rejected at
+      // validation, the intraledger path checks isLnTxRecorded before
+      // debiting, and on the external path LND's "already paid" is settled
+      // and reversed (recordLnSendRevert). So it is "nothing sent", handled
+      // like FAILURE below (released, still counted as ACTIVE) — never PAID,
+      // which would consume the voucher and drop its liability unpaid.
+      const isSuccess = paymentResult.status === "SUCCESS"
 
       if (isSuccess) {
         // Settlement confirmed: the wallet has been debited, so the voucher
@@ -193,9 +198,14 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
           console.log("⏳ Payment is pending:", paymentResult)
           // For PENDING, we still return OK as the payment is in progress
           // The voucher remains claimed
-        } else if (paymentResult.status === "FAILURE") {
-          // Definite failure reported by the API: nothing was sent.
-          throw new PaymentRejectedError(`Payment failed with status: FAILURE`)
+        } else if (
+          paymentResult.status === "FAILURE" ||
+          paymentResult.status === "ALREADY_PAID"
+        ) {
+          // Definite outcome with no net debit: nothing was sent.
+          throw new PaymentRejectedError(
+            `Payment failed with status: ${paymentResult.status}`,
+          )
         } else {
           // Unknown status: outcome uncertain, keep the voucher claimed.
           throw new Error(`Payment returned unexpected status: ${paymentResult.status}`)

@@ -199,8 +199,8 @@ describe("voucher callback: invoice must match face value", () => {
   // Settled vouchers must leave the ACTIVE/CLAIMED liability aggregate —
   // Blink has already debited the wallet (PR #94 review). PENDING and
   // unknown outcomes stay CLAIMED (counted).
-  it.each(["SUCCESS", "ALREADY_PAID"])("marks the voucher PAID on %s", async (status) => {
-    mockPayLnInvoice.mockResolvedValueOnce({ status })
+  it("marks the voucher PAID on SUCCESS", async () => {
+    mockPayLnInvoice.mockResolvedValueOnce({ status: "SUCCESS" })
     const chargeId = "a".repeat(32)
 
     expect((await redeem(invoice({ sats: 500 }))).body).toEqual({ status: "OK" })
@@ -265,6 +265,19 @@ describe("voucher callback: release only when nothing was sent", () => {
     expect(mockStore.unclaimVoucher).toHaveBeenCalledTimes(1)
   })
 
+  it("ALREADY_PAID (no net debit) releases the voucher and never clears its liability", async () => {
+    // An exact-face-value invoice already paid elsewhere: Blink returns
+    // ALREADY_PAID without a net debit on the voucher wallet. The voucher
+    // must not become PAID (consumed unpaid, liability dropped); it is
+    // released to ACTIVE so its holder can retry, and stays counted.
+    mockPayLnInvoice.mockResolvedValueOnce({ status: "ALREADY_PAID" })
+    const res = await redeem(invoice({ sats: 500 }))
+
+    expect(res.body).toEqual({ status: "ERROR", reason: "Invoice has already been paid" })
+    expect(mockStore.markVoucherPaid).not.toHaveBeenCalled()
+    expect(mockStore.unclaimVoucher).toHaveBeenCalledTimes(1)
+  })
+
   it.each([
     [
       "a transport error",
@@ -289,8 +302,10 @@ describe("voucher callback: release only when nothing was sent", () => {
     expect(mockStore.markVoucherPaid).not.toHaveBeenCalled()
   })
 
-  it("never marks PAID on FAILURE or unknown outcomes", async () => {
+  it("never marks PAID on FAILURE, ALREADY_PAID or unknown outcomes", async () => {
     mockPayLnInvoice.mockResolvedValueOnce({ status: "FAILURE" })
+    await redeem(invoice({ sats: 500 }))
+    mockPayLnInvoice.mockResolvedValueOnce({ status: "ALREADY_PAID" })
     await redeem(invoice({ sats: 500 }))
     mockPayLnInvoice.mockResolvedValueOnce({ status: "WEIRD" })
     await redeem(invoice({ sats: 500 }))
