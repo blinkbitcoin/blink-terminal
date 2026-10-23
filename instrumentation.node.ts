@@ -26,7 +26,7 @@ import { BatchSpanProcessor } from "@opentelemetry/sdk-trace-node"
 import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions"
 import { WebSocket as WsWebSocket } from "ws"
 
-import { scrubSpanUrlAttributes } from "./lib/tracing-scrub"
+import { ScrubbingSpanProcessor } from "./lib/tracing-scrub"
 
 const serviceName = process.env.TRACING_SERVICE_NAME || "bbt"
 const otlpEndpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT
@@ -59,16 +59,15 @@ if (otlpEndpoint) {
     resource: resourceFromAttributes({
       [ATTR_SERVICE_NAME]: serviceName,
     }),
-    spanProcessor: new BatchSpanProcessor(
-      new OTLPTraceExporter({ url: `${otlpEndpoint}/v1/traces` }),
+    // Every span passes through ScrubbingSpanProcessor before export: URL
+    // query strings and capability path segments (voucher k1, Bolt Card
+    // key-fetch id, tap p/c) never leave the process — from
+    // HttpInstrumentation and from Next.js's own root span alike
+    // (blink-wip#1590). Wrap any additional span processor the same way.
+    spanProcessor: new ScrubbingSpanProcessor(
+      new BatchSpanProcessor(new OTLPTraceExporter({ url: `${otlpEndpoint}/v1/traces` })),
     ),
-    instrumentations: [
-      new NetInstrumentation(),
-      // Query strings carry bearer secrets on several routes (voucher k1,
-      // Bolt Card tap p/c): keep only the path on span URL attributes
-      // (blink-wip#1590).
-      new HttpInstrumentation({ requestHook: (span) => scrubSpanUrlAttributes(span) }),
-    ],
+    instrumentations: [new NetInstrumentation(), new HttpInstrumentation()],
   })
 
   sdk.start()
