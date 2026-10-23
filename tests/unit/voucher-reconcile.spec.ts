@@ -28,6 +28,9 @@ const {
   matchRedemptionCandidates,
   classifyVoucher,
   fetchTransactions,
+  isAuthFailure,
+  MIN_APPLY_AGE_MINUTES,
+  WINDOW_AFTER_MS,
   reconcileClaimedVouchers,
   parseArgs,
   MARK_PAID_SQL,
@@ -682,6 +685,205 @@ describe("reconcileClaimedVouchers", () => {
     expect(queries.filter(([text]) => text.startsWith("UPDATE"))).toHaveLength(1)
   })
 
+  describe("claim-after-snapshot race (--min-age-minutes floor for --apply)", () => {
+    // A is 20 minutes old. The competitor snapshot (the SELECT) sees only A.
+    // Then B — same wallet/memo/amount — is claimed and paid; its payment
+    // lands inside A's +30-minute window, B is not in the competitor map.
+    const A_CLAIMED_AT = NOW - 20 * MINUTE
+    const B_PAID_AT = NOW - 1 * MINUTE
+    const raceSetup = () => {
+      const { pool, queries } = setup([row({ id: "a", claimed_at: A_CLAIMED_AT })])
+      const ledger = jest.fn(async () => ({
+        transactions: [
+          settledTx({ id: "tx-b", createdAt: Math.floor(B_PAID_AT / 1000) }),
+        ],
+        complete: true,
+      }))
+      return { pool, queries, ledger }
+    }
+
+    it("floor = match window + 1 minute", () => {
+      expect(MIN_APPLY_AGE_MINUTES).toBe(WINDOW_AFTER_MS / MINUTE + 1)
+      expect(MIN_APPLY_AGE_MINUTES).toBe(31)
+    })
+
+    it("dry run below the floor shows the unsafe unique match — flagged unverified", async () => {
+      const { pool, queries, ledger } = raceSetup()
+      const logs: string[] = []
+      const summary = await reconcileClaimedVouchers({
+        pool,
+        fetchTransactions: ledger,
+        decryptApiKey: () => "key",
+        apply: false,
+        minAgeMinutes: 15,
+        now: NOW,
+        log: (m: string) => logs.push(m),
+      })
+      // B's payment looks unique to A: this is what the floor prevents.
+      expect(summary).toMatchObject({ checked: 1, matched: 1, unverified: 1, applied: 0 })
+      expect(logs.some((l) => l.startsWith("[warn] --min-age-minutes 15"))).toBe(true)
+      expect(logs.some((l) => l.includes("match window may still be open"))).toBe(true)
+      expect(queries.filter(([t]) => t.startsWith("UPDATE"))).toEqual([])
+    })
+
+    it("--apply below the floor is refused before any query", async () => {
+      const { pool, queries, ledger } = raceSetup()
+      await expect(
+        reconcileClaimedVouchers({
+          pool,
+          fetchTransactions: ledger,
+          decryptApiKey: () => "key",
+          apply: true,
+          minAgeMinutes: 15,
+          now: NOW,
+          log: () => {},
+        }),
+      ).rejects.toThrow("--apply requires --min-age-minutes >= 31")
+      expect(queries).toEqual([])
+      expect(ledger).not.toHaveBeenCalled()
+    })
+
+    it("--apply at the floor runs; A (20 min old) is then not a target", async () => {
+      const { pool, queries, ledger } = raceSetup()
+      const summary = await reconcileClaimedVouchers({
+        pool,
+        fetchTransactions: ledger,
+        decryptApiKey: () => "key",
+        apply: true,
+        minAgeMinutes: MIN_APPLY_AGE_MINUTES,
+        now: NOW,
+        log: () => {},
+      })
+      expect(summary).toMatchObject({ checked: 0, applied: 0 })
+      expect(queries.filter(([t]) => t.startsWith("UPDATE"))).toEqual([])
+    })
+  })
+
+  describe("credential failover", () => {
+    const AUTH_401 = () => new Error("Blink API HTTP 401")
+
+    it("tries a newer valid key when an older claim's key was revoked", async () => {
+      // Two targets on w1: the older claim stored the revoked key, the newer
+      // one a valid replacement. Rows arrive oldest first.
+      const { pool, queries } = setup([
+        row({
+          id: "old",
+          api_key_encrypted: "enc-revoked",
+          claimed_at: CLAIMED_AT - 10 * MINUTE,
+        }),
+        row({ id: "new", api_key_encrypted: "enc-valid" }),
+      ])
+      const ledger = jest.fn(async (apiKey: string) => {
+        if (apiKey === "revoked") throw AUTH_401()
+        return { transactions: [settledTx()], complete: true }
+      })
+      const logs: string[] = []
+      const summary = await reconcileClaimedVouchers({
+        pool,
+        fetchTransactions: ledger,
+        decryptApiKey: (enc: string) => enc.replace("enc-", ""),
+        apply: true,
+        now: NOW,
+        log: (m: string) => logs.push(m),
+      })
+
+      // Newest key first, so the valid one is tried first here; the wallet
+      // is scanned and both targets classified (one payment -> contested).
+      expect(ledger).toHaveBeenCalledTimes(1)
+      expect(ledger.mock.calls[0][0]).toBe("valid")
+      expect(summary).toMatchObject({ checked: 2, skippedWallets: 0, ambiguous: 2 })
+      expect(queries.filter(([t]) => t.startsWith("UPDATE"))).toEqual([])
+    })
+
+    it("falls over to the next key on an auth rejection", async () => {
+      const { pool } = setup([
+        row({
+          id: "old",
+          api_key_encrypted: "enc-valid",
+          claimed_at: CLAIMED_AT - 10 * MINUTE,
+        }),
+        row({ id: "new", api_key_encrypted: "enc-revoked" }), // newest, tried first, rejected
+      ])
+      const ledger = jest.fn(async (apiKey: string) => {
+        if (apiKey === "revoked") throw AUTH_401()
+        return { transactions: [], complete: true }
+      })
+      const summary = await reconcileClaimedVouchers({
+        pool,
+        fetchTransactions: ledger,
+        decryptApiKey: (enc: string) => enc.replace("enc-", ""),
+        now: NOW,
+        log: () => {},
+      })
+      expect(ledger.mock.calls.map((c) => c[0])).toEqual(["revoked", "valid"])
+      expect(summary).toMatchObject({ checked: 2, skippedWallets: 0, unmatched: 2 })
+    })
+
+    it("skips the wallet only after every key fails, listing what was tried", async () => {
+      const { pool } = setup([
+        row({
+          id: "a",
+          api_key_encrypted: "enc-r1",
+          claimed_at: CLAIMED_AT - 10 * MINUTE,
+        }),
+        row({ id: "b", api_key_encrypted: "enc-r2" }),
+        row({ id: "c", api_key_encrypted: "enc-bad" }), // undecryptable
+      ])
+      const logs: string[] = []
+      const summary = await reconcileClaimedVouchers({
+        pool,
+        fetchTransactions: jest.fn(async () => {
+          throw AUTH_401()
+        }),
+        decryptApiKey: (enc: string) => (enc === "enc-bad" ? null : enc),
+        now: NOW,
+        log: (m: string) => logs.push(m),
+      })
+      expect(summary).toMatchObject({ checked: 3, skippedWallets: 1 })
+      expect(logs.find((l) => l.startsWith("[skip] wallet w1"))).toContain(
+        "3 key(s) tried",
+      )
+    })
+
+    it("does not try further keys on a non-auth failure (5xx)", async () => {
+      const { pool } = setup([
+        row({
+          id: "old",
+          api_key_encrypted: "enc-a",
+          claimed_at: CLAIMED_AT - 10 * MINUTE,
+        }),
+        row({ id: "new", api_key_encrypted: "enc-b" }),
+      ])
+      const ledger = jest.fn(async () => {
+        throw new Error("Blink API HTTP 502")
+      })
+      const summary = await reconcileClaimedVouchers({
+        pool,
+        fetchTransactions: ledger,
+        decryptApiKey: (enc: string) => enc,
+        now: NOW,
+        log: () => {},
+      })
+      expect(ledger).toHaveBeenCalledTimes(1)
+      expect(summary).toMatchObject({ skippedWallets: 1 })
+    })
+
+    it("recognizes Blink auth rejections", () => {
+      for (const m of [
+        "Blink API HTTP 401",
+        "Blink API HTTP 403",
+        "Not authorized",
+        "UNAUTHENTICATED",
+        "Invalid API key",
+      ]) {
+        expect(isAuthFailure(new Error(m))).toBe(true)
+      }
+      for (const m of ["Blink API HTTP 502", "socket hang up", "Blink API HTTP 4010"]) {
+        expect(isAuthFailure(new Error(m))).toBe(false)
+      }
+    })
+  })
+
   it("never credits a recent claim's payment to a legacy claim", async () => {
     // A (legacy, payout never settled) claimed 61 min ago; B (same face
     // value) claimed 40 min ago and settled — inside A's +30 min window but
@@ -786,16 +988,26 @@ describe("parseArgs", () => {
         "--wallet",
         "w1",
         "--min-age-minutes",
-        "15",
+        "45",
         "--max-pages",
         "3",
       ]),
     ).toMatchObject({
       apply: true,
       walletId: "w1",
-      minAgeMinutes: 15,
+      minAgeMinutes: 45,
       maxPages: 3,
     })
+    // Dry runs may use any non-negative age
+    expect(parseArgs(["--min-age-minutes", "15"]).minAgeMinutes).toBe(15)
+  })
+
+  it("refuses --apply below the match-window floor at the CLI", () => {
+    expect(() => parseArgs(["--apply", "--min-age-minutes", "15"])).toThrow(
+      "--apply requires --min-age-minutes >= 31",
+    )
+    expect(parseArgs(["--apply", "--min-age-minutes", "31"]).minAgeMinutes).toBe(31)
+    expect(parseArgs(["--apply"]).minAgeMinutes).toBe(60) // default unchanged
   })
 
   it("rejects invalid numeric options", () => {

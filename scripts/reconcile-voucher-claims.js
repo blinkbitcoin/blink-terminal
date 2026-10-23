@@ -33,6 +33,15 @@
  *     voucher (lib/voucher-memo.ts) — defense in depth, never sufficient
  *   - transaction time within 2 minutes before / 30 minutes after claimed_at
  *
+ * Competitors are snapshotted (one SELECT) BEFORE the ledger is read, so a
+ * voucher claimed and paid after the snapshot is not in the competitor map.
+ * Its payment can still be credited to a target whose +30-minute window is
+ * still open — unless every target's window has already closed at snapshot
+ * time, in which case any payment that could fall in a target's window
+ * already exists and so does its voucher. Hence --apply requires
+ * --min-age-minutes >= MIN_APPLY_AGE_MINUTES (window + 1); dry runs may use
+ * smaller ages but their matches are reported as unverified.
+ *
  * Zero or multiple candidates leave the voucher CLAIMED, so it stays counted
  * in the liability aggregate (the conservative direction). A payment that
  * also matches any other claimed voucher of the wallet (CLAIMED or PAID, of
@@ -52,11 +61,17 @@
  * Options:
  *   --apply                 Write CLAIMED -> PAID (default: dry run)
  *   --wallet <id>           Only reconcile one Blink wallet id
- *   --min-age-minutes <n>   Only claims older than n minutes (default: 60)
+ *   --min-age-minutes <n>   Only claims older than n minutes (default: 60;
+ *                           --apply requires >= 31, see below)
  *   --max-pages <n>         Transaction pages to scan per wallet (default: 5)
  *   --help                  Show this help
  *
  * Requires ENCRYPTION_KEY (voucher API keys) and the usual database env vars.
+ *
+ * Known bound: every retained CLAIMED/PAID row of a wallet is loaded as a
+ * competitor. If that grows large, narrow the competitor query to rows whose
+ * claimed_at is within WINDOW_BEFORE_MS + WINDOW_AFTER_MS of a target's
+ * window — only those can share a payment with a target.
  */
 
 const fs = require("fs")
@@ -109,6 +124,11 @@ const TRANSACTIONS_QUERY = `
 /** Payment claim -> ledger timestamp tolerance (callback claims immediately). */
 const WINDOW_BEFORE_MS = 2 * 60 * 1000
 const WINDOW_AFTER_MS = 30 * 60 * 1000
+/**
+ * Smallest --min-age-minutes --apply accepts: a target's match window must
+ * have closed before the competitor snapshot (see header).
+ */
+const MIN_APPLY_AGE_MINUTES = WINDOW_AFTER_MS / 60000 + 1
 
 // Keep in sync with MARK_VOUCHER_PAID_SQL / WALLET_LOCK_SQL / LOCK_TIMEOUT_SQL
 // in lib/voucher-store.ts (parity asserted in tests/unit/voucher-reconcile.spec.ts).
@@ -176,6 +196,13 @@ function createdAtMs(tx) {
   if (!Number.isFinite(value)) return NaN
   // Blink's Timestamp scalar is Unix seconds; tolerate milliseconds too.
   return value > 1e12 ? value : value * 1000
+}
+
+/** Blink refused the credential (revoked / rotated / wrong account). */
+function isAuthFailure(err) {
+  return /HTTP 40[13]\b|not authorized|unauthenticated|invalid.*api.?key|wallet.*not.*(found|owned)/i.test(
+    String((err && err.message) || ""),
+  )
 }
 
 function isSettledOutgoing(tx) {
@@ -395,6 +422,22 @@ async function reconcileClaimedVouchers(deps) {
     log = console.log,
   } = deps
 
+  if (apply && minAgeMinutes < MIN_APPLY_AGE_MINUTES) {
+    throw new Error(
+      `--apply requires --min-age-minutes >= ${MIN_APPLY_AGE_MINUTES}: a target's ` +
+        `${WINDOW_AFTER_MS / 60000}-minute match window must have closed before the ` +
+        `competitor snapshot, or a voucher claimed and paid after the snapshot could ` +
+        `settle it (two liabilities cleared for one payment)`,
+    )
+  }
+  const windowOpen = minAgeMinutes < MIN_APPLY_AGE_MINUTES
+  if (windowOpen) {
+    log(
+      `[warn] --min-age-minutes ${minAgeMinutes} < ${MIN_APPLY_AGE_MINUTES}: targets' match ` +
+        `windows may still be open; matches are unverified (dry run only)`,
+    )
+  }
+
   const cutoff = now - minAgeMinutes * 60 * 1000
   const params = []
   // Every claimed voucher (CLAIMED or PAID, any age) is loaded: targets are
@@ -425,7 +468,9 @@ async function reconcileClaimedVouchers(deps) {
       groups.set(key, {
         walletId: row.wallet_id,
         environment: row.environment || "production",
-        apiKeyEncrypted: null,
+        // Distinct stored credentials of the targets, newest claim first
+        // (most likely still valid): tried in turn until one scans.
+        apiKeysEncrypted: [],
         vouchers: [],
       })
     }
@@ -433,7 +478,13 @@ async function reconcileClaimedVouchers(deps) {
     const claimedAt = Number(row.claimed_at)
     const isTarget = row.status === "CLAIMED" && claimedAt < cutoff
     if (isTarget) checked++
-    if (isTarget && !group.apiKeyEncrypted) group.apiKeyEncrypted = row.api_key_encrypted
+    if (
+      isTarget &&
+      row.api_key_encrypted &&
+      !group.apiKeysEncrypted.includes(row.api_key_encrypted)
+    ) {
+      group.apiKeysEncrypted.unshift(row.api_key_encrypted) // rows arrive oldest first
+    }
     // Same field mapping as VoucherStore._rowToVoucher, so the rebuilt memo
     // is byte-identical to the one the callback sent.
     group.vouchers.push({
@@ -465,31 +516,44 @@ async function reconcileClaimedVouchers(deps) {
   }
 
   for (const group of groups.values()) {
-    const apiKey = decryptApiKeyImpl(group.apiKeyEncrypted)
-    if (!apiKey) {
-      summary.skippedWallets++
-      log(`[skip] wallet ${group.walletId}: API key could not be decrypted`)
-      continue
-    }
-
     const targets = group.vouchers.filter((v) => v.isTarget)
     const earliestClaim = Math.min(...targets.map((v) => v.claimedAt))
-    let transactions
-    let complete
-    try {
-      const scan = await fetchTransactionsImpl(apiKey, group.environment, {
-        maxPages,
-        walletId: group.walletId,
-        untilMs: earliestClaim - WINDOW_BEFORE_MS,
-      })
-      // Tolerate a bare array (older callers/tests): treat it as complete.
-      transactions = Array.isArray(scan) ? scan : scan.transactions
-      complete = Array.isArray(scan) ? true : scan.complete === true
-    } catch (err) {
+
+    // Credential failover: a revoked/rotated key on one claim must not strand
+    // the wallet when another claim stored a valid replacement. Auth
+    // rejections move on to the next key; other failures (5xx, network) are
+    // not the key's fault and skip the wallet as before.
+    let scan = null
+    const keysTried = []
+    for (const encrypted of group.apiKeysEncrypted) {
+      const apiKey = decryptApiKeyImpl(encrypted)
+      if (!apiKey) {
+        keysTried.push("undecryptable")
+        continue
+      }
+      try {
+        scan = await fetchTransactionsImpl(apiKey, group.environment, {
+          maxPages,
+          walletId: group.walletId,
+          untilMs: earliestClaim - WINDOW_BEFORE_MS,
+        })
+        break
+      } catch (err) {
+        keysTried.push(err.message)
+        if (!isAuthFailure(err)) break
+      }
+    }
+    if (!scan) {
       summary.skippedWallets++
-      log(`[skip] wallet ${group.walletId}: ${err.message}`)
+      log(
+        `[skip] wallet ${group.walletId}: ${keysTried.length} key(s) tried — ` +
+          (keysTried.length ? keysTried.join("; ") : "no stored key"),
+      )
       continue
     }
+    // Tolerate a bare array (older callers/tests): treat it as complete.
+    const transactions = Array.isArray(scan) ? scan : scan.transactions
+    const complete = Array.isArray(scan) ? true : scan.complete === true
     // An incomplete scan cannot prove uniqueness: a rival candidate may sit
     // in the unscanned part of the window. Report, never write.
     if (!complete) {
@@ -525,10 +589,11 @@ async function reconcileClaimedVouchers(deps) {
 
       if (result.outcome === "matched" && rivals === 1) {
         summary.matched++
-        if (!complete) {
+        if (!complete || windowOpen) {
           summary.unverified++
           log(
-            `[match:unverified] ${label} ${amountLabel} -> tx ${result.transaction.id} (incomplete scan)`,
+            `[match:unverified] ${label} ${amountLabel} -> tx ${result.transaction.id} ` +
+              `(${!complete ? "incomplete scan" : "match window may still be open"})`,
           )
         } else if (apply) {
           const outcome = await markPaidLocked(pool, group.walletId, voucher.id)
@@ -586,6 +651,11 @@ function parseArgs(argv) {
     if (!Number.isFinite(args.minAgeMinutes) || args.minAgeMinutes < 0) {
       throw new Error("--min-age-minutes must be a non-negative number")
     }
+  }
+  if (args.apply && args.minAgeMinutes < MIN_APPLY_AGE_MINUTES) {
+    throw new Error(
+      `--apply requires --min-age-minutes >= ${MIN_APPLY_AGE_MINUTES} (the match window must have closed)`,
+    )
   }
 
   const maxPages = value("--max-pages")
@@ -674,7 +744,10 @@ module.exports = {
   classifyVoucher,
   reconcileClaimedVouchers,
   fetchTransactions,
+  isAuthFailure,
   parseArgs,
+  MIN_APPLY_AGE_MINUTES,
+  WINDOW_AFTER_MS,
   MARK_PAID_SQL,
   WALLET_LOCK_SQL,
   LOCK_TIMEOUT_SQL,
