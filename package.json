@@ -42,7 +42,7 @@
     "@opentelemetry/semantic-conventions": "^1.33.0",
     "@react-pdf/renderer": "^4.5.1",
     "@react-pdf/types": "^2.11.1",
-    "@t3-oss/env-nextjs": "^0.6.1",
+    "@t3-oss/env-nextjs": "^0.13.11",
     "bcryptjs": "^2.4.3",
     "bech32": "^2.0.0",
     "bolt11": "^1.4.1",
@@ -60,7 +60,7 @@
     "react-qr-code": "^2.0.18",
     "redis": "^4.7.0",
     "ws": "^8.18.3",
-    "zod": "^3.23.8"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.11",

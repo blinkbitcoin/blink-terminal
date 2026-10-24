@@ -1,7 +1,10 @@
 /**
  * Zod input validation schemas for API routes
  *
- * Aligned with blink stack convention: zod@3.23.8.
+ * zod 4 (>= 4.6.6, GHSA-mrhx-c7xc-m3w5). Every array parsed from a request
+ * carries a .max(): zod collects one issue per failing element, so an
+ * unbounded array schema let a sub-1 MB body allocate ~150 MB per request.
+ * Since 4.6.6 a length violation stops before the elements are parsed.
  * Provides reusable schemas and a `validateBody` helper for API handlers.
  *
  * Usage:
@@ -45,6 +48,14 @@ export const paymentHashSchema = z.string().regex(/^[a-f0-9]{64}$/i, {
  */
 export const MEMO_MAX_LENGTH = 640
 
+/** Request array bounds (see the header). Real Nostr auth events carry 2-3 tags. */
+export const MAX_TIP_RECIPIENTS = 20
+export const MAX_NOSTR_TAGS = 50
+export const MAX_NOSTR_TAG_ITEMS = 10
+const nostrTagsSchema = z
+  .array(z.array(z.string()).max(MAX_NOSTR_TAG_ITEMS))
+  .max(MAX_NOSTR_TAGS)
+
 /** Lightning invoice / payment request (lnbc...). */
 export const invoiceSchema = z.string().min(1)
 
@@ -69,7 +80,11 @@ export const createInvoiceSchema = z.object({
   baseAmount: optionalAmountSchema,
   tipAmount: optionalAmountSchema,
   tipPercent: z.coerce.number().min(0).max(100).optional(),
-  tipRecipients: z.array(z.record(z.unknown())).optional().default([]),
+  tipRecipients: z
+    .array(z.record(z.string(), z.unknown()))
+    .max(MAX_TIP_RECIPIENTS)
+    .optional()
+    .default([]),
   baseAmountDisplay: optionalAmountSchema,
   tipAmountDisplay: optionalAmountSchema,
   nwcActive: z.boolean().optional(),
@@ -114,7 +129,7 @@ export const verifyOwnershipSchema = z.object({
   signedEvent: z.object({
     kind: z.number(),
     content: z.string(),
-    tags: z.array(z.array(z.string())),
+    tags: nostrTagsSchema,
     pubkey: nostrPubkeySchema,
     sig: z.string().min(1),
     id: z.string().optional(),
@@ -127,7 +142,7 @@ export const nostrLoginSchema = z.object({
   event: z.object({
     kind: z.literal(27235),
     content: z.string(),
-    tags: z.array(z.array(z.string())),
+    tags: nostrTagsSchema,
     pubkey: nostrPubkeySchema,
     sig: z.string().min(1),
     id: z.string(),
