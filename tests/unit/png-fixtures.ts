@@ -49,3 +49,20 @@ export const rgbaPng = (width: number, height: number) => {
 }
 
 export const dataUrl = (png: Buffer) => `data:image/png;base64,${png.toString("base64")}`
+
+/** 1x1 RGBA whose single scanline uses filter type 5 (valid are 0..4): png-js throws asynchronously. */
+export const badFilterPng = () =>
+  Buffer.concat([
+    SIGNATURE,
+    ihdr(1, 1),
+    chunk("IDAT", zlib.deflateSync(Buffer.from([5, 255, 255, 255, 255]))),
+    chunk("IEND"),
+  ])
+
+/** IHDR 1x1, then a PLTE header claiming 20,000,000 bytes that are absent (41 bytes). */
+export const forgedPlteLength = () => {
+  const head = Buffer.alloc(8)
+  head.writeUInt32BE(20_000_000, 0)
+  head.write("PLTE", 4, "latin1")
+  return Buffer.concat([SIGNATURE, ihdr(1, 1), head])
+}

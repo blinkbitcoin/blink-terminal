@@ -1,15 +1,29 @@
 /** @jest-environment node */
 
 /**
- * /api/paycode/pdf input bounds (blink-wip#1664 follow-up). The route is
- * public (the public POS prints paycodes without a session) and renders in
- * the single Node process. Measured against a production build before the
- * fix: a 100 KB displayAmount took 25 s and starved concurrent requests; a
- * 198 KB PNG declaring 6000x6000 took 6 s (~144 MB decoded). Every rendered
- * value is now bounded before the renderer runs.
+ * /api/paycode/pdf (blink-wip#1664). The route is public (the public POS
+ * prints paycodes without a session) and renders in the single Node process.
+ *
+ * - Text: measured on a production build before the fix, a 100 KB
+ *   displayAmount took 25 s and starved concurrent requests. Every rendered
+ *   value is bounded before the renderer runs.
+ * - Image: the renderer's PNG parser (png-js) trusts chunk lengths (heap
+ *   OOM from a 41-byte PNG), inflates without a limit, and throws from an
+ *   async callback on a bad filter byte (request left hanging). The QR is
+ *   therefore generated server-side from the username; a caller-supplied
+ *   qrDataUrl is ignored and never reaches the renderer.
  */
 
-import { toDataURL } from "qrcode"
+import jsQR from "jsqr"
+import { PNG } from "pngjs"
+
+import { getAppUrl, getLnAddressDomain } from "../../lib/config/api"
+import { buildStaticPaycode } from "../../lib/paycode-lnurl"
+import paycodePdfHandler, { config } from "../../pages/api/paycode/pdf"
+
+import { badFilterPng, dataUrl, forgedPlteLength, rgbaPng } from "./png-fixtures"
+
+// jest.mock calls are hoisted above these imports.
 
 const mockRenderToBuffer = jest.fn()
 jest.mock("@react-pdf/renderer", () => ({
@@ -23,20 +37,14 @@ jest.mock("../../lib/rate-limit", () => ({
   RATE_LIMIT_PUBLIC: {},
 }))
 
-import paycodePdfHandler, { config } from "../../pages/api/paycode/pdf"
-
-import { SIGNATURE, dataUrl, ihdr, rgbaPng } from "./png-fixtures"
-
-/** A PNG data URL that is only a signature + IHDR declaring w x h (no pixels). */
-const pngHeader = (w: number, h: number) =>
-  dataUrl(Buffer.concat([SIGNATURE, ihdr(w, h)]))
-
-/** The review's 41-byte PNG: IHDR 1x1, then a PLTE header claiming 20 MB that is absent. */
-const forgedPlte = () => {
-  const head = Buffer.alloc(8)
-  head.writeUInt32BE(20_000_000, 0)
-  head.write("PLTE", 4, "latin1")
-  return dataUrl(Buffer.concat([SIGNATURE, ihdr(1, 1), head]))
+interface RenderedPaycode {
+  lightningAddress: string
+  qrDataUrl: string
+  logoDataUrl?: string
+  webUrl?: string
+  username?: string
+  amount?: number
+  displayAmount?: string
 }
 
 const call = async (body: unknown) => {
@@ -60,51 +68,102 @@ const call = async (body: unknown) => {
   return res
 }
 
-describe("paycode PDF input bounds", () => {
-  let clientQr: string
-  let log: jest.SpyInstance
+/** The paycode props the route handed to the (mocked) renderer. */
+const rendered = (): RenderedPaycode =>
+  (mockRenderToBuffer.mock.calls[0][0] as { props: { paycode: RenderedPaycode } }).props
+    .paycode
 
-  beforeAll(async () => {
-    // Exactly what components/PublicPOS/PrintPaycodeView.tsx produces.
-    clientQr = await toDataURL("https://pay.blink.sv/lnurlp/alice", {
-      width: 400,
-      margin: 2,
-      errorCorrectionLevel: "H",
-    })
-  })
+/** Decode a QR PNG data URL back to its text, as a phone camera would. */
+const scan = (url: string) => {
+  const png = PNG.sync.read(Buffer.from(url.split(",")[1], "base64"))
+  return jsQR(new Uint8ClampedArray(png.data), png.width, png.height)?.data
+}
 
-  beforeEach(() => {
-    mockRenderToBuffer.mockReset()
-    mockRenderToBuffer.mockResolvedValue(Buffer.from("%PDF"))
-    log = jest.spyOn(console, "log").mockImplementation(() => {})
-    jest.spyOn(console, "error").mockImplementation(() => {})
-  })
+const expected = (username: string, env: "production" | "staging") =>
+  buildStaticPaycode(username, getLnAddressDomain(env), getAppUrl(env))
 
-  const base = () => ({
-    lightningAddress: "alice@blink.sv",
-    username: "alice",
-    qrDataUrl: clientQr,
-  })
+let log: jest.SpyInstance
+beforeEach(() => {
+  mockRenderToBuffer.mockReset()
+  mockRenderToBuffer.mockResolvedValue(Buffer.from("%PDF"))
+  log = jest.spyOn(console, "log").mockImplementation(() => {})
+  jest.spyOn(console, "error").mockImplementation(() => {})
+})
 
-  it("renders the request the app's client sends", async () => {
+describe("paycode PDF: the QR is built server-side", () => {
+  it.each(["production", "staging"] as const)(
+    "%s: the QR scans to the same paycode the client shows (lib/paycode-lnurl.ts)",
+    async (environment) => {
+      const res = await call({ username: "Alice_1", environment })
+      expect(res.statusCode).toBe(200)
+      const paycode = rendered()
+      const want = expected("alice_1", environment)
+      expect(scan(paycode.qrDataUrl)).toBe(want.qrValue)
+      expect(paycode.lightningAddress).toBe(want.lightningAddress)
+      expect(paycode.webUrl).toBe(want.webUrl)
+      expect(paycode.username).toBe("alice_1")
+      expect(paycode.logoDataUrl).toMatch(/^data:image\/png;base64,/)
+      expect((res.body as { lightningAddress: string }).lightningAddress).toBe(
+        want.lightningAddress,
+      )
+    },
+  )
+
+  it("older clients: username derived from lightningAddress; their webUrl is not used", async () => {
     const res = await call({
-      ...base(),
-      amount: null,
-      displayAmount: null,
-      webUrl: "https://terminal.blinkbtc.com/alice",
+      lightningAddress: "bob@blink.sv",
+      qrDataUrl: dataUrl(rgbaPng(4, 4)),
+      webUrl: "https://evil.example/bob",
     })
     expect(res.statusCode).toBe(200)
-    expect(mockRenderToBuffer).toHaveBeenCalledTimes(1)
+    expect(rendered().username).toBe("bob")
+    expect(rendered().webUrl).not.toContain("evil.example")
   })
 
+  it.each([
+    [
+      "the review's 70-byte PNG with scanline filter 5 (async throw, request hangs)",
+      badFilterPng(),
+    ],
+    ["the review's 41-byte PNG with a forged PLTE length (heap OOM)", forgedPlteLength()],
+    ["a valid but unrelated PNG", rgbaPng(8, 8)],
+  ])("a caller-supplied qrDataUrl never reaches the renderer: %s", async (_name, png) => {
+    const res = await call({ username: "alice", qrDataUrl: dataUrl(png) })
+    expect(res.statusCode).toBe(200)
+    const paycode = rendered()
+    expect(paycode.qrDataUrl).not.toBe(dataUrl(png))
+    expect(scan(paycode.qrDataUrl)).toBe(expected("alice", "production").qrValue)
+  })
+
+  it.each([
+    ["missing", {}],
+    ["too short", { username: "ab" }],
+    ["bad characters", { username: "al ice" }],
+    ["not a string", { username: ["alice"] }],
+    ["bad lightningAddress localpart", { lightningAddress: "a!b@blink.sv" }],
+  ])("rejects a %s username", async (_name, body) => {
+    const res = await call(body)
+    expect(res.statusCode).toBe(400)
+    expect((res.body as { error: string }).error).toBe("Missing or invalid username")
+    expect(mockRenderToBuffer).not.toHaveBeenCalled()
+  })
+
+  it("rejects an unknown environment", async () => {
+    const res = await call({ username: "alice", environment: "mainnet" })
+    expect(res.statusCode).toBe(400)
+    expect(mockRenderToBuffer).not.toHaveBeenCalled()
+  })
+})
+
+describe("paycode PDF: rendered text is bounded", () => {
   it("renders a fixed-amount paycode within bounds", async () => {
     const res = await call({
-      ...base(),
+      username: "alice",
       amount: 1000,
       displayAmount: "$1,000,000.00 USD",
     })
     expect(res.statusCode).toBe(200)
-    expect(mockRenderToBuffer).toHaveBeenCalledTimes(1)
+    expect(rendered().displayAmount).toBe("$1,000,000.00 USD")
   })
 
   it.each([
@@ -132,62 +191,20 @@ describe("paycode PDF input bounds", () => {
       { amount: 21_000_000 * 100_000_000 + 1 },
       "Invalid amount",
     ],
-    [
-      "webUrl over 256 chars",
-      { webUrl: `https://x/${"a".repeat(256)}` },
-      "Invalid webUrl",
-    ],
-    [
-      "PNG declaring 6000x6000 (decompression bomb)",
-      { qrDataUrl: pngHeader(6000, 6000) },
-      "Invalid qrDataUrl",
-    ],
-    [
-      "a valid PNG 1025 px wide",
-      { qrDataUrl: dataUrl(rgbaPng(1025, 1)) },
-      "Invalid qrDataUrl",
-    ],
-    [
-      "a tiny PNG with a forged chunk length (renderer heap OOM)",
-      { qrDataUrl: forgedPlte() },
-      "Invalid qrDataUrl",
-    ],
-    ["PNG declaring 0x0", { qrDataUrl: pngHeader(0, 0) }, "Invalid qrDataUrl"],
-    [
-      "PNG signature without IHDR",
-      { qrDataUrl: "data:image/png;base64,iVBORw0KGgo=" },
-      "Invalid qrDataUrl",
-    ],
-    [
-      "JPEG (the client only sends PNG; dimensions unchecked)",
-      { qrDataUrl: "data:image/jpeg;base64,/9j/4AAQ" },
-      "Invalid qrDataUrl",
-    ],
-    [
-      "data URL over 256 KB",
-      { qrDataUrl: pngHeader(400, 400) + "A".repeat(256 * 1024) },
-      "Invalid qrDataUrl",
-    ],
   ])("rejects %s before rendering", async (_name, override, error) => {
-    const res = await call({ ...base(), ...override })
+    const res = await call({ username: "alice", ...override })
     expect(res.statusCode).toBe(400)
     expect((res.body as { error: string }).error).toBe(error)
     expect(mockRenderToBuffer).not.toHaveBeenCalled()
   })
 
-  it("accepts the maximum PNG side", async () => {
-    expect(
-      (await call({ ...base(), qrDataUrl: dataUrl(rgbaPng(1024, 1024)) })).statusCode,
-    ).toBe(200)
-  })
-
   it("never logs caller-supplied free text", async () => {
-    await call({ ...base(), displayAmount: "LOGME".repeat(20) })
-    await call({ ...base(), amount: 5, displayAmount: "LOGME" })
+    await call({ username: "alice", displayAmount: "LOGME".repeat(20) })
+    await call({ username: "alice", amount: 5, displayAmount: "LOGME" })
     expect(JSON.stringify(log.mock.calls)).not.toContain("LOGME")
   })
 
-  it("caps the request body (was 10 MB)", () => {
-    expect(config.api.bodyParser.sizeLimit).toBe("300kb")
+  it("caps the request body (was 10 MB; room for the ignored qrDataUrl of older clients)", () => {
+    expect(config.api.bodyParser.sizeLimit).toBe("100kb")
   })
 })

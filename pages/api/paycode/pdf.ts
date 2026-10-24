@@ -1,26 +1,49 @@
+import fs from "fs"
+import path from "path"
+
 import { renderToBuffer } from "@react-pdf/renderer"
 import type { NextApiRequest, NextApiResponse } from "next"
+import { toDataURL } from "qrcode"
 import React from "react"
 
-import { checkPngDataUrl } from "../../../lib/pdf/png-guard"
-import { isSafeImageDataUrl } from "../../../lib/pdf/safe-image-src"
+import {
+  getAppUrl,
+  getEnvironment,
+  getLnAddressDomain,
+  type EnvironmentName,
+} from "../../../lib/config/api"
+import { buildStaticPaycode, isValidBlinkUsername } from "../../../lib/paycode-lnurl"
 import { withRateLimit, RATE_LIMIT_PUBLIC } from "../../../lib/rate-limit"
 
 /**
  * Input bounds (blink-wip#1664 follow-up). This route is public and renders
  * in the single Node process: react-pdf's text layout is super-linear (a
- * 100 KB displayAmount took 25 s, starving every other request) and a small
- * PNG can declare huge dimensions (a 198 KB, 6000x6000 PNG took 6 s and
- * ~144 MB to decode). Every rendered value is now bounded.
+ * 100 KB displayAmount took 25 s, starving every other request). Every
+ * rendered text value is bounded.
+ *
+ * The QR image is generated HERE, never taken from the caller: the
+ * renderer's PNG parser (png-js) trusts chunk lengths, inflates without a
+ * limit and throws from async callbacks on bad filter bytes, so any
+ * caller-supplied PNG could exhaust the heap or leave the request hanging.
+ * A `qrDataUrl` in the body (sent by older clients) is ignored.
  */
 const LIMITS = {
   displayAmount: 64, // e.g. "$1,000,000.00 USD"
-  webUrl: 256,
   maxSats: 21_000_000 * 100_000_000,
-  // The app sends a 400x400 PNG QR (components/PublicPOS/PrintPaycodeView.tsx).
-  qrDataUrlLength: 256 * 1024,
-  qrMaxSide: 1024,
 } as const
+
+// Same rendering as the client's on-screen QR (components/PublicPOS/PrintPaycodeView.tsx).
+const QR_OPTIONS = { width: 400, margin: 2, errorCorrectionLevel: "H" } as const
+
+// The centre logo, a print-sized copy of public/logos/blink-qr-logo.png.
+let logoDataUrl: string | null = null
+const getLogoDataUrl = (): string => {
+  if (!logoDataUrl) {
+    const file = path.join(process.cwd(), "public", "logos", "blink-qr-logo-pdf.png")
+    logoDataUrl = `data:image/png;base64,${fs.readFileSync(file).toString("base64")}`
+  }
+  return logoDataUrl
+}
 
 // Dynamic import to avoid issues with font registration at module load time
 let pdfModule: typeof import("../../../lib/pdf/PaycodePDF") | null = null
@@ -36,12 +59,13 @@ const getPdfModule = async () => {
  *
  * POST /api/paycode/pdf
  * Body: {
- *   lightningAddress: string (e.g., "username@blink.sv"),
- *   qrDataUrl: string (base64 data URL of QR code),
- *   amount: number (optional, sats amount for fixed paycode),
- *   displayAmount: string (optional, formatted display e.g., "$5.00 USD"),
- *   webUrl: string (the web fallback URL)
+ *   username: string (Blink username; or derived from lightningAddress),
+ *   environment?: "production" | "staging" (default: the server's),
+ *   amount?: number (sats, fixed-amount label only),
+ *   displayAmount?: string (formatted display e.g., "$5.00 USD"),
  * }
+ * The paycode (LNURL, web fallback, lightning address) and its QR are built
+ * server-side with lib/paycode-lnurl.ts, exactly as the client builds them.
  *
  * Returns: PDF as base64 string
  */
@@ -54,74 +78,44 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 
   try {
-    const { lightningAddress, qrDataUrl, amount, displayAmount, webUrl, username } =
-      req.body as {
-        lightningAddress: string
-        qrDataUrl: string
+    const { lightningAddress, amount, displayAmount, username, environment } =
+      (req.body ?? {}) as {
+        lightningAddress?: unknown
         amount?: number | null
         displayAmount?: string | null
-        webUrl?: string | null
-        username?: string
+        username?: unknown
+        environment?: unknown
       }
 
-    // Validate input. lightningAddress must be a real `localpart@domain` (it is
-    // used to render text and to derive the default webUrl/username), so reject
-    // anything that isn't — avoids log injection, malformed PDFs, and
-    // inconsistent defaults.
+    // username, or (older clients) the localpart of lightningAddress.
+    const rawUsername =
+      username !== undefined && username !== null
+        ? username
+        : typeof lightningAddress === "string"
+          ? lightningAddress.split("@")[0]
+          : undefined
+    if (!isValidBlinkUsername(rawUsername)) {
+      return res.status(400).json({
+        error: "Missing or invalid username",
+        hint: "username must be 3-50 chars of [a-zA-Z0-9_]",
+      })
+    }
+
     if (
-      !lightningAddress ||
-      typeof lightningAddress !== "string" ||
-      !/^[a-zA-Z0-9_.-]{1,50}@[a-zA-Z0-9.-]{1,253}$/.test(lightningAddress)
+      environment !== undefined &&
+      environment !== null &&
+      environment !== "production" &&
+      environment !== "staging"
     ) {
       return res.status(400).json({
-        error: "Missing or invalid lightningAddress",
-        hint: "Provide a valid Lightning address (e.g., username@blink.sv)",
+        error: "Invalid environment",
+        hint: 'environment must be "production" or "staging"',
       })
     }
-
-    // username is optional; when present it must match the Blink username
-    // charset. Fall back to the lightningAddress localpart otherwise.
-    if (
-      username !== undefined &&
-      (typeof username !== "string" || !/^[a-zA-Z0-9_]{1,50}$/.test(username))
-    ) {
-      return res.status(400).json({
-        error: "Invalid username",
-        hint: "username must be 1-50 chars of [a-zA-Z0-9_]",
-      })
-    }
-
-    if (!qrDataUrl || typeof qrDataUrl !== "string") {
-      return res.status(400).json({
-        error: "Missing or invalid qrDataUrl",
-        hint: "Provide a valid base64 data URL of the QR code",
-      })
-    }
-
-    // SSRF guard: this is a public endpoint and the value is handed to the PDF
-    // renderer's <Image src=...>, which will FETCH remote/file URLs. Only accept
-    // inline base64 image data URLs so an attacker cannot coerce server-side
-    // requests to arbitrary hosts.
-    if (!isSafeImageDataUrl(qrDataUrl)) {
-      return res.status(400).json({
-        error: "Invalid qrDataUrl",
-        hint: "qrDataUrl must be an inline data:image/(png|jpeg|webp);base64,... URL",
-      })
-    }
-
-    // Decode-cost guard: the renderer's PNG parser trusts chunk lengths and
-    // inflates IDAT without a limit, so only a structurally valid PNG whose
-    // pixels inflate to exactly the declared (bounded) size may reach it.
-    const png = checkPngDataUrl(qrDataUrl, {
-      maxSide: LIMITS.qrMaxSide,
-      maxDataUrlLength: LIMITS.qrDataUrlLength,
-    })
-    if (!png.ok) {
-      return res.status(400).json({
-        error: "Invalid qrDataUrl",
-        hint: `qrDataUrl must be a valid, non-interlaced PNG of at most ${LIMITS.qrMaxSide}x${LIMITS.qrMaxSide} px and ${LIMITS.qrDataUrlLength / 1024} KB`,
-      })
-    }
+    const env: EnvironmentName =
+      environment === "production" || environment === "staging"
+        ? environment
+        : getEnvironment()
 
     // amount: absent/null, or a positive whole number of sats.
     if (
@@ -146,33 +140,27 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       })
     }
 
-    if (
-      webUrl !== undefined &&
-      webUrl !== null &&
-      (typeof webUrl !== "string" || webUrl.length > LIMITS.webUrl)
-    ) {
-      return res.status(400).json({
-        error: "Invalid webUrl",
-        hint: `webUrl must be a string of at most ${LIMITS.webUrl} chars`,
-      })
-    }
+    const paycode = buildStaticPaycode(
+      rawUsername,
+      getLnAddressDomain(env),
+      getAppUrl(env),
+    )
+    const qrDataUrl = await toDataURL(paycode.qrValue, QR_OPTIONS)
 
     // Dynamically import PDF module
     const { PaycodeDocument } = await getPdfModule()
 
-    console.log(`📄 Generating Paycode PDF for ${lightningAddress}`)
+    console.log(`📄 Generating Paycode PDF for ${paycode.lightningAddress}`)
 
-    // Create document element (usernames are lowercase; normalize the defaults)
-    const localpart = lightningAddress.split("@")[0].toLowerCase()
-    const safeUsername = (username || localpart).toLowerCase()
     const documentElement = React.createElement(PaycodeDocument, {
       paycode: {
-        lightningAddress,
+        lightningAddress: paycode.lightningAddress,
         qrDataUrl,
+        logoDataUrl: getLogoDataUrl(),
         amount: amount || undefined,
         displayAmount: displayAmount || undefined,
-        webUrl: webUrl || `https://terminal.blinkbtc.com/${safeUsername}`,
-        username: safeUsername,
+        webUrl: paycode.webUrl,
+        username: rawUsername.toLowerCase(),
       },
     })
 
@@ -189,7 +177,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     return res.status(200).json({
       success: true,
       pdf: pdfBase64,
-      lightningAddress,
+      lightningAddress: paycode.lightningAddress,
       hasFixedAmount: !!(amount && amount > 0),
     })
   } catch (error: unknown) {
@@ -206,10 +194,10 @@ export default withRateLimit(handler, RATE_LIMIT_PUBLIC, "paycode/pdf")
 
 export const config = {
   api: {
-    // The QR data URL is capped at 256 KB and every other field is short, so
-    // a larger body is never legitimate.
+    // Every accepted field is short. Older clients still send a ~10-40 KB
+    // qrDataUrl (ignored), so leave room for it.
     bodyParser: {
-      sizeLimit: "300kb",
+      sizeLimit: "100kb",
     },
   },
 }

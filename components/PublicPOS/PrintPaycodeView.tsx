@@ -2,7 +2,7 @@ import { useRouter } from "next/router"
 import { QRCodeCanvas, QRCodeSVG } from "qrcode.react"
 import { useMemo, useState } from "react"
 
-import { getAppUrl, getLnAddressDomain } from "../../lib/config/api"
+import { getAppUrl, getEnvironment, getLnAddressDomain } from "../../lib/config/api"
 import { usePublicPOSValidation } from "../../lib/hooks/usePublicPOSValidation"
 import { useTheme } from "../../lib/hooks/useTheme"
 import { buildStaticPaycode } from "../../lib/paycode-lnurl"
@@ -134,49 +134,12 @@ export default function PrintPaycodeView({
     setGeneratingPdf(true)
     setPdfError(null)
     try {
-      // Render the QR (wrapped value, level H) to a canvas, then composite the
-      // Bitcoin logo into the center so the PDF matches the on-screen/print QR.
-      const qrSize = 400
-      const qrCanvas = document.createElement("canvas")
-      const QRCodeLib = await import("qrcode")
-      await QRCodeLib.toCanvas(qrCanvas, paycode.qrValue, {
-        width: qrSize,
-        margin: 2,
-        errorCorrectionLevel: "H",
-      })
-
-      const ctx = qrCanvas.getContext("2d")
-      if (ctx) {
-        const logo = new Image()
-        logo.src = QR_LOGO_SRC
-        await new Promise<void>((resolve) => {
-          logo.onload = () => resolve()
-          logo.onerror = () => resolve() // fall back to logo-less QR on error
-        })
-        if (logo.complete && logo.naturalWidth > 0) {
-          const logoSize = Math.round(qrSize * 0.22)
-          const pos = Math.round((qrSize - logoSize) / 2)
-          const pad = Math.round(logoSize * 0.08)
-          // White excavated backing so the logo reads cleanly.
-          ctx.fillStyle = "#ffffff"
-          ctx.fillRect(pos - pad, pos - pad, logoSize + pad * 2, logoSize + pad * 2)
-          ctx.drawImage(logo, pos, pos, logoSize, logoSize)
-        }
-      }
-
-      const qrDataUrl = qrCanvas.toDataURL("image/png")
-
+      // The server builds the paycode and its QR (same value and logo as on
+      // screen); it never takes an image from the client (blink-wip#1664).
       const response = await fetch("/api/paycode/pdf", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          lightningAddress: paycode.lightningAddress,
-          qrDataUrl,
-          amount: null,
-          displayAmount: null,
-          webUrl: paycode.webUrl,
-          username,
-        }),
+        body: JSON.stringify({ username, environment: getEnvironment() }),
       })
 
       if (!response.ok) {
