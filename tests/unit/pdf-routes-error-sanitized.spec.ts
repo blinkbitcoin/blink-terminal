@@ -81,7 +81,9 @@ describe("PDF routes sanitize 500 responses", () => {
       paycodePdfHandler,
       {
         lightningAddress: "alice@blink.sv",
-        qrDataUrl: "data:image/png;base64,iVBORw0KGgo=",
+        // a real 1x1 PNG (the route checks the IHDR dimensions)
+        qrDataUrl:
+          "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
       },
       "Failed to generate Paycode PDF",
     ],

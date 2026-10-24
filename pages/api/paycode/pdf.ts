@@ -2,8 +2,24 @@ import { renderToBuffer } from "@react-pdf/renderer"
 import type { NextApiRequest, NextApiResponse } from "next"
 import React from "react"
 
-import { isSafeImageDataUrl } from "../../../lib/pdf/safe-image-src"
+import { isSafeImageDataUrl, pngDataUrlDimensions } from "../../../lib/pdf/safe-image-src"
 import { withRateLimit, RATE_LIMIT_PUBLIC } from "../../../lib/rate-limit"
+
+/**
+ * Input bounds (blink-wip#1664 follow-up). This route is public and renders
+ * in the single Node process: react-pdf's text layout is super-linear (a
+ * 100 KB displayAmount took 25 s, starving every other request) and a small
+ * PNG can declare huge dimensions (a 198 KB, 6000x6000 PNG took 6 s and
+ * ~144 MB to decode). Every rendered value is now bounded.
+ */
+const LIMITS = {
+  displayAmount: 64, // e.g. "$1,000,000.00 USD"
+  webUrl: 256,
+  maxSats: 21_000_000 * 100_000_000,
+  // The app sends a 400x400 PNG QR (components/PublicPOS/PrintPaycodeView.tsx).
+  qrDataUrlLength: 256 * 1024,
+  qrMaxSide: 1024,
+} as const
 
 // Dynamic import to avoid issues with font registration at module load time
 let pdfModule: typeof import("../../../lib/pdf/PaycodePDF") | null = null
@@ -41,19 +57,11 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       req.body as {
         lightningAddress: string
         qrDataUrl: string
-        amount?: number
-        displayAmount?: string
-        webUrl?: string
+        amount?: number | null
+        displayAmount?: string | null
+        webUrl?: string | null
         username?: string
       }
-
-    console.log("📄 Paycode PDF API called with:", {
-      lightningAddress,
-      amount,
-      displayAmount,
-      webUrl,
-      qrDataUrlLength: qrDataUrl?.length,
-    })
 
     // Validate input. lightningAddress must be a real `localpart@domain` (it is
     // used to render text and to derive the default webUrl/username), so reject
@@ -97,6 +105,55 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       return res.status(400).json({
         error: "Invalid qrDataUrl",
         hint: "qrDataUrl must be an inline data:image/(png|jpeg|webp);base64,... URL",
+      })
+    }
+
+    const dims = pngDataUrlDimensions(qrDataUrl)
+    if (
+      qrDataUrl.length > LIMITS.qrDataUrlLength ||
+      !dims ||
+      dims.width < 1 ||
+      dims.height < 1 ||
+      dims.width > LIMITS.qrMaxSide ||
+      dims.height > LIMITS.qrMaxSide
+    ) {
+      return res.status(400).json({
+        error: "Invalid qrDataUrl",
+        hint: `qrDataUrl must be a PNG of at most ${LIMITS.qrMaxSide}x${LIMITS.qrMaxSide} px and ${LIMITS.qrDataUrlLength / 1024} KB`,
+      })
+    }
+
+    // amount: absent/null, or a positive whole number of sats.
+    if (
+      amount !== undefined &&
+      amount !== null &&
+      !(Number.isSafeInteger(amount) && amount > 0 && amount <= LIMITS.maxSats)
+    ) {
+      return res.status(400).json({
+        error: "Invalid amount",
+        hint: "amount must be a positive whole number of sats",
+      })
+    }
+
+    if (
+      displayAmount !== undefined &&
+      displayAmount !== null &&
+      (typeof displayAmount !== "string" || displayAmount.length > LIMITS.displayAmount)
+    ) {
+      return res.status(400).json({
+        error: "Invalid displayAmount",
+        hint: `displayAmount must be a string of at most ${LIMITS.displayAmount} chars`,
+      })
+    }
+
+    if (
+      webUrl !== undefined &&
+      webUrl !== null &&
+      (typeof webUrl !== "string" || webUrl.length > LIMITS.webUrl)
+    ) {
+      return res.status(400).json({
+        error: "Invalid webUrl",
+        hint: `webUrl must be a string of at most ${LIMITS.webUrl} chars`,
       })
     }
 
@@ -147,11 +204,12 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
 export default withRateLimit(handler, RATE_LIMIT_PUBLIC, "paycode/pdf")
 
-// Disable body parser limit for large QR data URLs
 export const config = {
   api: {
+    // The QR data URL is capped at 256 KB and every other field is short, so
+    // a larger body is never legitimate.
     bodyParser: {
-      sizeLimit: "10mb",
+      sizeLimit: "300kb",
     },
   },
 }
