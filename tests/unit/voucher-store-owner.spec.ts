@@ -67,8 +67,11 @@ describe("getVouchersByWalletIds", () => {
     const [sql, params] = mockPoolQuery.mock.calls[0]
     expect(sql).toMatch(/COALESCE\(environment, 'production'\) = \$2/)
     expect(sql).toMatch(/wallet_id = ANY\(\$1\)/)
-    // id breaks created_at ties so cursor pages never skip or repeat (#1617)
-    expect(sql).toMatch(/ORDER BY created_at DESC, id DESC\s+LIMIT \$3/)
+    // sha256(id) breaks created_at ties so cursor pages never skip or repeat,
+    // without the id (a redemption secret) ever being the cursor (#1617)
+    expect(sql).toMatch(
+      /ORDER BY created_at DESC, encode\(sha256\(convert_to\(id, 'UTF8'\)\), 'hex'\) DESC\s+LIMIT \$3/,
+    )
     expect(params).toEqual([["w1", "w2"], "production", OWNER_LIST_LIMIT])
     expect(vouchers).toHaveLength(1)
     expect(vouchers[0]).toMatchObject({ walletId: "w1", environment: "production" })

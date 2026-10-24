@@ -58,11 +58,45 @@ describe("voucher list paging", () => {
     expect(ids(s)).toEqual(["e", "c"])
   })
 
-  it("equal createdAt is ordered by id, like the API", () => {
+  it("vouchers sharing the boundary createdAt are kept, never duplicated", () => {
     let s = applyFirstPage(emptyVoucherList<V>(), [v("z", 5), v("y", 5)], "5_y")
     s = appendPage(s, [v("x", 5), v("w", 4)], "4_w")
     s = applyFirstPage(s, [v("z", 5), v("y", 5)], "5_y")
     expect(ids(s)).toEqual(["z", "y", "x", "w"])
+  })
+
+  it("a refreshed page that no longer reaches the loaded pages resets (no silent gap) — cursor remaining", () => {
+    // Loaded: e d | c b (cursor after b). Then 3+ new vouchers arrive (e.g. tab
+    // hidden): the new first page h g has none of the loaded ids, and f, e, d
+    // sit between it and the old tail.
+    let s = applyFirstPage(emptyVoucherList<V>(), [v("e", 5), v("d", 4)], "4_d")
+    s = appendPage(s, [v("c", 3), v("b", 2)], "2_b")
+    s = applyFirstPage(s, [v("h", 8), v("g", 7)], "7_g")
+    expect(s).toEqual({
+      vouchers: [v("h", 8), v("g", 7)],
+      nextCursor: "7_g",
+      extended: false,
+    })
+  })
+
+  it("a refreshed page that no longer reaches the loaded pages resets — cursor already exhausted", () => {
+    let s = applyFirstPage(emptyVoucherList<V>(), [v("e", 5), v("d", 4)], "4_d")
+    s = appendPage(s, [v("c", 3)], null) // everything was loaded
+    s = applyFirstPage(s, [v("h", 8), v("g", 7)], "7_g")
+    // Without the reset the button would be gone and f, e, d unreachable.
+    expect(s).toEqual({
+      vouchers: [v("h", 8), v("g", 7)],
+      nextCursor: "7_g",
+      extended: false,
+    })
+  })
+
+  it("one shared voucher is enough continuity to keep the older pages", () => {
+    let s = applyFirstPage(emptyVoucherList<V>(), [v("e", 5), v("d", 4)], "4_d")
+    s = appendPage(s, [v("c", 3)], "3_c")
+    s = applyFirstPage(s, [v("f", 6), v("e", 5)], "5_e")
+    expect(ids(s)).toEqual(["f", "e", "d", "c"])
+    expect(s).toMatchObject({ nextCursor: "3_c", extended: true })
   })
 
   it("a poll whose first page is now everything resets to a single page", () => {

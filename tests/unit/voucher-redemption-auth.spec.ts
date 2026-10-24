@@ -83,6 +83,7 @@ jest.mock("../../lib/blink-api", () => {
 
 import { BlinkAuthError, PaymentRejectedError } from "../../lib/blink-api"
 import { VOUCHER_API_KEY_HEADER } from "../../lib/voucher-auth"
+import { voucherTiebreak } from "../../lib/voucher-listing"
 import callbackHandler from "../../pages/api/voucher/callback"
 import cancelHandler from "../../pages/api/voucher/cancel"
 import createHandler from "../../pages/api/voucher/create"
@@ -400,7 +401,7 @@ describe("voucher list: current wallet owner only", () => {
     expect(mockStore.getVouchersByWalletIds).toHaveBeenCalledWith(
       ["wallet-1", "wallet-usd"],
       "production",
-      101, // default page (100) + 1 to detect a next page
+      501, // no limit: 500 as before pagination (+1 to detect a next page)
       { before: null, status: undefined },
     )
     const body = res.body as { vouchers: Array<{ id: string }>; stats: { total: number } }
@@ -430,7 +431,7 @@ describe("voucher list: current wallet owner only", () => {
       expect(mockStore.getVouchersByWalletIds).toHaveBeenCalledWith(
         ["wallet-1", "wallet-usd"],
         "production",
-        101,
+        501,
         { before: null, status },
       )
     }
@@ -439,6 +440,17 @@ describe("voucher list: current wallet owner only", () => {
       { status: "whatever" },
     )
     expect(bad.statusCode).toBe(400)
+  })
+
+  it("an omitted limit still returns up to 500 (older clients do not page)", async () => {
+    const res = await list({ [VOUCHER_API_KEY_HEADER]: OWNER_KEY })
+    expect(res.statusCode).toBe(200)
+    expect(mockStore.getVouchersByWalletIds).toHaveBeenCalledWith(
+      ["wallet-1", "wallet-usd"],
+      "production",
+      501,
+      { before: null, status: undefined },
+    )
   })
 
   it("returns nextCursor when there are more vouchers than the page", async () => {
@@ -454,7 +466,9 @@ describe("voucher list: current wallet owner only", () => {
       truncated: boolean
     }
     expect(body.vouchers.map((v) => v.id[0])).toEqual(["a", "b"])
-    expect(body.nextCursor).toBe(`2000_${"b".repeat(32)}`)
+    // created_at + SHA-256 of the id: never the id (a redemption secret)
+    expect(body.nextCursor).toBe(`2000_${voucherTiebreak("b".repeat(32))}`)
+    expect(body.nextCursor).not.toContain("b".repeat(8))
     expect(body.truncated).toBe(true)
 
     await list(
@@ -465,7 +479,10 @@ describe("voucher list: current wallet owner only", () => {
       ["wallet-1", "wallet-usd"],
       "production",
       3,
-      { before: { createdAt: 2000, id: "b".repeat(32) }, status: undefined },
+      {
+        before: { createdAt: 2000, tiebreak: voucherTiebreak("b".repeat(32)) },
+        status: undefined,
+      },
     )
   })
 
@@ -482,7 +499,7 @@ describe("voucher list: current wallet owner only", () => {
     expect(mockStore.getVouchersByWalletIds).toHaveBeenCalledWith(
       ["wallet-stg"],
       "staging",
-      101,
+      501,
       { before: null, status: undefined },
     )
   })
@@ -492,7 +509,7 @@ describe("voucher list: current wallet owner only", () => {
     expect(mockStore.getVouchersByWalletIds).toHaveBeenCalledWith(
       ["wallet-1", "wallet-usd"],
       "production",
-      101, // default page (100) + 1 to detect a next page
+      501, // no limit: 500 as before pagination (+1 to detect a next page)
       { before: null, status: undefined },
     )
   })

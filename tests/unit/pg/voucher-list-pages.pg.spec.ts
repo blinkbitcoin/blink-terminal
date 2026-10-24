@@ -93,8 +93,11 @@ describePg("voucher list pagination on real Postgres", () => {
   }
 
   const allIdsNewestFirst = async () =>
+    // The listing's order: created_at, then SHA-256 of the id (never the id).
     (
-      await sql.query("SELECT id FROM vouchers ORDER BY created_at DESC, id DESC")
+      await sql.query(
+        "SELECT id FROM vouchers ORDER BY created_at DESC, encode(sha256(convert_to(id, 'UTF8')), 'hex') DESC",
+      )
     ).rows.map((r) => r.id as string)
 
   const call = async (query: Record<string, string>) => {
@@ -167,8 +170,28 @@ describePg("voucher list pagination on real Postgres", () => {
     expect(ids).toEqual(await allIdsNewestFirst())
     expect(pages).toBe(6)
     const first = await call({})
-    expect(first.body.vouchers).toHaveLength(100) // default page size
+    expect(first.body.vouchers).toHaveLength(500) // no limit: 500, as before pagination
     expect(first.body.stats.total).toBe(520) // stats are never paged
+  })
+
+  it("no cursor (and so no request URL) ever contains a voucher id — ids are redemption secrets", async () => {
+    await seed(60, 4)
+    const all = await allIdsNewestFirst()
+    let before: string | null = null
+    const cursors: string[] = []
+    do {
+      const res = await call({ limit: "7", ...(before ? { before } : {}) })
+      before = res.body.nextCursor
+      if (before) cursors.push(before)
+    } while (before)
+    expect(cursors.length).toBeGreaterThan(5)
+    for (const cursor of cursors) {
+      const url = `/api/voucher/list?limit=7&before=${encodeURIComponent(cursor)}`
+      for (const voucherId of all) {
+        expect(url).not.toContain(voucherId)
+        expect(url.toUpperCase()).not.toContain(voucherId.substring(0, 8).toUpperCase())
+      }
+    }
   })
 
   it("route: a status filter reaches old matches (was applied after the 500 cap)", async () => {
@@ -252,12 +275,12 @@ describePg("voucher list pagination on real Postgres", () => {
     const base = [["w1", "w2"], "production", 101]
     for (const [shape, params] of [
       [{}, base],
-      [{ cursor: true }, [...base, Date.now(), id(1)]],
+      [{ cursor: true }, [...base, Date.now(), "0".repeat(64)]],
       [{ status: "EXPIRED" as const }, [...base, Date.now()]],
       [{ status: "CLAIMED" as const }, base],
       [
         { cursor: true, status: "ACTIVE" as const },
-        [...base, Date.now(), id(1), Date.now()],
+        [...base, Date.now(), "0".repeat(64), Date.now()],
       ],
     ] as const) {
       expect(await indexesUsed(sql, ownerListingSql(shape), [...params])).toContain(

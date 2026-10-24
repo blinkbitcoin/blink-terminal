@@ -766,7 +766,7 @@ class VoucherStore {
         // +1: callers fetch one extra row to tell whether a next page exists.
         Math.min(Math.max(1, limit), OWNER_LIST_LIMIT + 1),
       ]
-      if (before) params.push(before.createdAt, before.id)
+      if (before) params.push(before.createdAt, before.tiebreak)
       // Only the time-dependent filters (EXPIRED / ACTIVE) take "now".
       if (status && OWNER_STATUS_SQL[status].includes("$NOW")) params.push(Date.now())
       const result: QueryResult<VoucherRow> = await query(

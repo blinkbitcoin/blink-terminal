@@ -16,9 +16,6 @@ import {
 } from "../../../lib/voucher-listing"
 import voucherStore from "../../../lib/voucher-store"
 
-/** Default page size (the UI's); `limit` may ask for up to OWNER_LIST_LIMIT. */
-export const DEFAULT_PAGE_SIZE = 100
-
 /** Shape of a voucher record from the store */
 interface VoucherRecord {
   id: string
@@ -53,7 +50,8 @@ interface VoucherRecord {
  *   'EXPIRED', 'all'. CLAIMED is the redeemed bucket (CLAIMED + PAID); PAID
  *   alone is settled redemptions only. Default: returns all vouchers.
  *   Applied in the query, so older matches stay reachable page by page.
- * - limit: page size, 1..OWNER_LIST_LIMIT (default DEFAULT_PAGE_SIZE)
+ * - limit: page size, 1..OWNER_LIST_LIMIT (default OWNER_LIST_LIMIT, as before
+ *   pagination existed, so clients that do not page keep getting 500)
  * - before: the previous page's `nextCursor` (blink-wip#1617)
  *
  * Newest first. `nextCursor` is null on the last page (`truncated` mirrors
@@ -91,7 +89,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   const status = rawStatus === "ALL" ? undefined : (rawStatus as OwnerListStatus)
 
   const rawLimit = req.query.limit
-  const limit = rawLimit === undefined ? DEFAULT_PAGE_SIZE : Number(rawLimit)
+  const limit = rawLimit === undefined ? OWNER_LIST_LIMIT : Number(rawLimit)
   if (!Number.isInteger(limit) || limit < 1 || limit > OWNER_LIST_LIMIT) {
     return res.status(400).json({ error: `limit must be 1-${OWNER_LIST_LIMIT}` })
   }

@@ -78,7 +78,7 @@ describe("VoucherManager", () => {
   })
 
   it("loads older pages on demand (blink-wip#1617)", async () => {
-    const cursor = `1000_${"a".repeat(32)}`
+    const cursor = `1000_${"9".repeat(64)}` // created_at + sha256(id): no voucher id
     fetchMock.mockImplementation((url: string) =>
       url.includes("before=")
         ? ok({ ...listBody(["b".repeat(32)]), nextCursor: null })
@@ -112,7 +112,7 @@ describe("VoucherManager", () => {
         })
       }
       return key === "blink_old"
-        ? ok({ ...listBody(["a".repeat(32)]), nextCursor: `1000_${"a".repeat(32)}` })
+        ? ok({ ...listBody(["a".repeat(32)]), nextCursor: `1000_${"9".repeat(64)}` })
         : ok(listBody(["c".repeat(32)]))
     })
 
