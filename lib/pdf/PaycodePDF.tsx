@@ -12,7 +12,10 @@ interface PaperFormat {
 
 interface PaycodeData {
   lightningAddress: string
+  /** Server-generated QR (pages/api/paycode/pdf.ts), never caller-supplied. */
   qrDataUrl: string
+  /** Server-owned centre logo, drawn over the QR. */
+  logoDataUrl?: string
   amount?: number
   displayAmount?: string
   webUrl?: string
@@ -34,9 +37,17 @@ export const PAPER_FORMATS: Record<string, PaperFormat> = {
 // Get available formats for validation
 export const getAvailableFormats = (): string[] => Object.keys(PAPER_FORMATS)
 
+// Centre logo, same proportions as the client's canvas composite
+// (components/PublicPOS/PrintPaycodeView.tsx): 22% of the QR, white backing
+// padded by 8% of the logo. Error-correction level H tolerates the cover.
+const QR_SIZE = 320
+const LOGO_SIZE = QR_SIZE * 0.22
+const LOGO_PAD = LOGO_SIZE * 0.08
+const LOGO_BOX = LOGO_SIZE + LOGO_PAD * 2
+
 // Styles for Paycode PDF — mirrors the on-screen "Print QR Code" poster:
-// black/white/gray only, centered QR with the Bitcoin logo baked into the
-// provided qrDataUrl. No purple/yellow accents.
+// black/white/gray only, centered QR with the Bitcoin logo over its centre.
+// No purple/yellow accents.
 const styles = StyleSheet.create({
   page: {
     backgroundColor: "#FFFFFF",
@@ -90,8 +101,26 @@ const styles = StyleSheet.create({
     padding: 16,
   },
   qrCode: {
-    width: 320,
-    height: 320,
+    width: QR_SIZE,
+    height: QR_SIZE,
+  },
+  qrFrame: {
+    position: "relative",
+    width: QR_SIZE,
+    height: QR_SIZE,
+  },
+  logoBox: {
+    position: "absolute",
+    left: (QR_SIZE - LOGO_BOX) / 2,
+    top: (QR_SIZE - LOGO_BOX) / 2,
+    width: LOGO_BOX,
+    height: LOGO_BOX,
+    padding: LOGO_PAD,
+    backgroundColor: "#FFFFFF",
+  },
+  logo: {
+    width: LOGO_SIZE,
+    height: LOGO_SIZE,
   },
   // Instructions (plain, no colored box)
   instructionsText: {
@@ -112,7 +141,8 @@ const styles = StyleSheet.create({
  * Generates a printable PDF with a Lightning paycode QR
  */
 export const PaycodeDocument: React.FC<PaycodeDocumentProps> = ({ paycode }) => {
-  const { lightningAddress, qrDataUrl, amount, displayAmount, username } = paycode
+  const { lightningAddress, qrDataUrl, logoDataUrl, amount, displayAmount, username } =
+    paycode
 
   const hasFixedAmount = amount && amount > 0
   const payee = username || lightningAddress.split("@")[0]
@@ -135,10 +165,19 @@ export const PaycodeDocument: React.FC<PaycodeDocumentProps> = ({ paycode }) => 
             </View>
           )}
 
-          {/* QR Code (Bitcoin logo already baked into qrDataUrl) */}
+          {/* QR Code with the Bitcoin logo over its centre */}
           <View style={styles.qrSection}>
             {safeImageSrc(qrDataUrl) && (
-              <Image style={styles.qrCode} src={safeImageSrc(qrDataUrl)} />
+              <View style={styles.qrFrame}>
+                <Image style={styles.qrCode} src={safeImageSrc(qrDataUrl)} />
+                {safeImageSrc(logoDataUrl) && (
+                  <View style={styles.logoBox}>
+                    {/* react-pdf <Image> (PDF), not an HTML <img>: no alt prop */}
+                    {/* eslint-disable-next-line jsx-a11y/alt-text */}
+                    <Image style={styles.logo} src={safeImageSrc(logoDataUrl)} />
+                  </View>
+                )}
+              </View>
             )}
           </View>
 

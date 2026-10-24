@@ -201,11 +201,12 @@ export function getPayUrl(): string {
  *
  * Prefers `NEXT_PUBLIC_BASE_URL` when set (allows self-hosters/staging to
  * override), else falls back to the environment's configured `appUrl`.
+ * @param env Environment (default: the current one)
  * @returns App origin URL (no trailing slash)
  */
-export function getAppUrl(): string {
+export function getAppUrl(env: EnvironmentName = getEnvironment()): string {
   const override = process.env.NEXT_PUBLIC_BASE_URL
-  const base = override && override.length > 0 ? override : getEnvironmentConfig().appUrl
+  const base = override && override.length > 0 ? override : ENVIRONMENTS[env].appUrl
   return base.replace(/\/+$/, "")
 }
 
@@ -219,10 +220,11 @@ export function getWsUrl(): string {
 
 /**
  * Get the Lightning Address domain for the current environment
+ * @param env Environment (default: the current one)
  * @returns Lightning Address domain (e.g., 'blink.sv' or 'pay.staging.blink.sv')
  */
-export function getLnAddressDomain(): string {
-  return getEnvironmentConfig().lnAddressDomain
+export function getLnAddressDomain(env: EnvironmentName = getEnvironment()): string {
+  return ENVIRONMENTS[env].lnAddressDomain
 }
 
 /**
