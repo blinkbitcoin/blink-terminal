@@ -6,18 +6,23 @@
  * with "Load older vouchers" — those are refreshed only when reloaded (a
  * deliberate trade-off: the poll stays one page).
  *
- * Continuity: keeping the older pages is only correct if the refreshed first
- * page still reaches into what was loaded. New vouchers are created "now", so
- * they only ever appear at the top; if the refreshed page contains a voucher
- * that was already loaded, everything older than it is either loaded or has
- * since been deleted. If it contains none (more than a page of new vouchers
- * since the last poll, e.g. while the tab was hidden), keeping the old tail
- * would leave a silent gap — so the list resets to the first page instead.
+ * Continuity: the older loaded pages are kept only if the refreshed first
+ * page ENDS on a voucher that was already loaded (the anchor). The loaded list
+ * is in server order and new vouchers are created "now", so they only ever
+ * appear at the top: everything older than the anchor is then either loaded
+ * (after it in the list) or has since been deleted — nothing unloaded can sit
+ * in between, so the loaded tail after the anchor continues the page exactly.
+ * Otherwise the list resets to the refreshed page and its cursor:
+ * - no overlap at all (more than a page of new vouchers since the last poll,
+ *   e.g. while the tab was hidden): keeping the tail would leave a gap;
+ * - the page reaches PAST what was loaded (cleanup deleted enough rows that
+ *   it ends on a never-loaded voucher): keeping the tail would resurrect
+ *   deleted vouchers behind a stale cursor.
  *
- * Ordering is never modelled here: the loaded list is always in the server's
- * order (pages are appended contiguously), so "older than the refreshed page"
- * is "after the anchor's position" — no timestamp comparison, which could not
- * reproduce the server's tiebreak for equal created_at.
+ * Ordering is never modelled here — positions only, no timestamp comparison,
+ * which could not reproduce the server's tiebreak for equal created_at. The
+ * older loaded pages are refreshed only when reloaded (a deliberate
+ * trade-off: the poll stays one page).
  */
 
 export interface PagedVoucher {
@@ -41,10 +46,10 @@ export const emptyVoucherList = <T extends PagedVoucher>(): VoucherListState<T> 
 
 /**
  * A (re)fetched first page. Without loaded older pages it replaces the list.
- * Otherwise, if it overlaps the loaded vouchers (see Continuity), it replaces
- * the part of the list it covers — new vouchers appear, changed ones update,
- * deleted ones (cleanup) disappear — and keeps the older loaded vouchers and
- * their cursor. Without overlap it resets to the first page and its cursor.
+ * Otherwise, if it ends on a loaded voucher (see Continuity), it replaces the
+ * part of the list it covers — new vouchers appear, changed ones update,
+ * deleted ones (cleanup) disappear — and keeps the vouchers loaded after it
+ * and their cursor. Otherwise it resets to the first page and its cursor.
  */
 export function applyFirstPage<T extends PagedVoucher>(
   prev: VoucherListState<T>,
@@ -52,17 +57,13 @@ export function applyFirstPage<T extends PagedVoucher>(
   nextCursor: string | null,
 ): VoucherListState<T> {
   const inPage = new Set(page.map((v) => v.id))
-  // Anchor: the last loaded voucher that the refreshed page still contains.
-  let anchor = -1
-  for (let i = prev.vouchers.length - 1; i >= 0; i--) {
-    if (inPage.has(prev.vouchers[i].id)) {
-      anchor = i
-      break
-    }
-  }
-  // Not extended, the first page is now everything there is, or there is no
-  // provable continuity with the loaded pages: start over from this page.
-  if (!prev.extended || page.length === 0 || nextCursor === null || anchor < 0) {
+  const last = page[page.length - 1]
+  // Anchor: the refreshed page's last voucher, in the loaded list.
+  const anchor = last ? prev.vouchers.findIndex((v) => v.id === last.id) : -1
+  // Not extended, the first page is now everything there is, or no provable
+  // continuity (no overlap, or the page reaches past what was loaded):
+  // start over from this page.
+  if (!prev.extended || nextCursor === null || anchor < 0) {
     return { vouchers: page, nextCursor, extended: false }
   }
   // Everything loaded after the anchor is older than the refreshed page;

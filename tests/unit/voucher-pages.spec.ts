@@ -118,6 +118,40 @@ describe("voucher list paging", () => {
     expect(ids(s)).toEqual(["B", "D", "E"])
   })
 
+  it("a refreshed page that reaches PAST the loaded vouchers resets — distinct timestamps (review repro)", () => {
+    // Loaded [A5,B4] + [C3,D2] (cursor after D). Cleanup deletes A, B and D;
+    // the refreshed page [C3,E1] ends on E, which was never loaded.
+    let s = applyFirstPage(emptyVoucherList<V>(), [v("A", 5), v("B", 4)], "4_b")
+    s = appendPage(s, [v("C", 3), v("D", 2)], "2_d")
+    s = applyFirstPage(s, [v("C", 3), v("E", 1)], "1_e")
+    // Not [C, E, D] with the stale cursor: D is deleted.
+    expect(s).toEqual({
+      vouchers: [v("C", 3), v("E", 1)],
+      nextCursor: "1_e",
+      extended: false,
+    })
+  })
+
+  it("a refreshed page that reaches PAST the loaded vouchers resets — tied timestamps", () => {
+    let s = applyFirstPage(emptyVoucherList<V>(), [v("A", 5), v("B", 5)], "5_b")
+    s = appendPage(s, [v("C", 5), v("D", 5)], "5_d")
+    // A, B and D deleted; E (same created_at, later in the tie order) was never loaded.
+    s = applyFirstPage(s, [v("C", 5), v("E", 5)], "5_e")
+    expect(s).toEqual({
+      vouchers: [v("C", 5), v("E", 5)],
+      nextCursor: "5_e",
+      extended: false,
+    })
+  })
+
+  it("new vouchers before the anchor are ordinary new vouchers", () => {
+    let s = applyFirstPage(emptyVoucherList<V>(), [v("c", 3), v("b", 2)], "2_b")
+    s = appendPage(s, [v("a", 1)], "1_a")
+    s = applyFirstPage(s, [v("d", 4), v("b", 2)], "2_b") // c deleted, d new
+    expect(ids(s)).toEqual(["d", "b", "a"])
+    expect(s).toMatchObject({ nextCursor: "1_a", extended: true })
+  })
+
   it("updateVoucher patches one loaded voucher (e.g. cancelled on an older page)", () => {
     let s = applyFirstPage(emptyVoucherList<V>(), [v("c", 3)], "3_c")
     s = appendPage(s, [v("b", 2), v("a", 1)], null)
