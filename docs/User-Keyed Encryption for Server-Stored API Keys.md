@@ -10,7 +10,7 @@
 
 ## 1. Problem Statement
 
-The current architecture uses a single server-side `ENCRYPTION_KEY` environment variable (via `CryptoJS.AES`) to encrypt all users' API keys, NWC URIs, and boltcard secrets before storing them in the database.
+The current architecture uses a single server-side `ENCRYPTION_KEY` environment variable (through `lib/crypto/keyring.js`) to encrypt all users' API keys, NWC URIs, and boltcard secrets before storing them in the database. By default the keyring still writes the CryptoJS-compatible AES-CBC format (rollback-safe); authenticated AES-256-GCM (`v2`) writes start per environment only once `ENCRYPTION_WRITE_FORMAT=v2` is set (blink-wip#1587, phase 2).
 
 **If the server is compromised, an attacker obtains:**
 
@@ -74,16 +74,16 @@ While now superseded by the Marmot Protocol, NIP-EE explicitly states: _"This NI
 ### Server-Side Encryption (`lib/auth.ts`) — The subject of this analysis
 
 ```typescript
-// Single static key encrypts ALL users' secrets
+// One server key (lib/crypto/keyring.js) encrypts ALL users' secrets
 static encryptApiKey(apiKey: string): string {
-  const key = getEncryptionKey()  // process.env.ENCRYPTION_KEY
-  return CryptoJS.AES.encrypt(apiKey, key).toString()
+  return envKeyring().encrypt(apiKey) // ENCRYPTION_KEY
 }
 ```
 
-- Single `ENCRYPTION_KEY` env var used to encrypt every user's data
+- Single `ENCRYPTION_KEY` env var used to encrypt every user's data (plus read-only `ENCRYPTION_KEY_PREVIOUS` during a rotation)
 - ~64 call sites across vouchers, boltcards, network consent, webhooks, payment splits
-- Uses `CryptoJS.AES` (deprecated library, AES-CBC without authentication)
+- Write format follows `ENCRYPTION_WRITE_FORMAT`: `legacy` (default) is CryptoJS-compatible AES-CBC without authentication; `v2` is AES-256-GCM tagged with a key id. Reads accept both.
+- Until phase 2 of `docs/encryption-key-rotation.md` runs in an environment, new values there are still written in the legacy format.
 
 ### Network Module — uses the same server key
 
@@ -187,7 +187,7 @@ For payment operations specifically (the main reason most API keys exist), **Nos
 | -------- | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------ |
 | **P0**   | Move from single `ENCRYPTION_KEY` to per-user derived keys (Tier 2)         | Eliminates single-point-of-failure. No client changes needed.                                                                              | Medium |
 | **P1**   | Implement NIP-44 client-side encryption for new API key storage flows       | User-present operations become zero-knowledge to server                                                                                    | Medium |
-| **P2**   | ~~Replace `CryptoJS.AES` with Node.js `crypto` (AES-256-GCM) server-side~~ | Done (blink-wip#1587): `lib/crypto/keyring.js` writes authenticated AES-256-GCM (`v2`) with rotatable keys; legacy CryptoJS values are re-encrypted by `scripts/reencrypt-secrets.js`. | Low    |
+| **P2**   | Replace `CryptoJS.AES` with Node.js `crypto` (AES-256-GCM) server-side      | **In progress** (blink-wip#1587). Implemented in `lib/crypto/keyring.js` (`v2` = AES-256-GCM, rotatable keys), but active per environment only after phase 2 sets `ENCRYPTION_WRITE_FORMAT=v2`; existing values are then re-encrypted with `scripts/reencrypt-secrets.js --apply` / `--check` (`docs/encryption-key-rotation.md`). Until then writes stay in the legacy CryptoJS format. | Low    |
 | **P3**   | Evaluate NIP-78 for storing encrypted user data on relays instead of our DB | Removes our server as a storage target entirely for eligible data                                                                          | Low    |
 | **P4**   | Investigate NIP-46 bunker integration for real-time decryption              | Best security model but adds infrastructure complexity                                                                                     | High   |
 
@@ -209,7 +209,7 @@ Boltcard keys (k0-k4) MUST be available to the server during card-tap processing
 
 ### Migration path
 
-Existing encrypted data uses the current `ENCRYPTION_KEY`. Any migration requires a re-encryption step. The existing `scripts/reencrypt-user-data.js` provides a pattern for this, but would need to be adapted for per-user key derivation.
+Existing encrypted data uses the current `ENCRYPTION_KEY`. Any migration requires a re-encryption step. The existing `scripts/reencrypt-secrets.js` (re-encryption under the current keyring key, used for phase 2 and key rotation) provides a pattern for this, but would need to be adapted for per-user key derivation.
 
 ---
 
@@ -222,6 +222,6 @@ Existing encrypted data uses the current `ENCRYPTION_KEY`. Any migration require
 | Autonomous operations   | Work today                             | Continue to work (per-user derived keys)                    |
 | Single point of failure | Yes (`ENCRYPTION_KEY`)                 | No (per-user keys)                                          |
 | Protocol alignment      | Custom, non-standard                   | NIP-44 (audited, standardized)                              |
-| Crypto library          | CryptoJS (deprecated, unauthenticated) | NIP-44 ChaCha20 + HMAC-SHA256 (audited)                     |
+| Crypto library          | CryptoJS-compatible AES-CBC by default (unauthenticated); AES-256-GCM `v2` after phase 2 | NIP-44 ChaCha20 + HMAC-SHA256 (audited)                     |
 
 The Nostr ecosystem provides the cryptographic primitives (NIP-44), the signer abstraction (NIP-46), and the storage patterns (NIP-78) to support user-keyed encryption of server-stored secrets. The hybrid model addresses the practical reality that the server performs autonomous operations while maximizing the security benefit for user-interactive flows.
