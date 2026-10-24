@@ -18,7 +18,7 @@ All of it goes through `lib/crypto/keyring.js`:
 - **Legacy values** (CryptoJS format, `U2FsdGVkX1…`) are read with the **oldest** configured key — never tried against several keys (no integrity check).
 - **Writes** follow `ENCRYPTION_WRITE_FORMAT`: `legacy` (default) or `v2`.
 
-`NETWORK_ENCRYPTION_KEY` currently encrypts nothing (`lib/network/crypto.ts` has no callers); rotating it has no effect.
+`NETWORK_ENCRYPTION_KEY` is retired: it encrypted nothing (the network module's consent API keys go through the keyring above), and the app no longer reads it. Removing it from the chart and blink-deployments follows charts#9563 and blink-deployments#10595.
 
 ## Prerequisites (deployment plumbing)
 

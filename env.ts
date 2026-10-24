@@ -65,7 +65,6 @@ export const env = createEnv({
     ENCRYPTION_KEY_PREVIOUS: z.string().min(1).optional(),
     // "legacy" (default: rollback-safe writes) or "v2" (blink-wip#1587).
     ENCRYPTION_WRITE_FORMAT: z.enum(["legacy", "v2"]).optional(),
-    NETWORK_ENCRYPTION_KEY: z.string().min(1).optional(),
 
     // --- External Services ---
     CITRUSRATE_API_KEY: z.string().min(1).optional(),
@@ -131,7 +130,6 @@ export const env = createEnv({
     ENCRYPTION_KEY: process.env.ENCRYPTION_KEY,
     ENCRYPTION_KEY_PREVIOUS: process.env.ENCRYPTION_KEY_PREVIOUS,
     ENCRYPTION_WRITE_FORMAT: process.env.ENCRYPTION_WRITE_FORMAT,
-    NETWORK_ENCRYPTION_KEY: process.env.NETWORK_ENCRYPTION_KEY,
 
     // External Services
     CITRUSRATE_API_KEY: process.env.CITRUSRATE_API_KEY,
