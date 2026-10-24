@@ -666,6 +666,74 @@ describe("processTopUpPayment: verified, claimed once, USD only on transfer succ
     expect(mockStore.topUpCard).not.toHaveBeenCalled()
   })
 
+  describe("a payment credits a card at most once (migration 032)", () => {
+    const usdCard = () => {
+      mockStore.getCard = jest
+        .fn()
+        .mockResolvedValue(card({ walletCurrency: "USD", walletId: "wallet-usd" }))
+      mockStore.getPendingTopUp = jest
+        .fn()
+        .mockResolvedValue({ cardId: CARD_ID, amount: 1000, currency: "USD" })
+      mockBlink.getExchangeRatePublic.mockResolvedValue({ satPriceInCurrency: 0.07 })
+      mockBlink.intraLedgerPaymentSend.mockResolvedValue({ status: "SUCCESS" })
+    }
+
+    it("already credited before (e.g. re-stored after cleanup): no transfer, no credit, claim kept", async () => {
+      receipt("SUCCESS", 1000)
+      usdCard()
+      mockStore.isTopUpCredited = jest.fn().mockResolvedValue(true)
+      const res = await processTopUpPayment(HASH)
+      expect(res).toMatchObject({ success: false, error: "Top-up already processed" })
+      expect(mockBlink.intraLedgerPaymentSend).not.toHaveBeenCalled()
+      expect(mockStore.topUpCard).not.toHaveBeenCalled()
+      expect(mockStore.unmarkTopUpProcessed).not.toHaveBeenCalled()
+      expect(mockStore.setTopUpReviewReason).not.toHaveBeenCalled()
+    })
+
+    it("the credited check fails: claim kept, flagged, nothing moved", async () => {
+      receipt("SUCCESS", 1000)
+      usdCard()
+      mockStore.isTopUpCredited = jest
+        .fn()
+        .mockRejectedValue(new Error("connection reset"))
+      expect((await processTopUpPayment(HASH)).success).toBe(false)
+      expect(mockBlink.intraLedgerPaymentSend).not.toHaveBeenCalled()
+      expect(mockStore.topUpCard).not.toHaveBeenCalled()
+      expect(mockStore.unmarkTopUpProcessed).not.toHaveBeenCalled()
+      expect(mockStore.setTopUpReviewReason).toHaveBeenCalledWith(
+        HASH,
+        expect.stringContaining("credited-check failed"),
+      )
+    })
+
+    it("BTC: lost the race to another credit (primary key) -> claim kept, not released, no review", async () => {
+      receipt("SUCCESS", 1000)
+      mockStore.isTopUpCredited = jest.fn().mockResolvedValue(false)
+      mockStore.topUpCard = jest
+        .fn()
+        .mockResolvedValue({ success: false, alreadyCredited: true, error: "x" })
+      const res = await processTopUpPayment(HASH)
+      expect(res).toMatchObject({ success: false, error: "Top-up already processed" })
+      expect(mockStore.unmarkTopUpProcessed).not.toHaveBeenCalled()
+      expect(mockStore.setTopUpReviewReason).not.toHaveBeenCalled()
+    })
+
+    it("USD: lost the race after this attempt's transfer -> flagged for review", async () => {
+      receipt("SUCCESS", 1000)
+      usdCard()
+      mockStore.isTopUpCredited = jest.fn().mockResolvedValue(false)
+      mockStore.topUpCard = jest
+        .fn()
+        .mockResolvedValue({ success: false, alreadyCredited: true, error: "x" })
+      expect((await processTopUpPayment(HASH)).success).toBe(false)
+      expect(mockStore.unmarkTopUpProcessed).not.toHaveBeenCalled()
+      expect(mockStore.setTopUpReviewReason).toHaveBeenCalledWith(
+        HASH,
+        expect.stringContaining("already credited"),
+      )
+    })
+  })
+
   describe("USD card", () => {
     beforeEach(() => {
       mockStore.getCard = jest
