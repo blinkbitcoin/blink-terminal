@@ -85,10 +85,10 @@ static encryptApiKey(apiKey: string): string {
 - ~64 call sites across vouchers, boltcards, network consent, webhooks, payment splits
 - Uses `CryptoJS.AES` (deprecated library, AES-CBC without authentication)
 
-### Network Module (`lib/network/crypto.ts`) — Separate but same pattern
+### Network Module — uses the same server key
 
-- Separate `NETWORK_ENCRYPTION_KEY` with proper AES-256-GCM via Node.js `crypto`
-- Same fundamental vulnerability: single server-held key for all users
+- Network consent API keys (`data_sharing_consents.blink_api_key_encrypted`) are encrypted with `AuthManager` / `ENCRYPTION_KEY`, like everything else.
+- The separate `NETWORK_ENCRYPTION_KEY` and `lib/network/crypto.ts` were never used and have been removed (blink-wip#1587).
 
 ### Client-Side Encryption (`lib/storage/CryptoUtils.ts`) — Already good
 
@@ -187,7 +187,7 @@ For payment operations specifically (the main reason most API keys exist), **Nos
 | -------- | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------ |
 | **P0**   | Move from single `ENCRYPTION_KEY` to per-user derived keys (Tier 2)         | Eliminates single-point-of-failure. No client changes needed.                                                                              | Medium |
 | **P1**   | Implement NIP-44 client-side encryption for new API key storage flows       | User-present operations become zero-knowledge to server                                                                                    | Medium |
-| **P2**   | Replace `CryptoJS.AES` with Node.js `crypto` (AES-256-GCM) server-side      | CryptoJS is deprecated and uses AES-CBC without authentication. `lib/network/crypto.ts` already does this correctly — use it as the model. | Low    |
+| **P2**   | ~~Replace `CryptoJS.AES` with Node.js `crypto` (AES-256-GCM) server-side~~ | Done (blink-wip#1587): `lib/crypto/keyring.js` writes authenticated AES-256-GCM (`v2`) with rotatable keys; legacy CryptoJS values are re-encrypted by `scripts/reencrypt-secrets.js`. | Low    |
 | **P3**   | Evaluate NIP-78 for storing encrypted user data on relays instead of our DB | Removes our server as a storage target entirely for eligible data                                                                          | Low    |
 | **P4**   | Investigate NIP-46 bunker integration for real-time decryption              | Best security model but adds infrastructure complexity                                                                                     | High   |
 
