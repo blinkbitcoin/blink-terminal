@@ -169,6 +169,8 @@ interface TopUpResult {
   balance?: number
   error?: string
   transaction?: unknown
+  /** Definite: this payment already credited a card (store.topUpCard). */
+  alreadyCredited?: boolean
 }
 
 interface BlinkTransaction {
@@ -570,6 +572,26 @@ async function processTopUpPayment(paymentHash: string): Promise<ProcessTopUpRes
   pendingTopUpsCache.delete(paymentHash)
   const release = () => boltcardStore.unmarkTopUpProcessed(paymentHash)
 
+  // A payment credits a card at most once (blink-wip#1623). The claim above
+  // only covers this pending row; the hash may have credited before (row
+  // re-stored, or cleaned up and recreated). Check before anything external
+  // happens (the USD transfer); topUpCard's primary key is the atomic
+  // backstop for a race past this check.
+  let alreadyCredited: boolean
+  try {
+    alreadyCredited = await boltcardStore.isTopUpCredited(paymentHash)
+  } catch (err: unknown) {
+    // Keep the claim: we cannot tell whether crediting is safe.
+    await review(`credited-check failed: ${(err as Error).message}`)
+    return { success: false, error: "Top-up credit check failed - manual review needed" }
+  }
+  if (alreadyCredited) {
+    console.error(
+      `[LNURLP] Payment ${paymentHash.substring(0, 16)}... already credited a card - not crediting again`,
+    )
+    return { success: false, error: "Top-up already processed" }
+  }
+
   let creditAmount = amountSats
   let creditUnit = "sats"
 
@@ -660,6 +682,15 @@ async function processTopUpPayment(paymentHash: string): Promise<ProcessTopUpRes
     )
     await review(`Credit outcome unknown: ${(err as Error).message}`)
     return { success: false, error: "Credit outcome unknown - manual review needed" }
+  }
+
+  if (result.alreadyCredited) {
+    // Lost a race to another credit of this payment: nothing written, keep
+    // the claim. USD: this attempt's transfer still moved funds -> review.
+    if (currency === "USD") {
+      await review("USD transfer done but payment already credited")
+    }
+    return { success: false, error: "Top-up already processed" }
   }
 
   if (!result.success) {

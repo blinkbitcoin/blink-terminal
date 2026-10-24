@@ -191,7 +191,12 @@ export interface TopUpResult {
   balance?: number
   transaction?: TransactionRecord | null
   error?: string
+  /** Definite: this payment hash already credited a card; nothing was written. */
+  alreadyCredited?: boolean
 }
+
+/** Primary key of boltcard_credited_topups (migration 032). */
+const CREDITED_TOPUP_PKEY = "boltcard_credited_topups_pkey"
 
 /** Derived keys returned from deriveKeysForCard */
 export interface DerivedKeysResult {
@@ -2194,14 +2199,23 @@ class BoltcardStore {
     const expiresAt: number = now + 60 * 60 * 1000 // 1 hour expiry
 
     try {
-      await query(
+      const stored: QueryResult<DbRow> = await query(
         `INSERT INTO boltcard_pending_topups 
          (payment_hash, card_id, amount, currency, created_at, expires_at, processed)
          VALUES ($1, $2, $3, $4, $5, $6, FALSE)
          ON CONFLICT (payment_hash) DO UPDATE SET
-           card_id = $2, amount = $3, currency = $4, expires_at = $6, processed = FALSE`,
+           card_id = $2, amount = $3, currency = $4, expires_at = $6, processed = FALSE
+         WHERE boltcard_pending_topups.processed = FALSE`,
         [paymentHash, cardId, amount, currency, now, expiresAt],
       )
+      // A processed (claimed) top-up is never reset to claimable: that would
+      // let the same payment be credited again (blink-wip#1623).
+      if ((stored.rowCount ?? 0) === 0) {
+        console.error(
+          `[BoltcardStore] Refusing to re-store already processed top-up ${paymentHash.substring(0, 16)}...`,
+        )
+        return false
+      }
 
       console.log(
         `[BoltcardStore] Stored pending top-up: ${paymentHash.substring(0, 16)}... for card ${cardId}`,
@@ -2259,6 +2273,18 @@ class BoltcardStore {
     )
 
     return (result.rowCount ?? 0) > 0
+  }
+
+  /**
+   * True when this payment hash has credited a card. Survives pending-row
+   * cleanup and card wipes (boltcard_credited_topups, migration 032).
+   */
+  async isTopUpCredited(paymentHash: string): Promise<boolean> {
+    const result: QueryResult<DbRow> = await query(
+      `SELECT 1 FROM boltcard_credited_topups WHERE payment_hash = $1`,
+      [paymentHash],
+    )
+    return result.rows.length > 0
   }
 
   /** True when a TOPUP audit row exists for this payment hash. */
@@ -2447,31 +2473,54 @@ class BoltcardStore {
     paymentHash: string,
     description: string | null = null,
   ): Promise<TopUpResult> {
-    // Balance mutation AND its audit record in ONE statement: no credited
-    // balance without its transaction row, and no window between them.
+    // Balance mutation, its audit record AND the credited-hash record in ONE
+    // statement: no credited balance without its transaction row, no window
+    // between them, and a payment hash credits at most once — a second
+    // credit fails boltcard_credited_topups' primary key and the whole
+    // statement rolls back (migration 032, blink-wip#1623).
     // Zero rows = definite failure (card missing / not active, nothing
-    // written); a thrown database error is AMBIGUOUS (the write may have
-    // committed) and is rethrown so callers keep the top-up claim.
-    const result: QueryResult<DbRow> = await query(
-      `WITH credited AS (
-         UPDATE boltcards
-         SET balance = balance + $2
-         WHERE id = $1 AND status = 'ACTIVE'
-         RETURNING id, balance
-       )
-       INSERT INTO boltcard_transactions
-         (card_id, tx_type, amount, balance_after, payment_hash, description, created_at)
-       SELECT id, $3, $2, balance, $4, $5, $6 FROM credited
-       RETURNING *`,
-      [
-        cardId,
-        amount,
-        TxType.TOPUP,
-        paymentHash || null,
-        description || "Card top-up",
-        Date.now(),
-      ],
-    )
+    // written). That primary-key violation = definite "already credited"
+    // (nothing written). Any other database error is AMBIGUOUS (the write may
+    // have committed) and is rethrown so callers keep the top-up claim.
+    let result: QueryResult<DbRow>
+    try {
+      result = await query(
+        `WITH credited AS (
+           UPDATE boltcards
+           SET balance = balance + $2
+           WHERE id = $1 AND status = 'ACTIVE'
+           RETURNING id, balance
+         ),
+         tx AS (
+           INSERT INTO boltcard_transactions
+             (card_id, tx_type, amount, balance_after, payment_hash, description, created_at)
+           SELECT id, $3, $2, balance, $4, $5, $6 FROM credited
+           RETURNING *
+         ),
+         recorded AS (
+           INSERT INTO boltcard_credited_topups (payment_hash, card_id, credited_at)
+           SELECT payment_hash, card_id, created_at FROM tx WHERE payment_hash IS NOT NULL
+         )
+         SELECT * FROM tx`,
+        [
+          cardId,
+          amount,
+          TxType.TOPUP,
+          paymentHash || null,
+          description || "Card top-up",
+          Date.now(),
+        ],
+      )
+    } catch (err: unknown) {
+      const pgErr = err as { code?: string; constraint?: string }
+      if (pgErr.code === "23505" && pgErr.constraint === CREDITED_TOPUP_PKEY) {
+        console.error(
+          `[BoltcardStore] Payment ${paymentHash.substring(0, 16)}... already credited a card - not crediting again`,
+        )
+        return { success: false, alreadyCredited: true, error: "Top-up already credited" }
+      }
+      throw err
+    }
 
     if ((result.rowCount ?? 0) === 0) {
       return { success: false, error: "Card not found or not active" }

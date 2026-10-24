@@ -61,13 +61,42 @@ export interface TestDatabase {
   connect: () => Promise<Client>
   /** Close lib/db's shared pool and drop the database. */
   teardown: () => Promise<void>
+  /** Apply the migrations skipped by `through` (no-op otherwise). */
+  migrateRest: () => Promise<void>
+}
+
+/** Migration number of a file (init.sql = 0), as the chart's runner reads it. */
+const migrationNumber = (file: string) =>
+  path.basename(file) === "init.sql" ? 0 : parseInt(path.basename(file).split("_")[0], 10)
+
+async function applyMigrations(url: string, files: string[]): Promise<void> {
+  const client = new Client({ connectionString: url })
+  await client.connect()
+  client.on("notice", () => undefined) // migrations RAISE NOTICE
+  try {
+    for (const file of files) {
+      try {
+        await client.query(fs.readFileSync(file, "utf8"))
+      } catch (err: unknown) {
+        throw new Error(
+          `Migration failed: ${path.basename(file)}: ${(err as Error).message}`,
+        )
+      }
+    }
+  } finally {
+    await client.end()
+  }
 }
 
 /**
  * Create and migrate a fresh database, and point lib/db at it. Call from
- * beforeAll (allow ~30 s) inside a describePg suite.
+ * beforeAll (allow ~30 s) inside a describePg suite. `through: N` stops after
+ * migration N (seed data a later migration must handle, then migrateRest()).
  */
-export async function setupTestDatabase(suite: string): Promise<TestDatabase> {
+export async function setupTestDatabase(
+  suite: string,
+  { through }: { through?: number } = {},
+): Promise<TestDatabase> {
   if (!PG_TEST_URL) throw new Error("PG_TEST_URL is not set")
   const name = `bt_test_${suite.replace(/[^a-z0-9]/gi, "_").toLowerCase()}_${Date.now()}_${Math.floor(
     Math.random() * 1e6,
@@ -82,22 +111,11 @@ export async function setupTestDatabase(suite: string): Promise<TestDatabase> {
   }
 
   const url = urlForDatabase(PG_TEST_URL, name)
-  const client = new Client({ connectionString: url })
-  await client.connect()
-  client.on("notice", () => undefined) // migrations RAISE NOTICE
-  try {
-    for (const file of migrationFiles()) {
-      try {
-        await client.query(fs.readFileSync(file, "utf8"))
-      } catch (err: unknown) {
-        throw new Error(
-          `Migration failed: ${path.basename(file)}: ${(err as Error).message}`,
-        )
-      }
-    }
-  } finally {
-    await client.end()
-  }
+  const all = migrationFiles()
+  const now =
+    through === undefined ? all : all.filter((f) => migrationNumber(f) <= through)
+  const rest = all.filter((f) => !now.includes(f))
+  await applyMigrations(url, now)
 
   // lib/db builds its pool lazily from DATABASE_URL on first use.
   process.env.DATABASE_URL = url
@@ -110,6 +128,7 @@ export async function setupTestDatabase(suite: string): Promise<TestDatabase> {
       await c.connect()
       return c
     },
+    migrateRest: () => applyMigrations(url, rest),
     teardown: async () => {
       const { closePool } = await import("../../../lib/db")
       await closePool()

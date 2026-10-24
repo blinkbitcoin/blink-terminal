@@ -412,6 +412,38 @@ describe("topUpCard: atomic credit + audit, definite vs ambiguous failure", () =
     mockPoolQuery.mockRejectedValueOnce(new Error("connection reset"))
     await expect(store().topUpCard("c1", 1000, "h")).rejects.toThrow("connection reset")
   })
+
+  it("records the credited hash in the SAME statement (migration 032)", async () => {
+    mockPoolQuery.mockResolvedValueOnce({ rowCount: 1, rows: [TX_ROW] })
+    await store().topUpCard("c1", 1000, "h", "d")
+    const q = String(mockPoolQuery.mock.calls[0][0]).replace(/\s+/g, " ")
+    expect(q).toMatch(
+      /INSERT INTO boltcard_credited_topups \(payment_hash, card_id, credited_at\) SELECT .* FROM tx/,
+    )
+  })
+
+  it("the credited-hash primary key violation is a DEFINITE 'already credited'", async () => {
+    mockPoolQuery.mockRejectedValueOnce(
+      Object.assign(new Error("duplicate key"), {
+        code: "23505",
+        constraint: "boltcard_credited_topups_pkey",
+      }),
+    )
+    await expect(store().topUpCard("c1", 1000, "h")).resolves.toMatchObject({
+      success: false,
+      alreadyCredited: true,
+    })
+  })
+
+  it("any other unique violation stays ambiguous and THROWS", async () => {
+    mockPoolQuery.mockRejectedValueOnce(
+      Object.assign(new Error("duplicate key"), {
+        code: "23505",
+        constraint: "something_else",
+      }),
+    )
+    await expect(store().topUpCard("c1", 1000, "h")).rejects.toThrow("duplicate key")
+  })
 })
 
 describe("review states (pending withdrawals, top-up flags)", () => {
