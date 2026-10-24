@@ -6,7 +6,7 @@
  */
 
 import { nip19 } from "nostr-tools"
-import type { DecodedResult } from "nostr-tools/lib/types/nip19"
+import type { DecodedResult } from "nostr-tools/nip19"
 
 import {
   SafeFetchError,
