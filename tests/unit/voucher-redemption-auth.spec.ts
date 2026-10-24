@@ -83,6 +83,7 @@ jest.mock("../../lib/blink-api", () => {
 
 import { BlinkAuthError, PaymentRejectedError } from "../../lib/blink-api"
 import { VOUCHER_API_KEY_HEADER } from "../../lib/voucher-auth"
+import { voucherTiebreak } from "../../lib/voucher-listing"
 import callbackHandler from "../../pages/api/voucher/callback"
 import cancelHandler from "../../pages/api/voucher/cancel"
 import createHandler from "../../pages/api/voucher/create"
@@ -400,6 +401,8 @@ describe("voucher list: current wallet owner only", () => {
     expect(mockStore.getVouchersByWalletIds).toHaveBeenCalledWith(
       ["wallet-1", "wallet-usd"],
       "production",
+      501, // no limit: 500 as before pagination (+1 to detect a next page)
+      { before: null, status: undefined },
     )
     const body = res.body as { vouchers: Array<{ id: string }>; stats: { total: number } }
     expect(body.vouchers.map((v) => v.id)).toEqual(["1".repeat(32)])
@@ -414,22 +417,73 @@ describe("voucher list: current wallet owner only", () => {
     expect(res.headers["cache-control"]).toBe("no-store")
   })
 
-  it("?status=PAID returns settled rows; ?status=CLAIMED covers CLAIMED + PAID", async () => {
-    mockStore.getVouchersByWalletIds.mockResolvedValue([
-      voucher({ id: "p".repeat(32), status: "PAID", claimed: true }),
-      voucher({ id: "c".repeat(32), status: "CLAIMED", claimed: true }),
-      voucher({ id: "1".repeat(32) }),
-    ])
-    const ids = async (status: string) =>
-      (
-        (await list({ [VOUCHER_API_KEY_HEADER]: OWNER_KEY }, { status })).body as {
-          vouchers: Array<{ id: string; status: string }>
-        }
-      ).vouchers.map((v) => `${v.id[0]}:${v.status}`)
+  it("?status= is passed to the store query (filtered in SQL, so older matches stay reachable)", async () => {
+    // The SQL classification itself is tested on real Postgres
+    // (tests/unit/pg/voucher-list-pages.pg.spec.ts).
+    for (const [query, status] of [
+      ["PAID", "PAID"],
+      ["claimed", "CLAIMED"],
+      ["ACTIVE", "ACTIVE"],
+      ["all", undefined],
+    ] as const) {
+      mockStore.getVouchersByWalletIds.mockClear()
+      await list({ [VOUCHER_API_KEY_HEADER]: OWNER_KEY }, { status: query })
+      expect(mockStore.getVouchersByWalletIds).toHaveBeenCalledWith(
+        ["wallet-1", "wallet-usd"],
+        "production",
+        501,
+        { before: null, status },
+      )
+    }
+    const bad = await list(
+      { [VOUCHER_API_KEY_HEADER]: OWNER_KEY },
+      { status: "whatever" },
+    )
+    expect(bad.statusCode).toBe(400)
+  })
 
-    expect(await ids("PAID")).toEqual(["p:PAID"])
-    expect(await ids("claimed")).toEqual(["p:PAID", "c:CLAIMED"])
-    expect(await ids("ACTIVE")).toEqual(["1:ACTIVE"])
+  it("an omitted limit still returns up to 500 (older clients do not page)", async () => {
+    const res = await list({ [VOUCHER_API_KEY_HEADER]: OWNER_KEY })
+    expect(res.statusCode).toBe(200)
+    expect(mockStore.getVouchersByWalletIds).toHaveBeenCalledWith(
+      ["wallet-1", "wallet-usd"],
+      "production",
+      501,
+      { before: null, status: undefined },
+    )
+  })
+
+  it("returns nextCursor when there are more vouchers than the page", async () => {
+    mockStore.getVouchersByWalletIds.mockResolvedValue([
+      voucher({ id: "a".repeat(32), createdAt: 3000 }),
+      voucher({ id: "b".repeat(32), createdAt: 2000 }),
+      voucher({ id: "c".repeat(32), createdAt: 1000 }),
+    ])
+    const res = await list({ [VOUCHER_API_KEY_HEADER]: OWNER_KEY }, { limit: "2" })
+    const body = res.body as {
+      vouchers: Array<{ id: string }>
+      nextCursor: string
+      truncated: boolean
+    }
+    expect(body.vouchers.map((v) => v.id[0])).toEqual(["a", "b"])
+    // created_at + SHA-256 of the id: never the id (a redemption secret)
+    expect(body.nextCursor).toBe(`2000_${voucherTiebreak("b".repeat(32))}`)
+    expect(body.nextCursor).not.toContain("b".repeat(8))
+    expect(body.truncated).toBe(true)
+
+    await list(
+      { [VOUCHER_API_KEY_HEADER]: OWNER_KEY },
+      { limit: "2", before: body.nextCursor },
+    )
+    expect(mockStore.getVouchersByWalletIds).toHaveBeenLastCalledWith(
+      ["wallet-1", "wallet-usd"],
+      "production",
+      3,
+      {
+        before: { createdAt: 2000, tiebreak: voucherTiebreak("b".repeat(32)) },
+        status: undefined,
+      },
+    )
   })
 
   it("answers 503 (not 401) when Blink is unavailable", async () => {
@@ -445,6 +499,8 @@ describe("voucher list: current wallet owner only", () => {
     expect(mockStore.getVouchersByWalletIds).toHaveBeenCalledWith(
       ["wallet-stg"],
       "staging",
+      501,
+      { before: null, status: undefined },
     )
   })
 
@@ -453,6 +509,8 @@ describe("voucher list: current wallet owner only", () => {
     expect(mockStore.getVouchersByWalletIds).toHaveBeenCalledWith(
       ["wallet-1", "wallet-usd"],
       "production",
+      501, // no limit: 500 as before pagination (+1 to detect a next page)
+      { before: null, status: undefined },
     )
   })
 

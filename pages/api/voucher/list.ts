@@ -7,8 +7,14 @@ import {
   OWNERSHIP_UNAVAILABLE,
   toEnvironment,
 } from "../../../lib/voucher-auth"
-import { isRedeemedStatus } from "../../../lib/voucher-expiry"
-import voucherStore, { OWNER_LIST_LIMIT } from "../../../lib/voucher-store"
+import {
+  decodeVoucherCursor,
+  encodeVoucherCursor,
+  OWNER_LIST_LIMIT,
+  OWNER_LIST_STATUSES,
+  type OwnerListStatus,
+} from "../../../lib/voucher-listing"
+import voucherStore from "../../../lib/voucher-store"
 
 /** Shape of a voucher record from the store */
 interface VoucherRecord {
@@ -42,7 +48,14 @@ interface VoucherRecord {
  * - environment: 'production' (default) or 'staging'
  * - status: Filter by status (optional): 'ACTIVE', 'CLAIMED', 'PAID', 'CANCELLED',
  *   'EXPIRED', 'all'. CLAIMED is the redeemed bucket (CLAIMED + PAID); PAID
- *   alone is settled redemptions only. Default: returns all vouchers
+ *   alone is settled redemptions only. Default: returns all vouchers.
+ *   Applied in the query, so older matches stay reachable page by page.
+ * - limit: page size, 1..OWNER_LIST_LIMIT (default OWNER_LIST_LIMIT, as before
+ *   pagination existed, so clients that do not page keep getting 500)
+ * - before: the previous page's `nextCursor` (blink-wip#1617)
+ *
+ * Newest first. `nextCursor` is null on the last page (`truncated` mirrors
+ * it for older clients). Stats always cover all of the caller's vouchers.
  */
 async function handler(req: NextApiRequest, res: NextApiResponse) {
   res.setHeader("Cache-Control", "no-store")
@@ -65,19 +78,46 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
   const ownedWallets = ownership.wallets
 
+  const rawStatus =
+    typeof req.query.status === "string" ? req.query.status.toUpperCase() : "ALL"
+  if (
+    rawStatus !== "ALL" &&
+    !OWNER_LIST_STATUSES.includes(rawStatus as OwnerListStatus)
+  ) {
+    return res.status(400).json({ error: "Invalid status filter" })
+  }
+  const status = rawStatus === "ALL" ? undefined : (rawStatus as OwnerListStatus)
+
+  const rawLimit = req.query.limit
+  const limit = rawLimit === undefined ? OWNER_LIST_LIMIT : Number(rawLimit)
+  if (!Number.isInteger(limit) || limit < 1 || limit > OWNER_LIST_LIMIT) {
+    return res.status(400).json({ error: `limit must be 1-${OWNER_LIST_LIMIT}` })
+  }
+
+  const before =
+    req.query.before === undefined ? null : decodeVoucherCursor(req.query.before)
+  if (req.query.before !== undefined && !before) {
+    return res.status(400).json({ error: "Invalid cursor" })
+  }
+
   try {
-    const filterStatus =
-      typeof req.query.status === "string" ? req.query.status : undefined
     const now = Date.now()
 
-    // Only vouchers drawn from wallets the caller currently owns
-    const allVouchers: VoucherRecord[] = await voucherStore.getVouchersByWalletIds(
+    // Only vouchers drawn from wallets the caller currently owns. One extra
+    // row tells whether there is a next page.
+    const page: VoucherRecord[] = await voucherStore.getVouchersByWalletIds(
       [...ownedWallets.keys()],
       environment,
+      limit + 1,
+      { before, status },
     )
+    const hasMore = page.length > limit
+    const pageVouchers = hasMore ? page.slice(0, limit) : page
+    const last = pageVouchers[pageVouchers.length - 1]
+    const nextCursor = hasMore && last ? encodeVoucherCursor(last) : null
 
     // Format vouchers for response
-    let vouchers = allVouchers.map((voucher: VoucherRecord) => {
+    const vouchers = pageVouchers.map((voucher: VoucherRecord) => {
       // Calculate time remaining for active vouchers
       let timeRemaining: number | null = null
       if (voucher.status === "ACTIVE" && voucher.expiresAt) {
@@ -105,23 +145,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       }
     })
 
-    // Filter by status if requested
-    if (filterStatus && filterStatus !== "all") {
-      const validStatuses = ["ACTIVE", "CLAIMED", "PAID", "CANCELLED", "EXPIRED"]
-      const normalizedFilter = filterStatus.toUpperCase()
-
-      if (validStatuses.includes(normalizedFilter)) {
-        // PAID is terminal CLAIMED: the redeemed bucket covers both, matching
-        // voucher_stats and the dashboard UI.
-        vouchers = vouchers.filter((v: VoucherRecord) =>
-          normalizedFilter === "CLAIMED"
-            ? isRedeemedStatus(v.status)
-            : v.status === normalizedFilter,
-        )
-      }
-    }
-
-    // Stats cover all of the caller's vouchers, not just the capped list
+    // Stats cover all of the caller's vouchers, not just this page
     const stats = await voucherStore.getVoucherStatsByWalletIds(
       [...ownedWallets.keys()],
       environment,
@@ -131,8 +155,9 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       success: true,
       vouchers: vouchers,
       count: vouchers.length,
-      // The listing is capped (newest first); stats are not.
-      truncated: allVouchers.length >= OWNER_LIST_LIMIT,
+      nextCursor,
+      // Older clients: more vouchers exist beyond this page.
+      truncated: nextCursor !== null,
       stats: stats,
     })
   } catch (error: unknown) {
