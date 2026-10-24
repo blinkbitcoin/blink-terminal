@@ -42,13 +42,42 @@ interface VerifyResult extends ValidationResult {
 }
 
 /**
- * Options passed to the main verify() method.
+ * Options common to header-based and event-based verification.
  */
-interface VerifyOptions {
-  authHeader: string
+interface VerifyCommonOptions {
   url: string
   method: string
   maxAgeSeconds?: number
+  /**
+   * Per-session challenge that the event MUST carry in a `challenge` tag.
+   *
+   * Plain NIP-98 has no nonce, so a signed event is a bearer artifact for its
+   * whole freshness window. The server-held NIP-46 flow mints a challenge per
+   * session and asks the signer to include it, which binds the signature to one
+   * specific sign-in attempt. Omitted for the legacy header flow, which relies
+   * on the freshness window alone.
+   */
+  challenge?: string
+  /**
+   * Pubkey the event MUST be signed by. Used by the NIP-46 worker to require
+   * that the key which answered `get_public_key` is the key that signed.
+   */
+  expectedPubkey?: string
+}
+
+/**
+ * Options passed to the main verify() method.
+ */
+interface VerifyOptions extends VerifyCommonOptions {
+  authHeader: string
+}
+
+/**
+ * Options for verifying an already-decoded event (server-held NIP-46 flow,
+ * where the signed event arrives over a relay rather than in a header).
+ */
+interface VerifySignedEventOptions extends VerifyCommonOptions {
+  event: unknown
 }
 
 // Cache for dynamically imported modules
@@ -344,6 +373,34 @@ class Nip98Verifier {
   }
 
   /**
+   * Validate the per-session challenge tag.
+   *
+   * Compared in constant time: the challenge is the replay guard for the
+   * server-held NIP-46 flow, so it is treated like a secret.
+   */
+  static validateChallengeTag(
+    event: NostrEvent,
+    expectedChallenge: string,
+  ): ValidationResult {
+    const challengeTag = getTagValue(event.tags, "challenge")
+
+    if (!challengeTag) {
+      return { valid: false, error: "Missing challenge tag" }
+    }
+
+    const expected = Buffer.from(expectedChallenge)
+    const presented = Buffer.from(challengeTag)
+    if (
+      expected.length !== presented.length ||
+      !crypto.timingSafeEqual(expected, presented)
+    ) {
+      return { valid: false, error: "Challenge mismatch" }
+    }
+
+    return { valid: true }
+  }
+
+  /**
    * Verify the event ID matches the calculated hash
    */
   static verifyEventId(event: NostrEvent): ValidationResult {
@@ -382,12 +439,7 @@ class Nip98Verifier {
   /**
    * Fully validate a NIP-98 authentication request
    */
-  static async verify({
-    authHeader,
-    url,
-    method,
-    maxAgeSeconds = MAX_EVENT_AGE_SECONDS,
-  }: VerifyOptions): Promise<VerifyResult> {
+  static async verify({ authHeader, ...rest }: VerifyOptions): Promise<VerifyResult> {
     // Extract token
     const event = this.extractToken(authHeader)
     if (!event) {
@@ -397,10 +449,38 @@ class Nip98Verifier {
       }
     }
 
+    return this.verifySignedEvent({ ...rest, event })
+  }
+
+  /**
+   * Fully validate an already-decoded NIP-98 event.
+   */
+  static async verifySignedEvent({
+    event: candidate,
+    url,
+    method,
+    maxAgeSeconds = MAX_EVENT_AGE_SECONDS,
+    challenge,
+    expectedPubkey,
+  }: VerifySignedEventOptions): Promise<VerifyResult> {
     // Validate structure
-    const structureResult = this.validateEventStructure(event)
+    const structureResult = this.validateEventStructure(candidate)
     if (!structureResult.valid) {
       return structureResult
+    }
+    const event = candidate as NostrEvent
+
+    // Bind the signature to the expected signer, when the caller knows it.
+    if (expectedPubkey && event.pubkey.toLowerCase() !== expectedPubkey.toLowerCase()) {
+      return { valid: false, error: "Event pubkey does not match expected signer" }
+    }
+
+    // Validate the per-session challenge, when one is required.
+    if (challenge) {
+      const challengeResult = this.validateChallengeTag(event, challenge)
+      if (!challengeResult.valid) {
+        return challengeResult
+      }
     }
 
     // Validate timestamp

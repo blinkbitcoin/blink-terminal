@@ -21,6 +21,9 @@ import {
   nostrLoginSchema,
   createVoucherSchema,
   validateBody,
+  MAX_TIP_RECIPIENTS,
+  MAX_NOSTR_TAGS,
+  MAX_NOSTR_TAG_ITEMS,
 } from "../../lib/validation"
 
 // ---------------------------------------------------------------------------
@@ -330,6 +333,96 @@ describe("lib/validation — route schemas", () => {
         createVoucherSchema.parse({ amount: 100, expiresInHours: 9000 }),
       ).toThrow()
     })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Request array bounds (GHSA-mrhx-c7xc-m3w5)
+// ---------------------------------------------------------------------------
+
+describe("lib/validation — request arrays are bounded (GHSA-mrhx-c7xc-m3w5)", () => {
+  const pubkey = "a".repeat(64)
+  const login = (tags: unknown) => ({
+    event: { kind: 27235, content: "", tags, pubkey, sig: "s", id: "i", created_at: 1 },
+  })
+  const ownership = (tags: unknown) => ({
+    signedEvent: { kind: 22242, content: "c", tags, pubkey, sig: "s" },
+  })
+
+  it("accepts real-shaped events and the maximum sizes", () => {
+    const tags = [
+      ["u", "https://terminal.blinkbtc.com/api/auth/nostr-login"],
+      ["method", "POST"],
+    ]
+    expect(nostrLoginSchema.safeParse(login(tags)).success).toBe(true)
+    const max = Array.from({ length: MAX_NOSTR_TAGS }, () =>
+      Array(MAX_NOSTR_TAG_ITEMS).fill("x"),
+    )
+    expect(nostrLoginSchema.safeParse(login(max)).success).toBe(true)
+    expect(verifyOwnershipSchema.safeParse(ownership(max)).success).toBe(true)
+    const recipients = Array.from({ length: MAX_TIP_RECIPIENTS }, () => ({
+      username: "bob",
+      share: 5,
+    }))
+    expect(
+      createInvoiceSchema.safeParse({
+        amount: 1,
+        currency: "BTC",
+        tipRecipients: recipients,
+      }).success,
+    ).toBe(true)
+  })
+
+  it.each([
+    ["too many tags", Array.from({ length: MAX_NOSTR_TAGS + 1 }, () => ["t"])],
+    ["a tag with too many items", [Array(MAX_NOSTR_TAG_ITEMS + 1).fill("x")]],
+  ])("rejects %s (login and ownership events)", (_name, tags) => {
+    expect(nostrLoginSchema.safeParse(login(tags)).success).toBe(false)
+    expect(verifyOwnershipSchema.safeParse(ownership(tags)).success).toBe(false)
+  })
+
+  it("rejects too many tip recipients", () => {
+    const recipients = Array.from({ length: MAX_TIP_RECIPIENTS + 1 }, () => ({
+      username: "bob",
+    }))
+    expect(
+      createInvoiceSchema.safeParse({
+        amount: 1,
+        currency: "BTC",
+        tipRecipients: recipients,
+      }).success,
+    ).toBe(false)
+  })
+
+  // The advisory's payload: one sub-1 MB body whose array elements all fail.
+  // Before (zod 3.23.8, unbounded): 500,000 issues, ~150 MB heap, ~0.7 s per
+  // request. Now the length check stops before any element is parsed.
+  it.each([
+    [
+      "nostr-login tags (one oversized tag)",
+      () => nostrLoginSchema.safeParse(login([Array(500_000).fill(1)])),
+    ],
+    [
+      "nostr-login tags (many tags)",
+      () => nostrLoginSchema.safeParse(login(Array(500_000).fill(1))),
+    ],
+    [
+      "verify-ownership tags",
+      () => verifyOwnershipSchema.safeParse(ownership([Array(500_000).fill(1)])),
+    ],
+    [
+      "create-invoice tipRecipients",
+      () =>
+        createInvoiceSchema.safeParse({
+          amount: 1,
+          currency: "BTC",
+          tipRecipients: Array(500_000).fill(1),
+        }),
+    ],
+  ])("an oversized array of failing elements is rejected cheaply: %s", (_name, parse) => {
+    const result = parse()
+    expect(result.success).toBe(false)
+    expect(result.error!.issues.length).toBeLessThanOrEqual(2)
   })
 })
 

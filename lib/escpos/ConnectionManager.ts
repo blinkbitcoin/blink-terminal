@@ -420,6 +420,33 @@ class ConnectionManager {
     return this._activeAdapter
   }
 
+  /**
+   * Get the best available adapter that is NOT the PDF fallback.
+   *
+   * The PDF adapter is voucher-only (it ignores ESC/POS bytes and renders a
+   * voucher PDF), so receipt printing must never route to it — even if the user
+   * previously selected PDF as their preferred method for vouchers.
+   *
+   * Honors the user's preferred adapter when it is available and non-PDF;
+   * otherwise picks the highest-priority available non-PDF adapter.
+   *
+   * @returns {Promise<BaseAdapter|null>} a non-PDF adapter, or null if none available
+   */
+  async getBestNonPdfAdapter(): Promise<BaseAdapter | null> {
+    const adapters = await this.getAvailableAdapters()
+
+    // Prefer the user's chosen adapter if it's available and not PDF.
+    const preferredType = this._preferences.preferredAdapter
+    if (preferredType && preferredType !== "pdf") {
+      const preferred = adapters.find((a) => a.type === preferredType && a.available)
+      if (preferred) return preferred.adapter
+    }
+
+    // Otherwise the highest-priority available non-PDF adapter.
+    const best = adapters.find((a) => a.available && a.type !== "pdf")
+    return best ? best.adapter : null
+  }
+
   // ============================================================
   // RECOMMENDATION ENGINE
   // ============================================================

@@ -157,7 +157,9 @@ class ProfileStorage {
   /**
    * Get profile by public key
    */
-  static getProfileByPublicKey(publicKey: string): StoredProfile | null {
+  static getProfileByPublicKey(
+    publicKey: string | null | undefined,
+  ): StoredProfile | null {
     if (!publicKey) return null
     const profiles: StoredProfile[] = this.getProfiles()
     // Normalize to lowercase for comparison (profiles store lowercase)

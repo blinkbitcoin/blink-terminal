@@ -1,10 +1,11 @@
 /**
  * Citrusrate Currency Definitions (Client-side ES Module)
  *
- * This file mirrors citrusrate-currencies.js but uses ES module exports
- * for use in React components and hooks.
+ * This file mirrors lib/rate-providers/citrusrate-currencies.ts but uses ES module
+ * exports for use in React components and hooks. Keep the two in sync.
  *
- * Contains metadata for all 40 African currencies supported by Citrusrate API.
+ * Contains metadata for the currencies served by the Citrusrate V1 API
+ * (verified against GET /v1/btc/all — 38 official rates as of Sept 2026).
  */
 
 // =============================================================================
@@ -35,7 +36,9 @@ export interface CitrusrateAltCurrency {
 // =============================================================================
 
 /**
- * 24 African currencies available ONLY through Citrusrate (not in Blink API)
+ * 21 currencies available ONLY through Citrusrate (not in Blink API)
+ * (20 African + VUV/Vanuatu). Removed: MRO, SLL, STD, ZWD — deprecated ISO
+ * codes no longer returned by the live Citrusrate API.
  * These are added directly to the currency list
  */
 export const CITRUSRATE_EXCLUSIVE_CURRENCIES: CitrusrateExclusiveCurrency[] = [
@@ -152,14 +155,6 @@ export const CITRUSRATE_EXCLUSIVE_CURRENCIES: CitrusrateExclusiveCurrency[] = [
     rateProvider: "citrusrate_official",
   },
   {
-    id: "MRO",
-    name: "Mauritanian Ouguiya (Citrusrate)",
-    flag: "🇲🇷",
-    symbol: "UM",
-    fractionDigits: 2,
-    rateProvider: "citrusrate_official",
-  },
-  {
     id: "RWF",
     name: "Rwandan Franc (Citrusrate)",
     flag: "🇷🇼",
@@ -184,26 +179,10 @@ export const CITRUSRATE_EXCLUSIVE_CURRENCIES: CitrusrateExclusiveCurrency[] = [
     rateProvider: "citrusrate_official",
   },
   {
-    id: "SLL",
-    name: "Sierra Leonean Leone (Citrusrate)",
-    flag: "🇸🇱",
-    symbol: "Le",
-    fractionDigits: 2,
-    rateProvider: "citrusrate_official",
-  },
-  {
     id: "SOS",
     name: "Somali Shilling (Citrusrate)",
     flag: "🇸🇴",
     symbol: "S",
-    fractionDigits: 2,
-    rateProvider: "citrusrate_official",
-  },
-  {
-    id: "STD",
-    name: "São Tomé Dobra (Citrusrate)",
-    flag: "🇸🇹",
-    symbol: "Db",
     fractionDigits: 2,
     rateProvider: "citrusrate_official",
   },
@@ -224,20 +203,29 @@ export const CITRUSRATE_EXCLUSIVE_CURRENCIES: CitrusrateExclusiveCurrency[] = [
     rateProvider: "citrusrate_official",
   },
   {
-    id: "ZWD",
-    name: "Zimbabwean Dollar (Citrusrate)",
-    flag: "🇿🇼",
-    symbol: "Z$",
-    fractionDigits: 2,
+    id: "VUV",
+    name: "Vanuatu Vatu (Citrusrate)",
+    flag: "🇻🇺",
+    symbol: "VT",
+    fractionDigits: 0,
     rateProvider: "citrusrate_official",
   },
 ]
 
 /**
- * 16 Citrusrate alternative currencies for those that overlap with Blink API
+ * 17 Citrusrate alternative currencies for those that overlap with Blink API
  * These provide an alternative rate source (Citrusrate aggregated African rates)
  */
 export const CITRUSRATE_ALT_CURRENCIES: CitrusrateAltCurrency[] = [
+  {
+    id: "EGP_CITRUS",
+    baseId: "EGP",
+    name: "Egyptian Pound (Citrusrate)",
+    flag: "🇪🇬",
+    symbol: "E£",
+    fractionDigits: 2,
+    rateProvider: "citrusrate_official",
+  },
   {
     id: "ETB_CITRUS",
     baseId: "ETB",

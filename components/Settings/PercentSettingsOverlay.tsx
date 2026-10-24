@@ -13,6 +13,11 @@ interface PercentSettingsOverlayProps {
   activeTipProfile: TipProfile | null
   commissionEnabled: boolean
   commissionPresets: number[]
+  /** True when the active receive wallet is a self-custodial (Spark) LN address.
+      Tips can't be forwarded for such wallets, so Tip % Settings is disabled.
+      Commission % Settings stays available (it's tied to the voucher sending
+      wallet, unrelated to the Spark receive wallet). */
+  isSparkLnAddress: boolean
   setShowPercentSettings: (show: boolean) => void
   setShowTipProfileSettings: (show: boolean) => void
   setShowCommissionSettings: (show: boolean) => void
@@ -25,6 +30,7 @@ export default function PercentSettingsOverlay({
   activeTipProfile,
   commissionEnabled,
   commissionPresets,
+  isSparkLnAddress,
   setShowPercentSettings,
   setShowTipProfileSettings,
   setShowCommissionSettings,
@@ -60,13 +66,19 @@ export default function PercentSettingsOverlay({
         {/* Content */}
         <div className="max-w-md mx-auto px-4 py-6">
           <div className="space-y-4">
-            {/* Tip % Settings */}
+            {/* Tip % Settings - disabled for self-custodial (Spark) receive
+                wallets (tips can't be forwarded). */}
             <button
               onClick={() => {
+                if (isSparkLnAddress) return
                 setShowPercentSettings(false)
                 setShowTipProfileSettings(true)
               }}
-              className={`w-full p-4 rounded-lg border-2 transition-all ${getSelectionTileClasses()}`}
+              disabled={isSparkLnAddress}
+              aria-disabled={isSparkLnAddress}
+              className={`w-full p-4 rounded-lg border-2 transition-all ${getSelectionTileClasses()} ${
+                isSparkLnAddress ? "opacity-50 cursor-not-allowed" : ""
+              }`}
             >
               <div className="flex items-center justify-between">
                 <div className="text-left">
@@ -74,12 +86,14 @@ export default function PercentSettingsOverlay({
                     Tip % Settings
                   </h3>
                   <p className="text-sm text-gray-600 dark:text-gray-400">
-                    Configure tip percentages for POS payments
+                    {isSparkLnAddress
+                      ? "Not available for self-custodial Lightning address wallets"
+                      : "Configure tip percentages for POS payments"}
                   </p>
                 </div>
                 <div className="flex items-center text-sm text-gray-500 dark:text-gray-400">
                   <span>{activeTipProfile?.name || "Custom"}</span>
-                  <span className="ml-1">&#8250;</span>
+                  {!isSparkLnAddress && <span className="ml-1">&#8250;</span>}
                 </div>
               </div>
             </button>

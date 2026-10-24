@@ -17,10 +17,15 @@ import { useState, useCallback, useEffect } from "react"
 
 import {
   FORMAT_LOCALES,
+  DEFAULT_AMOUNT_DISPLAY,
   type NumberFormatPreference,
   type BitcoinFormatPreference,
   type NumpadLayoutPreference,
+  type AmountDisplayPreference,
 } from "../number-format"
+import type { OrangePillMode } from "../orangepill"
+
+import { type Theme, normalizeEnabledThemes, parseEnabledThemes } from "./useTheme"
 
 // ============================================================================
 // Types
@@ -37,6 +42,9 @@ export type BitcoinFormat = BitcoinFormatPreference
 
 /** Numpad layout — re-exported from number-format.ts canonical types */
 export type NumpadLayout = NumpadLayoutPreference
+
+/** Amount display — re-exported from number-format.ts canonical types */
+export type AmountDisplay = AmountDisplayPreference
 
 /** Return type for the useDisplaySettings hook */
 export interface UseDisplaySettingsReturn {
@@ -57,6 +65,20 @@ export interface UseDisplaySettingsReturn {
   numpadLayout: NumpadLayout
   setNumpadLayout: (layout: NumpadLayout) => void
 
+  // Themes included in the logo-tap cycle (subset of THEME_ORDER, >= 1)
+  enabledThemes: Theme[]
+  setEnabledThemes: (themes: Theme[]) => void
+
+  // Amount display state (fiat-primary vs sats-primary)
+  amountDisplay: AmountDisplay
+  setAmountDisplay: (preference: AmountDisplay) => void
+
+  // Orange-pill receipt footer state
+  orangePillMode: OrangePillMode
+  setOrangePillMode: (mode: OrangePillMode) => void
+  orangePillStaticUrl: string
+  setOrangePillStaticUrl: (url: string) => void
+
   // Currency filter state (for currency selector search)
   currencyFilter: string
   setCurrencyFilter: (filter: string) => void
@@ -75,15 +97,41 @@ export interface UseDisplaySettingsReturn {
 // ============================================================================
 
 const STORAGE_KEYS = {
+  DISPLAY_CURRENCY: "blinkpos-display-currency",
   NUMBER_FORMAT: "blinkpos-number-format",
   BITCOIN_FORMAT: "blinkpos-bitcoin-format",
   NUMPAD_LAYOUT: "blinkpos-numpad-layout",
+  AMOUNT_DISPLAY: "blinkpos-amount-display",
+  ENABLED_THEMES: "blinkpos-enabled-themes",
+  ORANGE_PILL_MODE: "blinkpos-orangepill-mode",
+  ORANGE_PILL_STATIC_URL: "blinkpos-orangepill-static-url",
 } as const
 
 const DEFAULT_NUMBER_FORMAT: NumberFormat = "auto"
 const DEFAULT_BITCOIN_FORMAT: BitcoinFormat = "sats"
 const DEFAULT_NUMPAD_LAYOUT: NumpadLayout = "calculator"
 const DEFAULT_DISPLAY_CURRENCY: DisplayCurrency = "USD"
+
+/**
+ * Whether this device already has a *valid* persisted display-currency choice.
+ *
+ * Used by login-time effects to decide whether to seed the display currency
+ * from the account/server (first run only) or leave the device choice intact.
+ * Only a valid value (`"USD"`/`"BTC"`) counts — this must agree with the state
+ * initializer's validation so a corrupted/legacy value (e.g. `"EUR"`) does not
+ * block first-run seeding and strand the device on the default.
+ */
+export function hasStoredDisplayCurrency(): boolean {
+  if (typeof window === "undefined") {
+    return false
+  }
+  try {
+    const stored = localStorage.getItem(STORAGE_KEYS.DISPLAY_CURRENCY)
+    return stored === "USD" || stored === "BTC"
+  } catch {
+    return false
+  }
+}
 
 // ============================================================================
 // Helper Functions
@@ -155,9 +203,13 @@ export function useDisplaySettings(): UseDisplaySettingsReturn {
   // State
   // ---------------------------------------------------------------------------
 
-  const [displayCurrency, setDisplayCurrencyState] = useState<DisplayCurrency>(
-    DEFAULT_DISPLAY_CURRENCY,
-  )
+  const [displayCurrency, setDisplayCurrencyState] = useState<DisplayCurrency>(() => {
+    const stored = getFromStorage<string>(
+      STORAGE_KEYS.DISPLAY_CURRENCY,
+      DEFAULT_DISPLAY_CURRENCY,
+    )
+    return stored === "USD" || stored === "BTC" ? stored : DEFAULT_DISPLAY_CURRENCY
+  })
 
   const [numberFormat, setNumberFormatState] = useState<NumberFormat>(() =>
     getFromStorage(STORAGE_KEYS.NUMBER_FORMAT, DEFAULT_NUMBER_FORMAT),
@@ -171,6 +223,26 @@ export function useDisplaySettings(): UseDisplaySettingsReturn {
     getFromStorage(STORAGE_KEYS.NUMPAD_LAYOUT, DEFAULT_NUMPAD_LAYOUT),
   )
 
+  const [enabledThemes, setEnabledThemesState] = useState<Theme[]>(() =>
+    parseEnabledThemes(
+      typeof window === "undefined"
+        ? null
+        : window.localStorage.getItem(STORAGE_KEYS.ENABLED_THEMES),
+    ),
+  )
+
+  const [amountDisplay, setAmountDisplayState] = useState<AmountDisplay>(() =>
+    getFromStorage(STORAGE_KEYS.AMOUNT_DISPLAY, DEFAULT_AMOUNT_DISPLAY),
+  )
+
+  const [orangePillMode, setOrangePillModeState] = useState<OrangePillMode>(() =>
+    getFromStorage<OrangePillMode>(STORAGE_KEYS.ORANGE_PILL_MODE, "off"),
+  )
+
+  const [orangePillStaticUrl, setOrangePillStaticUrlState] = useState<string>(() =>
+    getFromStorage(STORAGE_KEYS.ORANGE_PILL_STATIC_URL, ""),
+  )
+
   const [currencyFilter, setCurrencyFilterState] = useState<string>("")
   const [currencyFilterDebounced, setCurrencyFilterDebouncedState] = useState<string>("")
 
@@ -180,10 +252,15 @@ export function useDisplaySettings(): UseDisplaySettingsReturn {
 
   const setDisplayCurrency = useCallback((currency: DisplayCurrency) => {
     setDisplayCurrencyState(currency)
+    setToStorage(STORAGE_KEYS.DISPLAY_CURRENCY, currency)
   }, [])
 
   const toggleDisplayCurrency = useCallback(() => {
-    setDisplayCurrencyState((prev) => (prev === "USD" ? "BTC" : "USD"))
+    setDisplayCurrencyState((prev) => {
+      const next = prev === "USD" ? "BTC" : "USD"
+      setToStorage(STORAGE_KEYS.DISPLAY_CURRENCY, next)
+      return next
+    })
   }, [])
 
   // ---------------------------------------------------------------------------
@@ -211,6 +288,40 @@ export function useDisplaySettings(): UseDisplaySettingsReturn {
   const setNumpadLayout = useCallback((layout: NumpadLayout) => {
     setNumpadLayoutState(layout)
     setToStorage(STORAGE_KEYS.NUMPAD_LAYOUT, layout)
+  }, [])
+
+  // ---------------------------------------------------------------------------
+  // Callbacks - Enabled Themes (logo-tap cycle set)
+  // ---------------------------------------------------------------------------
+
+  const setEnabledThemes = useCallback((themes: Theme[]) => {
+    // Keep canonical order and never persist an empty set.
+    const next = normalizeEnabledThemes(themes)
+    setEnabledThemesState(next)
+    setToStorage(STORAGE_KEYS.ENABLED_THEMES, JSON.stringify(next))
+  }, [])
+
+  // ---------------------------------------------------------------------------
+  // Callbacks - Amount Display
+  // ---------------------------------------------------------------------------
+
+  const setAmountDisplay = useCallback((preference: AmountDisplay) => {
+    setAmountDisplayState(preference)
+    setToStorage(STORAGE_KEYS.AMOUNT_DISPLAY, preference)
+  }, [])
+
+  // ---------------------------------------------------------------------------
+  // Callbacks - Orange-pill footer
+  // ---------------------------------------------------------------------------
+
+  const setOrangePillMode = useCallback((mode: OrangePillMode) => {
+    setOrangePillModeState(mode)
+    setToStorage(STORAGE_KEYS.ORANGE_PILL_MODE, mode)
+  }, [])
+
+  const setOrangePillStaticUrl = useCallback((url: string) => {
+    setOrangePillStaticUrlState(url)
+    setToStorage(STORAGE_KEYS.ORANGE_PILL_STATIC_URL, url)
   }, [])
 
   // ---------------------------------------------------------------------------
@@ -321,6 +432,20 @@ export function useDisplaySettings(): UseDisplaySettingsReturn {
     // Numpad layout
     numpadLayout,
     setNumpadLayout,
+
+    // Enabled themes (logo-tap cycle set)
+    enabledThemes,
+    setEnabledThemes,
+
+    // Amount display
+    amountDisplay,
+    setAmountDisplay,
+
+    // Orange-pill footer
+    orangePillMode,
+    setOrangePillMode,
+    orangePillStaticUrl,
+    setOrangePillStaticUrl,
 
     // Currency filter
     currencyFilter,

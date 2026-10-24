@@ -1,6 +1,22 @@
 #!/bin/bash
 # ============================================================================
-# Production Deployment Script - Git-Based Workflow
+# DEPRECATED — NOT THE PRODUCTION DEPLOYMENT PATH
+# ============================================================================
+#
+# Production runs on Kubernetes: CI publishes the image and bumps it in
+# blinkbitcoin/charts (charts/blink-terminal), which blink-deployments
+# installs via Helm. Database migrations are applied there by the
+# `run-migrations` init container (charts/blink-terminal/templates/
+# deployment.yaml): every database/migrations/*.sql above the current
+# schema_version, in sorted order, with `set -euo pipefail` and
+# `psql -v ON_ERROR_STOP=1`, before the app container starts.
+#
+# This legacy docker-compose script is kept for reference only. Its explicit
+# migration chain stops at 019 and is NOT maintained; do not use it to deploy
+# or to reason about which migrations production applies.
+#
+# ============================================================================
+# Production Deployment Script - Git-Based Workflow (legacy)
 # ============================================================================
 #
 # ⚠️  IMPORTANT: This app runs via DOCKER, NOT PM2!
@@ -471,15 +487,10 @@ ssh ${PROD_USER}@${PROD_SERVER} bash <<EOF
         
         echo "✅ Migration 008 applied successfully"
         
-        # Run one-time voucher migration from JSON to PostgreSQL
-        echo ""
-        echo "🔄 Checking for vouchers to migrate from JSON..."
-        if docker-compose -f docker-compose.prod.yml exec -T app sh -c "test -f .voucher-store.json && echo 'exists'" | grep -q 'exists'; then
-            echo "📦 Found .voucher-store.json, migrating vouchers to PostgreSQL..."
-            docker-compose -f docker-compose.prod.yml exec -T app node scripts/migrate-vouchers-to-postgres.js || echo "⚠️  Voucher migration encountered issues (non-fatal)"
-        else
-            echo "✅ No JSON voucher store found (fresh installation or already migrated)"
-        fi
+        # The one-time JSON -> PostgreSQL voucher migration script was retired
+        # (blink-wip#1587): it wrote unrotatable CryptoJS ciphertext with a
+        # hardcoded fallback key. Secrets are now written only through
+        # lib/crypto/keyring.js.
     else
         echo "✅ Migration 008 already applied (skipping)"
     fi
@@ -712,6 +723,33 @@ ssh ${PROD_USER}@${PROD_SERVER} bash <<EOF
         echo "✅ Migration 018 applied successfully"
     else
         echo "✅ Migration 018 already applied (skipping)"
+    fi
+    
+    # Refresh schema version
+    SCHEMA_VERSION=\$(get_schema_version)
+    
+    # Apply migration 019 (payment splits, events, active payments view)
+    if [ "\${SCHEMA_VERSION}" -lt 19 ]; then
+        echo "🔄 Applying migration 019 (payment splits and events tables)..."
+        
+        # Enable pipefail so the psql exit code is not masked by tee/grep/tail
+        set -o pipefail
+        if ! docker-compose -f docker-compose.prod.yml exec -T postgres psql -U blinkpos -d blinkpos < database/migrations/019_payment_splits.sql 2>&1 | tee ${BACKUP_DIR}/migration-019.log | grep -v "^$" | tail -20; then
+            set +o pipefail
+            echo ""
+            echo "❌ MIGRATION 019 FAILED!"
+            echo "📋 Check logs: ${BACKUP_DIR}/migration-019.log"
+            echo ""
+            echo "🔙 Rolling back deployment..."
+            docker-compose -f docker-compose.prod.yml down
+            echo "❌ Deployment stopped due to migration failure"
+            exit 1
+        fi
+        set +o pipefail
+        
+        echo "✅ Migration 019 applied successfully"
+    else
+        echo "✅ Migration 019 already applied (skipping)"
     fi
     
     # Display final schema version

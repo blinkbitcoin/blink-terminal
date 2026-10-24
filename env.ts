@@ -25,8 +25,23 @@ export const env = createEnv({
     BLINK_ENVIRONMENT: z.enum(["production", "staging"]).default("production"),
     BLINKPOS_API_KEY: z.string().min(1).optional(),
     BLINKPOS_BTC_WALLET_ID: z.string().min(1).optional(),
+    // Optional absolute ceiling (sats) on a single forward/tip payout from the
+    // BlinkPOS intermediary wallet. Defense-in-depth; unset disables the check.
+    BLINKPOS_MAX_FORWARD_SATS: z.coerce.number().int().positive().optional(),
     BLINK_WEBHOOK_SECRET: z.string().min(1).optional(),
     BLINK_STAGING_WEBHOOK_SECRET: z.string().min(1).optional(),
+    // Unlocks the detailed /api/health view (X-Health-Token). Unset: public
+    // body only (blink-wip#1690 item 3).
+    HEALTH_TOKEN: z.string().min(16).optional(),
+    // Bolt Card withdrawal reconciliation (blink-wip#1619): tick cadence
+    // (ms; 0 disables), per-pass deadline (ms, kept below the interval), rows
+    // per pass, and the age after which an unresolved withdrawal is reported.
+    // Runtime consumers read these through lib/boltcard/reconcile-config.ts,
+    // which falls back to defaults on invalid values instead of failing boot.
+    BOLTCARD_RECONCILE_INTERVAL_MS: z.coerce.number().int().nonnegative().optional(),
+    BOLTCARD_RECONCILE_PASS_TIMEOUT_MS: z.coerce.number().int().positive().optional(),
+    BOLTCARD_RECONCILE_BATCH: z.coerce.number().int().positive().optional(),
+    BOLTCARD_WITHDRAWAL_STALE_MINUTES: z.coerce.number().int().positive().optional(),
 
     // --- Database (PostgreSQL) ---
     DATABASE_URL: z.string().url().optional(),
@@ -45,7 +60,11 @@ export const env = createEnv({
     // --- Auth / Security ---
     JWT_SECRET: z.string().min(1),
     ENCRYPTION_KEY: z.string().min(1),
-    NETWORK_ENCRYPTION_KEY: z.string().min(1).optional(),
+    // Read-only keys during a rotation, comma-separated, newest first
+    // (lib/crypto/keyring.js, docs/encryption-key-rotation.md).
+    ENCRYPTION_KEY_PREVIOUS: z.string().min(1).optional(),
+    // "legacy" (default: rollback-safe writes) or "v2" (blink-wip#1587).
+    ENCRYPTION_WRITE_FORMAT: z.enum(["legacy", "v2"]).optional(),
 
     // --- External Services ---
     CITRUSRATE_API_KEY: z.string().min(1).optional(),
@@ -67,7 +86,14 @@ export const env = createEnv({
   client: {
     NEXT_PUBLIC_BASE_URL: z.string().url().optional(),
     NEXT_PUBLIC_GIT_COMMIT: z.string().optional(),
-    NEXT_PUBLIC_USE_NDK_NIP46: z.enum(["true", "false"]).optional(),
+    // Split Payments (tip splitting) requires the intermediate BlinkPOS escrow
+    // account (compliance concern) and is disabled by default. Set to "true" to
+    // re-enable the dormant escrow + forwarding path. See lib/config/features.ts.
+    NEXT_PUBLIC_SPLIT_PAYMENTS_ENABLED: z.enum(["true", "false"]).optional(),
+    // In-app password auth (password sign-in + create-account) is disabled by
+    // default so sign-in is Nostr-only. Set to "true" to re-enable the dormant
+    // in-app password UI. See lib/config/features.ts.
+    NEXT_PUBLIC_ENABLE_PASSWORD_AUTH: z.enum(["true", "false"]).optional(),
   },
 
   runtimeEnv: {
@@ -76,8 +102,14 @@ export const env = createEnv({
     BLINK_ENVIRONMENT: process.env.BLINK_ENVIRONMENT,
     BLINKPOS_API_KEY: process.env.BLINKPOS_API_KEY,
     BLINKPOS_BTC_WALLET_ID: process.env.BLINKPOS_BTC_WALLET_ID,
+    BLINKPOS_MAX_FORWARD_SATS: process.env.BLINKPOS_MAX_FORWARD_SATS,
     BLINK_WEBHOOK_SECRET: process.env.BLINK_WEBHOOK_SECRET,
     BLINK_STAGING_WEBHOOK_SECRET: process.env.BLINK_STAGING_WEBHOOK_SECRET,
+    HEALTH_TOKEN: process.env.HEALTH_TOKEN,
+    BOLTCARD_RECONCILE_INTERVAL_MS: process.env.BOLTCARD_RECONCILE_INTERVAL_MS,
+    BOLTCARD_RECONCILE_PASS_TIMEOUT_MS: process.env.BOLTCARD_RECONCILE_PASS_TIMEOUT_MS,
+    BOLTCARD_RECONCILE_BATCH: process.env.BOLTCARD_RECONCILE_BATCH,
+    BOLTCARD_WITHDRAWAL_STALE_MINUTES: process.env.BOLTCARD_WITHDRAWAL_STALE_MINUTES,
 
     // Database
     DATABASE_URL: process.env.DATABASE_URL,
@@ -96,7 +128,8 @@ export const env = createEnv({
     // Auth / Security
     JWT_SECRET: process.env.JWT_SECRET,
     ENCRYPTION_KEY: process.env.ENCRYPTION_KEY,
-    NETWORK_ENCRYPTION_KEY: process.env.NETWORK_ENCRYPTION_KEY,
+    ENCRYPTION_KEY_PREVIOUS: process.env.ENCRYPTION_KEY_PREVIOUS,
+    ENCRYPTION_WRITE_FORMAT: process.env.ENCRYPTION_WRITE_FORMAT,
 
     // External Services
     CITRUSRATE_API_KEY: process.env.CITRUSRATE_API_KEY,
@@ -115,6 +148,7 @@ export const env = createEnv({
     // Client
     NEXT_PUBLIC_BASE_URL: process.env.NEXT_PUBLIC_BASE_URL,
     NEXT_PUBLIC_GIT_COMMIT: process.env.NEXT_PUBLIC_GIT_COMMIT,
-    NEXT_PUBLIC_USE_NDK_NIP46: process.env.NEXT_PUBLIC_USE_NDK_NIP46,
+    NEXT_PUBLIC_SPLIT_PAYMENTS_ENABLED: process.env.NEXT_PUBLIC_SPLIT_PAYMENTS_ENABLED,
+    NEXT_PUBLIC_ENABLE_PASSWORD_AUTH: process.env.NEXT_PUBLIC_ENABLE_PASSWORD_AUTH,
   },
 })

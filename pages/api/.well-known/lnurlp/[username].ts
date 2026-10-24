@@ -1,7 +1,7 @@
 /**
  * Lightning Address Endpoint
  *
- * This endpoint handles Lightning Address requests for username@track.twentyone.ist
+ * This endpoint handles Lightning Address requests for username@terminal.blinkbtc.com
  * According to LUD-16, wallets query: GET /.well-known/lnurlp/<username>
  *
  * This proxies to our main LNURL-pay endpoint at /api/lnurlp/[username]
@@ -77,4 +77,4 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 }
 
-export default withRateLimit(handler, RATE_LIMIT_PUBLIC)
+export default withRateLimit(handler, RATE_LIMIT_PUBLIC, ".well-known/lnurlp/[username]")

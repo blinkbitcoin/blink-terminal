@@ -6,6 +6,8 @@
 
 import type { NextApiRequest, NextApiResponse } from "next"
 
+import { requireTrustedMutation } from "../../../../lib/auth/mutation-guard"
+import { requireSessionNpub } from "../../../../lib/auth/session-pubkey"
 import * as db from "../../../../lib/network/db"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../../lib/rate-limit"
 
@@ -14,14 +16,11 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     return res.status(405).json({ error: "Method not allowed" })
   }
 
-  const reviewerNpub = req.headers["x-user-npub"] as string | undefined
+  if (!requireTrustedMutation(req, res)) return
 
-  if (!reviewerNpub) {
-    return res.status(401).json({
-      success: false,
-      error: "Authentication required",
-    })
-  }
+  // Identity from the verified Nostr session only (blink-wip#1679).
+  const reviewerNpub = requireSessionNpub(req, res)
+  if (!reviewerNpub) return
 
   const { applicationId, action, rejectionReason } = req.body as {
     applicationId: string
@@ -113,4 +112,4 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 }
 
-export default withRateLimit(handler, RATE_LIMIT_WRITE)
+export default withRateLimit(handler, RATE_LIMIT_WRITE, "network/memberships/review")

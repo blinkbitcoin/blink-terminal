@@ -1,15 +1,19 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
 import * as boltcard from "../../../../lib/boltcard"
+import { requireSessionPubkey } from "../../../../lib/boltcard/owner-auth"
 import { withRateLimit, RATE_LIMIT_READ } from "../../../../lib/rate-limit"
 
 /**
  * API endpoint to list user's Boltcards
  *
- * GET /api/boltcard/cards?ownerPubkey=...
+ * GET /api/boltcard/cards
+ *
+ * Lists the cards owned by the authenticated Nostr session (auth-token
+ * cookie). Any ownerPubkey query parameter is ignored.
  *
  * Query parameters:
- * - ownerPubkey: Owner's Nostr pubkey (required)
+ * - includeUid: 'true' to include raw card UIDs
  *
  * Returns:
  * {
@@ -23,20 +27,10 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 
   try {
-    const ownerPubkey = req.query.ownerPubkey as string | undefined
-
-    if (!ownerPubkey) {
-      return res.status(400).json({
-        error: "Missing required parameter: ownerPubkey",
-      })
-    }
-
-    // Validate pubkey format (64 hex chars)
-    if (!/^[0-9a-fA-F]{64}$/.test(ownerPubkey)) {
-      return res.status(400).json({
-        error: "Invalid ownerPubkey format: expected 64 hex characters",
-      })
-    }
+    // The owner is the authenticated session — never a request parameter
+    // (a pubkey is public, so ?ownerPubkey= allowed listing anyone's cards).
+    const ownerPubkey = requireSessionPubkey(req, res)
+    if (!ownerPubkey) return
 
     // Check if UID should be included (default: no, for privacy)
     const includeUid = req.query.includeUid === "true"
@@ -122,4 +116,4 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 }
 
-export default withRateLimit(handler, RATE_LIMIT_READ)
+export default withRateLimit(handler, RATE_LIMIT_READ, "boltcard/cards")

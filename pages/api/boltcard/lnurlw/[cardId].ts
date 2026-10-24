@@ -1,8 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
-import BlinkAPI from "../../../../lib/blink-api"
 import * as boltcard from "../../../../lib/boltcard"
-import { getApiUrlForEnvironment, type EnvironmentName } from "../../../../lib/config/api"
+import { isBoltcardSpendEnabled } from "../../../../lib/config/features"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../../lib/rate-limit"
 
 /**
@@ -25,10 +24,17 @@ import { withRateLimit, RATE_LIMIT_WRITE } from "../../../../lib/rate-limit"
  * }
  *
  * POST /api/boltcard/lnurlw/[cardId]/callback
- * - k1: Card ID (from GET response)
+ * - k1: single-use session from the verified tap (required)
  * - pr: BOLT11 invoice to pay
  */
 async function handler(req: NextApiRequest, res: NextApiResponse) {
+  if (!isBoltcardSpendEnabled()) {
+    return res.status(503).json({
+      status: "ERROR",
+      reason: "Bolt Card payments are temporarily unavailable",
+    })
+  }
+
   const { cardId } = req.query
 
   if (!cardId) {
@@ -72,11 +78,12 @@ async function handleWithdrawGet(
       return res.redirect(302, `/boltcard-balance/${cardId}?p=${piccData}&c=${sunMac}`)
     }
 
-    // Enhanced logging for debugging card tap issues
+    // The tap's p (encrypted PICCData) and c (SunMAC) are its authorization:
+    // log presence and length only, never the values or the raw URL
+    // (blink-wip#1590).
     console.log(`[LNURLW] Card tap request for: ${cardId}`)
-    console.log(`[LNURLW] Full URL: ${req.url}`)
     console.log(
-      `[LNURLW] Query params: p=${piccData ? (piccData as string).substring(0, 16) + "..." : "MISSING"} (${(piccData as string)?.length || 0} chars), c=${sunMac || "MISSING"} (${(sunMac as string)?.length || 0} chars)`,
+      `[LNURLW] Tap params: p=${piccData ? "present" : "MISSING"} (${(piccData as string)?.length || 0} chars), c=${sunMac ? "present" : "MISSING"} (${(sunMac as string)?.length || 0} chars)`,
     )
 
     // If no p/c params, this might be a balance check or info request
@@ -88,14 +95,7 @@ async function handleWithdrawGet(
         return res.status(404).json({ status: "ERROR", reason: "Card not found" })
       }
 
-      // Check if this is a balance request
-      if (req.query.balance !== undefined) {
-        return res.status(200).json({
-          balance: card.balance,
-          currency: card.walletCurrency,
-          unit: card.walletCurrency === "USD" ? "cents" : "sats",
-        })
-      }
+      // No balance without a verified tap (see /api/boltcard/balance/[cardId])
 
       // Detailed error for missing params (helps debug card programming issues)
       const missingParams: string[] = []
@@ -119,7 +119,7 @@ async function handleWithdrawGet(
     // Validate parameter formats with helpful error messages
     if (!/^[0-9a-fA-F]{32}$/.test(piccData as string)) {
       console.log(
-        `[LNURLW] ERROR: Invalid PICCData format. Expected 32 hex chars, got ${(piccData as string).length}: ${(piccData as string).substring(0, 50)}...`,
+        `[LNURLW] ERROR: Invalid PICCData format. Expected 32 hex chars, got ${(piccData as string).length}`,
       )
       return res.status(400).json({
         status: "ERROR",
@@ -129,7 +129,7 @@ async function handleWithdrawGet(
 
     if (!/^[0-9a-fA-F]{16}$/.test(sunMac as string)) {
       console.log(
-        `[LNURLW] ERROR: Invalid SunMAC format. Expected 16 hex chars, got ${(sunMac as string).length}: ${sunMac}`,
+        `[LNURLW] ERROR: Invalid SunMAC format. Expected 16 hex chars, got ${(sunMac as string).length}`,
       )
       return res.status(400).json({
         status: "ERROR",
@@ -169,9 +169,10 @@ async function handleWithdrawPost(
   cardId: string,
 ) {
   try {
-    // LNURL-withdraw callback parameters
-    const k1 = req.body.k1 || req.query.k1
-    const pr = req.body.pr || req.query.pr
+    // LNURL-withdraw callback parameters (LUD-03). k1 is the single-use
+    // session from the verified tap — required.
+    const k1 = firstString(req.body?.k1) ?? firstString(req.query.k1)
+    const pr = firstString(req.body?.pr) ?? firstString(req.query.pr)
 
     if (!pr) {
       return res.status(400).json({
@@ -180,67 +181,7 @@ async function handleWithdrawPost(
       })
     }
 
-    // k1 should match cardId for security
-    if (k1 && k1 !== cardId) {
-      console.warn(`[LNURLW] k1 mismatch: ${k1} !== ${cardId}`)
-      return res.status(400).json({
-        status: "ERROR",
-        reason: "Invalid k1 parameter",
-      })
-    }
-
-    // Create invoice payment function
-    const payInvoice = async (
-      amountSats: number,
-      invoice: string,
-      apiKey: string,
-      environment: EnvironmentName,
-    ) => {
-      try {
-        const apiUrl = getApiUrlForEnvironment(environment)
-        const blinkAPI = new BlinkAPI(apiKey, apiUrl)
-
-        // Get wallet info to find the right wallet
-        const wallets = await blinkAPI.getWalletInfo()
-        const btcWallet = wallets.find(
-          (w: { walletCurrency: string; id: string }) => w.walletCurrency === "BTC",
-        )
-
-        if (!btcWallet) {
-          return { success: false, error: "No BTC wallet found" }
-        }
-
-        // Pay the invoice
-        const result = await blinkAPI.payLnInvoice(
-          btcWallet.id,
-          invoice,
-          "Boltcard payment",
-        )
-
-        if (result.status === "SUCCESS") {
-          const hash = await extractPaymentHash(invoice)
-          return {
-            success: true,
-            paymentHash: hash || undefined,
-          }
-        } else {
-          return {
-            success: false,
-            error: result.errors?.[0]?.message || `Payment status: ${result.status}`,
-          }
-        }
-      } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : "Unknown error"
-        console.error("❌ Payment error:", error)
-        return {
-          success: false,
-          error: message,
-        }
-      }
-    }
-
-    // Process the callback
-    const response = await boltcard.lnurlw.handleWithdrawCallback(cardId, pr, payInvoice)
+    const response = await boltcard.lnurlw.handleWithdrawCallback(cardId, k1, pr)
 
     return res.status(response.status === "OK" ? 200 : 400).json(response)
   } catch (error: unknown) {
@@ -252,25 +193,8 @@ async function handleWithdrawPost(
   }
 }
 
-/**
- * Extract payment hash from BOLT11 invoice
- */
-async function extractPaymentHash(invoice: string): Promise<string | null> {
-  try {
-    // The payment hash is in the tagged data section
-    // For simplicity, we'll use the bolt11 library if available
-    const bolt11 = await import("bolt11")
-    const decode = bolt11.default?.decode ?? bolt11.decode
-    const decoded = decode(invoice)
-    const tag = decoded.tags.find(
-      (t: { tagName: string }) => t.tagName === "payment_hash",
-    )
-    return tag ? String(tag.data) : null
-  } catch (_error: unknown) {
-    // Return null if we can't extract it
-    return null
-  }
-}
+const firstString = (value: unknown): string | undefined =>
+  typeof value === "string" && value ? value : undefined
 
 /**
  * Get the server URL from the request
@@ -289,4 +213,4 @@ function getServerUrl(req: NextApiRequest) {
   return `${protocol}://${host}`
 }
 
-export default withRateLimit(handler, RATE_LIMIT_WRITE)
+export default withRateLimit(handler, RATE_LIMIT_WRITE, "boltcard/lnurlw/[cardId]")

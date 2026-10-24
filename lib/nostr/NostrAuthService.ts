@@ -112,6 +112,8 @@ interface Nip98LoginResult {
   user?: Record<string, unknown>
   error?: string
   details?: string
+  /** Set for deliberate cancellation (timeout/supersession) so callers can distinguish it. */
+  errorType?: string
 }
 
 /** Result from server session verification */
@@ -144,17 +146,35 @@ interface DebugChallengeInfo {
 // ============= NostrConnect service type (dynamic imports) =============
 
 /**
- * Minimal interface for the dynamically imported NostrConnect services.
- * The UnsignedEvent parameter includes an index signature for
- * compatibility with the imported .js services.
+ * Storage keys written by the removed browser-held NIP-46 implementation
+ * (issue #70). Nothing reads them any more; they are purged so a stale signer
+ * session cannot linger in a returning user's browser indefinitely.
  */
-interface NostrConnectServiceLike {
-  isConnected: () => boolean
-  signEvent: (event: UnsignedEvent) => Promise<{
-    success: boolean
-    event?: SignedEvent
-    error?: string
-  }>
+const LEGACY_NIP46_KEYS = [
+  "blinkpos_nip46_session",
+  "blinkpos_nip46_clientkey",
+  "blinkpos_nip46_pending",
+] as const
+
+/**
+ * Drop the browser-held NIP-46 leftovers. Best-effort and idempotent: storage
+ * access can throw (private mode, disabled storage) and a failure here must
+ * never block sign-in.
+ */
+function purgeLegacyNip46Storage(): void {
+  if (typeof window === "undefined") return
+  for (const key of LEGACY_NIP46_KEYS) {
+    try {
+      window.localStorage?.removeItem(key)
+    } catch {
+      // ignore
+    }
+    try {
+      window.sessionStorage?.removeItem(key)
+    } catch {
+      // ignore
+    }
+  }
 }
 
 // Use localStorage for signer flow (persists across page reloads/redirects)
@@ -554,9 +574,11 @@ class NostrAuthService {
 
   /**
    * Sign in with Nostr Connect (NIP-46)
-   * Called after successful NIP-46 connection via NostrConnectService
    *
-   * @param publicKey - Public key from connected remote signer
+   * Called after the SERVER has verified the signer's kind-27235 signature and
+   * the browser has consumed the resulting session (issue #70).
+   *
+   * @param publicKey - Public key the server verified for this session
    * @returns {AuthResult}
    */
   static signInWithNostrConnect(publicKey: string): AuthResult {
@@ -567,6 +589,10 @@ class NostrAuthService {
       }
 
       const normalizedPublicKey = publicKey.toLowerCase()
+
+      // A successful server-side sign-in supersedes anything the old
+      // browser-held implementation may have left behind.
+      purgeLegacyNip46Storage()
 
       // Store auth data with nostrConnect method
       this.storeAuthData(normalizedPublicKey, "nostrConnect")
@@ -1062,8 +1088,21 @@ class NostrAuthService {
    * @returns {Promise<SignedEvent>}
    * @throws {Error} If using external signer (will redirect) or if session key not available
    */
-  static async signEvent(event: UnsignedEvent): Promise<SignedEvent> {
-    const method = this.getCurrentMethod()
+  /**
+   * Sign an event with the caller's sign-in method.
+   *
+   * `methodOverride` lets a sign-in flow sign BEFORE it has registered itself as the current
+   * user. Without it, the stored auth data has to be written first purely so this dispatch can
+   * read it back, which forces a flow to mutate shared state before it knows it will succeed
+   * (PR #66 review). Omitting it preserves the previous behavior exactly.
+   */
+  static async signEvent(
+    event: UnsignedEvent,
+    methodOverride?: SignInMethod,
+    signal?: AbortSignal,
+  ): Promise<SignedEvent> {
+    if (signal?.aborted) throw new Error("aborted")
+    const method = methodOverride ?? this.getCurrentMethod()
 
     if (!method) {
       throw new Error("Not authenticated. Please sign in first.")
@@ -1084,71 +1123,16 @@ class NostrAuthService {
       }
       return this.signEventWithPrivateKey(event, privateKey)
     } else if (method === "nostrConnect") {
-      // Sign with remote signer via NIP-46
-      return this.signEventWithNostrConnect(event)
+      // Since issue #70 the NIP-46 conversation lives on the server and exists
+      // only for the duration of one sign-in, so there is no browser-side signer
+      // to reach here. Sign-in goes through the server session endpoints
+      // (lib/nostr/NostrConnectClient); nothing else needs remote signing.
+      throw new Error(
+        "Nostr Connect signing is handled server-side. Please sign in again.",
+      )
     }
 
     throw new Error(`Unknown sign-in method: ${method}`)
-  }
-
-  /**
-   * Sign event using Nostr Connect (NIP-46)
-   *
-   * Note: We check which service is actually connected, not just the feature flag
-   * - QR code flow (nostrconnect://) uses legacy NostrConnectService
-   * - Bunker URL flow uses NostrConnectServiceNDK when USE_NDK=true
-   * - We need to check both services and use whichever one is connected
-   *
-   * @param event
-   * @returns {Promise<SignedEvent>}
-   */
-  static async signEventWithNostrConnect(event: UnsignedEvent): Promise<SignedEvent> {
-    const USE_NDK = process.env.NEXT_PUBLIC_USE_NDK_NIP46 === "true"
-
-    // Import both services
-    const NostrConnectServiceNDK: NostrConnectServiceLike = (
-      await import("./NostrConnectServiceNDK")
-    ).default
-    const NostrConnectService: NostrConnectServiceLike = (
-      await import("./NostrConnectService")
-    ).default
-
-    // Check which service is actually connected
-    const ndkConnected = NostrConnectServiceNDK.isConnected()
-    const legacyConnected = NostrConnectService.isConnected()
-
-    logAuth(
-      "NostrAuthService",
-      "Checking connected services - NDK:",
-      ndkConnected,
-      "Legacy:",
-      legacyConnected,
-    )
-
-    // Use whichever service is actually connected
-    // Priority: If both connected, prefer NDK when USE_NDK is true
-    if (ndkConnected && (USE_NDK || !legacyConnected)) {
-      logAuth("NostrAuthService", "Using NDK service for signing")
-      const result = await NostrConnectServiceNDK.signEvent(event)
-
-      if (!result.success) {
-        throw new Error(result.error || "Failed to sign event via Nostr Connect (NDK)")
-      }
-
-      return result.event!
-    } else if (legacyConnected) {
-      logAuth("NostrAuthService", "Using legacy nostr-tools service for signing")
-      const result = await NostrConnectService.signEvent(event)
-
-      if (!result.success) {
-        throw new Error(result.error || "Failed to sign event via Nostr Connect")
-      }
-
-      return result.event!
-    } else {
-      // Neither service is connected
-      throw new Error("Nostr Connect session not active. Please reconnect.")
-    }
   }
 
   /**
@@ -1294,6 +1278,8 @@ class NostrAuthService {
   static async createAuthEvent(
     url: string,
     method: string = "GET",
+    signWithMethod?: SignInMethod,
+    signal?: AbortSignal,
   ): Promise<SignedEvent> {
     const event: UnsignedEvent = {
       kind: 27235, // NIP-98 HTTP Auth
@@ -1305,7 +1291,7 @@ class NostrAuthService {
       content: "",
     }
 
-    return this.signEvent(event)
+    return this.signEvent(event, signWithMethod, signal)
   }
 
   /**
@@ -1372,6 +1358,7 @@ class NostrAuthService {
     localStorage.removeItem(SIGN_IN_STORAGE_KEY)
     // Clear session private key from memory
     this.clearSessionPrivateKey()
+    purgeLegacyNip46Storage()
     // Note: We don't clear ENCRYPTED_NSEC_KEY here - that's the user's account
     // They should use clearEncryptedNsec() explicitly if they want to delete their account
   }
@@ -1514,10 +1501,16 @@ class NostrAuthService {
    *
    * @returns {Promise<Nip98LoginResult>}
    */
-  static async nip98Login(): Promise<Nip98LoginResult> {
+  static async nip98Login(opts?: {
+    signWithMethod?: SignInMethod
+    signal?: AbortSignal
+  }): Promise<Nip98LoginResult> {
     logAuth("NostrAuthService", "nip98Login called")
 
-    if (!this.isAuthenticated()) {
+    // With an explicit signing method the caller has not registered itself yet — deliberately,
+    // so it does not mutate shared auth state before it knows this succeeds (PR #66 review).
+    // Without one, the stored auth data is still the source of truth.
+    if (!opts?.signWithMethod && !this.isAuthenticated()) {
       logAuth("NostrAuthService", "Not authenticated - cannot do NIP-98 login")
       return { success: false, error: "Not signed in with Nostr" }
     }
@@ -1528,7 +1521,12 @@ class NostrAuthService {
       logAuth("NostrAuthService", "Creating auth event for URL:", loginUrl)
 
       // Create and sign NIP-98 event
-      const signedEvent = await this.createAuthEvent(loginUrl, "POST")
+      const signedEvent = await this.createAuthEvent(
+        loginUrl,
+        "POST",
+        opts?.signWithMethod,
+        opts?.signal,
+      )
       logAuth("NostrAuthService", "Signed event created:", signedEvent ? "yes" : "no")
 
       if (!signedEvent) {
@@ -1547,9 +1545,33 @@ class NostrAuthService {
           "Content-Type": "application/json",
         },
         credentials: "include", // Include cookies in response
+        signal: opts?.signal, // Abortable: a superseded/timed-out attempt must not commit a cookie
       })
 
-      const data = (await response.json()) as Record<string, unknown>
+      // THE SESSION IS ESTABLISHED AT HEADER RECEIPT, not at body consumption. The server sets
+      // the auth-token cookie with the response headers, so by the time this fetch resolves OK
+      // the browser already holds a live session. Reading the body is a SECOND await, and an
+      // abort landing there used to be reported as "no session" — the caller then skipped
+      // compensation and the cookie survived as a live session for a cancelled attempt
+      // (PR #66 post-merge review). From here on, cancellation must compensate, never assume
+      // nothing happened.
+      const established = response.ok
+
+      let data: Record<string, unknown> = {}
+      try {
+        data = (await response.json()) as Record<string, unknown>
+      } catch (bodyErr: unknown) {
+        // An abort (or any failure) while consuming the body does not undo the cookie.
+        if (established) {
+          logAuthWarn(
+            "NostrAuthService",
+            "Login response body unreadable, but the session was established:",
+            bodyErr,
+          )
+          return { success: true, user: undefined }
+        }
+        throw bodyErr
+      }
       logAuth("NostrAuthService", "NIP-98 login response:", response.status, data)
 
       if (!response.ok) {
@@ -1565,6 +1587,11 @@ class NostrAuthService {
         user: data.user as Record<string, unknown> | undefined,
       }
     } catch (err: unknown) {
+      // An aborted request is a deliberate cancellation (timeout or supersession), not a
+      // failure to surface — and it must not commit a session.
+      if (opts?.signal?.aborted || (err instanceof Error && err.name === "AbortError")) {
+        return { success: false, error: "Aborted", errorType: "superseded" }
+      }
       logAuthError("NostrAuthService", "NIP-98 login error:", err)
       return {
         success: false,
@@ -1627,7 +1654,11 @@ class NostrAuthService {
    */
   static async fetchChallenge(): Promise<ChallengeResult> {
     try {
-      const response = await fetch("/api/auth/challenge")
+      // credentials: "include" so the HttpOnly challenge cookie (the redemption
+      // secret) is stored on this browser; it is required by verify-ownership.
+      const response = await fetch("/api/auth/challenge", {
+        credentials: "include",
+      })
       const data = (await response.json()) as Record<string, unknown>
 
       if (!response.ok) {

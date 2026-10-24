@@ -29,7 +29,7 @@ import type { NextApiRequest, NextApiResponse } from "next"
 
 import * as boltcardCrypto from "../../../../lib/boltcard/crypto"
 import * as lnurlw from "../../../../lib/boltcard/lnurlw"
-import boltcardStore from "../../../../lib/boltcard/store"
+import boltcardStore, { CARD_ACTIVATION_FAILED } from "../../../../lib/boltcard/store"
 import { withRateLimit, RATE_LIMIT_READ } from "../../../../lib/rate-limit"
 
 async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -37,19 +37,9 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   const requestId = Math.random().toString(36).substring(7)
   const timestamp = new Date().toISOString()
 
-  console.log(`[KeysAPI][${requestId}] ========== INCOMING REQUEST ==========`)
-  console.log(`[KeysAPI][${requestId}] Timestamp: ${timestamp}`)
-  console.log(`[KeysAPI][${requestId}] Method: ${req.method}`)
-  console.log(`[KeysAPI][${requestId}] URL: ${req.url}`)
-  console.log(`[KeysAPI][${requestId}] Query: ${JSON.stringify(req.query)}`)
-  console.log(`[KeysAPI][${requestId}] Headers: ${JSON.stringify(req.headers)}`)
-  console.log(`[KeysAPI][${requestId}] Body: ${JSON.stringify(req.body)}`)
-  console.log(
-    `[KeysAPI][${requestId}] Remote IP: ${req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "unknown"}`,
-  )
-  console.log(
-    `[KeysAPI][${requestId}] User-Agent: ${req.headers["user-agent"] || "none"}`,
-  )
+  // Never log headers, body, the registration id or the response: the id is a
+  // single-use capability and the response contains the card keys.
+  console.log(`[KeysAPI][${requestId}] ${req.method} keys request`)
 
   // Set CORS headers for NFC Programmer app
   res.setHeader("Access-Control-Allow-Origin", "*")
@@ -69,7 +59,6 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       status: "OK",
       message:
         'Boltcard keys endpoint. POST with { UID: "14-hex-chars" } to get card keys.',
-      registrationId: req.query.registrationId,
       timestamp,
     })
   }
@@ -125,9 +114,10 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     }
 
     if (registration.status !== "PENDING") {
-      return res.status(400).json({
+      // Single-use: an already-used link is indistinguishable from a bad one
+      return res.status(404).json({
         status: "ERROR",
-        reason: `Registration is ${registration.status.toLowerCase()}`,
+        reason: "Registration not found",
       })
     }
 
@@ -166,10 +156,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       card.name || "Boltcard",
     )
 
-    console.log(
-      `[KeysAPI][${requestId}] SUCCESS - Card programmed: ${card.id} (UID: ${cardUid})`,
-    )
-    console.log(`[KeysAPI][${requestId}] Response: ${JSON.stringify(keysResponse)}`)
+    console.log(`[KeysAPI][${requestId}] Card programmed: ${card.id}`)
 
     res.status(200).json(keysResponse)
   } catch (error: unknown) {
@@ -177,6 +164,18 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     console.error(`[KeysAPI][${requestId}] ERROR:`, error)
 
     // Handle specific errors
+    if (error instanceof Error && error.message === CARD_ACTIVATION_FAILED) {
+      // No keys: the card row exists but isn't active. Recovery is a fresh
+      // registration with the same card (same-owner reprogram).
+      return res.status(500).json({
+        status: "ERROR",
+        reason:
+          "Card could not be activated - start a new registration and tap the same card",
+      })
+    }
+    if (error instanceof Error && error.message === "Registration is not pending") {
+      return res.status(404).json({ status: "ERROR", reason: "Registration not found" })
+    }
     if (error instanceof Error && error.message.includes("already registered")) {
       return res.status(409).json({
         status: "ERROR",
@@ -211,4 +210,4 @@ function getServerUrl(req: NextApiRequest) {
   return `${protocol}://${host}`
 }
 
-export default withRateLimit(handler, RATE_LIMIT_READ)
+export default withRateLimit(handler, RATE_LIMIT_READ, "boltcard/keys/[registrationId]")

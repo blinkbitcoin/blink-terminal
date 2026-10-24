@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react"
 
-import { getApiUrl, getEnvironment } from "../config/api"
+import { getEnvironment } from "../config/api"
 
 interface ValidationError {
   message: string
@@ -11,6 +11,13 @@ interface ValidationError {
 
 interface UsePublicPOSValidationParams {
   username: string
+  /**
+   * When false, skips the network validation entirely (no request, no spinner,
+   * no error). Use in contexts where the username is already known valid — e.g.
+   * the authenticated Settings → Paycodes overlay or the Public POS side-menu,
+   * where the parent page already resolved the username. Defaults to true.
+   */
+  enabled?: boolean
 }
 
 interface UsePublicPOSValidationReturn {
@@ -31,43 +38,41 @@ interface UsePublicPOSValidationReturn {
  */
 export function usePublicPOSValidation({
   username,
+  enabled = true,
 }: UsePublicPOSValidationParams): UsePublicPOSValidationReturn {
   const [validationError, setValidationError] = useState<ValidationError | null>(null)
-  const [validating, setValidating] = useState(true) // Start true - validate on mount
+  // Start "validating" only when enabled; skipped contexts render immediately.
+  const [validating, setValidating] = useState(enabled)
   const [validatedWalletCurrency, setValidatedWalletCurrency] = useState("BTC")
 
   useEffect(() => {
+    if (!enabled) {
+      // Known-valid username (overlay context): no request, no spinner.
+      setValidating(false)
+      setValidationError(null)
+      return
+    }
+
     const validateUser = async () => {
       setValidating(true)
       setValidationError(null)
 
       const currentEnv = getEnvironment()
-      const apiUrl = getApiUrl()
 
-      console.log(
-        `[PublicPOS] Validating user '${username}' on ${currentEnv} (${apiUrl})`,
-      )
+      console.log(`[PublicPOS] Validating user '${username}' on ${currentEnv}`)
 
       try {
-        const response = await fetch(apiUrl, {
+        // Resolve via custodial-first → LNURL fallback so self-custodial
+        // (Spark) usernames are recognized even without a custodial wallet.
+        const response = await fetch("/api/blink/resolve-receiver", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            query: `
-              query AccountDefaultWallet($username: Username!) {
-                accountDefaultWallet(username: $username) {
-                  id
-                  walletCurrency
-                }
-              }
-            `,
-            variables: { username },
-          }),
+          body: JSON.stringify({ username, environment: currentEnv }),
         })
 
         const data = await response.json()
 
-        if (data.errors || !data.data?.accountDefaultWallet?.id) {
+        if (!response.ok || !data.exists) {
           console.log(`[PublicPOS] User '${username}' not found on ${currentEnv}`)
 
           const envLabel =
@@ -85,11 +90,9 @@ export function usePublicPOSValidation({
         } else {
           console.log(
             `[PublicPOS] User '${username}' validated on ${currentEnv}:`,
-            data.data.accountDefaultWallet,
+            data.type,
           )
-          setValidatedWalletCurrency(
-            data.data.accountDefaultWallet.walletCurrency || "BTC",
-          )
+          setValidatedWalletCurrency(data.walletCurrency || "BTC")
           setValidationError(null)
         }
       } catch (error) {
@@ -106,7 +109,7 @@ export function usePublicPOSValidation({
     }
 
     validateUser()
-  }, [username])
+  }, [username, enabled])
 
   return { validationError, validating, validatedWalletCurrency }
 }

@@ -5,7 +5,11 @@
  */
 
 // We need to load this module dynamically due to mixed exports
-import type { ProfileStorage as ProfileStorageClass } from "../../lib/storage/ProfileStorage"
+import type {
+  ProfileExportData,
+  ProfileStorage as ProfileStorageClass,
+  StoredProfile,
+} from "../../lib/storage/ProfileStorage"
 
 let ProfileStorage: typeof ProfileStorageClass
 
@@ -50,7 +54,7 @@ describe("ProfileStorage", () => {
       it("should save profiles to localStorage", () => {
         const profiles = [{ id: "1", publicKey: "abc" }]
 
-        ProfileStorage.saveProfiles(profiles)
+        ProfileStorage.saveProfiles(profiles as unknown as StoredProfile[])
 
         const stored = JSON.parse(localStorage.getItem("blinkpos_profiles") || "[]")
         expect(stored).toEqual(profiles)
@@ -109,7 +113,7 @@ describe("ProfileStorage", () => {
         const found = ProfileStorage.getProfileByPublicKey("abc123")
 
         expect(found).toBeDefined()
-        expect(found.publicKey).toBe("abc123")
+        expect(found!.publicKey).toBe("abc123")
       })
 
       it("should handle case-insensitive lookup", () => {
@@ -139,7 +143,7 @@ describe("ProfileStorage", () => {
         const found = ProfileStorage.getProfileById(created.id)
 
         expect(found).toBeDefined()
-        expect(found.id).toBe(created.id)
+        expect(found!.id).toBe(created.id)
       })
 
       it("should return null for non-existent ID", () => {
@@ -157,12 +161,13 @@ describe("ProfileStorage", () => {
         ProfileStorage.updateProfile(profile)
 
         const updated = ProfileStorage.getProfileById(profile.id)
-        expect(updated.preferences.darkMode).toBe(false)
+        expect(updated!.preferences.darkMode).toBe(false)
       })
 
       it("should throw for non-existent profile", () => {
         expect(() => {
-          ProfileStorage.updateProfile({ id: "nonexistent" })
+          // Runtime only reads .id before throwing "Profile not found"
+          ProfileStorage.updateProfile({ id: "nonexistent" } as StoredProfile)
         }).toThrow("Profile not found")
       })
     })
@@ -203,7 +208,7 @@ describe("ProfileStorage", () => {
 
         const active = ProfileStorage.getActiveProfile()
 
-        expect(active.id).toBe(profile.id)
+        expect(active!.id).toBe(profile.id)
       })
 
       it("should return null when no active profile", () => {
@@ -312,11 +317,11 @@ describe("ProfileStorage", () => {
         ProfileStorage.setActiveBlinkAccount(profileId, second.id)
 
         const profile = ProfileStorage.getProfileById(profileId)
-        const activeAccount = profile.blinkAccounts.find(
+        const activeAccount = profile!.blinkAccounts.find(
           (a: { isActive: boolean; id: string; lastUsed?: unknown }) => a.isActive,
         )
-        expect(activeAccount.id).toBe(second.id)
-        expect(activeAccount.lastUsed).toBeDefined()
+        expect(activeAccount!.id).toBe(second.id)
+        expect(activeAccount!.lastUsed).toBeDefined()
       })
     })
 
@@ -327,7 +332,7 @@ describe("ProfileStorage", () => {
         ProfileStorage.removeBlinkAccount(profileId, account.id)
 
         const profile = ProfileStorage.getProfileById(profileId)
-        expect(profile.blinkAccounts).toHaveLength(0)
+        expect(profile!.blinkAccounts).toHaveLength(0)
       })
 
       it("should make first remaining account active if active was removed", async () => {
@@ -337,7 +342,7 @@ describe("ProfileStorage", () => {
         ProfileStorage.removeBlinkAccount(profileId, first.id)
 
         const profile = ProfileStorage.getProfileById(profileId)
-        expect(profile.blinkAccounts[0].isActive).toBe(true)
+        expect(profile!.blinkAccounts[0].isActive).toBe(true)
       })
     })
 
@@ -348,9 +353,9 @@ describe("ProfileStorage", () => {
         const active = ProfileStorage.getActiveBlinkAccount()
 
         expect(active).toBeDefined()
-        expect(active.label).toBe("Test")
+        expect(active!.label).toBe("Test")
         // apiKey should be encrypted object, not plain string
-        expect(typeof active.apiKey).toBe("object")
+        expect(typeof active!.apiKey).toBe("object")
       })
 
       it("should return null when no active account", () => {
@@ -392,10 +397,10 @@ describe("ProfileStorage", () => {
         ProfileStorage.setActiveNWCConnection(profileId, second.id)
 
         const profile = ProfileStorage.getProfileById(profileId)
-        const active = profile.nwcConnections.find(
+        const active = profile!.nwcConnections.find(
           (c: { isActive: boolean; id: string }) => c.isActive,
         )
-        expect(active.id).toBe(second.id)
+        expect(active!.id).toBe(second.id)
       })
     })
 
@@ -406,7 +411,7 @@ describe("ProfileStorage", () => {
         ProfileStorage.removeNWCConnection(profileId, conn.id)
 
         const profile = ProfileStorage.getProfileById(profileId)
-        expect(profile.nwcConnections).toHaveLength(0)
+        expect(profile!.nwcConnections).toHaveLength(0)
       })
 
       it("should clear forward settings if forwarding target removed", async () => {
@@ -419,8 +424,8 @@ describe("ProfileStorage", () => {
         ProfileStorage.removeNWCConnection(profileId, conn.id)
 
         const profile = ProfileStorage.getProfileById(profileId)
-        expect(profile.tippingSettings.forwardToNWC).toBe(false)
-        expect(profile.tippingSettings.forwardNWCId).toBeNull()
+        expect(profile!.tippingSettings.forwardToNWC).toBe(false)
+        expect(profile!.tippingSettings.forwardNWCId).toBeNull()
       })
     })
   })
@@ -441,10 +446,10 @@ describe("ProfileStorage", () => {
         })
 
         const profile = ProfileStorage.getProfileById(profileId)
-        expect(profile.tippingSettings.enabled).toBe(false)
-        expect(profile.tippingSettings.defaultPercentages).toEqual([5, 10, 15])
+        expect(profile!.tippingSettings.enabled).toBe(false)
+        expect(profile!.tippingSettings.defaultPercentages).toEqual([5, 10, 15])
         // Original values should be preserved
-        expect(profile.tippingSettings.customAmountEnabled).toBe(true)
+        expect(profile!.tippingSettings.customAmountEnabled).toBe(true)
       })
     })
 
@@ -456,10 +461,10 @@ describe("ProfileStorage", () => {
         })
 
         const profile = ProfileStorage.getProfileById(profileId)
-        expect(profile.preferences.darkMode).toBe(false)
-        expect(profile.preferences.defaultCurrency).toBe("USD")
+        expect(profile!.preferences.darkMode).toBe(false)
+        expect(profile!.preferences.defaultCurrency).toBe("USD")
         // Original values should be preserved
-        expect(profile.preferences.sounds).toBe(true)
+        expect(profile!.preferences.sounds).toBe(true)
       })
     })
   })
@@ -473,7 +478,7 @@ describe("ProfileStorage", () => {
 
         expect(exported.version).toBe(1)
         expect(exported.exportedAt).toBeDefined()
-        expect(exported.profile.publicKey).toBe("abc123")
+        expect(exported.profile!.publicKey).toBe("abc123")
       })
 
       it("should throw for non-existent profile", () => {
@@ -505,7 +510,8 @@ describe("ProfileStorage", () => {
           profiles: [{ publicKey: "newprofile", preferences: { darkMode: false } }],
         }
 
-        ProfileStorage.importProfiles(importData, true)
+        // Import deliberately tolerates partial/untrusted backup payloads
+        ProfileStorage.importProfiles(importData as unknown as ProfileExportData, true)
 
         const profiles = ProfileStorage.getProfiles()
         expect(profiles).toHaveLength(2)
@@ -525,16 +531,19 @@ describe("ProfileStorage", () => {
           ],
         }
 
-        ProfileStorage.importProfiles(importData, true)
+        ProfileStorage.importProfiles(importData as unknown as ProfileExportData, true)
 
         const profile = ProfileStorage.getProfileByPublicKey("abc123")
-        expect(profile.preferences.darkMode).toBe(false)
-        expect(profile.tippingSettings.enabled).toBe(false)
+        expect(profile!.preferences.darkMode).toBe(false)
+        expect(profile!.tippingSettings.enabled).toBe(false)
       })
 
       it("should throw for unsupported version", () => {
         expect(() =>
-          ProfileStorage.importProfiles({ version: 99, profiles: [] }),
+          ProfileStorage.importProfiles({
+            version: 99,
+            profiles: [],
+          } as unknown as ProfileExportData),
         ).toThrow("Unsupported backup version")
       })
     })

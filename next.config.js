@@ -2,6 +2,7 @@
 
 // Get git commit hash at build time
 const { execSync } = require("child_process")
+const path = require("path")
 let gitCommit = "dev"
 try {
   gitCommit = execSync("git rev-parse --short HEAD").toString().trim()
@@ -138,7 +139,7 @@ const nextConfig = {
       },
     ]
   },
-  webpack: (config, { isServer }) => {
+  webpack: (config, { isServer, dev, webpack }) => {
     if (!isServer) {
       config.resolve.fallback = {
         ...config.resolve.fallback,
@@ -146,12 +147,54 @@ const nextConfig = {
         net: false,
         tls: false,
       }
+
+      // lib/lnurl.ts is isomorphic. On the server it must use the SSRF-safe
+      // node:https fetcher; in the browser (no SSRF risk, no node: modules)
+      // swap in a window.fetch implementation with the same API. Server
+      // builds always get the real guard.
+      config.plugins.push(
+        new webpack.NormalModuleReplacementPlugin(
+          /[\\/]server[\\/]safe-fetch-json$/,
+          path.resolve(__dirname, "lib/server/safe-fetch-json.browser.ts"),
+        ),
+        new webpack.NormalModuleReplacementPlugin(
+          /[\\/]nwc[\\/]pinned-socket$/,
+          path.resolve(__dirname, "lib/nwc/pinned-socket.browser.ts"),
+        ),
+      )
     }
 
     // Handle WebSocket modules properly
     config.externals = config.externals || []
     if (isServer) {
       config.externals.push("ws")
+    }
+
+    // Dev-only: stop the file watcher from reacting to runtime-written files.
+    //
+    // API routes persist data INSIDE the project root (file-storage fallback
+    // writes user records under .data/, plus the tip/voucher stores). In dev,
+    // the default webpack watcher treats those writes as source changes and
+    // triggers a Fast Refresh full reload. That reload remounts the app, which
+    // re-runs the auth check + cross-device sync, which writes again — a tight
+    // reload loop (and it eventually trips the auth rate limit). Ignoring these
+    // runtime paths breaks the loop. These dirs are also git-ignored.
+    if (dev) {
+      const ignored = [
+        "**/.git/**",
+        "**/node_modules/**",
+        "**/.next/**",
+        "**/.data/**",
+        "**/.tip-store.json",
+        "**/.tip-store.json.backup.*",
+        "**/.voucher-store.json",
+        "**/*.log",
+      ]
+      const existing = config.watchOptions && config.watchOptions.ignored
+      config.watchOptions = {
+        ...config.watchOptions,
+        ignored: Array.isArray(existing) ? [...existing, ...ignored] : ignored,
+      }
     }
 
     return config

@@ -18,7 +18,6 @@ import { hkdf } from "@noble/hashes/hkdf"
 import { hmac } from "@noble/hashes/hmac"
 import { sha256 } from "@noble/hashes/sha256"
 import { bytesToHex, hexToBytes, utf8ToBytes, concatBytes } from "@noble/hashes/utils"
-// @ts-expect-error -- nostr-tools subpath exports require moduleResolution:"bundler", works at runtime via webpack
 import { generateSecretKey, getPublicKey } from "nostr-tools/pure"
 
 export interface DiagnosticTestResult {

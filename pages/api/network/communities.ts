@@ -7,6 +7,8 @@
 
 import type { NextApiRequest, NextApiResponse } from "next"
 
+import { requireTrustedMutation } from "../../../lib/auth/mutation-guard"
+import { requireSessionNpub } from "../../../lib/auth/session-pubkey"
 import * as db from "../../../lib/network/db"
 import { withRateLimit, RATE_LIMIT_READ } from "../../../lib/rate-limit"
 
@@ -103,16 +105,12 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 
   if (req.method === "POST") {
+    if (!requireTrustedMutation(req, res)) return
     try {
       // Create community - SUPER ADMIN ONLY
-      const userNpub = req.headers["x-user-npub"] as string | undefined
-
-      if (!userNpub) {
-        return res.status(401).json({
-          success: false,
-          error: "Authentication required",
-        })
-      }
+      // Identity from the verified Nostr session only (blink-wip#1679).
+      const userNpub = requireSessionNpub(req, res)
+      if (!userNpub) return
 
       // Verify super admin
       const isSuperAdmin = await db.isSuperAdmin(userNpub)
@@ -206,4 +204,4 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   return res.status(405).json({ error: "Method not allowed" })
 }
 
-export default withRateLimit(handler, RATE_LIMIT_READ)
+export default withRateLimit(handler, RATE_LIMIT_READ, "network/communities")

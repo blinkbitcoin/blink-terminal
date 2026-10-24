@@ -1,9 +1,9 @@
 import crypto from "crypto"
 
-import CryptoJS from "crypto-js"
 import jwt from "jsonwebtoken"
 
 import { getApiUrl } from "./config/api"
+import { envKeyring } from "./crypto/keyring"
 
 const JWT_SECRET: string = (() => {
   const secret = process.env.JWT_SECRET
@@ -29,15 +29,6 @@ interface BlinkApiResponse {
   }
 }
 
-// Helper to get encryption key at runtime (not captured at module load time)
-function getEncryptionKey(): string {
-  const key = process.env.ENCRYPTION_KEY
-  if (!key) {
-    throw new Error("ENCRYPTION_KEY environment variable is required")
-  }
-  return key
-}
-
 class AuthManager {
   // Generate secure user session
   static generateSession(username: string): string {
@@ -60,22 +51,16 @@ class AuthManager {
     }
   }
 
-  // Encrypt API key for storage
+  // Encrypt a secret for storage: authenticated v2 ciphertext under the
+  // current ENCRYPTION_KEY (lib/crypto/keyring.js, blink-wip#1587).
   static encryptApiKey(apiKey: string): string {
-    const key: string = getEncryptionKey()
-    return CryptoJS.AES.encrypt(apiKey, key).toString()
+    return envKeyring().encrypt(apiKey)
   }
 
-  // Decrypt API key for use
+  // Decrypt a stored secret: v2 (any configured key, selected by key id) or
+  // legacy CryptoJS ciphertext. Null when it cannot be decrypted.
   static decryptApiKey(encryptedKey: string): string | null {
-    try {
-      const key: string = getEncryptionKey()
-      const bytes: CryptoJS.lib.WordArray = CryptoJS.AES.decrypt(encryptedKey, key)
-      const decrypted: string = bytes.toString(CryptoJS.enc.Utf8)
-      return decrypted || null
-    } catch (_err: unknown) {
-      return null
-    }
+    return envKeyring().decrypt(encryptedKey)
   }
 
   // Validate Blink API key

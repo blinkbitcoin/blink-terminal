@@ -2,6 +2,8 @@ import { Document, Page, Text, View, Image, StyleSheet } from "@react-pdf/render
 import type { Style } from "@react-pdf/types/style"
 import React from "react"
 
+import { safeImageSrc } from "./safe-image-src"
+
 /**
  * PDF style record — maps style names to react-pdf Style objects.
  * Replaces Record<string, any> for type safety.
@@ -426,7 +428,9 @@ const VoucherCard: React.FC<VoucherCardProps> = ({
     <View style={styles.voucherCard}>
       {/* Header with Blink Logo */}
       <View style={styles.header}>
-        {voucher.logoDataUrl && <Image src={voucher.logoDataUrl} style={styles.logo} />}
+        {safeImageSrc(voucher.logoDataUrl) && (
+          <Image src={safeImageSrc(voucher.logoDataUrl)} style={styles.logo} />
+        )}
       </View>
 
       {/* Info Section */}
@@ -526,7 +530,9 @@ const VoucherCard: React.FC<VoucherCardProps> = ({
 
       {/* QR Code */}
       <View style={styles.qrSection}>
-        {voucher.qrDataUrl && <Image src={voucher.qrDataUrl} style={styles.qrCode} />}
+        {safeImageSrc(voucher.qrDataUrl) && (
+          <Image src={safeImageSrc(voucher.qrDataUrl)} style={styles.qrCode} />
+        )}
       </View>
 
       {/* Voucher Secret */}
@@ -707,7 +713,9 @@ const ReissueVoucherCard: React.FC<ReissueVoucherCardProps> = ({ voucher, styles
     <View style={styles.container}>
       {/* Header with Blink Logo */}
       <View style={styles.header}>
-        {voucher.logoDataUrl && <Image src={voucher.logoDataUrl} style={styles.logo} />}
+        {safeImageSrc(voucher.logoDataUrl) && (
+          <Image src={safeImageSrc(voucher.logoDataUrl)} style={styles.logo} />
+        )}
         <View style={styles.reissueLabel}>
           <Text style={styles.reissueLabelText}>
             {isUsdVoucher ? "Reissued USD Voucher" : "Reissued Voucher"}
@@ -797,7 +805,9 @@ const ReissueVoucherCard: React.FC<ReissueVoucherCardProps> = ({ voucher, styles
 
       {/* QR Code */}
       <View style={styles.qrSection}>
-        {voucher.qrDataUrl && <Image src={voucher.qrDataUrl} style={styles.qrCode} />}
+        {safeImageSrc(voucher.qrDataUrl) && (
+          <Image src={safeImageSrc(voucher.qrDataUrl)} style={styles.qrCode} />
+        )}
       </View>
 
       {/* Voucher Secret */}

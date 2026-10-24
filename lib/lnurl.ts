@@ -6,7 +6,13 @@
  */
 
 import { nip19 } from "nostr-tools"
-import type { DecodedResult } from "nostr-tools/lib/types/nip19"
+import type { DecodedResult } from "nostr-tools/nip19"
+
+import {
+  SafeFetchError,
+  type SafeFetchErrorCode,
+  safeFetchJson,
+} from "./server/safe-fetch-json"
 
 // =============================================================================
 // Types
@@ -46,6 +52,13 @@ export interface LnurlInvoiceResponse {
   paymentRequest: string
   paymentHash?: string
   successAction?: unknown
+  /**
+   * LUD-21 verify URL, when the LNURL server advertises one. Used by the POS to
+   * poll payment status without an authenticated GraphQL call. Self-custodial
+   * (Spark) recipients on blink-lnurl-server require this path for settlement
+   * detection.
+   */
+  verify?: string
 }
 
 export interface LnurlFullInvoiceResponse extends LnurlInvoiceResponse {
@@ -81,6 +94,61 @@ interface LnurlCallbackResponse {
   pr?: string
   paymentHash?: string
   successAction?: unknown
+  // LUD-21: URL to poll payment status (settled/preimage) for this invoice.
+  verify?: string
+}
+
+// =============================================================================
+// Resilient, SSRF-safe fetch
+// =============================================================================
+
+const DEFAULT_FETCH_RETRIES = 2 // total attempts = retries + 1
+const RETRY_BACKOFF_MS = 300
+// LNURL-pay metadata may embed a base64 image (LUD-06), so allow more than the
+// safeFetchJson default.
+const LNURL_MAX_BODY_BYTES = 256 * 1024
+
+// Transport-level failures worth retrying. Policy rejections (non-https,
+// private/internal address, oversized body, bad JSON, HTTP status) are not.
+const RETRYABLE_CODES: ReadonlySet<SafeFetchErrorCode> = new Set(["NETWORK", "TIMEOUT"])
+
+/**
+ * GET a JSON document from a user- or third-party-supplied URL (Lightning address
+ * domain, LNURL callback, LUD-21 verify URL) with retry-with-backoff.
+ *
+ * All requests go through safeFetchJson: https only, DNS-pinned, private /
+ * link-local / loopback addresses refused, redirects re-checked. Never call
+ * raw fetch() on user- or third-party-supplied URLs (SSRF).
+ *
+ * Server-side calls to the Blink LNURL host (blink.sv / lnurl.blink.sv)
+ * intermittently fail with transient connection errors even though the host is
+ * healthy; a single blip must not surface as "address not found", so transient
+ * failures are retried.
+ *
+ * @param url - URL to fetch
+ * @param retries - number of retries after the first attempt
+ */
+export async function fetchJsonWithRetry(
+  url: string,
+  retries: number = DEFAULT_FETCH_RETRIES,
+): Promise<unknown> {
+  let lastError: unknown
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await safeFetchJson(url, { maxBodyBytes: LNURL_MAX_BODY_BYTES })
+    } catch (err) {
+      lastError = err
+      const retryable = err instanceof SafeFetchError && RETRYABLE_CODES.has(err.code)
+      if (!retryable || attempt === retries) break
+
+      await new Promise((resolve) =>
+        setTimeout(resolve, RETRY_BACKOFF_MS * (attempt + 1)),
+      )
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("LNURL request failed")
 }
 
 // =============================================================================
@@ -207,17 +275,7 @@ export function validateNpubCashAddress(address: string): NpubCashValidationResu
 export async function fetchLnurlPayMetadata(
   lnurlEndpoint: string,
 ): Promise<LnurlPayMetadata> {
-  const response: Response = await fetch(lnurlEndpoint, {
-    headers: {
-      Accept: "application/json",
-    },
-  })
-
-  if (!response.ok) {
-    throw new Error(`LNURL endpoint returned ${response.status}: ${response.statusText}`)
-  }
-
-  const data: LnurlPayResponse = await response.json()
+  const data = (await fetchJsonWithRetry(lnurlEndpoint)) as LnurlPayResponse
 
   // Validate it's a pay request
   if (data.tag !== "payRequest") {
@@ -264,17 +322,7 @@ export async function requestInvoiceFromCallback(
     url.searchParams.set("comment", comment)
   }
 
-  const response: Response = await fetch(url.toString(), {
-    headers: {
-      Accept: "application/json",
-    },
-  })
-
-  if (!response.ok) {
-    throw new Error(`LNURL callback returned ${response.status}: ${response.statusText}`)
-  }
-
-  const data: LnurlCallbackResponse = await response.json()
+  const data = (await fetchJsonWithRetry(url.toString())) as LnurlCallbackResponse
 
   if (data.status === "ERROR") {
     throw new Error(`LNURL error: ${data.reason || "Unknown error"}`)
@@ -288,6 +336,7 @@ export async function requestInvoiceFromCallback(
     paymentRequest: data.pr,
     paymentHash: data.paymentHash,
     successAction: data.successAction,
+    verify: data.verify,
   }
 }
 
@@ -335,6 +384,25 @@ export async function getInvoiceFromLightningAddress(
     comment = "" // Comments not allowed
   }
 
+  // The callback must stay on the lightning-address host. Blink's live
+  // metadata is the one exception: blink.sv returns a callback on
+  // lnurl.blink.sv. Anything else is rejected before it is fetched.
+  let callbackUrl: URL
+  try {
+    callbackUrl = new URL(lnurlData.callback)
+  } catch {
+    throw new Error("Invalid LNURL callback")
+  }
+  const metadataHost = new URL(lnurlEndpoint).hostname
+  const trustedHop =
+    metadataHost === "blink.sv" && callbackUrl.hostname === "lnurl.blink.sv"
+  if (
+    callbackUrl.protocol !== "https:" ||
+    (callbackUrl.hostname !== metadataHost && !trustedHop)
+  ) {
+    throw new Error("Invalid LNURL callback")
+  }
+
   // Request invoice
   const invoiceData: LnurlInvoiceResponse = await requestInvoiceFromCallback(
     lnurlData.callback,
@@ -346,7 +414,52 @@ export async function getInvoiceFromLightningAddress(
     paymentRequest: invoiceData.paymentRequest,
     paymentHash: invoiceData.paymentHash,
     successAction: invoiceData.successAction,
+    verify: invoiceData.verify,
     metadata: lnurlData,
+  }
+}
+
+/**
+ * LUD-21 verify response.
+ * See https://github.com/lnurl/luds/blob/luds/21.md
+ */
+export interface LnurlVerifyResult {
+  /** True once the LNURL server has observed the invoice as paid. */
+  settled: boolean
+  /** Payment preimage, present once settled. */
+  preimage?: string
+  /** The bolt11 payment request the verify URL refers to. */
+  pr?: string
+}
+
+/**
+ * Poll a LUD-21 verify URL to check whether an invoice has been paid.
+ *
+ * Note for self-custodial (Spark) recipients on blink-lnurl-server: the verify
+ * endpoint is populated by the Spark SSP webhook (there is no synchronous Spark
+ * status pull server-side), so `settled` only flips to true once that webhook
+ * lands. Polling tolerates the lag; do not expect sub-second confirmation.
+ *
+ * @param verifyUrl - The LUD-21 verify URL returned alongside the invoice
+ * @returns Parsed verify result
+ */
+export async function verifyLnurlPayment(verifyUrl: string): Promise<LnurlVerifyResult> {
+  const data = (await fetchJsonWithRetry(verifyUrl)) as {
+    status?: string
+    reason?: string
+    settled?: boolean
+    preimage?: string | null
+    pr?: string
+  }
+
+  if (data.status === "ERROR") {
+    throw new Error(`LNURL verify error: ${data.reason || "Unknown error"}`)
+  }
+
+  return {
+    settled: data.settled === true,
+    preimage: data.preimage ?? undefined,
+    pr: data.pr,
   }
 }
 
@@ -356,30 +469,9 @@ export async function getInvoiceFromLightningAddress(
  * @returns Probe result with validity and capacity info
  */
 export async function probeNpubCashAddress(
-  address: string,
+  _address: string,
 ): Promise<NpubCashProbeResult> {
-  try {
-    const validation: NpubCashValidationResult = validateNpubCashAddress(address)
-    if (!validation.valid) {
-      return { valid: false, error: validation.error }
-    }
-
-    const { lnurlEndpoint } = parseLightningAddress(address)
-    const metadata: LnurlPayMetadata = await fetchLnurlPayMetadata(lnurlEndpoint)
-
-    return {
-      valid: true,
-      minSats: Math.ceil(metadata.minSendable / 1000),
-      maxSats: Math.floor(metadata.maxSendable / 1000),
-      allowsNostr: metadata.allowsNostr,
-    }
-  } catch (err: unknown) {
-    const error = err instanceof Error ? err : new Error(String(err))
-    return {
-      valid: false,
-      error: error.message,
-    }
-  }
+  return { valid: false, error: "npub.cash is no longer available" }
 }
 
 export default {
@@ -390,5 +482,6 @@ export default {
   fetchLnurlPayMetadata,
   requestInvoiceFromCallback,
   getInvoiceFromLightningAddress,
+  verifyLnurlPayment,
   probeNpubCashAddress,
 }

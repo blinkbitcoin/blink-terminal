@@ -12,6 +12,7 @@ import QRCode from "react-qr-code"
 
 import { unlockAudioContext, playSound } from "../lib/audio-utils"
 import { getEnvironment } from "../lib/config/api"
+import { isVoucherPdfEnabled } from "../lib/config/features"
 import {
   formatDisplayAmount as formatCurrency,
   getCurrencyById,
@@ -134,6 +135,16 @@ interface MultiVoucherProps {
   usdExchangeRate?: ExchangeRateData | null
   usdWalletId?: string | null
   initialExpiry?: string
+  /**
+   * Push notification of the current total amount (sats + USD cents, amount
+   * x quantity) and currency mode. Replaces the Dashboard's former 300ms
+   * polling of the imperative getters for the capacity indicator.
+   */
+  onAmountChange?: (
+    amountInSats: number,
+    amountInUsdCents: number,
+    currencyMode: VoucherCurrencyMode,
+  ) => void
 }
 
 /** Step names for the wizard flow */
@@ -194,6 +205,7 @@ const MultiVoucher = forwardRef<MultiVoucherHandle, MultiVoucherProps>(
       usdExchangeRate = null,
       usdWalletId = null,
       initialExpiry = DEFAULT_EXPIRY,
+      onAmountChange,
     },
     ref,
   ) => {
@@ -1035,6 +1047,54 @@ const MultiVoucher = forwardRef<MultiVoucherHandle, MultiVoucherProps>(
       }
     }
 
+    // Sats per voucher for the current entered amount (0 when not resolvable).
+    const computeSatsPerVoucher = (): number => {
+      if (!amount || amount === "" || amount === "0") return 0
+      const numericAmount = parseFloat(amount)
+      if (isNaN(numericAmount) || numericAmount <= 0) return 0
+
+      if (isBitcoinCurrency(displayCurrency)) return Math.round(numericAmount)
+      if (!exchangeRate?.satPriceInCurrency) return 0
+
+      const currency = getCurrencyById(displayCurrency, currencies)
+      const fractionDigits = currency?.fractionDigits ?? 2
+      const amountInMinorUnits = numericAmount * Math.pow(10, fractionDigits)
+      return Math.round(amountInMinorUnits / exchangeRate.satPriceInCurrency)
+    }
+
+    // Current total amount in sats (amount x quantity, for capacity indicator)
+    const computeAmountInSats = (): number => computeSatsPerVoucher() * quantity
+
+    // Current total amount in USD cents (amount x quantity)
+    const computeAmountInUsdCents = (): number => {
+      const satsPerVoucher = computeSatsPerVoucher()
+      if (satsPerVoucher <= 0 || !usdExchangeRate?.satPriceInCurrency) return 0
+      const centsPerVoucher = Math.round(
+        satsPerVoucher * usdExchangeRate.satPriceInCurrency,
+      )
+      return centsPerVoucher * quantity // Total for all vouchers
+    }
+
+    // Push amount changes to the parent (capacity indicator) instead of
+    // being polled via the imperative handle on a timer.
+    useEffect(() => {
+      onAmountChange?.(
+        computeAmountInSats(),
+        computeAmountInUsdCents(),
+        voucherCurrencyMode as VoucherCurrencyMode,
+      )
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [
+      amount,
+      quantity,
+      displayCurrency,
+      exchangeRate,
+      usdExchangeRate,
+      currencies,
+      voucherCurrencyMode,
+      onAmountChange,
+    ])
+
     // Expose handlers for keyboard navigation
     useImperativeHandle(ref, () => ({
       handleDigitPress,
@@ -1044,64 +1104,15 @@ const MultiVoucher = forwardRef<MultiVoucherHandle, MultiVoucherProps>(
         if (currentStep === "amount") {
           handleOkPress()
         } else if (currentStep === "config") {
-          generateVouchers()
+          if (isVoucherPdfEnabled()) generateVouchers()
         } else if (currentStep === "preview") {
-          downloadPdf()
+          if (isVoucherPdfEnabled()) downloadPdf()
         }
       },
       hasValidAmount: (): boolean => isValidAmount(),
       getCurrentStep: (): StepName => currentStep,
-      // Get current total amount in sats (for capacity indicator in Dashboard)
-      // Returns amount × quantity for multi-voucher
-      getAmountInSats: (): number => {
-        if (!amount || amount === "" || amount === "0") return 0
-        const numericAmount = parseFloat(amount)
-        if (isNaN(numericAmount) || numericAmount <= 0) return 0
-
-        let amountPerVoucher: number
-        if (isBitcoinCurrency(displayCurrency)) {
-          amountPerVoucher = Math.round(numericAmount)
-        } else if (exchangeRate?.satPriceInCurrency) {
-          const currency = getCurrencyById(displayCurrency, currencies)
-          const fractionDigits = currency?.fractionDigits ?? 2
-          const amountInMinorUnits = numericAmount * Math.pow(10, fractionDigits)
-          amountPerVoucher = Math.round(
-            amountInMinorUnits / exchangeRate.satPriceInCurrency,
-          )
-        } else {
-          return 0
-        }
-        return amountPerVoucher * quantity // Total for all vouchers
-      },
-      // Get current total amount in USD cents (for capacity indicator when in USD mode)
-      // Returns amount × quantity for multi-voucher
-      getAmountInUsdCents: (): number => {
-        if (!amount || amount === "" || amount === "0") return 0
-        const numericAmount = parseFloat(amount)
-        if (isNaN(numericAmount) || numericAmount <= 0) return 0
-
-        // First get sats per voucher
-        let amountPerVoucherSats = 0
-        if (isBitcoinCurrency(displayCurrency)) {
-          amountPerVoucherSats = Math.round(numericAmount)
-        } else if (exchangeRate?.satPriceInCurrency) {
-          const currency = getCurrencyById(displayCurrency, currencies)
-          const fractionDigits = currency?.fractionDigits ?? 2
-          const amountInMinorUnits = numericAmount * Math.pow(10, fractionDigits)
-          amountPerVoucherSats = Math.round(
-            amountInMinorUnits / exchangeRate.satPriceInCurrency,
-          )
-        }
-
-        // Convert sats to USD cents using USD exchange rate
-        if (amountPerVoucherSats > 0 && usdExchangeRate?.satPriceInCurrency) {
-          const centsPerVoucher = Math.round(
-            amountPerVoucherSats * usdExchangeRate.satPriceInCurrency,
-          )
-          return centsPerVoucher * quantity // Total for all vouchers
-        }
-        return 0
-      },
+      getAmountInSats: computeAmountInSats,
+      getAmountInUsdCents: computeAmountInUsdCents,
       // Get current voucher currency mode
       getVoucherCurrencyMode: (): string => voucherCurrencyMode,
       getSelectedExpiry: (): string => selectedExpiry,
@@ -1406,9 +1417,16 @@ const MultiVoucher = forwardRef<MultiVoucherHandle, MultiVoucherProps>(
 
         {/* Action Buttons */}
         <div className="px-4 pb-4 space-y-3">
+          {/* Batch vouchers are only usable via the (disabled) PDF route. */}
+          {!isVoucherPdfEnabled() && (
+            <div className="bg-amber-100 dark:bg-amber-900 border border-amber-400 dark:border-amber-700 text-amber-800 dark:text-amber-200 px-3 py-2 rounded text-sm">
+              Batch voucher printing is temporarily unavailable.
+            </div>
+          )}
           <button
             onClick={generateVouchers}
-            className="w-full h-14 bg-purple-600 dark:bg-purple-500 hover:bg-purple-700 dark:hover:bg-purple-600 text-white rounded-lg text-lg font-semibold transition-colors shadow-md flex items-center justify-center gap-2"
+            disabled={!isVoucherPdfEnabled()}
+            className="w-full h-14 bg-purple-600 dark:bg-purple-500 hover:bg-purple-700 dark:hover:bg-purple-600 disabled:bg-gray-400 dark:disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg text-lg font-semibold transition-colors shadow-md flex items-center justify-center gap-2"
           >
             <svg
               className="w-5 h-5"
@@ -1515,7 +1533,7 @@ const MultiVoucher = forwardRef<MultiVoucherHandle, MultiVoucherProps>(
             {/* Print button - green outline (main action) */}
             <button
               onClick={printVouchers}
-              disabled={printing || downloadingPdf}
+              disabled={!isVoucherPdfEnabled() || printing || downloadingPdf}
               className="h-14 bg-white dark:bg-black border-2 border-green-600 dark:border-green-500 hover:border-green-700 dark:hover:border-green-400 hover:bg-green-50 dark:hover:bg-green-900 text-green-600 dark:text-green-400 disabled:border-gray-400 disabled:text-gray-400 disabled:cursor-not-allowed rounded-lg text-lg font-normal transition-colors shadow-md flex items-center justify-center gap-2"
             >
               {printing ? (
@@ -1546,7 +1564,7 @@ const MultiVoucher = forwardRef<MultiVoucherHandle, MultiVoucherProps>(
             {/* Download PDF button - orange/yellow outline */}
             <button
               onClick={downloadPdf}
-              disabled={downloadingPdf || printing}
+              disabled={!isVoucherPdfEnabled() || downloadingPdf || printing}
               className="h-14 bg-white dark:bg-black border-2 border-orange-500 dark:border-orange-500 hover:border-orange-600 dark:hover:border-orange-400 hover:bg-orange-50 dark:hover:bg-orange-900 text-orange-500 dark:text-orange-400 disabled:border-gray-400 disabled:text-gray-400 disabled:cursor-not-allowed rounded-lg text-lg font-normal transition-colors shadow-md flex items-center justify-center gap-2"
             >
               {downloadingPdf ? (

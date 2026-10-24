@@ -1,9 +1,16 @@
-import React, { useState, useEffect, forwardRef, useImperativeHandle } from "react"
+import React, {
+  useState,
+  useEffect,
+  useRef,
+  forwardRef,
+  useImperativeHandle,
+} from "react"
 import QRCode from "react-qr-code"
 
 import { unlockAudioContext, playSound } from "../lib/audio-utils"
 import type { Wallet } from "../lib/blink-api"
 import { getEnvironment } from "../lib/config/api"
+import { isSplitPaymentsEnabled } from "../lib/config/features"
 import {
   formatDisplayAmount as formatCurrency,
   getCurrencyById,
@@ -77,6 +84,9 @@ interface POSProps {
   tipsEnabled: boolean
   tipPresets: number[]
   tipRecipients?: TipRecipient[]
+  /** True when the active receive wallet is a self-custodial (Spark) LN address.
+      Such receivers have no escrow, so tips can't be forwarded — suppress them. */
+  isSparkLnAddress?: boolean
   soundEnabled: boolean
   onInvoiceStateChange?: (showing: boolean) => void
   onInvoiceChange?: (invoice: InvoiceData | null) => void
@@ -103,6 +113,11 @@ interface POSProps {
   triggerPaymentAnimation?: (data: PaymentData) => void
   isPublicPOS?: boolean
   publicUsername?: string | null
+  /** URL pre-fill (public POS): amount in display-currency major units and
+      invoice memo from the `?amount=` / `?memo=` query params. Seeded once at
+      mount; both stay fully editable (pay.blink.sv parity). */
+  initialAmount?: string
+  initialMemo?: string
 }
 
 export interface POSRef {
@@ -131,6 +146,11 @@ interface InvoiceData {
   displayAmount?: number
   displayCurrency?: string
   satAmount?: number
+  // Structured tip info (kept alongside the memo text so the success screen
+  // and printed receipt can show a tip breakdown)
+  tipAmount?: number
+  tipCurrency?: string
+  tipPercent?: number
   [key: string]: string | number | boolean | undefined
 }
 
@@ -152,6 +172,7 @@ const POS = forwardRef<POSRef, POSProps>(
       tipsEnabled,
       tipPresets,
       tipRecipients = [],
+      isSparkLnAddress = false,
       soundEnabled,
       onInvoiceStateChange,
       onInvoiceChange,
@@ -172,10 +193,12 @@ const POS = forwardRef<POSRef, POSProps>(
       triggerPaymentAnimation,
       isPublicPOS = false,
       publicUsername = null,
+      initialAmount,
+      initialMemo,
     },
     ref,
   ) => {
-    const [amount, setAmount] = useState<string>("")
+    const [amount, setAmount] = useState<string>(initialAmount ?? "")
     const [total, setTotal] = useState<number>(0)
     const [items, setItems] = useState<number[]>([])
     const [invoice, setInvoice] = useState<InvoiceData | null>(null)
@@ -194,8 +217,10 @@ const POS = forwardRef<POSRef, POSProps>(
     const [customTipValue, setCustomTipValue] = useState<string>("")
     const [tipOptionIndex, setTipOptionIndex] = useState<number>(0) // Keyboard navigation index
 
-    // Cart memo (when coming from item cart)
-    const [cartMemo, setCartMemo] = useState<string>("")
+    // Cart memo (when coming from item cart, or seeded from the ?memo= URL
+    // param on the public POS — matching the native app's deep-link pre-fill).
+    // Flows into the invoice memo as "<memo> = <amount> (<sats> sats)".
+    const [cartMemo, setCartMemo] = useState<string>(initialMemo ?? "")
 
     // BC Theme helpers
     const isBlinkClassic =
@@ -484,8 +509,15 @@ const POS = forwardRef<POSRef, POSProps>(
     }, [cartCheckoutData, onCartCheckoutProcessed])
 
     // Check if invoice was paid when app regains focus (handles webhook forwarding case)
+    //
+    // This path is only relevant to the legacy escrow/forwarding flow: it queries
+    // the BlinkPOS wallet via /api/blink/check-payment and (for NWC merchants)
+    // forwards funds from BlinkPOS. With the intermediate account removed (Split
+    // Payments disabled), invoices are minted directly on the merchant wallet and
+    // settlement is detected by usePaymentPolling, so this block is skipped.
     useEffect(() => {
       if (!invoice?.paymentHash) return
+      if (!isSplitPaymentsEnabled()) return
 
       const checkPaymentOnFocus = async () => {
         try {
@@ -558,7 +590,7 @@ const POS = forwardRef<POSRef, POSProps>(
 
                       console.log("📄 NWC forwarding data:", {
                         baseAmount,
-                        hasTips: !!tipResult.tipData,
+                        hasTips: !!tipResult.tipsDeferred,
                       })
 
                       // Step 2: Create NWC invoice for base amount
@@ -598,15 +630,17 @@ const POS = forwardRef<POSRef, POSProps>(
                         if (payResponse.ok) {
                           console.log("✅ NWC base amount forwarded successfully!")
 
-                          // Step 4: Send tips if there are deferred tips
-                          if (tipResult.tipsDeferred && tipResult.tipData) {
+                          // Step 4: Send tips if there are deferred tips.
+                          // SECURITY: we no longer send tip amounts/recipients from
+                          // the client — the server reads them from the stored,
+                          // claimed payment record keyed on paymentHash.
+                          if (tipResult.tipsDeferred) {
                             console.log("💰 Sending deferred tips...")
                             await fetch("/api/blink/send-nwc-tips", {
                               method: "POST",
                               headers: { "Content-Type": "application/json" },
                               body: JSON.stringify({
                                 paymentHash: invoice.paymentHash,
-                                tipData: tipResult.tipData,
                                 environment: getEnvironment(),
                               }),
                             })
@@ -643,6 +677,16 @@ const POS = forwardRef<POSRef, POSProps>(
                   currency: "BTC",
                   memo: invoice.memo || `BlinkPOS: ${paymentAmount} sats`,
                   isForwarded: true,
+                  satAmount: invoice.satAmount || invoice.satoshis || paymentAmount,
+                  displayAmount: invoice.displayAmount,
+                  displayCurrency: invoice.displayCurrency,
+                  paymentHash: invoice.paymentHash,
+                  paymentRequest: invoice.paymentRequest,
+                  timestamp: Date.now(),
+                  merchant: publicUsername || _user?.username || undefined,
+                  tipAmount: invoice.tipAmount,
+                  tipCurrency: invoice.tipCurrency,
+                  tipPercent: invoice.tipPercent,
                 })
               }
 
@@ -682,8 +726,11 @@ const POS = forwardRef<POSRef, POSProps>(
       invoice?.satoshis,
       invoice?.amount,
       invoice?.memo,
+      invoice,
       onPaymentReceived,
       triggerPaymentAnimation,
+      publicUsername,
+      _user,
     ])
 
     // Notify parent when invoice or tip dialog state changes
@@ -701,8 +748,17 @@ const POS = forwardRef<POSRef, POSProps>(
       }
     }, [showTipDialog, showCustomTipInput])
 
+    // Tracks the latest exchange-rate request so stale responses are ignored
+    const exchangeRateRequestRef = useRef(0)
+
     const fetchExchangeRate = async () => {
       if (isBitcoinCurrency(displayCurrency)) return
+
+      // Monotonic request id: only the most recently issued request may
+      // apply its result, so a slow response for a previously selected
+      // currency can't overwrite the current one (fiat→sats conversion
+      // derives from this rate).
+      const requestId = ++exchangeRateRequestRef.current
 
       setLoadingRate(true)
       try {
@@ -726,6 +782,9 @@ const POS = forwardRef<POSRef, POSProps>(
 
         const data = await response.json()
 
+        // A newer request was issued while this one was in flight — drop it
+        if (requestId !== exchangeRateRequestRef.current) return
+
         if (data.success) {
           setExchangeRate({
             satPriceInCurrency: data.satPriceInCurrency,
@@ -736,12 +795,15 @@ const POS = forwardRef<POSRef, POSProps>(
           throw new Error(data.error || "Failed to fetch exchange rate")
         }
       } catch (err: unknown) {
+        if (requestId !== exchangeRateRequestRef.current) return
         console.error("Exchange rate error:", err)
         setError(
           `Failed to fetch ${displayCurrency} exchange rate: ${(err as Error).message}`,
         )
       } finally {
-        setLoadingRate(false)
+        if (requestId === exchangeRateRequestRef.current) {
+          setLoadingRate(false)
+        }
       }
     }
 
@@ -1141,9 +1203,12 @@ const POS = forwardRef<POSRef, POSProps>(
         return
       }
 
-      // Show tip overlay if tips are enabled and we haven't skipped it
+      // Show tip overlay if tips are enabled and we haven't skipped it.
+      // Self-custodial (Spark) receivers have no escrow to forward tips, so the
+      // tip dialog is suppressed for them (tipRecipients is also emptied upstream).
       if (
         tipsEnabled &&
+        !isSparkLnAddress &&
         tipRecipients &&
         tipRecipients.length > 0 &&
         !shouldSkipTipDialog &&
@@ -1286,21 +1351,37 @@ const POS = forwardRef<POSRef, POSProps>(
             currentEnvironment,
           )
 
-          const response = await fetch("/api/blink/public-invoice", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              username: publicUsername,
-              amount: finalTotalInSats,
-              memo: memo || `Payment to ${publicUsername}`,
-              walletCurrency: "BTC",
-              environment: currentEnvironment, // Pass environment to API
-            }),
+          const publicInvoiceBody = JSON.stringify({
+            username: publicUsername,
+            amount: finalTotalInSats,
+            memo: memo || `Payment to ${publicUsername}`,
+            walletCurrency: "BTC",
+            environment: currentEnvironment, // Pass environment to API
           })
 
-          const data = await response.json()
+          // Custodial-first: try the custodial on-behalf-of endpoint. If the
+          // username is not a custodial Blink account (404), fall back to the
+          // Lightning-address (LNURL-pay) endpoint, which serves self-custodial
+          // (Spark) accounts and returns a LUD-21 verifyUrl for settlement.
+          let response = await fetch("/api/blink/public-invoice", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: publicInvoiceBody,
+          })
+          let data = await response.json()
+
+          if (response.status === 404) {
+            console.log(
+              "↪️ Custodial lookup missed; trying self-custodial LN-address path for:",
+              publicUsername,
+            )
+            response = await fetch("/api/blink/public-invoice-lnaddress", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: publicInvoiceBody,
+            })
+            data = await response.json()
+          }
 
           console.log("Public invoice response:", data)
 
@@ -1316,6 +1397,9 @@ const POS = forwardRef<POSRef, POSProps>(
               displayCurrency: displayCurrency,
               satAmount: finalTotalInSats,
               memo: memo,
+              tipAmount: effectiveTipPercent > 0 ? tipAmount : 0,
+              tipCurrency: displayCurrency,
+              tipPercent: effectiveTipPercent,
             }
             setInvoice(enhancedInvoice)
             // Notify parent of invoice creation with full invoice data
@@ -1342,6 +1426,66 @@ const POS = forwardRef<POSRef, POSProps>(
           // Tip is the difference between total invoice and base (ensures base + tip = total)
           const tipInSats =
             effectiveTipPercent > 0 ? Math.max(0, finalTotalInSats - baseInSats) : 0
+
+          // SELF-CUSTODIAL (Spark) DIRECT RECEIVE:
+          // When the active receiving wallet is a Blink LN-address wallet, try the
+          // direct LN-address endpoint first. For a self-custodial (Spark) account
+          // it mints an invoice directly on the merchant's Lightning address (no
+          // BlinkPOS escrow, no forwarding) and returns a LUD-21 verify URL for
+          // settlement detection. For a custodial account it responds 409, and we
+          // fall back to the escrow create-invoice path below.
+          if (hasBlinkLnAddressWallet && activeBlinkAccount?.username) {
+            const scResponse = await fetch("/api/blink/public-invoice-lnaddress", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                username: activeBlinkAccount.username,
+                amount: finalTotalInSats,
+                memo: memo || `Payment to ${activeBlinkAccount.username}`,
+                walletCurrency: "BTC",
+                environment: getEnvironment(),
+              }),
+            })
+
+            // ONLY a confirmed custodial 409 falls through to the escrow path.
+            // For any other outcome we must NOT mint a BlinkPOS escrow invoice:
+            // a known/possibly-Spark receiver has no custodial BTC wallet, so an
+            // escrow invoice could never be forwarded (forward-ln-address would
+            // fail with "Could not resolve recipient BTC wallet"), stranding the
+            // customer-paid funds in BlinkPOS. Surface the error instead — it
+            // propagates to the outer catch and is shown to the operator.
+            if (scResponse.status === 409) {
+              // Custodial account; fall through to the escrow create-invoice path.
+              console.log("↪️ LN-address account is custodial; using escrow path.")
+            } else {
+              const scData = await scResponse.json().catch(() => ({}))
+              if (!scResponse.ok) {
+                throw new Error(scData.error || `Server error: ${scResponse.status}`)
+              }
+              if (!scData.success || !scData.invoice) {
+                throw new Error("Invalid response from server")
+              }
+              const enhancedInvoice: InvoiceData = {
+                ...scData.invoice,
+                displayAmount: totalWithTip,
+                displayCurrency: displayCurrency,
+                satAmount: finalTotalInSats,
+                memo: memo,
+                tipAmount: effectiveTipPercent > 0 ? tipAmount : 0,
+                tipCurrency: displayCurrency,
+                tipPercent: effectiveTipPercent,
+              }
+              setInvoice(enhancedInvoice)
+              if (onInvoiceChange) {
+                console.log(
+                  "📋 Self-custodial invoice created (direct, no escrow):",
+                  scData.invoice.paymentHash?.substring(0, 16) + "...",
+                )
+                onInvoiceChange(enhancedInvoice)
+              }
+              return
+            }
+          }
 
           // Get NWC connection URI for server-side forwarding (if NWC is active)
           let nwcConnectionUri: string | null = null
@@ -1396,7 +1540,14 @@ const POS = forwardRef<POSRef, POSProps>(
             }),
           }
 
-          console.log("Creating invoice with request body:", requestBody)
+          // Redact secrets (API key, NWC connection URI) from logs
+          console.log("Creating invoice with request body:", {
+            ...requestBody,
+            ...(requestBody.apiKey && {
+              apiKey: `${String(requestBody.apiKey).substring(0, 8)}...`,
+            }),
+            ...(requestBody.nwcConnectionUri && { nwcConnectionUri: "[redacted]" }),
+          })
 
           const response = await fetch("/api/blink/create-invoice", {
             method: "POST",
@@ -1422,6 +1573,9 @@ const POS = forwardRef<POSRef, POSProps>(
               displayCurrency: displayCurrency,
               satAmount: finalTotalInSats,
               memo: memo,
+              tipAmount: effectiveTipPercent > 0 ? tipAmount : 0,
+              tipCurrency: displayCurrency,
+              tipPercent: effectiveTipPercent,
             }
             setInvoice(enhancedInvoice)
             // Notify parent of invoice creation for NFC scanning and payment hash tracking

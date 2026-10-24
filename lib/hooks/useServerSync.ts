@@ -3,7 +3,12 @@ import { useEffect, useRef, useCallback } from "react"
 import { initTransactionLabels } from "../../components/TransactionDetail"
 import { getApiUrl } from "../config/api"
 
-import type { NumberFormat, NumpadLayout, DisplayCurrency } from "./useDisplaySettings"
+import {
+  hasStoredDisplayCurrency,
+  type NumberFormat,
+  type NumpadLayout,
+  type DisplayCurrency,
+} from "./useDisplaySettings"
 import type { SoundTheme } from "./useSoundSettings"
 import type {
   VoucherWallet,
@@ -242,7 +247,20 @@ export function useServerSync({
               JSON.stringify(serverPrefs.tipPresets),
             )
           }
-          if (serverPrefs.displayCurrency) {
+          // Seed display currency from server prefs on first run only, and
+          // only when the response represents genuinely stored user data.
+          // The GET endpoint returns default preferences (displayCurrency
+          // "BTC") for never-synced users; `lastSynced` is absent in that
+          // case. Without this guard the default could seed + persist before
+          // useDashboardData seeds from the account's actual preferredCurrency
+          // (a real race on the async nostr/non-custodial login path), and a
+          // persisted device choice must always survive login. Outbound sync
+          // below still propagates local changes to the server.
+          if (
+            serverPrefs.displayCurrency &&
+            !hasStoredDisplayCurrency() &&
+            data.lastSynced
+          ) {
             setDisplayCurrency(serverPrefs.displayCurrency as DisplayCurrency)
           }
           if (serverPrefs.numberFormat) {

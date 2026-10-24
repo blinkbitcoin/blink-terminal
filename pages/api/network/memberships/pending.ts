@@ -6,6 +6,7 @@
 
 import type { NextApiRequest, NextApiResponse } from "next"
 
+import { requireSessionNpub } from "../../../../lib/auth/session-pubkey"
 import type { MembershipRow } from "../../../../lib/network/db"
 import * as db from "../../../../lib/network/db"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../../lib/rate-limit"
@@ -15,15 +16,10 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     return res.status(405).json({ error: "Method not allowed" })
   }
 
-  const userNpub = req.headers["x-user-npub"] as string | undefined
+  // Identity from the verified Nostr session only (blink-wip#1679).
+  const userNpub = requireSessionNpub(req, res)
+  if (!userNpub) return
   const { communityId } = req.query as { communityId?: string }
-
-  if (!userNpub) {
-    return res.status(401).json({
-      success: false,
-      error: "Authentication required",
-    })
-  }
 
   try {
     const isSuperAdmin = await db.isSuperAdmin(userNpub)
@@ -92,4 +88,4 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 }
 
-export default withRateLimit(handler, RATE_LIMIT_WRITE)
+export default withRateLimit(handler, RATE_LIMIT_WRITE, "network/memberships/pending")

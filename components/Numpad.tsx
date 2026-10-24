@@ -58,9 +58,10 @@ export default function Numpad({
   // Base button styles for different themes
   const getButtonClasses = (type: ButtonType = "digit"): string => {
     if (isBlinkClassicDark) {
-      // BC Dark: transparent bg, #393939 border, hover → #1D1D1D bg + #FFAD0D border
+      // BC Dark (main-app keypad, issue #44): transparent bg, #393939 1px border,
+      // 28px digits, hover → #1D1D1D bg + #FFAD0D border. C/backspace amber.
       const baseClassic =
-        "h-16 md:h-20 bg-transparent border border-blink-classic-border hover:bg-blink-classic-bg hover:border-blink-classic-amber rounded-xl text-xl md:text-2xl font-bold transition-colors"
+        "h-16 md:h-20 bg-transparent border border-blink-classic-border hover:bg-blink-classic-bg hover:border-blink-classic-amber rounded-xl text-[28px] leading-8 font-bold transition-colors"
 
       switch (type) {
         case "digit":
@@ -79,19 +80,21 @@ export default function Numpad({
             voucherCurrencyMode === "BTC"
               ? "border-orange-500 text-orange-500 hover:border-orange-400 hover:text-orange-400"
               : "border-green-500 text-green-500 hover:border-green-400 hover:text-green-400"
-          return `h-16 md:h-20 bg-transparent border ${toggleColorDark} rounded-xl text-xl md:text-2xl font-bold transition-colors flex items-center justify-center`
+          return `h-16 md:h-20 bg-transparent border ${toggleColorDark} rounded-xl text-[28px] leading-8 font-bold transition-colors flex items-center justify-center`
         }
         case "ok":
-          return "h-[136px] md:h-[172px] bg-transparent border border-blink-classic-border hover:bg-blink-classic-bg hover:border-blink-classic-amber rounded-xl text-lg md:text-xl font-bold transition-colors text-white disabled:opacity-50 disabled:cursor-not-allowed row-span-2 flex items-center justify-center"
+          // 2px green (success) border + green text, 24px label — matches the design.
+          return "h-[136px] md:h-[172px] bg-transparent border-2 border-success hover:bg-blink-classic-bg rounded-xl text-[24px] font-bold transition-colors text-success disabled:opacity-50 disabled:cursor-not-allowed row-span-2 flex items-center justify-center"
         default:
           return baseClassic
       }
     }
 
     if (isBlinkClassicLight) {
-      // BC Light: transparent bg, #E2E2E4 border, hover → #F2F2F4 bg + #FFAD0D border
+      // BC Light (main-app keypad, issue #44): transparent bg, #E2E2E4 1px border,
+      // 28px digits, hover → #F2F2F4 bg. C/backspace primary orange (#FC5805).
       const baseClassic =
-        "h-16 md:h-20 bg-transparent border border-blink-classic-border-light hover:bg-blink-classic-hover-light hover:border-blink-classic-amber rounded-xl text-xl md:text-2xl font-bold transition-colors"
+        "h-16 md:h-20 bg-transparent border border-blink-classic-border-light hover:bg-blink-classic-hover-light hover:border-blink-classic-amber rounded-xl text-[28px] leading-8 font-bold transition-colors"
 
       switch (type) {
         case "digit":
@@ -99,9 +102,9 @@ export default function Numpad({
         case "plus":
           return `${baseClassic} text-black disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center`
         case "clear":
-          return `${baseClassic} text-blink-classic-amber`
+          return `${baseClassic} text-blink-primary`
         case "backspace":
-          return `${baseClassic} text-blink-classic-amber flex items-center justify-center`
+          return `${baseClassic} text-blink-primary flex items-center justify-center`
         case "decimal":
           return `${baseClassic} text-black disabled:opacity-50 disabled:cursor-not-allowed`
         case "currencyToggle": {
@@ -110,10 +113,11 @@ export default function Numpad({
             voucherCurrencyMode === "BTC"
               ? "border-orange-500 text-orange-500 hover:border-orange-400 hover:text-orange-400"
               : "border-green-500 text-green-500 hover:border-green-400 hover:text-green-400"
-          return `h-16 md:h-20 bg-transparent border ${toggleColorLight} rounded-xl text-xl md:text-2xl font-bold transition-colors flex items-center justify-center`
+          return `h-16 md:h-20 bg-transparent border ${toggleColorLight} rounded-xl text-[28px] leading-8 font-bold transition-colors flex items-center justify-center`
         }
         case "ok":
-          return "h-[136px] md:h-[172px] bg-transparent border border-blink-classic-border-light hover:bg-blink-classic-hover-light hover:border-blink-classic-amber rounded-xl text-lg md:text-xl font-bold transition-colors text-black disabled:opacity-50 disabled:cursor-not-allowed row-span-2 flex items-center justify-center"
+          // 2px green (success) border + green text, 24px label — matches the design.
+          return "h-[136px] md:h-[172px] bg-transparent border-2 border-success hover:bg-blink-classic-hover-light rounded-xl text-[24px] font-bold transition-colors text-success disabled:opacity-50 disabled:cursor-not-allowed row-span-2 flex items-center justify-center"
         default:
           return baseClassic
       }

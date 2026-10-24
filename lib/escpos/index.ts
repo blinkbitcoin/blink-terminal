@@ -36,6 +36,8 @@ export {
   formatExpiry,
   formatSats,
 } from "./VoucherReceipt"
+export { default as ReceiptBuilder } from "./ReceiptBuilder"
+export type { ReceiptData, ReceiptOptions } from "./ReceiptBuilder"
 export {
   default as QRCodeRasterizer,
   imageDataToBitmap,

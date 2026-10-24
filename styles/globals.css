@@ -8,10 +8,16 @@
   box-sizing: border-box;
 }
 
-/* Inter Tight font for payment amount displays */
+/* Inter Tight font for payment amount displays.
+   The "Source Sans Pro" fallback (the app's global font, loaded alongside
+   Inter Tight) keeps the swap-window fallback consistent with the rest of the
+   UI. Without it, on a cold first paint (notably the Public POS route) the
+   browser falls back to the generic serif-leaning `sans-serif` for glyphs not
+   yet covered by the loaded Inter Tight subset (e.g. the decimal-separator
+   comma), producing a mismatched comma in amounts like "$0,00". */
 .font-inter-tight,
 .font-inter-tight * {
-  font-family: "Inter Tight", sans-serif !important;
+  font-family: "Inter Tight", "Source Sans Pro", sans-serif !important;
 }
 
 /* Mobile responsiveness fixes */

@@ -1,5 +1,6 @@
 import Link from "next/link"
 
+import { type Theme, THEME_LABELS } from "../../lib/hooks/useTheme"
 import { FORMAT_LABELS, type NumberFormatPreference } from "../../lib/number-format"
 
 /**
@@ -11,8 +12,8 @@ import { FORMAT_LABELS, type NumberFormatPreference } from "../../lib/number-for
 
 interface PublicPOSSideMenuProps {
   onClose: () => void
-  theme: string
-  cycleTheme: () => void
+  theme: Theme
+  onShowThemeCycle: () => void
   displayCurrency: string
   numberFormat: NumberFormatPreference
   soundEnabled: boolean
@@ -29,7 +30,7 @@ interface PublicPOSSideMenuProps {
 export default function PublicPOSSideMenu({
   onClose,
   theme,
-  cycleTheme,
+  onShowThemeCycle,
   displayCurrency,
   numberFormat,
   soundEnabled,
@@ -138,9 +139,12 @@ export default function PublicPOSSideMenu({
               </div>
             </Link>
 
-            {/* Theme Selection */}
+            {/* Theme Selection — opens the selectable theme-cycle overlay */}
             <button
-              onClick={cycleTheme}
+              onClick={() => {
+                onShowThemeCycle()
+                onClose()
+              }}
               className={`w-full rounded-lg p-4 ${getMenuTileClasses()} transition-colors`}
             >
               <div className="flex items-center justify-between">
@@ -148,16 +152,7 @@ export default function PublicPOSSideMenu({
                   Theme
                 </span>
                 <div className="flex items-center text-sm text-gray-500 dark:text-gray-400">
-                  <span>
-                    {theme === "dark"
-                      ? "Dark"
-                      : theme === "blink-classic-dark"
-                        ? "BC Dark"
-                        : theme === "light"
-                          ? "Light"
-                          : "BC Light"}
-                  </span>
-                  <span className="ml-1 text-xs">(tap to change)</span>
+                  <span>{THEME_LABELS[theme as Theme]}</span>
                 </div>
               </div>
             </button>

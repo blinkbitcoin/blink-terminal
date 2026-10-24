@@ -72,12 +72,18 @@ server.log
 backup_*
 
 # Local documentation (not for GitHub)
+research_prism_splits.md
 ROADMAP.md
 NIP46_PORTAL_INTEGRATION.md
 MERCHANT_VERIFICATION_BTCMAP.md
 CSV_EXPORT_FIELDS.md
 PROJECT_STATUS_UPDATE_DEC_2025.md
+AGENTS.md
+spark_term_plan.md
 .voucher-store.json
+
+# opencode local config
+opencode.json
 
 # CI build artifacts
 ci/build/

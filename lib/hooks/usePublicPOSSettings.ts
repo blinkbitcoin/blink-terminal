@@ -1,11 +1,22 @@
-import { useState, useEffect, type Dispatch, type SetStateAction } from "react"
+import {
+  useState,
+  useEffect,
+  useCallback,
+  type Dispatch,
+  type SetStateAction,
+} from "react"
 
 import type { SoundThemeName } from "../audio-utils"
-import type {
-  NumberFormatPreference,
-  BitcoinFormatPreference,
-  NumpadLayoutPreference,
+import {
+  DEFAULT_AMOUNT_DISPLAY,
+  type NumberFormatPreference,
+  type BitcoinFormatPreference,
+  type NumpadLayoutPreference,
+  type AmountDisplayPreference,
 } from "../number-format"
+import type { OrangePillMode } from "../orangepill"
+
+import { type Theme, normalizeEnabledThemes, parseEnabledThemes } from "./useTheme"
 
 interface UsePublicPOSSettingsReturn {
   displayCurrency: string
@@ -16,10 +27,18 @@ interface UsePublicPOSSettingsReturn {
   setBitcoinFormat: Dispatch<SetStateAction<BitcoinFormatPreference>>
   numpadLayout: NumpadLayoutPreference
   setNumpadLayout: Dispatch<SetStateAction<NumpadLayoutPreference>>
+  enabledThemes: Theme[]
+  setEnabledThemes: (themes: Theme[]) => void
+  amountDisplay: AmountDisplayPreference
+  setAmountDisplay: Dispatch<SetStateAction<AmountDisplayPreference>>
   soundEnabled: boolean
   setSoundEnabled: Dispatch<SetStateAction<boolean>>
   soundTheme: SoundThemeName
   setSoundTheme: Dispatch<SetStateAction<SoundThemeName>>
+  orangePillMode: OrangePillMode
+  setOrangePillMode: Dispatch<SetStateAction<OrangePillMode>>
+  orangePillStaticUrl: string
+  setOrangePillStaticUrl: Dispatch<SetStateAction<string>>
 }
 
 /**
@@ -30,9 +49,37 @@ interface UsePublicPOSSettingsReturn {
  * - Number format, Bitcoin format, numpad layout
  * - Sound enabled/theme
  * - All localStorage persistence (publicpos-* keys)
+ *
+ * @param initialDisplayCurrency - Optional per-link initial display currency
+ *   (from the `?display=` URL param, already normalized SSR-side). When present
+ *   it takes precedence and becomes the new persisted device default. When
+ *   absent, the last display currency chosen on this device is restored from
+ *   localStorage (`publicpos-display-currency`), falling back to USD.
  */
-export function usePublicPOSSettings(): UsePublicPOSSettingsReturn {
-  const [displayCurrency, setDisplayCurrency] = useState("USD")
+const PUBLICPOS_DISPLAY_CURRENCY_KEY = "publicpos-display-currency"
+
+export function usePublicPOSSettings(
+  initialDisplayCurrency?: string,
+): UsePublicPOSSettingsReturn {
+  const [displayCurrency, setDisplayCurrency] = useState(() => {
+    if (initialDisplayCurrency) {
+      return initialDisplayCurrency
+    }
+    // Any fiat code is valid here (public POS is multi-currency), so we only
+    // guard against a missing/empty value. A stale/unknown stored code is
+    // accepted as-is; the ?display= param path additionally validates against
+    // the loaded currency list in PublicPOSDashboard, but that check does not
+    // run when restoring from localStorage without a param.
+    if (typeof window !== "undefined") {
+      try {
+        const stored = localStorage.getItem(PUBLICPOS_DISPLAY_CURRENCY_KEY)
+        return stored && stored.length > 0 ? stored : "USD"
+      } catch {
+        return "USD"
+      }
+    }
+    return "USD"
+  })
 
   const [numberFormat, setNumberFormat] = useState<NumberFormatPreference>(() => {
     if (typeof window !== "undefined") {
@@ -64,6 +111,32 @@ export function usePublicPOSSettings(): UsePublicPOSSettingsReturn {
     return "calculator"
   })
 
+  const [enabledThemes, setEnabledThemesState] = useState<Theme[]>(() =>
+    parseEnabledThemes(
+      typeof window !== "undefined"
+        ? localStorage.getItem("publicpos-enabledThemes")
+        : null,
+    ),
+  )
+
+  const setEnabledThemes = useCallback((themes: Theme[]) => {
+    const next = normalizeEnabledThemes(themes)
+    setEnabledThemesState(next)
+    if (typeof window !== "undefined") {
+      localStorage.setItem("publicpos-enabledThemes", JSON.stringify(next))
+    }
+  }, [])
+
+  const [amountDisplay, setAmountDisplay] = useState<AmountDisplayPreference>(() => {
+    if (typeof window !== "undefined") {
+      return (
+        (localStorage.getItem("publicpos-amountDisplay") as AmountDisplayPreference) ||
+        DEFAULT_AMOUNT_DISPLAY
+      )
+    }
+    return DEFAULT_AMOUNT_DISPLAY
+  })
+
   const [soundEnabled, setSoundEnabled] = useState(() => {
     if (typeof window !== "undefined") {
       const saved = localStorage.getItem("publicpos-soundEnabled")
@@ -80,7 +153,27 @@ export function usePublicPOSSettings(): UsePublicPOSSettingsReturn {
     return "success"
   })
 
+  const [orangePillMode, setOrangePillMode] = useState<OrangePillMode>(() => {
+    if (typeof window !== "undefined") {
+      return (localStorage.getItem("publicpos-orangePillMode") as OrangePillMode) || "off"
+    }
+    return "off"
+  })
+
+  const [orangePillStaticUrl, setOrangePillStaticUrl] = useState<string>(() => {
+    if (typeof window !== "undefined") {
+      return localStorage.getItem("publicpos-orangePillStaticUrl") || ""
+    }
+    return ""
+  })
+
   // Persist all settings to localStorage
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      localStorage.setItem(PUBLICPOS_DISPLAY_CURRENCY_KEY, displayCurrency)
+    }
+  }, [displayCurrency])
+
   useEffect(() => {
     if (typeof window !== "undefined") {
       localStorage.setItem("publicpos-soundEnabled", JSON.stringify(soundEnabled))
@@ -111,6 +204,24 @@ export function usePublicPOSSettings(): UsePublicPOSSettingsReturn {
     }
   }, [numpadLayout])
 
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      localStorage.setItem("publicpos-amountDisplay", amountDisplay)
+    }
+  }, [amountDisplay])
+
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      localStorage.setItem("publicpos-orangePillMode", orangePillMode)
+    }
+  }, [orangePillMode])
+
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      localStorage.setItem("publicpos-orangePillStaticUrl", orangePillStaticUrl)
+    }
+  }, [orangePillStaticUrl])
+
   return {
     displayCurrency,
     setDisplayCurrency,
@@ -120,9 +231,17 @@ export function usePublicPOSSettings(): UsePublicPOSSettingsReturn {
     setBitcoinFormat,
     numpadLayout,
     setNumpadLayout,
+    enabledThemes,
+    setEnabledThemes,
+    amountDisplay,
+    setAmountDisplay,
     soundEnabled,
     setSoundEnabled,
     soundTheme,
     setSoundTheme,
+    orangePillMode,
+    setOrangePillMode,
+    orangePillStaticUrl,
+    setOrangePillStaticUrl,
   }
 }

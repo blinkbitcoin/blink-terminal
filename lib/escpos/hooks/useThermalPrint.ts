@@ -71,6 +71,10 @@ interface UseThermalPrintReturn {
     voucher: Record<string, unknown>,
     printOptions?: Record<string, unknown>,
   ) => Promise<PrintHookResult>
+  printReceipt: (
+    receipt: Record<string, unknown>,
+    printOptions?: Record<string, unknown>,
+  ) => Promise<PrintHookResult>
   printStandard: (
     voucher: Record<string, unknown>,
     opts?: Record<string, unknown>,
@@ -282,6 +286,55 @@ export function useThermalPrint(
   )
 
   /**
+   * Print a payment receipt.
+   *
+   * Receipts route through PrintService.printReceipt, which selects the best
+   * available NON-PDF adapter (the PDF adapter is voucher-only and ignores raw
+   * ESC/POS). This means receipt printing does not necessarily follow the
+   * persisted selectMethod preference when that preference is PDF; otherwise it
+   * honors the preferred adapter. In practice that's the CompanionAdapter
+   * `app=payment` deep link on mobile, or raw ESC/POS via local-print-server /
+   * WebSerial on desktop.
+   *
+   * @param receipt - Pre-formatted receipt data (amount string already combined)
+   * @param printOptions - Print options
+   */
+  const printReceipt = useCallback(
+    async (
+      receipt: Record<string, unknown>,
+      printOptions: Record<string, unknown> = {},
+    ): Promise<PrintHookResult> => {
+      if (!printServiceRef.current) {
+        return { success: false, error: "Print service not initialized" }
+      }
+
+      setIsPrinting(true)
+      setError(null)
+      setPrintStatus(PrintStatus.PENDING)
+
+      try {
+        const result = await printServiceRef.current.printReceipt(
+          receipt as never,
+          printOptions,
+        )
+        setLastResult(result)
+        if (!result.success) {
+          setError(result.error || null)
+        }
+        return result
+      } catch (err: unknown) {
+        const errorMsg: string = (err as Error).message || "Print failed"
+        setError(errorMsg)
+        setLastResult({ success: false, error: errorMsg })
+        return { success: false, error: errorMsg }
+      } finally {
+        setIsPrinting(false)
+      }
+    },
+    [],
+  )
+
+  /**
    * Change print method
    */
   const selectMethod = useCallback(async (methodType: string): Promise<void> => {
@@ -354,6 +407,7 @@ export function useThermalPrint(
 
     // Methods
     print,
+    printReceipt,
     printStandard,
     printMinimal,
     printReissue,

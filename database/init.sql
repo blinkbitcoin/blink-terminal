@@ -33,11 +33,27 @@ VALUES (
 );
 
 -- ============================================
+-- USER RECORDS TABLE
+-- Generic per-user key/value store keyed by sha256(userId). Holds POS
+-- profiles/wallets, voucher (sending) wallet, split profiles, preferences,
+-- cart, and legacy API-key / Nostr-link records. Shared across all replicas
+-- so user config does not diverge per pod. See migration 020 for details.
+-- ============================================
+CREATE TABLE IF NOT EXISTS user_records (
+    user_hash VARCHAR(64) PRIMARY KEY,
+    data JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_records_updated ON user_records(updated_at DESC);
+
+-- ============================================
 -- COMPLETION
 -- ============================================
 DO $$
 BEGIN
     RAISE NOTICE 'BlinkPOS database initialized successfully!';
     RAISE NOTICE 'Extensions enabled: uuid-ossp';
-    RAISE NOTICE 'Tables created: system_metrics';
+    RAISE NOTICE 'Tables created: system_metrics, user_records';
 END $$;

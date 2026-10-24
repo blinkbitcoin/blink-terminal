@@ -6,7 +6,7 @@ import type { ListTransactionsParams } from "../nwc/NWCClient"
 
 import type { PaymentData } from "./useBlinkWebSocket"
 import type { CombinedUser } from "./useCombinedAuth"
-import type { DisplayCurrency } from "./useDisplaySettings"
+import { hasStoredDisplayCurrency, type DisplayCurrency } from "./useDisplaySettings"
 import type { LocalNWCConnection, NWCOperationResult } from "./useNWC"
 import type { LocalBlinkAccount } from "./useProfile"
 import type { VoucherWallet, VoucherCurrencyMode } from "./useVoucherWalletState"
@@ -50,16 +50,6 @@ interface _NWCTransaction {
   invoice_description?: string
   created_at?: number
   settled_at?: number
-  [key: string]: unknown
-}
-
-/**
- * Ref handle for voucher/multivoucher child components
- */
-interface VoucherRefHandle {
-  getAmountInSats?: () => number
-  getAmountInUsdCents?: () => number
-  getVoucherCurrencyMode?: () => string
   [key: string]: unknown
 }
 
@@ -113,8 +103,6 @@ export interface UseDashboardDataParams {
   lastPayment: PaymentData | null
   // Refs (created in Dashboard, passed in)
   posPaymentReceivedRef: MutableRefObject<(() => void) | null>
-  voucherRef: MutableRefObject<VoucherRefHandle | null>
-  multiVoucherRef: MutableRefObject<VoucherRefHandle | null>
 }
 
 /**
@@ -186,8 +174,6 @@ export function useDashboardData({
   lastPayment,
   // Refs (created in Dashboard, passed in)
   posPaymentReceivedRef,
-  voucherRef,
-  multiVoucherRef,
 }: UseDashboardDataParams): UseDashboardDataReturn {
   // --- fetchApiKey ---
   const fetchApiKey = async (): Promise<string | null> => {
@@ -545,10 +531,12 @@ export function useDashboardData({
     if (user) {
       // ✅ REMOVED: fetchData() - transactions now load ONLY when user clicks "Transactions" tab
 
-      // Set display currency from user preference
-      if (user.preferredCurrency) {
+      // Seed display currency from the account preference on first run only.
+      // Once the device has a persisted choice, it is authoritative and must
+      // not be overwritten on login (persist last selected currency per device).
+      if (user.preferredCurrency && !hasStoredDisplayCurrency()) {
         console.log(
-          `Setting display currency to user preference: ${user.preferredCurrency}`,
+          `Seeding display currency from user preference: ${user.preferredCurrency}`,
         )
         setDisplayCurrency(user.preferredCurrency as DisplayCurrency)
       }
@@ -573,30 +561,16 @@ export function useDashboardData({
     }
   }, [voucherWallet?.apiKey, currentView, fetchVoucherWalletBalance])
 
-  // Poll for current amount from child components (for capacity indicator)
+  // Reset the capacity-indicator amount when leaving voucher views.
+  // While ON a voucher view, the amount is pushed by Voucher/MultiVoucher via
+  // their onAmountChange callback (previously this was a 300ms poll of the
+  // child components' imperative getters).
   useEffect(() => {
     if (currentView !== "voucher" && currentView !== "multivoucher") {
       setCurrentAmountInSats(0)
       setCurrentAmountInUsdCents(0)
       setCurrentVoucherCurrencyMode("BTC")
-      return
     }
-
-    const pollAmount = (): void => {
-      const ref = currentView === "voucher" ? voucherRef.current : multiVoucherRef.current
-      const amountSats = ref?.getAmountInSats?.() || 0
-      const amountUsdCents = ref?.getAmountInUsdCents?.() || 0
-      const currencyMode = (ref?.getVoucherCurrencyMode?.() ||
-        "BTC") as VoucherCurrencyMode
-      setCurrentAmountInSats(amountSats)
-      setCurrentAmountInUsdCents(amountUsdCents)
-      setCurrentVoucherCurrencyMode(currencyMode)
-    }
-
-    pollAmount() // Initial
-    const interval = setInterval(pollAmount, 300) // Poll every 300ms
-
-    return () => clearInterval(interval)
   }, [currentView])
 
   // Fetch balance when Send Wallet overlay opens

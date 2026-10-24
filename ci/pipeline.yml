@@ -1,3 +1,4 @@
+#@ load("@ytt:overlay", "overlay")
 #@ load("@ytt:data", "data")
 
 #@ load("vendor/pipeline-fragments.lib.yml",
@@ -7,7 +8,6 @@
 #@   "release",
 #@   "open_charts_pr",
 #@   "repo_resource",
-#@   "nodejs_deps_resource",
 #@   "install_nodejs_deps",
 #@   "deps_version_resource",
 #@   "bundled_deps_resource",
@@ -24,6 +24,18 @@
 #@   "slack_resource",
 #@   "gcr_resource_type",
 #@   "slack_resource_type")
+
+#! The shared pnpm resource only watches pnpm-lock.yaml. Keep the dependency
+#! bundle in sync with every file that affects pnpm's install result.
+#@ def pnpm_deps_resource():
+name: deps
+type: git
+source:
+  paths: [package.json, pnpm-lock.yaml, pnpm-workspace.yaml, patches/*]
+  uri: #@ data.values.git_uri
+  branch: #@ data.values.git_branch
+  private_key: #@ data.values.github_private_key
+#@ end
 
 groups:
 - name: terminal
@@ -47,7 +59,7 @@ resources:
 - #@ repo_resource(webhook=True)
 - #@ pipeline_tasks_resource()
 - #@ edge_image_resource()
-- #@ nodejs_deps_resource(pckgMgr="pnpm")
+- #@ pnpm_deps_resource()
 - #@ deps_version_resource()
 - #@ bundled_deps_resource()
 - #@ slack_resource()
@@ -62,3 +74,17 @@ resources:
 resource_types:
 - #@ gcr_resource_type()
 - #@ slack_resource_type()
+
+#! Keep the pinned shared template unchanged while using supported Git get params.
+#@overlay/match by=lambda _, left, right: "jobs" in left, expects=1
+---
+jobs:
+#@overlay/match by="name", expects=1
+- name: bump-image-in-chart
+  plan:
+  #@overlay/match by=lambda _, left, right: "in_parallel" in left, expects=1
+  - in_parallel:
+    #@overlay/match by=overlay.subset({"get": "charts-repo"}), expects=1
+    - params:
+        #@overlay/remove
+        skip_download:

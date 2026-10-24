@@ -1,39 +1,45 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
+import { shortId } from "../../../lib/log-redact"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
+import {
+  getOwnedWallets,
+  getVoucherApiKey,
+  OWNERSHIP_UNAVAILABLE,
+  toEnvironment,
+} from "../../../lib/voucher-auth"
 import voucherStore from "../../../lib/voucher-store"
 
 /**
  * API endpoint to cancel a voucher
  *
  * POST /api/voucher/cancel
+ * Header: x-voucher-api-key: <API key whose account currently owns the
+ *         voucher's wallet (checked live against Blink)>
  * Body: { chargeId: string }
  *
  * Returns:
  * - 200: { success: true }
  * - 400: { error: string } - Invalid request or voucher state
- * - 404: { error: string } - Voucher not found
+ * - 401: { error: string } - Missing API key
+ * - 404: { error: string } - Voucher not found (or not owned by the caller)
  * - 405: { error: string } - Method not allowed
  */
 async function handler(req: NextApiRequest, res: NextApiResponse) {
-  // Add CORS headers for compatibility
-  res.setHeader("Access-Control-Allow-Origin", "*")
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS")
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type")
-
-  if (req.method === "OPTIONS") {
-    return res.status(200).end()
-  }
-
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" })
   }
 
+  const apiKey = getVoucherApiKey(req)
+  if (!apiKey) {
+    return res.status(401).json({ error: "Voucher wallet API key required" })
+  }
+
   try {
-    const { chargeId } = req.body as { chargeId: string }
+    const { chargeId } = (req.body ?? {}) as { chargeId?: unknown }
 
     // Validate required field
-    if (!chargeId) {
+    if (!chargeId || typeof chargeId !== "string") {
       return res.status(400).json({
         error: "Missing required field: chargeId",
       })
@@ -42,7 +48,15 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     // Get voucher with status to check current state (async)
     const voucher = await voucherStore.getVoucherWithStatus(chargeId)
 
-    if (!voucher) {
+    // Ownership is checked live in the voucher's own environment. Same
+    // response for "doesn't exist", "not yours" and "key not valid" (no oracle).
+    const ownership = voucher
+      ? await getOwnedWallets(apiKey, toEnvironment(voucher.environment))
+      : null
+    if (ownership && !ownership.ok && ownership.reason === "unavailable") {
+      return res.status(OWNERSHIP_UNAVAILABLE.status).json(OWNERSHIP_UNAVAILABLE.body)
+    }
+    if (!voucher || !ownership?.ok || !ownership.wallets.has(voucher.walletId)) {
       return res.status(404).json({
         error: "Voucher not found",
       })
@@ -62,16 +76,24 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       })
     }
 
-    // Cancel the voucher (async)
+    // Cancel the voucher (async). The update is guarded (ACTIVE and not
+    // claimed), so a redemption that wins the race leaves it untouched.
     const success = await voucherStore.cancelVoucher(chargeId)
 
     if (!success) {
+      const current = await voucherStore.getVoucherWithStatus(chargeId)
+      if (current && current.status !== "ACTIVE") {
+        return res.status(409).json({
+          error: `Voucher is no longer active (${current.status.toLowerCase()})`,
+          status: current.status,
+        })
+      }
       return res.status(500).json({
         error: "Failed to cancel voucher",
       })
     }
 
-    console.log("🚫 Voucher cancelled via API:", chargeId)
+    console.log("🚫 Voucher cancelled via API:", shortId(chargeId))
 
     res.status(200).json({
       success: true,
@@ -88,4 +110,4 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 }
 
-export default withRateLimit(handler, RATE_LIMIT_WRITE)
+export default withRateLimit(handler, RATE_LIMIT_WRITE, "voucher/cancel")

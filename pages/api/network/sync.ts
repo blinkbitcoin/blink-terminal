@@ -7,6 +7,8 @@
 
 import type { NextApiRequest, NextApiResponse } from "next"
 
+import { requireTrustedMutation } from "../../../lib/auth/mutation-guard"
+import { requireSessionNpub } from "../../../lib/auth/session-pubkey"
 import type { MetricsRow } from "../../../lib/network/db"
 import * as db from "../../../lib/network/db"
 import {
@@ -38,14 +40,9 @@ async function canTriggerSync(userNpub: string, communityId?: string): Promise<b
 }
 
 async function handler(req: NextApiRequest, res: NextApiResponse) {
-  const userNpub = req.headers["x-user-npub"] as string | undefined
-
-  if (!userNpub) {
-    return res.status(401).json({
-      success: false,
-      error: "Authentication required",
-    })
-  }
+  // Identity from the verified Nostr session only (blink-wip#1679).
+  const userNpub = requireSessionNpub(req, res)
+  if (!userNpub) return
 
   // GET - Get sync status and metrics
   if (req.method === "GET") {
@@ -107,6 +104,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
   // POST - Trigger sync
   if (req.method === "POST") {
+    if (!requireTrustedMutation(req, res)) return
+
     const { communityId, syncAll } = req.body as {
       communityId?: string
       syncAll?: boolean
@@ -171,4 +170,4 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   return res.status(405).json({ error: "Method not allowed" })
 }
 
-export default withRateLimit(handler, RATE_LIMIT_WRITE)
+export default withRateLimit(handler, RATE_LIMIT_WRITE, "network/sync")

@@ -147,7 +147,7 @@ interface CheckAndProcessResult {
   errors: number
 }
 
-type InvoiceStatus = "PAID" | "PENDING" | "EXPIRED" | "ERROR"
+type InvoiceStatus = "PAID" | "PENDING" | "UNSEEN" | "EXPIRED" | "ERROR"
 
 interface WalletInfo {
   id: string
@@ -169,6 +169,8 @@ interface TopUpResult {
   balance?: number
   error?: string
   transaction?: unknown
+  /** Definite: this payment already credited a card (store.topUpCard). */
+  alreadyCredited?: boolean
 }
 
 interface BlinkTransaction {
@@ -370,12 +372,24 @@ async function handleTopUpCallback(
   // We'll credit the card when the invoice is paid
   // IMPORTANT: For both BTC and USD cards, we now create BTC invoices (exact sat amount)
   // So we always store amount in SATS here. For USD cards, we convert sats→cents at processing time.
-  await storePendingTopUp(
+  const stored = await storePendingTopUp(
     cardId,
     invoiceResult.paymentHash as string,
     amountSats,
     card.walletCurrency,
   )
+
+  // Never hand out an invoice we cannot credit: without the pending record,
+  // neither the webhook nor polling has the card/amount mapping.
+  if (!stored) {
+    console.error(
+      `[LNURLP] Pending top-up record failed to persist for card ${cardId}; invoice withheld`,
+    )
+    return {
+      status: "ERROR",
+      reason: "Could not register the top-up - please try again",
+    }
+  }
 
   console.log(
     `[LNURLP] Generated invoice for card ${cardId} (${card.walletCurrency}) top-up: ${amountSats} sats`,
@@ -454,19 +468,13 @@ async function storePendingTopUp(
  * @returns Result { success, cardId, amount, error }
  */
 async function processTopUpPayment(paymentHash: string): Promise<ProcessTopUpResult> {
-  // Try cache first, then database
-  let pending: PendingTopUpData | null | undefined = pendingTopUpsCache.get(paymentHash)
-
+  // The database is authoritative (the in-memory cache may be stale/processed)
+  const pending = (await boltcardStore.getPendingTopUp(
+    paymentHash,
+  )) as PendingTopUpData | null
   if (!pending) {
-    // Not in cache, try database
-    pending = (await boltcardStore.getPendingTopUp(
-      paymentHash,
-    )) as PendingTopUpData | null
-
-    if (!pending) {
-      console.log(`[LNURLP] No pending top-up found for payment hash: ${paymentHash}`)
-      return { success: false, error: "No pending top-up found" }
-    }
+    console.log(`[LNURLP] No pending top-up found for payment hash: ${paymentHash}`)
+    return { success: false, error: "No pending top-up found" }
   }
 
   const { cardId, amount: amountSats, currency } = pending
@@ -478,90 +486,223 @@ async function processTopUpPayment(paymentHash: string): Promise<ProcessTopUpRes
     return { success: false, error: "Card not found" }
   }
 
-  let creditAmount = amountSats
-  let creditUnit = "sats"
+  const BlinkAPI = (await import("../blink-api")).default
+  const { PaymentRejectedError } = await import("../blink-api")
+  const { getApiUrlForEnvironment } = await import("../config/api")
+  const apiUrl = getApiUrlForEnvironment(card.environment as "production" | "staging")
+  const blinkAPI = new BlinkAPI(card.apiKey as string, apiUrl)
 
-  // For USD cards, transfer funds from BTC wallet to USD wallet
+  // The top-up invoice was created on the owner's BTC wallet (the card's
+  // wallet for BTC cards); USD cards also need the USD wallet for the transfer.
+  let btcWalletId: string = card.walletId
+  let usdWalletId: string | undefined
   if (currency === "USD") {
     try {
-      const BlinkAPI = (await import("../blink-api")).default
-      const { getApiUrlForEnvironment } = await import("../config/api")
-      const apiUrl = getApiUrlForEnvironment(card.environment as "production" | "staging")
-      const blinkAPI = new BlinkAPI(card.apiKey as string, apiUrl)
-
-      // Get both wallets
       const wallets: WalletInfo[] = await blinkAPI.getWalletInfo()
       const btcWallet = wallets.find((w: WalletInfo) => w.walletCurrency === "BTC")
       const usdWallet = wallets.find((w: WalletInfo) => w.walletCurrency === "USD")
-
       if (!btcWallet || !usdWallet) {
         console.error(`[LNURLP] Missing wallet: BTC=${!!btcWallet}, USD=${!!usdWallet}`)
         return { success: false, error: "Missing BTC or USD wallet for transfer" }
       }
-
-      console.log(
-        `[LNURLP] USD card: Transferring ${amountSats} sats from BTC wallet (${btcWallet.id}) to USD wallet (${usdWallet.id})`,
-      )
-
-      // Transfer sats from BTC wallet to USD wallet
-      // Blink automatically converts at current exchange rate
-      const transferResult: TransferResult = await blinkAPI.intraLedgerPaymentSend(
-        btcWallet.id,
-        usdWallet.id,
-        amountSats,
-        `Boltcard top-up transfer`,
-      )
-
-      if (transferResult.status !== "SUCCESS") {
-        console.error(`[LNURLP] Transfer failed: ${JSON.stringify(transferResult)}`)
-        // Don't fail completely - the funds are still in BTC wallet
-        // Log for manual review but continue to credit local balance
-        console.warn(
-          `[LNURLP] ⚠️ Transfer to USD wallet failed, but proceeding with local balance credit. Manual review needed.`,
-        )
-      } else {
-        console.log(
-          `[LNURLP] ✅ Successfully transferred ${amountSats} sats to USD wallet`,
-        )
-      }
-
-      // Get exchange rate for local balance tracking (in cents)
-      const rate: ExchangeRate = await BlinkAPI.getExchangeRatePublic("USD")
-      // rate.satPriceInCurrency = cents per sat (e.g., 0.069 at ~$97k/BTC)
-      // Same approach as lnurlw.js convertSatsToCents()
-      creditAmount = Math.round(amountSats * rate.satPriceInCurrency)
-      creditUnit = "cents"
-      console.log(
-        `[LNURLP] Converting ${amountSats} sats to ${creditAmount} cents (rate: ${rate.satPriceInCurrency} cents/sat)`,
-      )
+      btcWalletId = btcWallet.id
+      usdWalletId = usdWallet.id
     } catch (err: unknown) {
-      console.error(`[LNURLP] USD transfer/conversion error: ${(err as Error).message}`)
-      // For transfer errors, we should still try to track the balance
-      // The funds are in BTC wallet, so we can try again later
-      return { success: false, error: `USD transfer failed: ${(err as Error).message}` }
+      return { success: false, error: `Wallet lookup failed: ${(err as Error).message}` }
     }
   }
 
-  // Credit the card's local balance
-  const result: TopUpResult = await boltcardStore.topUpCard(
-    cardId,
-    creditAmount,
+  // 1. Never credit on a claim alone: verify with Blink that the invoice was
+  //    received, for at least the expected amount, whoever triggered this.
+  const receipt = await fetchInvoiceReceipt(
     paymentHash,
-    `Top-up via LNURL-pay (${amountSats} sats)`,
+    card.apiKey as string,
+    apiUrl,
+    btcWalletId,
   )
-
-  if (!result.success) {
-    return { success: false, error: result.error }
+  if (receipt.status !== "PAID") {
+    return { success: false, error: `Top-up not paid (${receipt.status})` }
+  }
+  if (Math.abs(receipt.settlementAmount as number) < amountSats) {
+    console.error(
+      `[LNURLP] Top-up ${paymentHash.substring(0, 16)}... received ${receipt.settlementAmount} < expected ${amountSats} sats`,
+    )
+    return { success: false, error: "Received amount is lower than the top-up amount" }
   }
 
-  // Mark as processed in database and remove from cache
-  await boltcardStore.markTopUpProcessed(paymentHash)
-  pendingTopUpsCache.delete(paymentHash)
-
-  // If card was PENDING, activate it on first top-up
+  // A card still PENDING is activated by its first top-up — BEFORE claiming
+  // or transferring anything. If activation doesn't persist, nothing has been
+  // claimed or moved and the top-up can retry once the card is active.
   if (card.status === CardStatus.PENDING) {
-    await boltcardStore.activateCard(cardId)
+    if (!(await boltcardStore.activateCard(cardId))) {
+      console.error(`[LNURLP] Could not activate card ${cardId} for its first top-up`)
+      return { success: false, error: "Card could not be activated" }
+    }
     console.log(`[LNURLP] Card ${cardId} activated on first top-up`)
+  }
+
+  // 2. Claim it atomically: of concurrent processors (webhook + polling) only
+  //    one proceeds, so a payment is credited at most once. A database error
+  //    is ambiguous (the claim may have committed) and must be flagged, not
+  //    reported as a clean "already processed".
+  const review = (reason: string) =>
+    boltcardStore.setTopUpReviewReason(paymentHash, reason)
+  let claimed: boolean
+  try {
+    claimed = await boltcardStore.markTopUpProcessed(paymentHash)
+  } catch (err: unknown) {
+    console.error(
+      `[LNURLP] Top-up claim outcome unknown for ${paymentHash.substring(0, 16)}...: ${(err as Error).message}`,
+    )
+    await review(`claim outcome unknown: ${(err as Error).message}`)
+    return {
+      success: false,
+      error: "Top-up claim outcome unknown - manual review needed",
+    }
+  }
+  if (!claimed) {
+    // A replay of a processed claim that never got a credit must stay visible.
+    // Cleanup deletes processed rows after 24h unless they are flagged.
+    if (!(await boltcardStore.hasTopUpTransaction(paymentHash))) {
+      // Does not replace a reason already recorded by the first failure.
+      await boltcardStore.flagUncreditedTopUp(paymentHash)
+    }
+    return { success: false, error: "Top-up already processed" }
+  }
+  pendingTopUpsCache.delete(paymentHash)
+  const release = () => boltcardStore.unmarkTopUpProcessed(paymentHash)
+
+  // A payment credits a card at most once (blink-wip#1623). The claim above
+  // only covers this pending row; the hash may have credited before (row
+  // re-stored, or cleaned up and recreated). Check before anything external
+  // happens (the USD transfer); topUpCard's primary key is the atomic
+  // backstop for a race past this check.
+  let alreadyCredited: boolean
+  try {
+    alreadyCredited = await boltcardStore.isTopUpCredited(paymentHash)
+  } catch (err: unknown) {
+    // Keep the claim: we cannot tell whether crediting is safe.
+    await review(`credited-check failed: ${(err as Error).message}`)
+    return { success: false, error: "Top-up credit check failed - manual review needed" }
+  }
+  if (alreadyCredited) {
+    console.error(
+      `[LNURLP] Payment ${paymentHash.substring(0, 16)}... already credited a card - not crediting again`,
+    )
+    return { success: false, error: "Top-up already processed" }
+  }
+
+  let creditAmount = amountSats
+  let creditUnit = "sats"
+
+  // 3. USD cards: move the received sats to the USD wallet; credit only if
+  //    the transfer succeeded.
+  if (currency === "USD") {
+    let transferResult: TransferResult
+    try {
+      transferResult = await blinkAPI.intraLedgerPaymentSend(
+        btcWalletId,
+        usdWalletId as string,
+        amountSats,
+        `Boltcard top-up transfer`,
+      )
+    } catch (err: unknown) {
+      if (err instanceof PaymentRejectedError) {
+        // Rejected, nothing moved: release for a later retry
+        await release()
+        return { success: false, error: `USD transfer failed: ${(err as Error).message}` }
+      }
+      // Outcome unknown: keep the claim (a retry could transfer twice)
+      console.error(
+        `[LNURLP] USD transfer outcome unknown for top-up ${paymentHash.substring(0, 16)}... - manual review needed: ${(err as Error).message}`,
+      )
+      await review(`USD transfer outcome unknown: ${(err as Error).message}`)
+      return {
+        success: false,
+        error: "USD transfer outcome unknown - manual review needed",
+      }
+    }
+
+    // PaymentSendResult (blinkbitcoin public schema) is SUCCESS | FAILURE |
+    // PENDING | ALREADY_PAID. FAILED is accepted too so a spelling drift
+    // cannot wedge a transfer that never moved. Only a terminal failure
+    // releases the claim. PENDING may still settle, ALREADY_PAID did move,
+    // and unknown statuses say nothing — those keep the claim for review.
+    const transferStatus = String(transferResult.status || "").toUpperCase()
+    if (transferStatus === "FAILED" || transferStatus === "FAILURE") {
+      console.error(`[LNURLP] Transfer failed: ${JSON.stringify(transferResult)}`)
+      await release()
+      return { success: false, error: "USD transfer failed" }
+    }
+    if (transferStatus !== "SUCCESS") {
+      console.error(
+        `[LNURLP] Transfer status ${transferStatus} for top-up ${paymentHash.substring(0, 16)}... - manual review needed`,
+      )
+      await review(`USD transfer status ${transferStatus}`)
+      return {
+        success: false,
+        error: `USD transfer ${transferStatus.toLowerCase()} - manual review needed`,
+      }
+    }
+
+    try {
+      // Get exchange rate for local balance tracking (in cents)
+      const rate: ExchangeRate = await BlinkAPI.getExchangeRatePublic("USD")
+      creditAmount = Math.round(amountSats * rate.satPriceInCurrency)
+      creditUnit = "cents"
+    } catch (err: unknown) {
+      // Transfer done, credit not computed: keep the claim, manual review
+      console.error(
+        `[LNURLP] Rate lookup failed after USD transfer for top-up ${paymentHash.substring(0, 16)}... - manual review needed: ${(err as Error).message}`,
+      )
+      await review(`Rate lookup failed after transfer: ${(err as Error).message}`)
+      return {
+        success: false,
+        error: "Rate lookup failed after transfer - manual review needed",
+      }
+    }
+  }
+
+  // 4. Credit the card's local balance. topUpCard distinguishes a definite
+  // failure (zero rows: card missing/not active — nothing written) from an
+  // ambiguous database error (the write may have committed), which throws.
+  let result: TopUpResult
+  try {
+    result = await boltcardStore.topUpCard(
+      cardId,
+      creditAmount,
+      paymentHash,
+      `Top-up via LNURL-pay (${amountSats} sats)`,
+    )
+  } catch (err: unknown) {
+    // Ambiguous: the balance write may have committed. NEVER release the
+    // claim (a retry would credit twice) — flag for manual review.
+    console.error(
+      `[LNURLP] Top-up credit outcome unknown for ${paymentHash.substring(0, 16)}... - manual review needed: ${(err as Error).message}`,
+    )
+    await review(`Credit outcome unknown: ${(err as Error).message}`)
+    return { success: false, error: "Credit outcome unknown - manual review needed" }
+  }
+
+  if (result.alreadyCredited) {
+    // Lost a race to another credit of this payment: nothing written, keep
+    // the claim. USD: this attempt's transfer still moved funds -> review.
+    if (currency === "USD") {
+      await review("USD transfer done but payment already credited")
+    }
+    return { success: false, error: "Top-up already processed" }
+  }
+
+  if (!result.success) {
+    // Definite failure, nothing written. BTC: nothing external happened ->
+    // retryable. USD: the transfer already happened -> keep the claim AND
+    // flag it for review (the transferred funds need reconciliation).
+    if (currency !== "USD") {
+      await release()
+    } else {
+      await review(`Post-transfer credit failed: ${result.error}`)
+    }
+    return { success: false, error: result.error }
   }
 
   console.log(
@@ -611,15 +752,25 @@ async function getAllPendingTopUps(): Promise<PendingTopUpData[]> {
  * @param apiKey - Blink API key
  * @param apiUrl - Blink API URL
  * @param walletId - Wallet ID to check transactions for
- * @returns Payment status: 'PAID', 'PENDING', 'EXPIRED', or 'ERROR'
+ * @returns { status: PAID | PENDING | UNSEEN | EXPIRED | ERROR }. PAID always
+ * carries a finite numeric settlementAmount (otherwise ERROR). UNSEEN means
+ * Blink has no transaction for the hash; PENDING means one exists and is not
+ * terminal.
  */
-async function checkInvoiceStatus(
+/**
+ * Payment/invoice status lookup, classified by DIRECTION because outgoing and
+ * incoming payments have different terminal statuses:
+ * - RECEIVE (top-ups): SUCCESS is final; FAILED -> EXPIRED.
+ * - SEND (withdrawals): SUCCESS is final; FAILURE is the terminal failure.
+ */
+async function fetchInvoiceReceipt(
   paymentHash: string,
   apiKey: string,
   apiUrl: string,
   walletId: string,
-): Promise<InvoiceStatus> {
-  // Query recent transactions to find if this payment hash exists as a receive
+  direction: "RECEIVE" | "SEND" = "RECEIVE",
+  signal?: AbortSignal,
+): Promise<InvoiceReceipt> {
   const query = `
     query GetTransactionsByPaymentHash($paymentHash: PaymentHash!, $walletId: WalletId!) {
       me {
@@ -649,6 +800,10 @@ async function checkInvoiceStatus(
         query,
         variables: { paymentHash, walletId },
       }),
+      // Callers running under a deadline (the reconcile scheduler) abort a
+      // slow lookup instead of waiting on it; an abort is reported as ERROR
+      // ("try again next pass"), never as a payment outcome.
+      ...(signal ? { signal } : {}),
     })
 
     if (!response.ok) {
@@ -657,7 +812,7 @@ async function checkInvoiceStatus(
         `[LNURLP] Invoice status check failed: HTTP ${response.status}`,
         text.substring(0, 200),
       )
-      return "ERROR"
+      return { status: "ERROR" }
     }
 
     const data = await response.json()
@@ -665,40 +820,72 @@ async function checkInvoiceStatus(
     if (data.errors) {
       const errorMsg = data.errors[0]?.message
       console.error(`[LNURLP] Invoice status check GraphQL error: ${errorMsg}`)
-      return "ERROR"
+      return { status: "ERROR" }
     }
 
     const transactions: BlinkTransaction[] | undefined =
       data.data?.me?.defaultAccount?.walletById?.transactionsByPaymentHash
 
     if (!transactions || transactions.length === 0) {
-      // No transaction found - invoice might still be pending or expired
-      return "PENDING"
+      // No transaction at all. Distinct from an in-flight SEND/PENDING so a
+      // never-sent payment can be restored without touching one that may settle.
+      return { status: "UNSEEN" }
     }
 
-    // Look for a successful receive transaction
+    // Look for a successful transaction in the requested direction
     const receiveTransaction = transactions.find(
-      (tx: BlinkTransaction) => tx.direction === "RECEIVE" && tx.status === "SUCCESS",
+      (tx: BlinkTransaction) => tx.direction === direction && tx.status === "SUCCESS",
     )
 
     if (receiveTransaction) {
+      // Fail closed: without a finite numeric settlement amount we cannot
+      // prove the expected amount was received.
+      const amount = Number(receiveTransaction.settlementAmount)
+      if (!Number.isFinite(amount)) {
+        console.error(
+          `[LNURLP] Paid invoice ${paymentHash.substring(0, 16)}... has no usable settlementAmount`,
+        )
+        return { status: "ERROR" }
+      }
       console.log(
-        `[LNURLP] Found paid invoice: ${paymentHash.substring(0, 16)}... amount: ${receiveTransaction.settlementAmount}`,
+        `[LNURLP] Found paid invoice: ${paymentHash.substring(0, 16)}... amount: ${amount}`,
       )
-      return "PAID"
+      return { status: "PAID", settlementAmount: amount }
     }
 
-    // Transaction exists but not successful
-    const failedTx = transactions.find((tx: BlinkTransaction) => tx.status === "FAILED")
+    // Transaction exists but not successful. Terminal failure is FAILURE on
+    // the send path and FAILED on the receive path historically; accept both
+    // spellings on both directions.
+    const failedTx = transactions.find(
+      (tx: BlinkTransaction) =>
+        tx.direction === direction && ["FAILED", "FAILURE"].includes(tx.status),
+    )
     if (failedTx) {
-      return "EXPIRED"
+      return { status: "EXPIRED" }
     }
 
-    return "PENDING"
+    return { status: "PENDING" }
   } catch (err: unknown) {
     console.error(`[LNURLP] Invoice status check exception: ${(err as Error).message}`)
-    return "ERROR"
+    return { status: "ERROR" }
   }
+}
+
+/**
+ * Check invoice payment status via Blink API (see fetchInvoiceReceipt)
+ * @returns Payment status: 'PAID', 'PENDING', 'EXPIRED', or 'ERROR'
+ */
+async function checkInvoiceStatus(
+  paymentHash: string,
+  apiKey: string,
+  apiUrl: string,
+  walletId: string,
+  direction?: "RECEIVE" | "SEND",
+  signal?: AbortSignal,
+): Promise<InvoiceStatus> {
+  return (
+    await fetchInvoiceReceipt(paymentHash, apiKey, apiUrl, walletId, direction, signal)
+  ).status
 }
 
 /**
@@ -799,7 +986,8 @@ async function checkAndProcessPendingTopUps(
           `[LNURLP] Cleaned up expired top-up invoice: ${(pending.paymentHash as string).substring(0, 16)}...`,
         )
       }
-      // For 'PENDING' or 'ERROR' status, we leave it for next check
+      // PENDING (in flight), UNSEEN (no transaction yet), or ERROR: next check.
+      // UNSEEN is not an expiry — do not mark the top-up processed.
     } catch (err: unknown) {
       console.error(`[LNURLP] Error processing pending top-up: ${(err as Error).message}`)
       errors++
@@ -839,12 +1027,20 @@ export {
   getPendingTopUp,
   getAllPendingTopUps,
   checkInvoiceStatus,
+  fetchInvoiceReceipt,
   checkAndProcessPendingTopUps,
   generateTopUpQR,
   TopUpLimits,
 }
 
+interface InvoiceReceipt {
+  status: InvoiceStatus
+  /** Settlement amount of the RECEIVE transaction (sats for a BTC wallet) */
+  settlementAmount?: number
+}
+
 export type {
+  InvoiceReceipt,
   BoltcardCard,
   LnurlPayResponse,
   LnurlPayCallbackResponse,

@@ -77,7 +77,7 @@ describe("lib/rate-limit", () => {
   describe("withRateLimit()", () => {
     it("should call through to the handler when under limit", async () => {
       const inner = jest.fn((_req, res) => res.status(200).json({ ok: true }))
-      const handler = withRateLimit(inner, { max: 5 })
+      const handler = withRateLimit(inner, { max: 5 }, "test-route")
 
       const req = mockReq()
       const res = mockRes()
@@ -89,7 +89,7 @@ describe("lib/rate-limit", () => {
 
     it("should return 429 after exceeding max requests", async () => {
       const inner = jest.fn((_req, res) => res.status(200).json({ ok: true }))
-      const handler = withRateLimit(inner, { max: 3 })
+      const handler = withRateLimit(inner, { max: 3 }, "test-route")
 
       const req = mockReq()
 
@@ -112,7 +112,7 @@ describe("lib/rate-limit", () => {
 
     it("should track limits per IP independently", async () => {
       const inner = jest.fn((_req, res) => res.status(200).json({ ok: true }))
-      const handler = withRateLimit(inner, { max: 2 })
+      const handler = withRateLimit(inner, { max: 2 }, "test-route")
 
       // IP A: 2 requests
       const reqA = mockReq({
@@ -138,27 +138,57 @@ describe("lib/rate-limit", () => {
       expect(resB._status).toBe(200)
     })
 
-    it("should extract IP from x-forwarded-for header (first value)", async () => {
+    it("keys x-forwarded-for on the rightmost hop (the one our proxy appended)", async () => {
       const inner = jest.fn((_req, res) => res.status(200).json({ ok: true }))
-      const handler = withRateLimit(inner, { max: 1 })
-
-      const req = mockReq({
-        headers: { "x-forwarded-for": "10.0.0.1, 10.0.0.2, 10.0.0.3" },
-      } as Partial<NextApiRequest>)
+      const handler = withRateLimit(inner, { max: 1 }, "test-route")
 
       const res1 = mockRes()
-      await handler(req, res1)
+      await handler(
+        mockReq({
+          headers: { "x-forwarded-for": "10.0.0.1, 10.0.0.2, 10.0.0.3" },
+        } as Partial<NextApiRequest>),
+        res1,
+      )
       expect(res1._status).toBe(200)
 
-      // Should be limited now for 10.0.0.1
+      // A spoofed, changing leftmost value does not reset the limit
       const res2 = mockRes()
-      await handler(req, res2)
+      await handler(
+        mockReq({
+          headers: { "x-forwarded-for": "9.9.9.9, 10.0.0.3" },
+        } as Partial<NextApiRequest>),
+        res2,
+      )
+      expect(res2._status).toBe(429)
+    })
+
+    it("prefers x-real-ip over a client-supplied x-forwarded-for", async () => {
+      const inner = jest.fn((_req, res) => res.status(200).json({ ok: true }))
+      const handler = withRateLimit(inner, { max: 1 }, "test-route")
+
+      const res1 = mockRes()
+      await handler(
+        mockReq({
+          headers: { "x-real-ip": "203.0.113.7", "x-forwarded-for": "1.1.1.1" },
+        } as Partial<NextApiRequest>),
+        res1,
+      )
+      expect(res1._status).toBe(200)
+
+      // Rotating x-forwarded-for doesn't help: still the same x-real-ip
+      const res2 = mockRes()
+      await handler(
+        mockReq({
+          headers: { "x-real-ip": "203.0.113.7", "x-forwarded-for": "2.2.2.2" },
+        } as Partial<NextApiRequest>),
+        res2,
+      )
       expect(res2._status).toBe(429)
     })
 
     it("should extract IP from x-real-ip header", async () => {
       const inner = jest.fn((_req, res) => res.status(200).json({ ok: true }))
-      const handler = withRateLimit(inner, { max: 1 })
+      const handler = withRateLimit(inner, { max: 1 }, "test-route")
 
       const req = mockReq({
         headers: { "x-real-ip": "192.168.1.1" },
@@ -175,7 +205,7 @@ describe("lib/rate-limit", () => {
 
     it("should fall back to socket.remoteAddress when no headers", async () => {
       const inner = jest.fn((_req, res) => res.status(200).json({ ok: true }))
-      const handler = withRateLimit(inner, { max: 1 })
+      const handler = withRateLimit(inner, { max: 1 }, "test-route")
 
       const req = mockReq({
         headers: {},
@@ -195,7 +225,7 @@ describe("lib/rate-limit", () => {
       jest.useFakeTimers()
 
       const inner = jest.fn((_req, res) => res.status(200).json({ ok: true }))
-      const handler = withRateLimit(inner, { max: 1, windowMs: 1000 })
+      const handler = withRateLimit(inner, { max: 1, windowMs: 1000 }, "test-route")
 
       const req = mockReq()
 
@@ -222,7 +252,7 @@ describe("lib/rate-limit", () => {
 
     it("should use 'unknown' IP when no IP source available", async () => {
       const inner = jest.fn((_req, res) => res.status(200).json({ ok: true }))
-      const handler = withRateLimit(inner, { max: 1 })
+      const handler = withRateLimit(inner, { max: 1 }, "test-route")
 
       const req = mockReq({
         headers: {},

@@ -45,8 +45,7 @@ A powerful Bitcoin Lightning terminal for Blink power users. Execute advanced op
 
 - **Split Payments**: Automatically split payments between merchant and tip recipient
 - **Zero-Fee Forwarding**: Uses Blink intraledger transactions for instant, free forwarding
-- **Flexible Destinations**: Forward to Blink usernames, Lightning Addresses, or npub.cash addresses
-- **npub.cash Integration**: Special support for npub.cash addresses with zero-fee forwarding
+- **Flexible Destinations**: Forward to Blink usernames or Lightning Addresses
 - **Configurable Presets**: Set custom tip percentages (e.g., 10%, 15%, 20%)
 
 ### Wallet Connectivity
@@ -59,7 +58,8 @@ A powerful Bitcoin Lightning terminal for Blink power users. Execute advanced op
 
 ### Authentication
 
-- **Nostr Authentication**: NIP-07 (browser extensions) and NIP-55 (external signers like Amber)
+- **Nostr Authentication**: NIP-07 (browser extensions), NIP-55 (external signers like Amber) and NIP-46 (Nostr Connect / remote signers)
+- **Server-held NIP-46 sessions**: the relay subscription for a Nostr Connect sign-in lives on the server, so opening the signer app (which backgrounds the browser tab) cannot lose the signer's one-shot response
 - **Cross-Device Sync**: Profile settings and credentials sync across devices when authenticated via Nostr
 - **Encrypted Storage**: Client-side encryption for sensitive credentials (API keys, NWC URIs)
 
@@ -92,6 +92,15 @@ Frontend (Next.js) → Direct Blink WebSocket → Instant Payment Detection
 - **Redis**: Sub-millisecond access to active payments and hot data (24h TTL)
 - **PostgreSQL**: Permanent storage for transaction history, vouchers, and analytics
 - **Automatic Migration**: Data flows from Redis to PostgreSQL after completion
+
+### Redis Key Conventions
+
+All Redis keys are prefixed with `blink-terminal:` to prevent collisions when sharing a Redis instance with other services:
+
+| Key Pattern | Purpose | TTL |
+|---|---|---|
+| `blink-terminal:rate:{provider}:{CURRENCY}` | Exchange rate cache | 45s |
+| `blink-terminal:payment:{paymentHash}` | Active payment data (hot cache) | 15-30min |
 
 ## Quick Start
 
@@ -224,11 +233,20 @@ DATABASE_URL=postgresql://blinkpos:password@localhost:5432/blinkpos
 
 ### Authentication
 
-| Endpoint                | Method | Description                     |
-| ----------------------- | ------ | ------------------------------- |
-| `POST /api/auth/login`  | POST   | Authenticate with Blink API key |
-| `POST /api/auth/logout` | POST   | Clear user session              |
-| `GET /api/auth/verify`  | GET    | Verify current session          |
+| Endpoint                                       | Method | Description                                     |
+| ---------------------------------------------- | ------ | ----------------------------------------------- |
+| `POST /api/auth/login`                         | POST   | Authenticate with Blink API key                 |
+| `POST /api/auth/logout`                        | POST   | Clear user session                              |
+| `GET /api/auth/verify`                         | GET    | Verify current session                          |
+| `POST /api/auth/nostr-login`                   | POST   | NIP-98 login (extension / generated keys)       |
+| `POST /api/nostr-connect/sessions`             | POST   | Start a NIP-46 sign-in; returns a ready URI     |
+| `GET /api/nostr-connect/sessions/:id`          | GET    | Poll session status (never mints a cookie)      |
+| `POST /api/nostr-connect/sessions/:id/consume` | POST   | Consume the approval and set the session cookie |
+| `DELETE /api/nostr-connect/sessions/:id`       | DELETE | Cancel a session and release its relay sockets  |
+
+The NIP-46 endpoints are bound to the browser that created the session by an
+HttpOnly `SameSite=Strict` cookie; the session id alone is not a login
+capability. See `lib/nip46-server/` for the transport and session model.
 
 ### Blink Integration
 
@@ -244,15 +262,30 @@ DATABASE_URL=postgresql://blinkpos:password@localhost:5432/blinkpos
 
 ### Vouchers
 
-| Endpoint                                   | Method | Description                            |
-| ------------------------------------------ | ------ | -------------------------------------- |
-| `POST /api/voucher/create`                 | POST   | Create new voucher                     |
-| `GET /api/voucher/list`                    | GET    | List all vouchers with filtering       |
-| `GET /api/voucher/status/:chargeId`        | GET    | Check voucher status                   |
-| `POST /api/voucher/cancel`                 | POST   | Cancel an unclaimed voucher            |
-| `POST /api/voucher/pdf`                    | POST   | Generate voucher PDF (single or batch) |
-| `GET /api/voucher/lnurl/:chargeId/:amount` | GET    | LNURL-withdraw endpoint                |
-| `POST /api/voucher/callback`               | POST   | LNURL callback for redemption          |
+| Endpoint                                   | Method | Description                                                                   |
+| ------------------------------------------ | ------ | ----------------------------------------------------------------------------- |
+| `POST /api/voucher/create`                 | POST   | Create a voucher. Body `apiKey` must currently own `walletId` and match `walletCurrency` |
+| `GET /api/voucher/list`                    | GET    | List the caller's vouchers. Requires `x-voucher-api-key`; `?environment=`, `?status=` |
+| `GET /api/voucher/status/:chargeId`        | GET    | Check voucher status (capability URL: the chargeId is the secret)             |
+| `POST /api/voucher/cancel`                 | POST   | Cancel an unclaimed voucher. Requires `x-voucher-api-key`                     |
+| `POST /api/voucher/pdf`                    | POST   | Disabled (returns 503)                                                        |
+| `GET /api/voucher/lnurl/:chargeId/:amount` | GET    | LNURL-withdraw endpoint (LUD-03)                                              |
+| `GET /api/voucher/callback`                | GET    | LNURL-withdraw callback; pays only an invoice for exactly the face value      |
+
+Voucher management (`list`, `cancel`, `create`) is authorized by **current wallet
+ownership**: the presented Blink API key is checked live against Blink and must own
+the voucher's wallet in the voucher's environment. A revoked key stops working
+immediately; a replacement key for the same wallet can manage older vouchers.
+`list` and `cancel` are same-origin only (no CORS). Voucher ids are LNURL `k1`
+redemption secrets and are only returned to the current owner. If Blink can't be
+reached to check ownership, these routes answer `503` (retry) rather than an auth error.
+`list` returns at most 500 vouchers (newest first, `truncated: true` when capped);
+`stats` always cover all of the owner's vouchers.
+
+**Rotated / revoked funding key:** a voucher pays out with the API key it was created
+with. If that key is revoked, redemption fails with "This voucher's wallet is no
+longer available" and the voucher stays active; the owner can cancel it with the
+replacement key and reissue.
 
 ### Batch Payments
 
@@ -311,7 +344,7 @@ docker-compose -f docker-compose.prod.yml up -d
 | Transaction History & CSV Export      | Completed   |
 | NWC Integration                       | Completed   |
 | Lightning Address Forwarding          | Completed   |
-| npub.cash Integration                 | Completed   |
+| npub.cash Integration                 | Removed     |
 | Cross-Device Sync                     | Completed   |
 | NFC Payments                          | Completed   |
 | Nostr Authentication (NIP-07, NIP-55) | Completed   |

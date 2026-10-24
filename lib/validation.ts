@@ -1,7 +1,10 @@
 /**
  * Zod input validation schemas for API routes
  *
- * Aligned with blink stack convention: zod@3.23.8.
+ * zod 4 (>= 4.6.6, GHSA-mrhx-c7xc-m3w5). Every array parsed from a request
+ * carries a .max(): zod collects one issue per failing element, so an
+ * unbounded array schema let a sub-1 MB body allocate ~150 MB per request.
+ * Since 4.6.6 a length violation stops before the elements are parsed.
  * Provides reusable schemas and a `validateBody` helper for API handlers.
  *
  * Usage:
@@ -38,6 +41,21 @@ export const paymentHashSchema = z.string().regex(/^[a-f0-9]{64}$/i, {
   message: "Invalid payment hash format (expected 64 hex characters)",
 })
 
+/**
+ * Maximum memo length across the app. The receipt route
+ * (pages/api/transaction/receipt-pdf.ts) enforces the same bound — it imports
+ * this constant rather than duplicating the literal (PR #93 review).
+ */
+export const MEMO_MAX_LENGTH = 640
+
+/** Request array bounds (see the header). Real Nostr auth events carry 2-3 tags. */
+export const MAX_TIP_RECIPIENTS = 20
+export const MAX_NOSTR_TAGS = 50
+export const MAX_NOSTR_TAG_ITEMS = 10
+const nostrTagsSchema = z
+  .array(z.array(z.string()).max(MAX_NOSTR_TAG_ITEMS))
+  .max(MAX_NOSTR_TAGS)
+
 /** Lightning invoice / payment request (lnbc...). */
 export const invoiceSchema = z.string().min(1)
 
@@ -54,7 +72,7 @@ export const nostrPubkeySchema = z.string().regex(/^[a-f0-9]{64}$/i, {
 export const createInvoiceSchema = z.object({
   amount: z.union([z.string(), z.number()]),
   currency: currencySchema,
-  memo: z.string().max(640).optional(),
+  memo: z.string().max(MEMO_MAX_LENGTH).optional(),
   walletId: z.string().optional(),
   apiKey: z.string().optional(),
   userWalletId: z.string().optional(),
@@ -62,12 +80,16 @@ export const createInvoiceSchema = z.object({
   baseAmount: optionalAmountSchema,
   tipAmount: optionalAmountSchema,
   tipPercent: z.coerce.number().min(0).max(100).optional(),
-  tipRecipients: z.array(z.record(z.unknown())).optional().default([]),
+  tipRecipients: z
+    .array(z.record(z.string(), z.unknown()))
+    .max(MAX_TIP_RECIPIENTS)
+    .optional()
+    .default([]),
   baseAmountDisplay: optionalAmountSchema,
   tipAmountDisplay: optionalAmountSchema,
   nwcActive: z.boolean().optional(),
   nwcConnectionUri: z.string().optional(),
-  blinkLnAddress: z.string().optional(),
+  blinkLnAddress: z.boolean().optional(),
   blinkLnAddressWalletId: z.string().optional(),
   blinkLnAddressUsername: z.string().optional(),
   npubCashActive: z.boolean().optional(),
@@ -75,12 +97,24 @@ export const createInvoiceSchema = z.object({
   environment: environmentSchema,
 })
 
+/**
+ * POST /api/blink/forward-with-tips
+ * Only paymentHash is authoritative; totalAmount/memo are advisory. All money
+ * amounts and recipients are read server-side from the stored payment record.
+ */
+export const forwardWithTipsSchema = z.object({
+  paymentHash: paymentHashSchema,
+  totalAmount: z.coerce.number().int().positive().optional(),
+  memo: z.string().max(MEMO_MAX_LENGTH).optional().default(""),
+  environment: environmentSchema.optional(),
+})
+
 /** POST /api/blink/pay-invoice */
 export const payInvoiceSchema = z.object({
   paymentHash: paymentHashSchema,
   invoice: invoiceSchema.optional(),
   paymentRequest: invoiceSchema.optional(),
-  memo: z.string().max(640).optional().default(""),
+  memo: z.string().max(MEMO_MAX_LENGTH).optional().default(""),
   environment: environmentSchema,
 })
 
@@ -95,7 +129,7 @@ export const verifyOwnershipSchema = z.object({
   signedEvent: z.object({
     kind: z.number(),
     content: z.string(),
-    tags: z.array(z.array(z.string())),
+    tags: nostrTagsSchema,
     pubkey: nostrPubkeySchema,
     sig: z.string().min(1),
     id: z.string().optional(),
@@ -108,7 +142,7 @@ export const nostrLoginSchema = z.object({
   event: z.object({
     kind: z.literal(27235),
     content: z.string(),
-    tags: z.array(z.array(z.string())),
+    tags: nostrTagsSchema,
     pubkey: nostrPubkeySchema,
     sig: z.string().min(1),
     id: z.string(),
@@ -120,7 +154,7 @@ export const nostrLoginSchema = z.object({
 export const createVoucherSchema = z.object({
   amount: satAmountSchema,
   currency: currencySchema.optional().default("BTC"),
-  memo: z.string().max(640).optional(),
+  memo: z.string().max(MEMO_MAX_LENGTH).optional(),
   recipientLnAddress: z.string().optional(),
   expiresInHours: z.coerce.number().int().positive().max(8760).optional(),
 })

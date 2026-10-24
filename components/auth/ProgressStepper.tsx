@@ -4,7 +4,6 @@
  * Shows a vertical list of steps with status indicators:
  * - complete: green checkmark
  * - current: spinning purple indicator
- * - waiting: amber pulsing indicator (for user action required)
  * - pending: gray empty circle
  * - error: red X
  *
@@ -18,7 +17,7 @@ interface Stage {
   label: string
 }
 
-type StageStatus = "complete" | "current" | "waiting" | "pending" | "error"
+type StageStatus = "complete" | "current" | "pending" | "error"
 
 interface ProgressStepperProps {
   /** List of stages to display */
@@ -27,15 +26,12 @@ interface ProgressStepperProps {
   currentStage: string
   /** Stage where error occurred (optional) */
   errorStage: string | null
-  /** Show waiting indicator on first stage */
-  waitingForApproval: boolean
 }
 
 export default function ProgressStepper({
   stages,
   currentStage,
   errorStage,
-  waitingForApproval,
 }: ProgressStepperProps) {
   const getStageStatus = (stageId: string): StageStatus => {
     const stageIds = stages.map((s) => s.id)
@@ -52,8 +48,7 @@ export default function ProgressStepper({
       return "pending"
 
     if (stageIndex < currentIndex || currentStage === "complete") return "complete"
-    if (stageIndex === currentIndex)
-      return waitingForApproval && stageId === stages[0]?.id ? "waiting" : "current"
+    if (stageIndex === currentIndex) return "current"
     return "pending"
   }
 
@@ -104,23 +99,6 @@ export default function ProgressStepper({
                 </svg>
               </div>
             )}
-            {status === "waiting" && (
-              <div className="w-6 h-6 rounded-full border-2 border-amber-500 bg-amber-50 dark:bg-amber-900/30 flex items-center justify-center flex-shrink-0">
-                <svg
-                  className="w-4 h-4 text-amber-500 animate-pulse"
-                  fill="none"
-                  viewBox="0 0 24 24"
-                  stroke="currentColor"
-                >
-                  <path
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth="2"
-                    d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
-                  />
-                </svg>
-              </div>
-            )}
             {status === "pending" && (
               <div className="w-6 h-6 rounded-full border-2 border-gray-300 dark:border-gray-600 flex-shrink-0" />
             )}
@@ -149,11 +127,9 @@ export default function ProgressStepper({
                   ? "text-green-600 dark:text-green-400"
                   : status === "current"
                     ? "text-purple-600 dark:text-purple-400 font-medium"
-                    : status === "waiting"
-                      ? "text-amber-600 dark:text-amber-400 font-medium"
-                      : status === "error"
-                        ? "text-red-600 dark:text-red-400"
-                        : "text-gray-400 dark:text-gray-500"
+                    : status === "error"
+                      ? "text-red-600 dark:text-red-400"
+                      : "text-gray-400 dark:text-gray-500"
               }`}
             >
               {s.label}

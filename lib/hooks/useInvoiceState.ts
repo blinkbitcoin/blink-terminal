@@ -26,6 +26,11 @@ export interface InvoiceData {
   amount?: number
   /** Invoice description/memo */
   memo?: string
+  /**
+   * LUD-21 verify URL for self-custodial (Spark) direct-receive invoices.
+   * When present, payment polling uses it instead of the escrow status endpoint.
+   */
+  verifyUrl?: string
 }
 
 /** Callback data for payment received events */

@@ -5,10 +5,20 @@
  * GET /api/paycode/lnurlp/[username]?amount=1000 (optional, in sats)
  *
  * Following LUD-06 spec: https://github.com/lnurl/luds/blob/luds/06.md
+ *
+ * RESERVED FOR FUTURE USE: fixed-amount paycodes were removed from the UI when
+ * the Paycodes menu and the `/[username]/print` page were unified into the
+ * shared, variable-amount-only PrintPaycodeView. This route (and its callback
+ * sibling) is intentionally retained so fixed amounts can be reintroduced
+ * without re-implementing the server side.
+ * NOTE: the upstream fetch below currently targets pay.blink.sv, which resolves
+ * custodial accounts only — reintroducing fixed amounts for self-custodial
+ * (Spark) users would require pointing this at the LN-address domain (blink.sv).
  */
 
 import type { NextApiRequest, NextApiResponse } from "next"
 
+import { isValidBlinkUsername } from "../../../../lib/paycode-lnurl"
 import { withRateLimit, RATE_LIMIT_PUBLIC } from "../../../../lib/rate-limit"
 
 async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -30,9 +40,14 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 
   try {
-    const { username, amount } = req.query as { username: string; amount?: string }
+    const { username, amount } = req.query as {
+      username?: string | string[]
+      amount?: string | string[]
+    }
 
-    if (!username) {
+    // Same validation as the callback: the username is interpolated into a
+    // pay.blink.sv path (blink-wip#1690 item 2).
+    if (!isValidBlinkUsername(username)) {
       return res.status(200).json({
         status: "ERROR",
         reason: "Username required",
@@ -43,7 +58,7 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
     // Fetch the original LNURL-pay metadata from Blink
     const blinkResponse = await fetch(
-      `https://pay.blink.sv/.well-known/lnurlp/${username}`,
+      `https://pay.blink.sv/.well-known/lnurlp/${encodeURIComponent(username)}`,
     )
 
     if (!blinkResponse.ok) {
@@ -59,14 +74,14 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
     // Build our callback URL
     const protocol = req.headers["x-forwarded-proto"] || "https"
     const host = req.headers["x-forwarded-host"] || req.headers.host
-    const callbackUrl = `${protocol}://${host}/api/paycode/lnurlp/callback/${username}`
+    const callbackUrl = `${protocol}://${host}/api/paycode/lnurlp/callback/${encodeURIComponent(username)}`
 
     // If amount is specified, set min=max for fixed amount
     let minSendable = blinkData.minSendable
     let maxSendable = blinkData.maxSendable
     let isFixedAmount = false
 
-    if (amount) {
+    if (typeof amount === "string") {
       const amountSats = parseInt(amount)
       if (!isNaN(amountSats) && amountSats > 0) {
         const amountMsats = amountSats * 1000 // Convert to millisatoshis
@@ -149,4 +164,4 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 }
 
-export default withRateLimit(handler, RATE_LIMIT_PUBLIC)
+export default withRateLimit(handler, RATE_LIMIT_PUBLIC, "paycode/lnurlp/[username]")

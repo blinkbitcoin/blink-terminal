@@ -16,16 +16,13 @@ import {
   isStaging,
   getEnvironmentConfig,
 } from "../../lib/config/api"
+import { isPasswordAuthEnabled } from "../../lib/config/features"
 import { useNostrAuth } from "../../lib/hooks/useNostrAuth"
 import { useTheme } from "../../lib/hooks/useTheme"
 import NostrAuthService from "../../lib/nostr/NostrAuthService"
-import NostrConnectService from "../../lib/nostr/NostrConnectService"
 import { AUTH_VERSION_FULL, logAuth, logAuthError } from "../../lib/version"
 
 import NostrConnectModal from "./NostrConnectModal"
-
-// Feature flag to use NDK implementation for bunker:// URLs
-const _USE_NDK = process.env.NEXT_PUBLIC_USE_NDK_NIP46 === "true"
 
 /** Auth mode for the form's view state */
 type AuthMode = "main" | "create" | "password"
@@ -64,7 +61,6 @@ export default function NostrLoginForm() {
   // NIP-46 Nostr Connect state
   // Modal handles the full sign-in flow internally
   const [showNostrConnectModal, setShowNostrConnectModal] = useState<boolean>(false)
-  const [nostrConnectURI, setNostrConnectURI] = useState<string>("")
 
   // Ref to prevent multiple rapid sign-in attempts (refs don't trigger re-renders)
   const signingInRef = useRef<boolean>(false)
@@ -84,9 +80,7 @@ export default function NostrLoginForm() {
   const [confirmPassword, setConfirmPassword] = useState<string>("")
   const [hasStoredAccount, setHasStoredAccount] = useState<boolean>(false)
 
-  // Detect iOS vs Android for showing appropriate mobile options
-  const isIOS =
-    typeof navigator !== "undefined" && /iPad|iPhone|iPod/.test(navigator.userAgent)
+  // Detect Android for showing appropriate mobile options
   const isAndroid =
     typeof navigator !== "undefined" && /Android/.test(navigator.userAgent)
 
@@ -372,21 +366,14 @@ export default function NostrLoginForm() {
   }
 
   // NIP-46 Nostr Connect handlers
-  const handleNostrConnectSignIn = async () => {
+  //
+  // The nostrconnect:// URI is minted by the server (issue #70), which
+  // subscribes to the signer's reply BEFORE handing the URI back. The modal owns
+  // that request so it can show its own progress and error states.
+  const handleNostrConnectSignIn = () => {
     logAuth("NostrLoginForm", "Starting Nostr Connect flow")
     setLocalError(null)
-
-    try {
-      // Generate the nostrconnect:// URI
-      const uri = NostrConnectService.generateConnectionURI()
-      setNostrConnectURI(uri)
-      setShowNostrConnectModal(true)
-
-      logAuth("NostrLoginForm", "Generated URI, showing modal")
-    } catch (err: unknown) {
-      logAuthError("NostrLoginForm", "Failed to generate connection URI:", err)
-      setLocalError("Failed to start Nostr Connect: " + (err as Error).message)
-    }
+    setShowNostrConnectModal(true)
   }
 
   // Handle successful Nostr Connect sign-in
@@ -398,7 +385,6 @@ export default function NostrLoginForm() {
       pubkey?.substring(0, 16) + "...",
     )
     setShowNostrConnectModal(false)
-    setNostrConnectURI("")
     // Navigation will happen automatically via auth state change
   }, [])
 
@@ -406,7 +392,6 @@ export default function NostrLoginForm() {
   const handleNostrConnectClose = () => {
     logAuth("NostrLoginForm", "Closing Nostr Connect modal")
     setShowNostrConnectModal(false)
-    setNostrConnectURI("")
   }
 
   // v29: The modal now handles the full connection flow internally,
@@ -1101,8 +1086,8 @@ export default function NostrLoginForm() {
 
           {/* Sign-in Methods */}
           <div className="space-y-4">
-            {/* Password Sign-In (if account exists) */}
-            {hasStoredAccount && (
+            {/* Password Sign-In (if account exists) — gated: Nostr-only by default */}
+            {isPasswordAuthEnabled() && hasStoredAccount && (
               <>
                 <button
                   onClick={() => setAuthMode("password")}
@@ -1316,53 +1301,28 @@ export default function NostrLoginForm() {
               </details>
             )}
 
-            {/* Create New Account Button */}
-            <button
-              onClick={() => setAuthMode("create")}
-              disabled={signingIn}
-              className="group relative w-full flex justify-center items-center py-4 px-6 border-2 border-emerald-500 text-lg font-medium rounded-xl text-emerald-600 dark:text-emerald-400 bg-transparent hover:bg-emerald-50 dark:hover:bg-emerald-900/20 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-            >
-              <svg
-                className="w-6 h-6 mr-3"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
+            {/* Create New Account Button — gated: Nostr-only by default */}
+            {isPasswordAuthEnabled() && (
+              <button
+                onClick={() => setAuthMode("create")}
+                disabled={signingIn}
+                className="group relative w-full flex justify-center items-center py-4 px-6 border-2 border-emerald-500 text-lg font-medium rounded-xl text-emerald-600 dark:text-emerald-400 bg-transparent hover:bg-emerald-50 dark:hover:bg-emerald-900/20 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth="2"
-                  d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z"
-                />
-              </svg>
-              Create New Account
-            </button>
-
-            {/* iOS hint - show when no extension detected */}
-            {isIOS && !hasExtension && (
-              <div className="text-center p-4 bg-blue-50 dark:bg-blue-900/20 rounded-xl border border-blue-200 dark:border-blue-800">
-                <p className="text-sm text-blue-700 dark:text-blue-300">
-                  &#128241; Nostr Connect works best with{" "}
-                  <a
-                    href="https://nsec.app"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="font-medium underline hover:text-blue-800 dark:hover:text-blue-200"
-                  >
-                    nsec.app
-                  </a>{" "}
-                  (web-based signer). For browser extension, install{" "}
-                  <a
-                    href="https://apps.apple.com/cy/app/nostash/id6744309333"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="font-medium underline hover:text-blue-800 dark:hover:text-blue-200"
-                  >
-                    Nostash
-                  </a>{" "}
-                  for Safari.
-                </p>
-              </div>
+                <svg
+                  className="w-6 h-6 mr-3"
+                  fill="none"
+                  stroke="currentColor"
+                  viewBox="0 0 24 24"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth="2"
+                    d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z"
+                  />
+                </svg>
+                Create New Account
+              </button>
             )}
 
             {/* Android hint */}
@@ -1385,7 +1345,6 @@ export default function NostrLoginForm() {
           {/* v32: Nostr Connect Modal - handles full sign-in flow with progress UI */}
           {showNostrConnectModal && (
             <NostrConnectModal
-              uri={nostrConnectURI}
               onSuccess={handleNostrConnectSuccess}
               onCancel={handleNostrConnectClose}
               signInWithNostrConnect={signInWithNostrConnect}
@@ -1429,10 +1388,12 @@ export default function NostrLoginForm() {
                   your Nostr keys on mobile. For iOS, use the Nostash extension for
                   Safari.
                 </p>
-                <p className="mt-2">
-                  <strong>Create New Account</strong> generates a Nostr identity protected
-                  by your password - works everywhere!
-                </p>
+                {isPasswordAuthEnabled() && (
+                  <p className="mt-2">
+                    <strong>Create New Account</strong> generates a Nostr identity
+                    protected by your password - works everywhere!
+                  </p>
+                )}
               </div>
             </details>
           </div>

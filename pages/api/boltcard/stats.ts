@@ -1,6 +1,8 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
 import * as boltcard from "../../../lib/boltcard"
+import { requireSessionPubkey } from "../../../lib/boltcard/owner-auth"
+import { getReconcileConfig } from "../../../lib/boltcard/reconcile-config"
 import { withRateLimit, RATE_LIMIT_READ } from "../../../lib/rate-limit"
 
 /**
@@ -8,24 +10,76 @@ import { withRateLimit, RATE_LIMIT_READ } from "../../../lib/rate-limit"
  *
  * GET /api/boltcard/stats
  *
- * Returns aggregate statistics about all boltcards
+ * Returns statistics about the authenticated owner's cards only (Nostr
+ * session required). Aggregates across other owners are never exposed.
  */
 async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "GET") {
     return res.status(405).json({ error: "Method not allowed" })
   }
 
-  try {
-    const stats = await boltcard.store.getStats()
+  const ownerPubkey = requireSessionPubkey(req, res)
+  if (!ownerPubkey) return
 
-    // Get pending top-ups count
-    const pendingTopUps = await boltcard.lnurlp.getAllPendingTopUps()
+  try {
+    const [cards, pendingRegistrations] = await Promise.all([
+      boltcard.store.getCardsByOwner(ownerPubkey),
+      boltcard.store.getPendingRegistrationsByOwner(ownerPubkey),
+    ])
+
+    const count = (predicate: (card: (typeof cards)[number]) => boolean) =>
+      cards.filter(predicate).length
+    const sum = (currency: string) =>
+      cards
+        .filter((card) => card.walletCurrency === currency && card.status !== "WIPED")
+        .reduce((total, card) => total + (card.balance || 0), 0)
+
+    const cardIds = new Set(cards.map((card) => card.id))
+    const pendingTopUps = (await boltcard.lnurlp.getAllPendingTopUps()).filter(
+      (topUp: { cardId: string }) => cardIds.has(topUp.cardId),
+    )
+    // Claimed top-ups whose transfer/credit outcome is unresolved (kept
+    // claims are invisible to the pending queries above)
+    const needingReview = (await boltcard.store.getTopUpsNeedingReview()).filter(
+      (topUp) => cardIds.has(topUp.cardId),
+    )
+    // Card payments still in flight (deduction kept, Blink outcome not yet
+    // final) and the ones unresolved past the ops threshold (blink-wip#1619)
+    const ownerCardIds = [...cardIds]
+    const [inFlight, stale] =
+      ownerCardIds.length > 0
+        ? await Promise.all([
+            boltcard.store.getStaleWithdrawals(0, ownerCardIds),
+            boltcard.store.getStaleWithdrawals(
+              getReconcileConfig().staleMinutes * 60_000,
+              ownerCardIds,
+            ),
+          ])
+        : [[], []]
 
     res.status(200).json({
       success: true,
       stats: {
-        ...stats,
+        total: cards.length,
+        pending: count((card) => card.status === "PENDING"),
+        active: count((card) => card.status === "ACTIVE"),
+        disabled: count((card) => card.status === "DISABLED"),
+        wiped: count((card) => card.status === "WIPED"),
+        btcCards: count((card) => card.walletCurrency === "BTC"),
+        usdCards: count((card) => card.walletCurrency === "USD"),
+        totalBtcBalanceSats: sum("BTC"),
+        totalUsdBalanceCents: sum("USD"),
+        pendingRegistrations: pendingRegistrations.length,
         pendingTopUps: pendingTopUps.length,
+        topUpsNeedingReview: needingReview.length,
+        withdrawalsInFlight: inFlight.length,
+        withdrawalsStale: stale.map((w) => ({
+          paymentHash: w.paymentHash,
+          cardId: w.cardId,
+          amount: w.amount,
+          kind: w.kind,
+          ageMinutes: Math.floor(w.ageMs / 60_000),
+        })),
       },
       timestamp: Date.now(),
     })
@@ -39,4 +93,4 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 }
 
-export default withRateLimit(handler, RATE_LIMIT_READ)
+export default withRateLimit(handler, RATE_LIMIT_READ, "boltcard/stats")

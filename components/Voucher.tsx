@@ -12,6 +12,7 @@ import QRCode from "react-qr-code"
 
 import { unlockAudioContext, playSound } from "../lib/audio-utils"
 import { getEnvironment } from "../lib/config/api"
+import { isVoucherPdfEnabled } from "../lib/config/features"
 import {
   formatDisplayAmount as formatCurrency,
   getCurrencyById,
@@ -84,6 +85,16 @@ interface VoucherProps {
   usdExchangeRate?: ExchangeRateData | null
   usdWalletId?: string | null
   initialExpiry?: string
+  /**
+   * Push notification of the current entered amount (sats + USD cents) and
+   * currency mode. Replaces the Dashboard's former 300ms polling of the
+   * imperative getters for the capacity indicator.
+   */
+  onAmountChange?: (
+    amountInSats: number,
+    amountInUsdCents: number,
+    currencyMode: VoucherCurrencyMode,
+  ) => void
 }
 
 /** Methods exposed via the forwarded ref */
@@ -131,6 +142,7 @@ const Voucher = forwardRef<VoucherHandle, VoucherProps>(
       usdExchangeRate = null,
       usdWalletId = null,
       initialExpiry = DEFAULT_EXPIRY,
+      onAmountChange,
     },
     ref,
   ) => {
@@ -317,8 +329,9 @@ const Voucher = forwardRef<VoucherHandle, VoucherProps>(
         // Poll immediately
         pollVoucherStatus(voucher.id)
 
-        // Then poll every 2 seconds
+        // Then poll every 2 seconds (skipping ticks while the tab is hidden)
         pollingIntervalRef.current = setInterval(() => {
+          if (document.visibilityState === "hidden") return
           pollVoucherStatus(voucher.id)
         }, 2000)
 
@@ -809,6 +822,47 @@ const Voucher = forwardRef<VoucherHandle, VoucherProps>(
       return createVoucherInternal(false, null)
     }
 
+    // Current amount in sats (for capacity indicator in Dashboard)
+    const computeAmountInSats = (): number => {
+      if (!amount || amount === "" || amount === "0") return 0
+      const numericAmount = parseFloat(amount)
+      if (isNaN(numericAmount) || numericAmount <= 0) return 0
+
+      if (isBitcoinCurrency(displayCurrency)) return Math.round(numericAmount)
+      if (!exchangeRate?.satPriceInCurrency) return 0
+
+      const currency = getCurrencyById(displayCurrency, currencies)
+      const fractionDigits = currency?.fractionDigits ?? 2
+      const amountInMinorUnits = numericAmount * Math.pow(10, fractionDigits)
+      return Math.round(amountInMinorUnits / exchangeRate.satPriceInCurrency)
+    }
+
+    // Current amount in USD cents (for capacity indicator when in USD mode)
+    const computeAmountInUsdCents = (): number => {
+      const amountInSats = computeAmountInSats()
+      if (amountInSats <= 0 || !usdExchangeRate?.satPriceInCurrency) return 0
+      return Math.round(amountInSats * usdExchangeRate.satPriceInCurrency)
+    }
+
+    // Push amount changes to the parent (capacity indicator) instead of
+    // being polled via the imperative handle on a timer.
+    useEffect(() => {
+      onAmountChange?.(
+        computeAmountInSats(),
+        computeAmountInUsdCents(),
+        voucherCurrencyMode as VoucherCurrencyMode,
+      )
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [
+      amount,
+      displayCurrency,
+      exchangeRate,
+      usdExchangeRate,
+      currencies,
+      voucherCurrencyMode,
+      onAmountChange,
+    ])
+
     // Expose numpad handlers for keyboard navigation
     useImperativeHandle(ref, () => ({
       handleDigitPress,
@@ -818,45 +872,8 @@ const Voucher = forwardRef<VoucherHandle, VoucherProps>(
       hasVoucher: () => !!voucher,
       hasValidAmount: () => isValidAmount(),
       isRedeemed: () => redeemed,
-      // Get current amount in sats (for capacity indicator in Dashboard)
-      getAmountInSats: (): number => {
-        if (!amount || amount === "" || amount === "0") return 0
-        const numericAmount = parseFloat(amount)
-        if (isNaN(numericAmount) || numericAmount <= 0) return 0
-
-        if (isBitcoinCurrency(displayCurrency)) {
-          return Math.round(numericAmount)
-        } else if (exchangeRate?.satPriceInCurrency) {
-          const currency = getCurrencyById(displayCurrency, currencies)
-          const fractionDigits = currency?.fractionDigits ?? 2
-          const amountInMinorUnits = numericAmount * Math.pow(10, fractionDigits)
-          return Math.round(amountInMinorUnits / exchangeRate.satPriceInCurrency)
-        }
-        return 0
-      },
-      // Get current amount in USD cents (for capacity indicator when in USD mode)
-      getAmountInUsdCents: (): number => {
-        if (!amount || amount === "" || amount === "0") return 0
-        const numericAmount = parseFloat(amount)
-        if (isNaN(numericAmount) || numericAmount <= 0) return 0
-
-        // First get sats
-        let amountInSats = 0
-        if (isBitcoinCurrency(displayCurrency)) {
-          amountInSats = Math.round(numericAmount)
-        } else if (exchangeRate?.satPriceInCurrency) {
-          const currency = getCurrencyById(displayCurrency, currencies)
-          const fractionDigits = currency?.fractionDigits ?? 2
-          const amountInMinorUnits = numericAmount * Math.pow(10, fractionDigits)
-          amountInSats = Math.round(amountInMinorUnits / exchangeRate.satPriceInCurrency)
-        }
-
-        // Convert sats to USD cents using USD exchange rate
-        if (amountInSats > 0 && usdExchangeRate?.satPriceInCurrency) {
-          return Math.round(amountInSats * usdExchangeRate.satPriceInCurrency)
-        }
-        return 0
-      },
+      getAmountInSats: computeAmountInSats,
+      getAmountInUsdCents: computeAmountInUsdCents,
       // Get current voucher currency mode
       getVoucherCurrencyMode: () => voucherCurrencyMode as VoucherCurrencyMode,
       // Expiry state for external rendering
@@ -1990,40 +2007,42 @@ const Voucher = forwardRef<VoucherHandle, VoucherProps>(
                     </button>
                   )}
 
-                  {/* Download PDF Button */}
-                  <button
-                    onClick={generatePdf}
-                    disabled={generatingPdf}
-                    className={`w-full px-4 py-3 border-2 border-purple-600 text-purple-600 dark:text-purple-400 dark:border-purple-400 rounded-lg hover:bg-purple-50 dark:hover:bg-purple-900/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 ${
-                      printFormat === "a4" || printFormat === "letter"
-                        ? "bg-purple-600 text-white hover:bg-purple-700 border-purple-600"
-                        : ""
-                    }`}
-                  >
-                    {generatingPdf ? (
-                      <>
-                        <div className="animate-spin w-4 h-4 border-2 border-current border-t-transparent rounded-full"></div>
-                        Generating...
-                      </>
-                    ) : (
-                      <>
-                        <svg
-                          className="w-5 h-5"
-                          fill="none"
-                          stroke="currentColor"
-                          viewBox="0 0 24 24"
-                        >
-                          <path
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            strokeWidth="2"
-                            d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
-                          />
-                        </svg>
-                        Download PDF
-                      </>
-                    )}
-                  </button>
+                  {/* Download PDF Button (server-side voucher PDF disabled) */}
+                  {isVoucherPdfEnabled() && (
+                    <button
+                      onClick={generatePdf}
+                      disabled={generatingPdf}
+                      className={`w-full px-4 py-3 border-2 border-purple-600 text-purple-600 dark:text-purple-400 dark:border-purple-400 rounded-lg hover:bg-purple-50 dark:hover:bg-purple-900/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 ${
+                        printFormat === "a4" || printFormat === "letter"
+                          ? "bg-purple-600 text-white hover:bg-purple-700 border-purple-600"
+                          : ""
+                      }`}
+                    >
+                      {generatingPdf ? (
+                        <>
+                          <div className="animate-spin w-4 h-4 border-2 border-current border-t-transparent rounded-full"></div>
+                          Generating...
+                        </>
+                      ) : (
+                        <>
+                          <svg
+                            className="w-5 h-5"
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                          >
+                            <path
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              strokeWidth="2"
+                              d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
+                            />
+                          </svg>
+                          Download PDF
+                        </>
+                      )}
+                    </button>
+                  )}
 
                   {/* Browser Print Button - Fallback for desktop */}
                   <button

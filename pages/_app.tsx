@@ -38,8 +38,9 @@ function MyApp({ Component, pageProps }: AppProps) {
     const isAndroid = /Android/.test(navigator.userAgent)
     const isMobile = isIOS || isAndroid
 
-    // Enable for all mobile devices during debugging
-    if (isMobile) {
+    // Enable for mobile devices during debugging (dev only — the endpoint
+    // doesn't exist in production and the logger polls every 500ms forever)
+    if (isMobile && process.env.NODE_ENV !== "production") {
       try {
         const result = initRemoteLogger()
         console.log("[App] v39: Remote logging enabled, device:", result?.deviceId)
@@ -186,7 +187,7 @@ function MyApp({ Component, pageProps }: AppProps) {
         <meta httpEquiv="Expires" content="0" />
         <meta
           name="viewport"
-          content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"
+          content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
         />
       </Head>
       {/* Staging environment indicator banner */}

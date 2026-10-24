@@ -7,8 +7,7 @@
 
 import { useState, useEffect, useRef } from "react"
 
-// Expiry preset options (must match lib/voucher-expiry.js)
-// Note: 15m and 1h removed from UI but kept in voucher-expiry.js for backward compatibility
+// Expiry preset options (must match lib/voucher-expiry.ts)
 
 interface ExpiryOption {
   id: string
@@ -17,6 +16,10 @@ interface ExpiryOption {
 }
 
 const EXPIRY_OPTIONS: ExpiryOption[] = [
+  { id: "15m", label: "15 min", description: "15 minutes" },
+  { id: "1h", label: "1 hour", description: "1 hour" },
+  { id: "3h", label: "3 hours", description: "3 hours" },
+  { id: "12h", label: "12 hours", description: "12 hours" },
   { id: "24h", label: "24 hours", description: "24 hours" },
   { id: "72h", label: "72 hours", description: "72 hours" },
   { id: "7d", label: "7 days", description: "7 days" },
@@ -143,7 +146,7 @@ export default function ExpirySelector({
  * ExpiryBadge - Display expiry status as a colored badge
  */
 
-type VoucherStatus = "ACTIVE" | "CLAIMED" | "CANCELLED" | "EXPIRED"
+type VoucherStatus = "ACTIVE" | "CLAIMED" | "PAID" | "CANCELLED" | "EXPIRED"
 
 interface ExpiryBadgeProps {
   expiresAt: number
@@ -159,7 +162,10 @@ export function ExpiryBadge({ expiresAt, status, compact = false }: ExpiryBadgeP
   let badgeColor = "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400"
   let label = ""
 
-  if (status === "CLAIMED") {
+  if (status === "PAID") {
+    badgeColor = "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400"
+    label = "Paid"
+  } else if (status === "CLAIMED") {
     badgeColor = "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400"
     label = "Claimed"
   } else if (status === "CANCELLED") {

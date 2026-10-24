@@ -125,8 +125,18 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       })
     }
 
-    // Update counter for replay protection
-    await boltcardStore.updateLastCounter(cardId, verifyResult.counter ?? 0)
+    // Advance the replay counter and authorize /confirm in ONE atomic write.
+    // No keys unless it was persisted (replayed/concurrent tap -> refuse).
+    const recorded = await boltcardStore.recordVerifiedResetTap(
+      cardId,
+      verifyResult.counter ?? 0,
+    )
+    if (!recorded) {
+      return res.status(409).json({
+        status: "ERROR",
+        reason: "Card tap already used - tap the card again",
+      })
+    }
 
     console.log(
       `[ResetAPI] Card ${cardId} verified for reset. Counter: ${verifyResult.counter}`,
@@ -160,4 +170,4 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 }
 
-export default withRateLimit(handler, RATE_LIMIT_WRITE)
+export default withRateLimit(handler, RATE_LIMIT_WRITE, "boltcard/reset/[cardId]")

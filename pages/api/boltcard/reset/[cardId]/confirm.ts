@@ -3,11 +3,16 @@ import type { NextApiRequest, NextApiResponse } from "next"
 import boltcardStore from "../../../../../lib/boltcard/store"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../../../lib/rate-limit"
 
+/** How long after a tap-verified reset request the wipe may be confirmed. */
+const RESET_CONFIRM_WINDOW_MS = 10 * 60 * 1000
+
 /**
  * API endpoint to confirm card reset completion
  *
  * Called by NFC Programmer app after successfully resetting the card to factory defaults.
- * Marks the card as WIPED in the database.
+ * Marks the card as WIPED in the database — only within RESET_CONFIRM_WINDOW_MS
+ * of a tap-verified reset request (POST /api/boltcard/reset/[cardId]), so a
+ * bare cardId cannot wipe someone else's card.
  *
  * POST /api/boltcard/reset/[cardId]/confirm
  * Body: {} (empty) or { success: true }
@@ -62,13 +67,16 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       })
     }
 
-    // Mark card as wiped
-    const success = await boltcardStore.wipeCard(cardId)
+    // Mark card as wiped (only after a recent tap-verified reset)
+    const success = await boltcardStore.wipeCardAfterVerifiedReset(
+      cardId,
+      RESET_CONFIRM_WINDOW_MS,
+    )
 
     if (!success) {
-      return res.status(500).json({
+      return res.status(403).json({
         status: "ERROR",
-        reason: "Failed to mark card as wiped",
+        reason: "Reset not verified - tap the card in the reset flow first",
       })
     }
 
@@ -89,4 +97,4 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 }
 
-export default withRateLimit(handler, RATE_LIMIT_WRITE)
+export default withRateLimit(handler, RATE_LIMIT_WRITE, "boltcard/reset/[cardId]/confirm")

@@ -68,6 +68,10 @@ export function useExchangeRateFetcher({
 }: UseExchangeRateFetcherParams): void {
   // Fetch exchange rate when currency changes (for sats equivalent display in ItemCart)
   useEffect(() => {
+    // Ignore responses that land after the currency changed again — a slow
+    // response for a previous currency must not overwrite the current rate.
+    let cancelled = false
+
     const fetchExchangeRate = async (): Promise<void> => {
       if (isBitcoinCurrency(displayCurrency)) {
         setExchangeRate({ satPriceInCurrency: 1, currency: "BTC" })
@@ -88,6 +92,7 @@ export function useExchangeRateFetcher({
         })
 
         const data = await response.json()
+        if (cancelled) return
 
         if (data.success) {
           setExchangeRate({
@@ -99,13 +104,17 @@ export function useExchangeRateFetcher({
           console.error("Failed to fetch exchange rate:", data.error)
         }
       } catch (error: unknown) {
-        console.error("Exchange rate error:", error)
+        if (!cancelled) console.error("Exchange rate error:", error)
       } finally {
-        setLoadingRate(false)
+        if (!cancelled) setLoadingRate(false)
       }
     }
 
     fetchExchangeRate()
+
+    return () => {
+      cancelled = true
+    }
   }, [displayCurrency, apiKey])
 
   // Fetch USD exchange rate for voucher creation (needed for USD/Stablesats vouchers)
@@ -147,8 +156,15 @@ export function useExchangeRateFetcher({
     fetchUsdExchangeRate()
 
     // Refresh USD rate every 5 minutes while voucher wallet is connected
+    // (skipping ticks while the tab is hidden)
+    const refreshWhileVisible = (): void => {
+      const hidden =
+        typeof document !== "undefined" && document.visibilityState === "hidden"
+      if (hidden) return
+      fetchUsdExchangeRate()
+    }
     const intervalId: NodeJS.Timeout | null = voucherWallet?.apiKey
-      ? setInterval(fetchUsdExchangeRate, 5 * 60 * 1000)
+      ? setInterval(refreshWhileVisible, 5 * 60 * 1000)
       : null
 
     return () => {

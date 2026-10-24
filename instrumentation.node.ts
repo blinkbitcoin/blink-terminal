@@ -16,35 +16,100 @@
  * @module instrumentation.node
  */
 
-import { NodeSDK } from "@opentelemetry/sdk-node"
-import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http"
-import { Resource } from "@opentelemetry/resources"
-import { SEMRESATTRS_SERVICE_NAME } from "@opentelemetry/semantic-conventions"
-import { SimpleSpanProcessor } from "@opentelemetry/sdk-trace-node"
-import { NetInstrumentation } from "@opentelemetry/instrumentation-net"
-import { HttpInstrumentation } from "@opentelemetry/instrumentation-http"
 import { W3CTraceContextPropagator } from "@opentelemetry/core"
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http"
+import { HttpInstrumentation } from "@opentelemetry/instrumentation-http"
+import { NetInstrumentation } from "@opentelemetry/instrumentation-net"
+import { resourceFromAttributes } from "@opentelemetry/resources"
+import { NodeSDK } from "@opentelemetry/sdk-node"
+import { BatchSpanProcessor } from "@opentelemetry/sdk-trace-node"
+import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions"
+import { WebSocket as WsWebSocket } from "ws"
+
+import { ScrubbingSpanProcessor } from "./lib/tracing-scrub"
 
 const serviceName = process.env.TRACING_SERVICE_NAME || "bbt"
 const otlpEndpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT
 
-const sdk = new NodeSDK({
-  textMapPropagator: new W3CTraceContextPropagator(),
-  resource: new Resource({
-    [SEMRESATTRS_SERVICE_NAME]: serviceName,
-  }),
-  spanProcessor: new SimpleSpanProcessor(
-    new OTLPTraceExporter(
-      otlpEndpoint ? { url: `${otlpEndpoint}/v1/traces` } : undefined,
-    ),
-  ),
-  instrumentations: [new NetInstrumentation(), new HttpInstrumentation()],
-})
+/**
+ * Node 20 has no global WebSocket, and nostr-tools' relay pool reaches for
+ * `globalThis.WebSocket`. The server-held NIP-46 sign-in sessions
+ * (lib/nip46-server) open relay sockets outside any request, so the polyfill
+ * has to be installed at process start rather than inside a route module.
+ */
+if (typeof globalThis.WebSocket === "undefined") {
+  Object.assign(globalThis, { WebSocket: WsWebSocket })
+}
 
-sdk.start()
+/**
+ * Only initialize tracing when an OTLP collector endpoint is configured.
+ *
+ * Previously the SDK always started with a SimpleSpanProcessor pointed at the
+ * default `http://localhost:4318` collector. In local dev (no collector) the
+ * synchronous span export stalled the server's own outbound `fetch` calls
+ * intermittently for many seconds, which surfaced as spurious "User Not Found"
+ * (LNURL probe timeouts). Skipping init when unconfigured makes it a true no-op,
+ * and we use a BatchSpanProcessor (async, non-blocking) when it IS configured.
+ */
+let sdk: NodeSDK | undefined
+
+if (otlpEndpoint) {
+  sdk = new NodeSDK({
+    textMapPropagator: new W3CTraceContextPropagator(),
+    resource: resourceFromAttributes({
+      [ATTR_SERVICE_NAME]: serviceName,
+    }),
+    // Every span passes through ScrubbingSpanProcessor before export: URL
+    // query strings and capability path segments (voucher k1, Bolt Card
+    // key-fetch id, tap p/c) never leave the process — from
+    // HttpInstrumentation and from Next.js's own root span alike
+    // (blink-wip#1590). Wrap any additional span processor the same way.
+    spanProcessor: new ScrubbingSpanProcessor(
+      new BatchSpanProcessor(new OTLPTraceExporter({ url: `${otlpEndpoint}/v1/traces` })),
+    ),
+    instrumentations: [new NetInstrumentation(), new HttpInstrumentation()],
+  })
+
+  sdk.start()
+} else {
+  // eslint-disable-next-line no-console
+  console.log("[otel] OTEL_EXPORTER_OTLP_ENDPOINT not set — tracing disabled (no-op).")
+}
+
+/**
+ * Start the Citrusrate rate poller: pulls official + street rates from
+ * Citrusrate on a fixed 60s schedule into the shared Redis cache, so client
+ * requests to /api/rates/exchange-rate fan out from cache rather than each
+ * triggering an upstream call. No-ops when CITRUSRATE_API_KEY is unset.
+ */
+import("./lib/rate-providers/poller")
+  .then(({ startCitrusratePoller }) => startCitrusratePoller())
+  .catch((err: unknown) =>
+    // eslint-disable-next-line no-console
+    console.warn("[citrusrate-poller] failed to start:", err),
+  )
+
+/**
+ * Start the Bolt Card withdrawal reconciliation scheduler: settles PENDING /
+ * unknown-outcome card payments against Blink on a fixed cadence and logs
+ * rows that stay unresolved (blink-wip#1619). Stops on shutdown.
+ */
+import("./lib/boltcard/reconcile-scheduler")
+  .then(({ startBoltcardReconcileScheduler, stopBoltcardReconcileScheduler }) => {
+    startBoltcardReconcileScheduler()
+    return import("./lib/shutdown").then(({ onShutdown }) =>
+      onShutdown("boltcard-reconcile-scheduler", async () =>
+        stopBoltcardReconcileScheduler(),
+      ),
+    )
+  })
+  .catch((err: unknown) =>
+    // eslint-disable-next-line no-console
+    console.warn("[boltcard-reconcile] failed to start:", err),
+  )
 
 /**
  * Export the SDK instance so lib/shutdown.ts can call sdk.shutdown()
- * during graceful shutdown.
+ * during graceful shutdown. May be undefined when tracing is disabled.
  */
 export { sdk as otelSdk }

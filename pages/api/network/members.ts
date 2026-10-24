@@ -7,7 +7,10 @@
 
 import type { NextApiRequest, NextApiResponse } from "next"
 
+import { requireTrustedMutation } from "../../../lib/auth/mutation-guard"
+import { requireSessionNpub } from "../../../lib/auth/session-pubkey"
 import * as db from "../../../lib/network/db"
+import { isUuid } from "../../../lib/network/validation"
 import { withRateLimit, RATE_LIMIT_READ } from "../../../lib/rate-limit"
 
 interface MemberRecord {
@@ -25,18 +28,16 @@ interface MemberRecord {
 }
 
 async function handler(req: NextApiRequest, res: NextApiResponse) {
-  const userNpub = req.headers["x-user-npub"] as string | undefined
-
-  if (!userNpub) {
-    return res.status(401).json({
-      success: false,
-      error: "Authentication required",
-    })
-  }
+  // Identity from the verified Nostr session only (blink-wip#1679).
+  const userNpub = requireSessionNpub(req, res)
+  if (!userNpub) return
 
   const { communityId } = req.query as { communityId?: string }
 
-  if (!communityId) {
+  // Validate before it reaches the uuid column (blink-wip#1690 item 1): a
+  // malformed id used to raise a raw pg "invalid input syntax for type uuid"
+  // outside any try/catch, escaping as a 500 before authorization ran.
+  if (!communityId || !isUuid(communityId)) {
     return res.status(400).json({
       success: false,
       error: "Community ID is required",
@@ -44,21 +45,30 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 
   // Verify user is leader or super admin
-  const community = await db.getCommunityById(communityId)
-  if (!community) {
-    return res.status(404).json({
-      success: false,
-      error: "Community not found",
-    })
-  }
+  try {
+    const community = await db.getCommunityById(communityId)
+    if (!community) {
+      return res.status(404).json({
+        success: false,
+        error: "Community not found",
+      })
+    }
 
-  const isSuperAdmin = await db.isSuperAdmin(userNpub)
-  const isLeader = community.leader_npub === userNpub
+    const isSuperAdmin = await db.isSuperAdmin(userNpub)
+    const isLeader = community.leader_npub === userNpub
 
-  if (!isSuperAdmin && !isLeader) {
-    return res.status(403).json({
+    if (!isSuperAdmin && !isLeader) {
+      return res.status(403).json({
+        success: false,
+        error: "Only community leader or super admin can manage members",
+      })
+    }
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : "Unknown error"
+    console.error("Error authorizing member management:", message)
+    return res.status(500).json({
       success: false,
-      error: "Only community leader or super admin can manage members",
+      error: "Failed to fetch members",
     })
   }
 
@@ -101,6 +111,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
   // DELETE - Remove a member
   if (req.method === "DELETE") {
+    if (!requireTrustedMutation(req, res)) return
+
     try {
       const { membershipId } = req.body as { membershipId: string }
 
@@ -156,4 +168,4 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   return res.status(405).json({ error: "Method not allowed" })
 }
 
-export default withRateLimit(handler, RATE_LIMIT_READ)
+export default withRateLimit(handler, RATE_LIMIT_READ, "network/members")

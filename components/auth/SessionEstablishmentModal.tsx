@@ -244,12 +244,7 @@ export default function SessionEstablishmentModal({
         <div className="px-6 py-5">
           {stage !== "error" ? (
             <>
-              <ProgressStepper
-                stages={stages}
-                currentStage={stage}
-                errorStage={null}
-                waitingForApproval={false}
-              />
+              <ProgressStepper stages={stages} currentStage={stage} errorStage={null} />
 
               {/* Helpful tip during signing */}
               {stage === "signing" && !sessionReadyRef.current && (

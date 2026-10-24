@@ -1,8 +1,16 @@
 /**
- * In-memory rate limiting for API endpoints.
+ * Rate limiting for API endpoints.
  *
  * Provides a `withRateLimit` higher-order function that wraps any Next.js API
- * handler with per-IP sliding-window rate limiting.
+ * handler with per-IP fixed-window rate limiting.
+ *
+ * Backed by Redis (atomic INCR + EXPIRE) so limits are shared across all app
+ * instances / serverless invocations. If Redis is unavailable, it falls back to
+ * a per-process in-memory store so the limiter still degrades safely.
+ *
+ * IMPORTANT: client IP is taken from `x-real-ip`, else the rightmost
+ * `x-forwarded-for` hop (see getClientIp). This is only trustworthy behind a
+ * proxy that sets/overwrites these headers (ingress-nginx does).
  *
  * Tier presets:
  *   - AUTH        10 req/min  (login, challenge, verify)
@@ -14,6 +22,9 @@
  */
 
 import type { NextApiRequest, NextApiResponse, NextApiHandler } from "next"
+import type { RedisClientType } from "redis"
+
+import { getSharedRedisClient } from "./redis"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -47,58 +58,108 @@ export const RATE_LIMIT_WRITE: RateLimitOptions = { max: 30 }
 /** Authenticated read endpoints (balance, wallets, transactions). */
 export const RATE_LIMIT_READ: RateLimitOptions = { max: 120 }
 
-// ---------------------------------------------------------------------------
-// Internal store (per-IP, per-limiter instance)
-// ---------------------------------------------------------------------------
+/**
+ * Status-polling endpoints. The NIP-46 sign-in modal polls its session roughly
+ * every 1.5s for up to 5 minutes, which would blow through even the READ tier.
+ * Polling is a cheap Redis GET and is already bound by the session TTL and the
+ * concurrent-session caps, so it gets its own much higher tier rather than
+ * weakening the tier that guards session creation.
+ */
+export const RATE_LIMIT_POLL: RateLimitOptions = { max: 240 }
 
 const DEFAULT_WINDOW_MS = 60_000 // 1 minute
+const REDIS_KEY_PREFIX = "blink-terminal:ratelimit:"
+
+// ---------------------------------------------------------------------------
+// Shared Redis client (lazy singleton)
+// ---------------------------------------------------------------------------
+
+function redisEnabled(): boolean {
+  return process.env.ENABLE_HYBRID_STORAGE === "true"
+}
 
 /**
- * Create a rate limiter bound to its own in-memory store.
- *
- * Each call returns a `check` function that tracks a separate counter
- * per client IP.  Using separate instances per route (or route group)
- * keeps limits isolated.
+ * The limiter's Redis access goes through the shared client (lib/redis.ts), which owns the
+ * connection lifecycle: a bounded initial connect (so a cold-start outage fails fast instead of
+ * hanging the request) and recoverable established operation. The limiter degrades to in-memory
+ * on any Redis failure — a rate limiter must never take a request down with it (PR #71/#73).
+ */
+async function getRedisClient(): Promise<RedisClientType | null> {
+  if (!redisEnabled()) return null
+  try {
+    return await getSharedRedisClient()
+  } catch (error: unknown) {
+    console.warn(
+      "Rate limit Redis unavailable; falling back to in-memory:",
+      (error as Error).message,
+    )
+    return null
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Limiter
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a rate limiter. Uses Redis when available (shared across instances),
+ * otherwise an isolated in-memory store per limiter instance.
  */
 function createRateLimiter(opts: RateLimitOptions) {
   const { max, windowMs = DEFAULT_WINDOW_MS } = opts
+  const windowSec = Math.ceil(windowMs / 1000)
+
+  // In-memory fallback store, isolated per limiter instance.
   const store = new Map<string, RateLimitRecord>()
 
-  // Periodic cleanup — prevent unbounded memory growth.
   const cleanupTimer = setInterval(() => {
     const now = Date.now()
     for (const [ip, record] of store.entries()) {
-      if (now > record.resetAt) {
-        store.delete(ip)
-      }
+      if (now > record.resetAt) store.delete(ip)
     }
   }, windowMs)
+  if (cleanupTimer.unref) cleanupTimer.unref()
 
-  // Allow the process to exit even if the timer is still active.
-  if (cleanupTimer.unref) {
-    cleanupTimer.unref()
+  function checkInMemory(ip: string): boolean {
+    const now = Date.now()
+    const record = store.get(ip)
+    if (!record || now > record.resetAt) {
+      store.set(ip, { count: 1, resetAt: now + windowMs })
+      return true
+    }
+    if (record.count >= max) return false
+    record.count++
+    return true
   }
 
   return {
     /**
-     * Check whether `ip` is within the rate limit.
-     * Returns `true` if allowed, `false` if the limit has been exceeded.
+     * Returns `true` if the request is allowed, `false` if rate-limited.
+     * Bucketed by `key` (the limiter's identity) + client IP so different
+     * routes don't share a counter.
      */
-    check(ip: string): boolean {
-      const now = Date.now()
-      const record = store.get(ip)
-
-      if (!record || now > record.resetAt) {
-        store.set(ip, { count: 1, resetAt: now + windowMs })
-        return true
+    async check(key: string, ip: string): Promise<boolean> {
+      const redis = await getRedisClient()
+      if (!redis) {
+        return checkInMemory(ip)
       }
 
-      if (record.count >= max) {
-        return false
+      try {
+        const redisKey = `${REDIS_KEY_PREFIX}${key}:${ip}`
+        const count = await redis.incr(redisKey)
+        if (count === 1) {
+          // First hit in this window — set expiry.
+          await redis.expire(redisKey, windowSec)
+        }
+        return count <= max
+      } catch (error: unknown) {
+        // On any Redis error, degrade to in-memory rather than failing open/closed unexpectedly.
+        console.warn(
+          "Rate limit Redis check failed; using in-memory fallback:",
+          (error as Error).message,
+        )
+        return checkInMemory(ip)
       }
-
-      record.count++
-      return true
     },
   }
 }
@@ -107,14 +168,28 @@ function createRateLimiter(opts: RateLimitOptions) {
 // Client IP extraction
 // ---------------------------------------------------------------------------
 
+/**
+ * Client IP as seen by OUR ingress, never a client-chosen value.
+ *
+ * Behind ingress-nginx (L4 LoadBalancer, externalTrafficPolicy: Local,
+ * use-forwarded-headers: false) `$remote_addr` is the real client and nginx
+ * overwrites X-Real-IP / X-Forwarded-For with it. Prefer X-Real-IP; for
+ * X-Forwarded-For take the RIGHTMOST hop (the one appended by our proxy) —
+ * the leftmost entry is whatever the client sent if the chain ever appends.
+ */
 function getClientIp(req: NextApiRequest): string {
-  const forwarded = req.headers["x-forwarded-for"]
-  if (typeof forwarded === "string") {
-    return forwarded.split(",")[0].trim()
-  }
   const realIp = req.headers["x-real-ip"]
-  if (typeof realIp === "string") {
+  if (typeof realIp === "string" && realIp.trim()) {
     return realIp.trim()
+  }
+  const forwarded = req.headers["x-forwarded-for"]
+  const forwardedValue = Array.isArray(forwarded) ? forwarded.join(",") : forwarded
+  if (typeof forwardedValue === "string" && forwardedValue.trim()) {
+    const hops = forwardedValue
+      .split(",")
+      .map((hop) => hop.trim())
+      .filter(Boolean)
+    if (hops.length > 0) return hops[hops.length - 1]
   }
   return req.socket?.remoteAddress || "unknown"
 }
@@ -130,19 +205,29 @@ function getClientIp(req: NextApiRequest): string {
  * import { withRateLimit, RATE_LIMIT_AUTH } from "../../../lib/rate-limit"
  *
  * function handler(req, res) { ... }
- * export default withRateLimit(handler, RATE_LIMIT_AUTH)
+ * export default withRateLimit(handler, RATE_LIMIT_AUTH, "auth/login")
  * ```
+ *
+ * `routeName` should be the route path relative to pages/api (convention:
+ * the file path without extension). It keys the shared Redis counter, so it
+ * must be stable and unique per route — a module-load sequence number was
+ * used before, but import order differs per bundle/instance, which could
+ * make two different routes share one Redis counter.
  */
 export function withRateLimit(
   handler: NextApiHandler,
   opts: RateLimitOptions,
+  routeName: string,
 ): NextApiHandler {
   const limiter = createRateLimiter(opts)
+  // Stable per-route key so Redis counters are isolated per route.
+  const key = `${routeName}:${opts.max}:${opts.windowMs ?? DEFAULT_WINDOW_MS}`
 
   return async (req: NextApiRequest, res: NextApiResponse) => {
     const ip = getClientIp(req)
 
-    if (!limiter.check(ip)) {
+    const allowed = await limiter.check(key, ip)
+    if (!allowed) {
       return res.status(429).json({
         error: "Too many requests. Please wait a moment and try again.",
       })

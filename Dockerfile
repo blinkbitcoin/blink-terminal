@@ -10,7 +10,7 @@ RUN apk add --no-cache libc6-compat
 WORKDIR /app
 
 # Install dependencies
-COPY package.json pnpm-lock.yaml ./
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY patches ./patches
 RUN pnpm install --frozen-lockfile
 
@@ -27,7 +27,6 @@ ENV NEXT_TELEMETRY_DISABLED 1
 
 # v52: NEXT_PUBLIC_* variables must be set at build time for Next.js
 # They get inlined into the JavaScript bundle during build
-ENV NEXT_PUBLIC_USE_NDK_NIP46=true
 
 # Git commit hash for build versioning
 ARG GIT_COMMIT=unknown
@@ -62,6 +61,13 @@ COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 
 # Copy database init script for health checks
 COPY --from=builder /app/database ./database
+
+# Operator scripts and the keyring they share with the app (blink-wip#1587),
+# so they run in the app pod with its env:
+#   kubectl exec <pod> -- node scripts/reencrypt-secrets.js --check
+# Their dependencies (pg, bolt11) are in the standalone node_modules.
+COPY --from=builder --chown=nextjs:nodejs /app/scripts/reencrypt-secrets.js /app/scripts/reconcile-voucher-claims.js ./scripts/
+COPY --from=builder --chown=nextjs:nodejs /app/lib/crypto/keyring.js ./lib/crypto/keyring.js
 
 # Create .data directory for user session storage with proper permissions
 USER root

@@ -109,7 +109,7 @@ export default function CommissionSettingsOverlay({
               {commissionEnabled && (
                 <div className="pt-4 border-t border-gray-200 dark:border-gray-700">
                   <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">
-                    Commission Percentage Options (1-3 presets)
+                    Commission Percentage Options (1-4 presets)
                   </label>
                   <div className="flex flex-wrap gap-2">
                     {commissionPresets.map((preset, index) => (
@@ -143,12 +143,16 @@ export default function CommissionSettingsOverlay({
                       </div>
                     ))}
                   </div>
-                  {commissionPresets.length < 3 && (
+                  {commissionPresets.length < 4 && (
                     <button
                       onClick={() =>
                         setCommissionPresets([
                           ...commissionPresets,
-                          commissionPresets.length === 1 ? 2 : 3,
+                          commissionPresets.length === 1
+                            ? 2
+                            : commissionPresets.length === 2
+                              ? 3
+                              : 4,
                         ])
                       }
                       className="mt-3 px-4 py-2 text-sm bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 text-gray-900 dark:text-white rounded transition-colors"

@@ -1,7 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
-import AuthManager from "../../../../lib/auth"
 import * as boltcard from "../../../../lib/boltcard"
+import { requireOwnedCard } from "../../../../lib/boltcard/owner-auth"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../../lib/rate-limit"
 
 /**
@@ -22,34 +22,6 @@ import { withRateLimit, RATE_LIMIT_WRITE } from "../../../../lib/rate-limit"
  * - Only returns keys for cards owned by the authenticated user
  */
 
-/**
- * Verify request has valid NIP-98 session
- */
-function verifySession(req: NextApiRequest): {
-  valid: boolean
-  pubkey?: string
-  error?: string
-} {
-  const token = req.cookies?.["auth-token"]
-
-  if (!token) {
-    return { valid: false, error: "Authentication required - no session token" }
-  }
-
-  const session = AuthManager.verifySession(token)
-
-  if (!session) {
-    return { valid: false, error: "Invalid or expired session" }
-  }
-
-  if (!session.username?.startsWith("nostr:")) {
-    return { valid: false, error: "Not a Nostr session" }
-  }
-
-  const pubkey = session.username.replace("nostr:", "")
-  return { valid: true, pubkey }
-}
-
 async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "GET") {
     return res.status(405).json({ error: "Method not allowed" })
@@ -62,51 +34,32 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 
   try {
-    // Verify session authentication
-    const verification = verifySession(req)
+    // Owner session required; another owner's card answers 404
+    const owned = await requireOwnedCard(req, res, cardId, { includeKeys: true })
+    if (!owned) return
+    const { card, pubkey: userPubkey } = owned
 
-    if (!verification.valid) {
-      return res.status(401).json({
-        error: "Authentication required",
-        message: verification.error,
-      })
+    // Prefer the keys stored with the card (written at registration and on
+    // every reprogram), so wipe keys never depend on how the owner's
+    // issuer-key row is keyed. Derive only if stored keys are missing.
+    const stored = [card.k0, card.k1, card.k2, card.k3, card.k4]
+    let keys: { k0: string; k1: string; k2: string; k3: string; k4: string }
+    if (stored.every((key) => typeof key === "string" && key.length > 0)) {
+      const [k0, k1, k2, k3, k4] = stored as string[]
+      keys = { k0, k1, k2, k3, k4 }
+    } else {
+      const issuerKey = await boltcard.store.getIssuerKey(userPubkey)
+      if (!issuerKey) {
+        console.error(
+          `[WipeKeys] IssuerKey not found for owner: ${userPubkey.substring(0, 8)}...`,
+        )
+        return res.status(500).json({
+          error: "IssuerKey not found",
+          message: "Unable to derive card keys. Please contact support.",
+        })
+      }
+      keys = boltcard.crypto.deriveAllKeys(issuerKey, card.cardUid, card.version)
     }
-
-    const userPubkey = verification.pubkey as string
-
-    // Get the card
-    const card = await boltcard.store.getCard(cardId)
-
-    if (!card) {
-      return res.status(404).json({ error: "Card not found" })
-    }
-
-    // Verify ownership
-    if (card.ownerPubkey !== userPubkey) {
-      console.warn(
-        `[WipeKeys] Unauthorized access attempt: user ${userPubkey.substring(0, 8)}... tried to access card owned by ${card.ownerPubkey.substring(0, 8)}...`,
-      )
-      return res.status(403).json({
-        error: "Access denied",
-        message: "You do not own this card",
-      })
-    }
-
-    // Get IssuerKey for the owner
-    const issuerKey = await boltcard.store.getIssuerKey(userPubkey)
-
-    if (!issuerKey) {
-      console.error(
-        `[WipeKeys] IssuerKey not found for owner: ${userPubkey.substring(0, 8)}...`,
-      )
-      return res.status(500).json({
-        error: "IssuerKey not found",
-        message: "Unable to derive card keys. Please contact support.",
-      })
-    }
-
-    // Derive keys for the card's current version
-    const keys = boltcard.crypto.deriveAllKeys(issuerKey, card.cardUid, card.version)
 
     // Build wipe JSON in the format expected by NFC Programmer app
     // Format documented at: https://github.com/nicklaros/bolt-card-programmer
@@ -158,4 +111,4 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 }
 
-export default withRateLimit(handler, RATE_LIMIT_WRITE)
+export default withRateLimit(handler, RATE_LIMIT_WRITE, "boltcard/wipe-keys/[cardId]")

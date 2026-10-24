@@ -9,6 +9,8 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
 import AuthManager from "../../../lib/auth"
+import { requireTrustedMutation } from "../../../lib/auth/mutation-guard"
+import { requireSessionNpub } from "../../../lib/auth/session-pubkey"
 import BlinkAPI from "../../../lib/blink-api"
 import * as db from "../../../lib/network/db"
 import { withRateLimit, RATE_LIMIT_WRITE } from "../../../lib/rate-limit"
@@ -60,14 +62,9 @@ async function isUserMemberOfCommunity(
 }
 
 async function handler(req: NextApiRequest, res: NextApiResponse) {
-  const userNpub = req.headers["x-user-npub"] as string | undefined
-
-  if (!userNpub) {
-    return res.status(401).json({
-      success: false,
-      error: "Authentication required",
-    })
-  }
+  // Identity from the verified Nostr session only (blink-wip#1679).
+  const userNpub = requireSessionNpub(req, res)
+  if (!userNpub) return
 
   // GET - Check consent status
   if (req.method === "GET") {
@@ -130,6 +127,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
   // POST - Submit consent
   if (req.method === "POST") {
+    if (!requireTrustedMutation(req, res)) return
+
     const { communityId, apiKey } = req.body as { communityId: string; apiKey: string }
 
     if (!communityId) {
@@ -263,6 +262,8 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
 
   // DELETE - Revoke consent
   if (req.method === "DELETE") {
+    if (!requireTrustedMutation(req, res)) return
+
     const { communityId } = req.query as { communityId?: string }
 
     if (!communityId) {
@@ -324,4 +325,4 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
   return res.status(405).json({ error: "Method not allowed" })
 }
 
-export default withRateLimit(handler, RATE_LIMIT_WRITE)
+export default withRateLimit(handler, RATE_LIMIT_WRITE, "network/consent")

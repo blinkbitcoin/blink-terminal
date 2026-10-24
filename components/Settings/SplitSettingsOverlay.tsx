@@ -3,6 +3,7 @@
  * Extracted from Dashboard.js
  */
 import { getLnAddressDomain } from "../../lib/config/api"
+import { isSplitPaymentsEnabled } from "../../lib/config/features"
 import type { AuthMode } from "../../lib/hooks/useCombinedAuth"
 import type {
   SplitProfile,
@@ -97,6 +98,24 @@ export default function SplitSettingsOverlay({
         {/* Content */}
         <div className="max-w-md mx-auto px-4 py-6">
           <div className="space-y-4">
+            {/* Temporarily unavailable notice */}
+            {!isSplitPaymentsEnabled() && (
+              <div
+                className={`p-4 rounded-xl border ${
+                  isBlinkClassicDark
+                    ? "bg-amber-950/40 border-amber-800 text-amber-200"
+                    : "bg-amber-50 border-amber-300 text-amber-800"
+                }`}
+              >
+                <h3 className="font-semibold text-sm">Temporarily unavailable</h3>
+                <p className="mt-1 text-xs">
+                  Split Payments are paused while we move payments off the intermediary
+                  account. Your profiles below are saved and will work again once the
+                  feature returns.
+                </p>
+              </div>
+            )}
+
             {/* Create New Profile Button */}
             {authMode === "nostr" && (
               <button

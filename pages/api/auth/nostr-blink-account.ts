@@ -281,4 +281,4 @@ async function handleDelete(
   return res.status(200).json({ success: true })
 }
 
-export default withRateLimit(handler, RATE_LIMIT_AUTH)
+export default withRateLimit(handler, RATE_LIMIT_AUTH, "auth/nostr-blink-account")

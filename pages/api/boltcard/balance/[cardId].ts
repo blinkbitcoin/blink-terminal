@@ -128,8 +128,28 @@ async function handleBalanceGet(
       })
     }
 
-    // Update last counter for replay protection
-    await boltcard.store.updateLastCounter(cardId, tapResult.counter as number)
+    // Replay protection: the counter must actually advance (atomic, newer only)
+    const advanced = await boltcard.store.updateLastCounter(
+      cardId,
+      tapResult.counter as number,
+    )
+    if (!advanced) {
+      return res.status(409).json({
+        status: "ERROR",
+        reason: "Card tap already used - tap again",
+      })
+    }
+
+    // Reconcile this card's in-flight / unknown-outcome withdrawals
+    let withdrawalReconcile = { checked: 0, resolved: 0, restored: 0 }
+    try {
+      withdrawalReconcile = await boltcard.lnurlw.reconcilePendingWithdrawals(cardId)
+    } catch (reconcileError: unknown) {
+      console.error(
+        `[BALANCE] Withdrawal reconciliation failed for card ${cardId}:`,
+        reconcileError,
+      )
+    }
 
     // Check and process any pending top-ups before returning balance
     // This detects paid invoices that weren't processed via webhook
@@ -154,9 +174,10 @@ async function handleBalanceGet(
       // Continue with balance check even if top-up processing fails
     }
 
-    // Re-fetch card to get updated balance if any top-ups were processed
+    // Re-fetch when this tap credited a top-up or restored a failed withdrawal.
+    // Otherwise the response still shows the pre-reconcile balance.
     let updatedCard = card
-    if (pendingTopUpsResult.processed > 0) {
+    if (pendingTopUpsResult.processed > 0 || withdrawalReconcile.restored > 0) {
       updatedCard = (await boltcard.store.getCard(cardId)) || card
     }
 
@@ -282,4 +303,4 @@ function getServerUrl(req: NextApiRequest) {
   return `${protocol}://${host}`
 }
 
-export default withRateLimit(handler, RATE_LIMIT_READ)
+export default withRateLimit(handler, RATE_LIMIT_READ, "boltcard/balance/[cardId]")

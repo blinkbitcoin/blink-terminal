@@ -118,10 +118,10 @@ describe("useVoucherWalletState", () => {
       expect(result.current.voucherExpiry).toBe("24h")
     })
 
-    it("migrates legacy 15m expiry to 24h", () => {
+    it("preserves short 15m expiry (now a valid UI option)", () => {
       localStorageMock.setItem("blinkpos-voucher-expiry", "15m")
       const { result } = renderHook(() => useVoucherWalletState())
-      expect(result.current.voucherExpiry).toBe("24h")
+      expect(result.current.voucherExpiry).toBe("15m")
     })
   })
 

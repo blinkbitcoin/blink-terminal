@@ -1,6 +1,7 @@
 import React from "react"
 
 import type { Wallet } from "../lib/blink-api"
+import { isSplitPaymentsEnabled } from "../lib/config/features"
 import type { CurrencyMetadata } from "../lib/currency-utils"
 import type { PaymentData } from "../lib/hooks/useBlinkWebSocket"
 import type { CombinedUser } from "../lib/hooks/useCombinedAuth"
@@ -79,6 +80,7 @@ interface DashboardViewSwitcherProps {
   tipsEnabled: boolean
   tipPresets: number[]
   activeSplitProfile: SplitProfile | null
+  isSparkLnAddress: boolean
   setShowingInvoice: (showing: boolean) => void
   setCurrentInvoice: (invoice: InvoiceData | null) => void
   nfcState: UseNFCReturn | null
@@ -108,6 +110,12 @@ interface DashboardViewSwitcherProps {
   setVoucherCurrencyMode: (mode: VoucherCurrencyMode) => void
   usdExchangeRate: number | null
   voucherExpiry: string
+  /** Push handler for the current voucher amount (capacity indicator). */
+  onVoucherAmountChange: (
+    amountInSats: number,
+    amountInUsdCents: number,
+    currencyMode: VoucherCurrencyMode,
+  ) => void
   // Voucher-specific
   voucherRef: React.RefObject<VoucherHandle>
   setShowingVoucherQR: (showing: boolean) => void
@@ -185,6 +193,7 @@ export default function DashboardViewSwitcher({
   tipsEnabled,
   tipPresets,
   activeSplitProfile,
+  isSparkLnAddress,
   setShowingInvoice,
   setCurrentInvoice,
   nfcState,
@@ -208,6 +217,7 @@ export default function DashboardViewSwitcher({
   setVoucherCurrencyMode,
   usdExchangeRate,
   voucherExpiry,
+  onVoucherAmountChange,
   // Voucher-specific
   voucherRef,
   setShowingVoucherQR,
@@ -268,7 +278,7 @@ export default function DashboardViewSwitcher({
 
   if (currentView === "cart") {
     return (
-      <div className="h-[calc(100vh-180px)] min-h-[400px]">
+      <div className="h-[calc(100dvh-180px)] min-h-[400px]">
         <ItemCart
           ref={cartRef}
           displayCurrency={displayCurrency}
@@ -307,9 +317,14 @@ export default function DashboardViewSwitcher({
         connected={connected}
         manualReconnect={manualReconnect}
         reconnectAttempts={reconnectAttempts}
-        tipsEnabled={tipsEnabled}
+        tipsEnabled={isSplitPaymentsEnabled() ? tipsEnabled : false}
         tipPresets={tipPresets}
-        tipRecipients={activeSplitProfile?.recipients || []}
+        tipRecipients={
+          !isSplitPaymentsEnabled() || isSparkLnAddress
+            ? []
+            : activeSplitProfile?.recipients || []
+        }
+        isSparkLnAddress={isSparkLnAddress}
         soundEnabled={soundEnabled}
         onInvoiceStateChange={setShowingInvoice}
         onInvoiceChange={(invoiceData: unknown) => {
@@ -336,7 +351,7 @@ export default function DashboardViewSwitcher({
 
   if (currentView === "multivoucher") {
     return (
-      <div className="h-[calc(100vh-180px)] min-h-[400px]">
+      <div className="h-[calc(100dvh-180px)] min-h-[400px]">
         <MultiVoucher
           ref={multiVoucherRef}
           voucherWallet={voucherWallet}
@@ -358,6 +373,7 @@ export default function DashboardViewSwitcher({
           usdWalletId={voucherWalletUsdId}
           initialExpiry={voucherExpiry}
           onInternalTransition={onInternalTransition}
+          onAmountChange={onVoucherAmountChange}
         />
       </div>
     )
@@ -387,13 +403,14 @@ export default function DashboardViewSwitcher({
         usdWalletId={voucherWalletUsdId}
         initialExpiry={voucherExpiry}
         onInternalTransition={onInternalTransition}
+        onAmountChange={onVoucherAmountChange}
       />
     )
   }
 
   if (currentView === "vouchermanager") {
     return (
-      <div className="h-[calc(100vh-180px)] min-h-[400px]">
+      <div className="h-[calc(100dvh-180px)] min-h-[400px]">
         <VoucherManager
           ref={voucherManagerRef}
           voucherWallet={voucherWallet}

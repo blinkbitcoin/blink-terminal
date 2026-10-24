@@ -1,0 +1,4 @@
+# Normalize line endings on checkout so tooling that reads repo files
+# byte-for-byte (lockfile guards, hashes, diffs) behaves the same on
+# Windows / core.autocrlf clones as on Linux CI.
+* text=auto eol=lf

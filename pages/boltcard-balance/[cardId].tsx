@@ -73,10 +73,6 @@ export default function CardholderPage() {
     <>
       <Head>
         <title>{pageTitle}</title>
-        <meta
-          name="viewport"
-          content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"
-        />
         <meta name="theme-color" content="#000000" />
         <meta name="description" content="Check your Boltcard balance" />
         {/* Prevent caching for security */}

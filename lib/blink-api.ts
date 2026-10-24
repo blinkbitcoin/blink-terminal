@@ -108,6 +108,44 @@ const getApiUrlFromConfig = (): string => {
   }
 }
 
+/**
+ * The Blink API answered a payment mutation with `errors` — the payment was
+ * rejected and not executed (e.g. insufficient balance, invalid invoice).
+ * Distinct from transport / unknown-outcome failures, which stay plain Errors.
+ */
+class PaymentRejectedError extends Error {
+  readonly code: string | undefined
+
+  constructor(message: string, code?: string) {
+    super(message)
+    this.name = "PaymentRejectedError"
+    this.code = code
+  }
+}
+
+/**
+ * Blink refused the API key (invalid / revoked / missing or insufficient
+ * scope): HTTP 401/403, or a GraphQL "Not authorized" / UNAUTHENTICATED error.
+ * The operation was not executed.
+ */
+class BlinkAuthError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "BlinkAuthError"
+  }
+}
+
+const AUTH_ERROR_CODES = new Set(["UNAUTHENTICATED", "NOT_AUTHORIZED", "FORBIDDEN"])
+
+const isAuthGraphQLError = (error: { message?: unknown; [key: string]: unknown }) => {
+  const code = (error.extensions as { code?: unknown } | undefined)?.code
+  return (
+    (typeof code === "string" && AUTH_ERROR_CODES.has(code)) ||
+    (typeof error.message === "string" &&
+      /^(not authorized|unauthorized|unauthenticated)\b/i.test(error.message))
+  )
+}
+
 // =============================================================================
 // BlinkAPI Class
 // =============================================================================
@@ -126,10 +164,14 @@ class BlinkAPI {
     this.baseUrl = apiUrl || getApiUrlFromConfig()
   }
 
-  // Make GraphQL request to Blink API
+  // Make GraphQL request to Blink API. An optional AbortSignal cancels the
+  // underlying request (used by callers that run under a deadline, e.g. the
+  // locked voucher backing fetch); never pass one for payments, whose
+  // outcome must not become unknown by our own cancellation.
   async query(
     query: string,
     variables: Record<string, unknown> = {},
+    signal?: AbortSignal,
   ): Promise<GraphQLData> {
     // Extract operation name from "query Foo" or "mutation Foo" for span naming
     const operationName = query.match(/(?:query|mutation)\s+(\w+)/)?.[1] || "anonymous"
@@ -153,9 +195,14 @@ class BlinkAPI {
           method: "POST",
           headers,
           body: JSON.stringify({ query, variables }),
+          ...(signal ? { signal } : {}),
         })
 
         span.setAttribute("http.status_code", response.status)
+
+        if (response.status === 401 || response.status === 403) {
+          throw new BlinkAuthError(`Blink API rejected the API key (${response.status})`)
+        }
 
         // Check if response is OK before parsing JSON
         if (!response.ok) {
@@ -183,6 +230,9 @@ class BlinkAPI {
         const data: GraphQLResponse = await response.json()
 
         if (data.errors) {
+          if (data.errors.some(isAuthGraphQLError)) {
+            throw new BlinkAuthError(data.errors[0]?.message || "Not authorized")
+          }
           throw new Error(data.errors[0]?.message || "GraphQL error")
         }
 
@@ -223,7 +273,7 @@ class BlinkAPI {
   }
 
   // Get exchange rate for a currency
-  async getExchangeRate(currency: string): Promise<ExchangeRate> {
+  async getExchangeRate(currency: string, signal?: AbortSignal): Promise<ExchangeRate> {
     if (currency === "BTC") {
       return { satPriceInCurrency: 1 } // 1 sat = 1 sat
     }
@@ -243,7 +293,7 @@ class BlinkAPI {
       currency: currency.toUpperCase(),
     }
 
-    const data = await this.query(query, variables)
+    const data = await this.query(query, variables, signal)
 
     if (!data.realtimePrice || !data.realtimePrice.btcSatPrice) {
       throw new Error(`Exchange rate not available for ${currency}`)
@@ -263,7 +313,7 @@ class BlinkAPI {
   convertToSatoshis(
     amount: number,
     currency: string,
-    exchangeRate: ExchangeRate,
+    exchangeRate: ExchangeRate | null,
     fractionDigits: number = 2,
   ): number {
     if (currency === "BTC") {
@@ -505,7 +555,7 @@ class BlinkAPI {
   }
 
   // Get wallet IDs and currencies
-  async getWalletInfo(): Promise<Wallet[]> {
+  async getWalletInfo(signal?: AbortSignal): Promise<Wallet[]> {
     const query = `
       query {
         me {
@@ -520,7 +570,7 @@ class BlinkAPI {
       }
     `
 
-    const data = await this.query(query)
+    const data = await this.query(query, {}, signal)
     return data.me?.defaultAccount?.wallets || []
   }
 
@@ -573,7 +623,8 @@ class BlinkAPI {
     const data = await this.query(mutation, variables)
 
     if (data.intraLedgerPaymentSend?.errors?.length > 0) {
-      throw new Error(data.intraLedgerPaymentSend.errors[0].message)
+      const [error] = data.intraLedgerPaymentSend.errors
+      throw new PaymentRejectedError(error.message, error.code)
     }
 
     return data.intraLedgerPaymentSend
@@ -610,7 +661,8 @@ class BlinkAPI {
     const data = await this.query(query, variables)
 
     if (data.lnInvoicePaymentSend?.errors?.length > 0) {
-      throw new Error(data.lnInvoicePaymentSend.errors[0].message)
+      const [error] = data.lnInvoicePaymentSend.errors
+      throw new PaymentRejectedError(error.message, error.code)
     }
 
     return data.lnInvoicePaymentSend
@@ -1018,7 +1070,7 @@ class BlinkAPI {
 }
 
 export default BlinkAPI
-export { BlinkAPI }
+export { BlinkAPI, BlinkAuthError, PaymentRejectedError }
 export type {
   GraphQLResponse,
   ExchangeRate,

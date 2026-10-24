@@ -12,6 +12,9 @@ module.exports = {
         'blink-accent': '#FFAD0D',
         'blink-dark': '#1D1D1D',
         'blink-black': '#000000',
+        // Main-app keypad design tokens (blink-mobile colors.ts; issue #44)
+        'blink-primary': '#FC5805', // primary orange — light-mode C/backspace + accent
+        success: '#00A700', // OK key border + text
         // Blink Classic theme colors (from Figma)
         // BC Dark
         'blink-classic-border': '#393939',

@@ -17,7 +17,7 @@ import Link from "next/link"
 import { useRouter } from "next/router"
 import { useState, useEffect, useRef, useCallback } from "react"
 
-import { getApiUrl } from "../lib/config/api"
+import { getEnvironment, getAllValidDomains } from "../lib/config/api"
 import { useTheme, THEMES } from "../lib/hooks/useTheme"
 
 // Extend Window for MSStream (IE detection)
@@ -113,6 +113,33 @@ export default function SetupPWAForm() {
     inputRef.current?.focus()
   }, [])
 
+  /**
+   * Normalize a typed identifier to a bare Blink username.
+   * Accepts "username" or "username@<blink-domain>". A Blink domain is stripped;
+   * a non-Blink domain is rejected (Public POS is Blink-only). Returns
+   * { username } on success or { error } when the domain is not a Blink domain.
+   */
+  const normalizeBlinkUsername = useCallback(
+    (raw: string): { username?: string; error?: string } => {
+      const value = raw.trim().toLowerCase()
+      if (!value.includes("@")) {
+        return { username: value }
+      }
+      const parts = value.split("@")
+      if (parts.length !== 2 || !parts[0] || !parts[1]) {
+        return { error: "Invalid username format" }
+      }
+      const [localpart, domain] = parts
+      if (!getAllValidDomains().includes(domain)) {
+        return {
+          error: "Please enter a Blink username (e.g. yourname or yourname@blink.sv)",
+        }
+      }
+      return { username: localpart }
+    },
+    [],
+  )
+
   // Validate username against Blink API (debounced)
   // Returns true if the username is valid, false otherwise
   const validateUsername = useCallback(
@@ -123,33 +150,33 @@ export default function SetupPWAForm() {
         return false
       }
 
+      // Accept bare username or username@<blink-domain>; reject other domains.
+      const normalized = normalizeBlinkUsername(usernameToValidate)
+      if (normalized.error || !normalized.username) {
+        setValidationStatus("invalid")
+        setError(normalized.error || "Invalid username")
+        return false
+      }
+
       setValidating(true)
       setError(null)
 
       try {
-        const response = await fetch(getApiUrl(), {
+        // Resolve via custodial-first → LNURL fallback so self-custodial
+        // (Spark) usernames — which have no custodial accountDefaultWallet —
+        // are recognized as valid when their Lightning address resolves.
+        const response = await fetch("/api/blink/resolve-receiver", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            query: `
-            query AccountDefaultWallet($username: Username!) {
-              accountDefaultWallet(username: $username) {
-                id
-                walletCurrency
-              }
-            }
-          `,
-            variables: { username: usernameToValidate.trim().toLowerCase() },
+            username: normalized.username,
+            environment: getEnvironment(),
           }),
         })
 
         const data = await response.json()
 
-        if (data.errors) {
-          setValidationStatus("invalid")
-          setError("Username not found")
-          return false
-        } else if (data.data?.accountDefaultWallet?.id) {
+        if (response.ok && data.exists) {
           setValidationStatus("valid")
           setError(null)
           return true
@@ -167,7 +194,7 @@ export default function SetupPWAForm() {
         setValidating(false)
       }
     },
-    [],
+    [normalizeBlinkUsername],
   )
 
   // Handle input change with debounced validation
@@ -224,21 +251,32 @@ export default function SetupPWAForm() {
       return
     }
 
+    // Normalize to a bare Blink username (strip @blink.sv; reject other domains)
+    // so the public route /[blinkusername] receives a valid bare username and
+    // does not 404 on an @-containing path.
+    const normalized = normalizeBlinkUsername(trimmedUsername)
+    if (normalized.error || !normalized.username) {
+      setValidationStatus("invalid")
+      setError(normalized.error || "Invalid username")
+      return
+    }
+    const bareUsername = normalized.username
+
     // If not yet validated, validate first
     if (validationStatus !== "valid") {
-      const isValid = await validateUsername(trimmedUsername)
+      const isValid = await validateUsername(bareUsername)
       if (!isValid) {
         return
       }
     }
 
-    // Save to recent usernames
+    // Save to recent usernames (store what the user typed for convenience)
     saveToRecent(trimmedUsername)
 
     // Theme persists via useTheme hook - no need to force
 
-    // Navigate to Public POS
-    router.push(`/${trimmedUsername}`)
+    // Navigate to Public POS using the bare username
+    router.push(`/${bareUsername}`)
   }
 
   // Handle PWA install

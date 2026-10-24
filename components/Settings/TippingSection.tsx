@@ -4,6 +4,7 @@
 
 import { useState, useEffect } from "react"
 
+import { isSplitPaymentsEnabled } from "../../lib/config/features"
 import { useCombinedAuth } from "../../lib/hooks/useCombinedAuth"
 import { useTheme } from "../../lib/hooks/useTheme"
 
@@ -83,8 +84,27 @@ export default function TippingSection() {
     </button>
   )
 
+  const splitsEnabled = isSplitPaymentsEnabled()
+
   return (
     <div className="space-y-4">
+      {!splitsEnabled && (
+        <div
+          className={`rounded-lg p-4 border ${
+            darkMode
+              ? "bg-amber-950/40 border-amber-800 text-amber-200"
+              : "bg-amber-50 border-amber-300 text-amber-800"
+          }`}
+        >
+          <h4 className="font-medium text-sm">Tipping temporarily unavailable</h4>
+          <p className="mt-1 text-xs">
+            Tipping and Split Payments are paused while we move payments off the
+            intermediary account. Your saved settings are preserved and will apply again
+            once the feature returns.
+          </p>
+        </div>
+      )}
+
       {/* Enable Tipping */}
       <div className={`rounded-lg p-4 ${darkMode ? "bg-gray-900" : "bg-gray-50"}`}>
         <div className="flex items-center justify-between">

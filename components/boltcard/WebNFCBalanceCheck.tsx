@@ -77,7 +77,7 @@ function decodeNDEFRecord(record: NDEFRecord): string {
 /**
  * Parse Boltcard URL to extract cardId and auth params
  *
- * Example input: lnurlw://track.twentyone.ist/api/boltcard/lnurlw/95cf01bac29a10c17b7d32794d9421a3?p=A2EF40...&c=F509EE...
+ * Example input: lnurlw://terminal.blinkbtc.com/api/boltcard/lnurlw/95cf01bac29a10c17b7d32794d9421a3?p=A2EF40...&c=F509EE...
  * Returns: { cardId: '95cf01bac29a10c17b7d32794d9421a3', p: 'A2EF40...', c: 'F509EE...' }
  */
 function parseBoltcardUrl(url: string): ParsedBoltcardUrl | null {

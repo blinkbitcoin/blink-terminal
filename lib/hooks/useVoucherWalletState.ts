@@ -11,7 +11,21 @@ import { useState, useCallback } from "react"
 
 export type VoucherCurrencyMode = "BTC" | "USD"
 
-export type VoucherExpiry = "24h" | "48h" | "72h" | "168h"
+// Mirrors the preset IDs in lib/voucher-expiry.ts (EXPIRY_PRESETS).
+export type VoucherExpiry =
+  | "15m"
+  | "1h"
+  | "3h"
+  | "12h"
+  | "24h"
+  | "72h"
+  | "7d"
+  | "30d"
+  | "90d"
+  | "6mo"
+  // Legacy/loose values that may still exist in storage.
+  | "48h"
+  | "168h"
 
 export interface VoucherWalletScopes {
   receive?: boolean
@@ -118,8 +132,9 @@ function loadVoucherCurrencyMode(): VoucherCurrencyMode {
 function loadVoucherExpiry(): VoucherExpiry {
   if (typeof window !== "undefined") {
     const saved = localStorage.getItem("blinkpos-voucher-expiry")
-    // Migration: if saved is legacy values, migrate to '24h'
-    if (!saved || saved === "7d" || saved === "15m" || saved === "1h") {
+    // Migration: legacy default '7d' is migrated to '24h'. (15m/1h are now
+    // valid short UI options, so they are preserved.)
+    if (!saved || saved === "7d") {
       return "24h"
     }
     return saved as VoucherExpiry

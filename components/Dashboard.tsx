@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 
 import { useAccountManagement } from "../lib/hooks/useAccountManagement"
 import { useBlinkWebSocket } from "../lib/hooks/useBlinkWebSocket"
@@ -13,7 +13,9 @@ import { useInvoiceState } from "../lib/hooks/useInvoiceState"
 import { useNavigationHandlers } from "../lib/hooks/useNavigationHandlers"
 import { usePaycodeState } from "../lib/hooks/usePaycodeState"
 import { usePaymentPolling } from "../lib/hooks/usePaymentPolling"
+import { usePrintReceipt } from "../lib/hooks/usePrintReceipt"
 import { usePWAInstall, type BeforeInstallPromptEvent } from "../lib/hooks/usePWAInstall"
+import { useReceiverType } from "../lib/hooks/useReceiverType"
 import { useServerSync, getVoucherWalletKey } from "../lib/hooks/useServerSync"
 import { useSoundSettings } from "../lib/hooks/useSoundSettings"
 import { useSplitProfileActions } from "../lib/hooks/useSplitProfileActions"
@@ -47,6 +49,7 @@ import PercentSettingsOverlay from "./Settings/PercentSettingsOverlay"
 import RegionalSettingsOverlay from "./Settings/RegionalSettingsOverlay"
 import SoundThemesOverlay from "./Settings/SoundThemesOverlay"
 import SplitSettingsOverlay from "./Settings/SplitSettingsOverlay"
+import ThemeCycleOverlay from "./Settings/ThemeCycleOverlay"
 import TipProfileSettingsOverlay from "./Settings/TipProfileSettingsOverlay"
 import VoucherWalletOverlay from "./Settings/VoucherWalletOverlay"
 import WalletsOverlay from "./Settings/WalletsOverlay"
@@ -116,7 +119,7 @@ export default function Dashboard() {
     removeFromPopular,
     isPopularCurrency,
   } = useCurrencies()
-  const { cycleTheme } = useTheme()
+  const { cycleTheme, setTheme } = useTheme()
 
   // Theme styling utilities - extracted to useThemeStyles hook
   const {
@@ -174,6 +177,14 @@ export default function Dashboard() {
     setBitcoinFormat,
     numpadLayout,
     setNumpadLayout,
+    enabledThemes,
+    setEnabledThemes,
+    amountDisplay,
+    setAmountDisplay,
+    orangePillMode,
+    setOrangePillMode,
+    orangePillStaticUrl,
+    setOrangePillStaticUrl,
     currencyFilter,
     setCurrencyFilter,
     currencyFilterDebounced,
@@ -219,6 +230,15 @@ export default function Dashboard() {
     closeAllOverlays: _closeAllOverlays,
     closeAllSettings: _closeAllSettings,
   } = useUIVisibility()
+
+  // Selectable theme-cycle overlay (opened from the side menu Theme tile).
+  const [showThemeCycle, setShowThemeCycle] = useState(false)
+
+  // Logo-tap cycles through only the enabled (selected) themes.
+  const cycleEnabledThemes = useCallback(
+    () => cycleTheme(enabledThemes),
+    [cycleTheme, enabledThemes],
+  )
 
   // Wallet state (API key and wallet list) managed by useWalletState hook
   const { apiKey, setApiKey, wallets, setWallets } = useWalletState()
@@ -400,6 +420,17 @@ export default function Dashboard() {
     setCurrentVoucherCurrencyMode,
   } = useVoucherWalletState()
 
+  // Voucher/MultiVoucher push their current amount here (capacity indicator).
+  // Replaces the former 300ms polling of the child imperative getters.
+  const handleVoucherAmountChange = useCallback(
+    (amountInSats: number, amountInUsdCents: number, currencyMode: "BTC" | "USD") => {
+      setCurrentAmountInSats(amountInSats)
+      setCurrentAmountInUsdCents(amountInUsdCents)
+      setCurrentVoucherCurrencyMode(currencyMode)
+    },
+    [setCurrentAmountInSats, setCurrentAmountInUsdCents, setCurrentVoucherCurrencyMode],
+  )
+
   // Commission settings - extracted to useCommissionSettings hook
   const {
     commissionEnabled,
@@ -412,14 +443,7 @@ export default function Dashboard() {
   } = useCommissionSettings()
 
   // Paycode state - extracted to usePaycodeState hook
-  const {
-    showPaycode,
-    setShowPaycode,
-    paycodeAmount,
-    setPaycodeAmount,
-    paycodeGeneratingPdf,
-    setPaycodeGeneratingPdf,
-  } = usePaycodeState()
+  const { showPaycode, setShowPaycode } = usePaycodeState()
 
   // NOTE: activeTipProfile is now managed by useTipSettings hook above
 
@@ -527,6 +551,20 @@ export default function Dashboard() {
     useCustomWeights,
   })
 
+  // Self-custodial (Spark) detection. Spark receivers have no escrow account, so
+  // tip forwarding and payment splits are impossible — suppress those UIs.
+  const { isSparkLnAddress } = useReceiverType(activeBlinkAccount)
+
+  // If the active receive wallet is (or becomes) a self-custodial Spark LN
+  // address while a split profile is active, force-deactivate it so no
+  // un-forwardable tip is added to the invoice. This also clears tipsEnabled and
+  // tipRecipient (handled inside setActiveSplitProfileById).
+  useEffect(() => {
+    if (isSparkLnAddress && activeSplitProfile) {
+      setActiveSplitProfileById(null)
+    }
+  }, [isSparkLnAddress, activeSplitProfile, setActiveSplitProfileById])
+
   // Transaction search ref (state is in useTransactionState hook)
   const txSearchInputRef = useRef<HTMLInputElement>(null)
 
@@ -632,8 +670,6 @@ export default function Dashboard() {
     lastPayment,
     // Refs
     posPaymentReceivedRef,
-    voucherRef,
-    multiVoucherRef,
   })
 
   // Transaction operations - extracted to useTransactionActions hook
@@ -729,6 +765,17 @@ export default function Dashboard() {
     fetchData,
     soundEnabled,
     soundTheme,
+    merchant: user?.username ?? undefined,
+  })
+
+  // Receipt printing for the payment-success screen (manual, button-triggered)
+  const { printReceipt, printAvailable } = usePrintReceipt({
+    amountDisplay,
+    numberFormat,
+    bitcoinFormat,
+    currencies,
+    orangePillMode,
+    staticQRUrl: orangePillStaticUrl,
   })
 
   // Navigation handlers (touch swipe + keyboard) - extracted to useNavigationHandlers hook
@@ -787,13 +834,19 @@ export default function Dashboard() {
         onHide={hideAnimation}
         soundEnabled={soundEnabled}
         soundTheme={soundTheme}
+        amountDisplay={amountDisplay}
+        numberFormat={numberFormat}
+        bitcoinFormat={bitcoinFormat}
+        currencies={currencies}
+        onPrintReceipt={printReceipt}
+        printAvailable={printAvailable}
       />
 
       {/* Mobile Header - Hidden when showing invoice or voucher QR */}
       {!showingInvoice && !showingVoucherQR && (
         <MobileHeader
           theme={theme}
-          cycleTheme={cycleTheme}
+          cycleTheme={cycleEnabledThemes}
           currentView={currentView}
           handleViewTransition={handleViewTransition}
           isViewTransitioning={isViewTransitioning}
@@ -818,6 +871,7 @@ export default function Dashboard() {
           numberFormat={numberFormat}
           activeSplitProfile={activeSplitProfile}
           activeTipProfile={activeTipProfile}
+          isSparkLnAddress={isSparkLnAddress}
           soundEnabled={soundEnabled}
           soundTheme={soundTheme}
           showInstallPrompt={showInstallPrompt}
@@ -825,7 +879,7 @@ export default function Dashboard() {
           setShowKeyManagement={setShowKeyManagement}
           setShowAccountSettings={setShowAccountSettings}
           setShowVoucherWalletSettings={setShowVoucherWalletSettings}
-          cycleTheme={cycleTheme}
+          setShowThemeCycle={setShowThemeCycle}
           setShowCurrencySettings={setShowCurrencySettings}
           setShowRegionalSettings={setShowRegionalSettings}
           setShowTipSettings={setShowTipSettings}
@@ -835,7 +889,6 @@ export default function Dashboard() {
           setShowPaycode={setShowPaycode}
           setShowBatchPayments={setShowBatchPayments}
           setShowBoltcards={setShowBoltcards}
-          setShowNetworkOverlay={setShowNetworkOverlay}
           handleInstallApp={handleInstallApp}
           handleLogout={handleLogout}
           getSubmenuBgClasses={getSubmenuBgClasses}
@@ -888,7 +941,7 @@ export default function Dashboard() {
           nostrProfile={nostrProfile}
           darkMode={darkMode}
           theme={theme}
-          cycleTheme={cycleTheme}
+          cycleTheme={cycleEnabledThemes}
           setShowNetworkOverlay={setShowNetworkOverlay}
           setSideMenuOpen={setSideMenuOpen}
           transitionColorIndex={transitionColorIndex}
@@ -902,15 +955,8 @@ export default function Dashboard() {
       {/* Paycodes Overlay */}
       {showPaycode && activeBlinkAccount?.username && (
         <PaycodesOverlay
-          activeBlinkAccount={activeBlinkAccount}
-          paycodeAmount={paycodeAmount}
-          paycodeGeneratingPdf={paycodeGeneratingPdf}
-          darkMode={darkMode}
-          setShowPaycode={setShowPaycode}
-          setPaycodeAmount={setPaycodeAmount}
-          setPaycodeGeneratingPdf={setPaycodeGeneratingPdf}
-          getSubmenuBgClasses={getSubmenuBgClasses}
-          getSubmenuHeaderClasses={getSubmenuHeaderClasses}
+          username={activeBlinkAccount.username}
+          onBack={() => setShowPaycode(false)}
         />
       )}
 
@@ -929,12 +975,28 @@ export default function Dashboard() {
         />
       )}
 
+      {/* Theme cycle (selectable) overlay */}
+      {showThemeCycle && (
+        <ThemeCycleOverlay
+          theme={theme}
+          enabledThemes={enabledThemes}
+          setEnabledThemes={setEnabledThemes}
+          setTheme={setTheme}
+          setShowThemeCycle={setShowThemeCycle}
+          getSubmenuBgClasses={getSubmenuBgClasses}
+          getSubmenuHeaderClasses={getSubmenuHeaderClasses}
+          getSelectionTileClasses={getSelectionTileClasses}
+          getSelectionTileActiveClasses={getSelectionTileActiveClasses}
+        />
+      )}
+
       {/* % Settings Submenu Overlay (Tip % and Commission % when voucher wallet connected) */}
       {showPercentSettings && (
         <PercentSettingsOverlay
           activeTipProfile={activeTipProfile}
           commissionEnabled={commissionEnabled}
           commissionPresets={commissionPresets}
+          isSparkLnAddress={isSparkLnAddress}
           setShowPercentSettings={setShowPercentSettings}
           setShowTipProfileSettings={setShowTipProfileSettings}
           setShowCommissionSettings={setShowCommissionSettings}
@@ -978,8 +1040,9 @@ export default function Dashboard() {
         />
       )}
 
-      {/* Split Settings Overlay */}
-      {showTipSettings && !showCreateSplitProfile && (
+      {/* Split Settings Overlay - hidden for self-custodial (Spark) wallets,
+          which have no escrow and cannot forward/split tips. */}
+      {showTipSettings && !showCreateSplitProfile && !isSparkLnAddress && (
         <SplitSettingsOverlay
           authMode={authMode}
           activeSplitProfile={activeSplitProfile}
@@ -1072,9 +1135,15 @@ export default function Dashboard() {
           numberFormat={numberFormat}
           bitcoinFormat={bitcoinFormat}
           numpadLayout={numpadLayout}
+          amountDisplay={amountDisplay}
+          orangePillMode={orangePillMode}
+          orangePillStaticUrl={orangePillStaticUrl}
           setNumberFormat={setNumberFormat}
           setBitcoinFormat={setBitcoinFormat}
           setNumpadLayout={setNumpadLayout}
+          setAmountDisplay={setAmountDisplay}
+          setOrangePillMode={setOrangePillMode}
+          setOrangePillStaticUrl={setOrangePillStaticUrl}
           setShowRegionalSettings={setShowRegionalSettings}
           getSubmenuBgClasses={getSubmenuBgClasses}
           getSubmenuHeaderClasses={getSubmenuHeaderClasses}
@@ -1241,7 +1310,7 @@ export default function Dashboard() {
       )}
 
       <main
-        className={`max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mobile-content ${isFixedView ? "h-[calc(100vh-80px)] overflow-hidden py-2" : "py-6"}`}
+        className={`max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mobile-content ${isFixedView ? "h-[calc(100dvh-80px)] overflow-hidden py-2" : "py-6"}`}
         onTouchStart={handleTouchStart}
         onTouchMove={handleTouchMove}
         onTouchEnd={handleTouchEnd}
@@ -1263,6 +1332,7 @@ export default function Dashboard() {
           activeBlinkAccount={activeBlinkAccount}
           voucherExpiry={voucherExpiry}
           activeSplitProfile={activeSplitProfile}
+          isSparkLnAddress={isSparkLnAddress}
           voucherWalletBalanceLoading={voucherWalletBalanceLoading}
           isBlinkClassic={isBlinkClassic}
           currentVoucherCurrencyMode={currentVoucherCurrencyMode}
@@ -1297,7 +1367,7 @@ export default function Dashboard() {
           currencies={currencies}
           darkMode={darkMode}
           theme={theme}
-          cycleTheme={cycleTheme}
+          cycleTheme={cycleEnabledThemes}
           soundEnabled={soundEnabled}
           exchangeRate={exchangeRate}
           isViewTransitioning={isViewTransitioning}
@@ -1319,6 +1389,7 @@ export default function Dashboard() {
           tipsEnabled={tipsEnabled}
           tipPresets={tipPresets}
           activeSplitProfile={activeSplitProfile}
+          isSparkLnAddress={isSparkLnAddress}
           setShowingInvoice={setShowingInvoice}
           setCurrentInvoice={setCurrentInvoice}
           nfcState={nfcState}
@@ -1341,6 +1412,7 @@ export default function Dashboard() {
           setVoucherCurrencyMode={setVoucherCurrencyMode}
           usdExchangeRate={usdExchangeRate}
           voucherExpiry={voucherExpiry}
+          onVoucherAmountChange={handleVoucherAmountChange}
           voucherRef={voucherRef}
           setShowingVoucherQR={setShowingVoucherQR}
           multiVoucherRef={multiVoucherRef}

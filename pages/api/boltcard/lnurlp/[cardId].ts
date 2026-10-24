@@ -173,4 +173,4 @@ function getServerUrl(req: NextApiRequest) {
   return `${protocol}://${host}`
 }
 
-export default withRateLimit(handler, RATE_LIMIT_WRITE)
+export default withRateLimit(handler, RATE_LIMIT_WRITE, "boltcard/lnurlp/[cardId]")

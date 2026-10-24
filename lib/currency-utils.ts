@@ -12,8 +12,10 @@ import {
   formatNumber,
   formatBitcoinAmount,
   DEFAULT_BITCOIN_FORMAT,
+  DEFAULT_AMOUNT_DISPLAY,
   NumberFormatPreference,
   BitcoinFormatPreference,
+  AmountDisplayPreference,
 } from "./number-format"
 
 // =============================================================================
@@ -70,9 +72,55 @@ export const BTC_BIP177_CURRENCY: CurrencyMetadata = {
 
 /**
  * Street rate currencies (alternative exchange rates from Citrusrate)
- * These appear in the currency list alongside their official counterparts
+ * These appear in the currency list alongside their official counterparts.
+ * Covers all 13 currencies supported by Citrusrate's black-market endpoint
+ * (GET /v1/btc/blackmarket?currency=X) — verified live Sept 2026.
  */
 export const STREET_RATE_CURRENCIES: CurrencyMetadata[] = [
+  {
+    id: "EGP_STREET",
+    baseId: "EGP",
+    displayId: "EGP (street)",
+    symbol: "E£",
+    name: "Egyptian Pound (street rate)",
+    flag: "🇪🇬",
+    fractionDigits: 2,
+    rateProvider: "citrusrate_street",
+    isStreetRate: true,
+  },
+  {
+    id: "ETB_STREET",
+    baseId: "ETB",
+    displayId: "ETB (street)",
+    symbol: "Br",
+    name: "Ethiopian Birr (street rate)",
+    flag: "🇪🇹",
+    fractionDigits: 2,
+    rateProvider: "citrusrate_street",
+    isStreetRate: true,
+  },
+  {
+    id: "GHS_STREET",
+    baseId: "GHS",
+    displayId: "GHS (street)",
+    symbol: "₵",
+    name: "Ghanaian Cedi (street rate)",
+    flag: "🇬🇭",
+    fractionDigits: 2,
+    rateProvider: "citrusrate_street",
+    isStreetRate: true,
+  },
+  {
+    id: "MWK_STREET",
+    baseId: "MWK",
+    displayId: "MWK (street)",
+    symbol: "MK",
+    name: "Malawian Kwacha (street rate)",
+    flag: "🇲🇼",
+    fractionDigits: 2,
+    rateProvider: "citrusrate_street",
+    isStreetRate: true,
+  },
   {
     id: "MZN_STREET",
     baseId: "MZN", // The official currency this is based on
@@ -84,18 +132,94 @@ export const STREET_RATE_CURRENCIES: CurrencyMetadata[] = [
     rateProvider: "citrusrate_street",
     isStreetRate: true,
   },
-  // Easy to add more street rate currencies:
-  // {
-  //   id: 'NGN_STREET',
-  //   baseId: 'NGN',
-  //   displayId: 'NGN (street)',
-  //   symbol: '₦',
-  //   name: 'Nigerian Naira (street rate)',
-  //   flag: '🇳🇬',
-  //   fractionDigits: 2,
-  //   rateProvider: 'citrusrate_street',
-  //   isStreetRate: true
-  // },
+  {
+    id: "NAD_STREET",
+    baseId: "NAD",
+    displayId: "NAD (street)",
+    symbol: "$",
+    name: "Namibian Dollar (street rate)",
+    flag: "🇳🇦",
+    fractionDigits: 2,
+    rateProvider: "citrusrate_street",
+    isStreetRate: true,
+  },
+  {
+    id: "RWF_STREET",
+    baseId: "RWF",
+    displayId: "RWF (street)",
+    symbol: "RF",
+    name: "Rwandan Franc (street rate)",
+    flag: "🇷🇼",
+    fractionDigits: 0,
+    rateProvider: "citrusrate_street",
+    isStreetRate: true,
+  },
+  {
+    id: "TZS_STREET",
+    baseId: "TZS",
+    displayId: "TZS (street)",
+    symbol: "TSh",
+    name: "Tanzanian Shilling (street rate)",
+    flag: "🇹🇿",
+    fractionDigits: 2,
+    rateProvider: "citrusrate_street",
+    isStreetRate: true,
+  },
+  {
+    id: "UGX_STREET",
+    baseId: "UGX",
+    displayId: "UGX (street)",
+    symbol: "USh",
+    name: "Ugandan Shilling (street rate)",
+    flag: "🇺🇬",
+    fractionDigits: 0,
+    rateProvider: "citrusrate_street",
+    isStreetRate: true,
+  },
+  {
+    id: "XAF_STREET",
+    baseId: "XAF",
+    displayId: "XAF (street)",
+    symbol: "FCFA",
+    name: "CFA Franc BEAC (street rate)",
+    flag: "🇨🇲",
+    fractionDigits: 0,
+    rateProvider: "citrusrate_street",
+    isStreetRate: true,
+  },
+  {
+    id: "XOF_STREET",
+    baseId: "XOF",
+    displayId: "XOF (street)",
+    symbol: "CFA",
+    name: "CFA Franc BCEAO (street rate)",
+    flag: "🇸🇳",
+    fractionDigits: 0,
+    rateProvider: "citrusrate_street",
+    isStreetRate: true,
+  },
+  {
+    id: "ZAR_STREET",
+    baseId: "ZAR",
+    displayId: "ZAR (street)",
+    symbol: "R",
+    name: "South African Rand (street rate)",
+    flag: "🇿🇦",
+    fractionDigits: 2,
+    rateProvider: "citrusrate_street",
+    isStreetRate: true,
+  },
+  {
+    id: "ZMW_STREET",
+    baseId: "ZMW",
+    displayId: "ZMW (street)",
+    symbol: "ZK",
+    name: "Zambian Kwacha (street rate)",
+    flag: "🇿🇲",
+    fractionDigits: 2,
+    rateProvider: "citrusrate_street",
+    isStreetRate: true,
+  },
 ]
 
 // =============================================================================
@@ -292,6 +416,66 @@ export const formatDisplayAmount = (
   }
 
   return formatCurrencyAmount(value, currency, numberFormat, bitcoinFormat)
+}
+
+/**
+ * Format a combined amount string showing both the fiat value and the sats value,
+ * with the order determined by the amount-display preference.
+ *
+ * - fiat-primary: "$50.00 (5,000 sats)"
+ * - sats-primary: "5,000 sats ($50.00)"
+ *
+ * When no fiat value is available (e.g. a Bitcoin-denominated payment), only the
+ * sats value is returned. When the sats value is missing, only the fiat is returned.
+ *
+ * @param sats - Amount in satoshis (may be undefined for fiat-only contexts)
+ * @param displayAmount - Fiat amount (may be undefined for sats-only contexts)
+ * @param displayCurrency - Fiat currency id (e.g. "USD", "KES"); BTC currencies are treated as no-fiat
+ * @param amountDisplay - Which value is primary
+ * @param numberFormat - Number format preference
+ * @param bitcoinFormat - Bitcoin format preference
+ * @param currencyList - Currency metadata list (optional; enables symbol-aware fiat formatting)
+ * @returns Combined display string
+ */
+export const formatCombinedAmount = (
+  sats: number | undefined,
+  displayAmount: number | string | undefined,
+  displayCurrency: string | undefined,
+  amountDisplay: AmountDisplayPreference = DEFAULT_AMOUNT_DISPLAY,
+  numberFormat: NumberFormatPreference = "auto",
+  bitcoinFormat: BitcoinFormatPreference = DEFAULT_BITCOIN_FORMAT,
+  currencyList: CurrencyMetadata[] = [],
+): string => {
+  const hasSats = typeof sats === "number" && !Number.isNaN(sats)
+  const hasFiat =
+    displayAmount !== undefined &&
+    displayAmount !== null &&
+    displayAmount !== "" &&
+    !!displayCurrency &&
+    !isBitcoinCurrency(displayCurrency)
+
+  const satsStr = hasSats
+    ? formatBitcoinAmount(sats as number, bitcoinFormat, numberFormat)
+    : ""
+  const fiatStr = hasFiat
+    ? formatDisplayAmount(
+        displayAmount as number | string,
+        displayCurrency as string,
+        currencyList,
+        numberFormat,
+        bitcoinFormat,
+      )
+    : ""
+
+  // Only one side available
+  if (!hasFiat) return satsStr
+  if (!hasSats) return fiatStr
+
+  // Both available - order by preference
+  if (amountDisplay === "sats-primary") {
+    return `${satsStr} (${fiatStr})`
+  }
+  return `${fiatStr} (${satsStr})`
 }
 
 /**

@@ -652,13 +652,9 @@ export function verifySunMAC(
     // Step 1: Build SV2 = 3CC300010080 || UID || SDMReadCtr
     const sv2 = Buffer.concat([SV2_PREFIX, uid, counterBuf])
 
-    console.log("[BoltcardCrypto] verifySunMAC debug:", {
-      sv2: sv2.toString("hex"),
-      uid: uidHex,
-      counter,
-      counterHex: counterBuf.toString("hex"),
-      k2: k2Hex.substring(0, 8) + "...",
-    })
+    // No logging of SV2, MACs or key material here (blink-wip#1590): this
+    // runs on every tap, and on a tampered tap the expected MAC is exactly
+    // what a log reader would need to forge a valid one.
 
     // Step 2: Derive session MAC key: SesSdmFileReadMACKey = CMAC(K2, SV2)
     const sessionKey = calculateCMAC(k2, sv2)
@@ -678,12 +674,6 @@ export function verifySunMAC(
       fullMac[13],
       fullMac[15],
     ])
-
-    console.log("[BoltcardCrypto] verifySunMAC comparison:", {
-      receivedMac: sunMacHex,
-      expectedMac: expectedMac.toString("hex"),
-      fullMac: fullMac.toString("hex"),
-    })
 
     // Constant-time comparison
     return crypto.timingSafeEqual(sunMac, expectedMac)
@@ -722,8 +712,8 @@ export function verifyCardTap(
     return { valid: false, error: "Failed to decrypt PICCData" }
   }
 
+  // The UID is what SUN encryption hides from passive readers: don't log it.
   console.log("[BoltcardCrypto] verifyCardTap - PICCData decrypted:", {
-    cardUid: piccResult.cardUid,
     counter: piccResult.counter,
   })
 

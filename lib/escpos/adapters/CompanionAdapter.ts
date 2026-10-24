@@ -18,6 +18,8 @@
  * - Native apps can use optimized Bluetooth libraries
  */
 
+import { asciiizeReceiptText } from "../asciiize"
+
 import { BaseAdapter, AdapterStatus, AdapterCapabilities } from "./BaseAdapter"
 
 /**
@@ -58,8 +60,62 @@ interface VoucherLike {
   amount?: number
 }
 
+/**
+ * Orange-pill footer carried through the V1 `app=payment` deep link.
+ * All fields optional; lengths are capped before serialization to keep the
+ * deep-link URI small (Android Intent/URI size limits).
+ */
+interface ReceiptFooterLike {
+  /** Heading, e.g. "On this day, 2009:". */
+  heading?: string
+  /** Body text (already joined to a single string). */
+  text?: string
+  /** Caption under the QR, e.g. "Read: Bitcoin is Time - Gigi". */
+  caption?: string
+  /** QR payload (URL). */
+  qr?: string
+}
+
+interface ReceiptLike {
+  /** Pre-formatted amount line, e.g. "5,000 sats ($50.00)" */
+  amount?: string
+  merchant?: string
+  memo?: string
+  paymentHash?: string
+  timestamp?: number
+  /** Optional orange-pill education footer. */
+  footer?: ReceiptFooterLike
+}
+
+/**
+ * Max characters for footer fields in the deep link. The total `app=payment`
+ * URI stays well within Android's practical limits (a few KB) at these sizes.
+ * Quotes in rotation are filtered to <= 420 chars upstream, so footerText is
+ * essentially never truncated; the cap is a safety net for long history events.
+ */
+const FOOTER_TEXT_MAX = 420
+const FOOTER_HEADING_MAX = 48
+const FOOTER_CAPTION_MAX = 120
+
+/**
+ * Truncate to `max` chars on a word boundary, appending an ASCII "..." when
+ * cut. ASCII (not the `…` glyph) so it never mojibakes on a CP437 printer.
+ */
+function capText(s: string, max: number): string {
+  // Transliterate first so the deep link carries printer-safe ASCII (the
+  // companion app renders these params natively) and the length cap counts
+  // ASCII chars, not multi-byte code units.
+  const t = asciiizeReceiptText(s).trim()
+  if (t.length <= max) return t
+  const slice = t.slice(0, Math.max(0, max - 3))
+  const lastSpace = slice.lastIndexOf(" ")
+  const body = lastSpace > max * 0.6 ? slice.slice(0, lastSpace) : slice
+  return body.trimEnd() + "..."
+}
+
 interface PrintOptions {
   voucher?: VoucherLike
+  receipt?: ReceiptLike
   paperWidth?: number
   qrMode?: string
   timeout?: number
@@ -266,6 +322,13 @@ class CompanionAdapter extends BaseAdapter {
     const scheme = this.options.scheme
     const params = new URLSearchParams()
 
+    // Payment receipts use the V1 `app=payment` format. This is required because
+    // the companion app's V2 raw-ESC/POS path is a no-op on Nyx/Bitcoinize
+    // printers; the V1 path renders on both Nyx and generic Bluetooth printers.
+    if (options.receipt) {
+      return this._buildPaymentDeepLinkUrl(options.receipt)
+    }
+
     // Check if we should use legacy format (compatible with current companion app)
     // The current companion app expects app=voucher with individual parameters
     if (this.options.useLegacyFormat && options.voucher) {
@@ -399,6 +462,77 @@ class CompanionAdapter extends BaseAdapter {
 
     const url = `${scheme}://print?${params.toString()}`
     console.log("🖨️ Using legacy companion app format:", url)
+
+    return url
+  }
+
+  /**
+   * Build a payment-receipt deep link (V1 `app=payment` format).
+   *
+   * The companion app renders this on both Nyx/Bitcoinize and generic
+   * Bluetooth printers. Params map to MainActivity.parseV1PrintJob():
+   * username, amount, paymentHash, date, time, memo.
+   *
+   * @private
+   */
+  private _buildPaymentDeepLinkUrl(receipt: ReceiptLike): string {
+    const scheme = this.options.scheme
+    const params = new URLSearchParams()
+
+    // Default app type is payment; set explicitly for clarity.
+    params.set("app", "payment")
+
+    if (receipt.merchant) {
+      params.set("username", receipt.merchant)
+    }
+
+    // Pre-formatted combined amount string (e.g. "5,000 sats ($50.00)")
+    if (receipt.amount) {
+      params.set("amount", receipt.amount)
+    }
+
+    if (receipt.paymentHash) {
+      params.set("paymentHash", receipt.paymentHash)
+    }
+
+    if (receipt.memo) {
+      params.set("memo", receipt.memo)
+    }
+
+    // Split timestamp into date + time for the V1 template
+    const date = new Date(receipt.timestamp ?? Date.now())
+    const y = date.getFullYear()
+    const m = String(date.getMonth() + 1).padStart(2, "0")
+    const d = String(date.getDate()).padStart(2, "0")
+    params.set("date", `${y}-${m}-${d}`)
+
+    let hours = date.getHours()
+    const minutes = String(date.getMinutes()).padStart(2, "0")
+    const ampm = hours >= 12 ? "pm" : "am"
+    hours = hours % 12
+    if (hours === 0) hours = 12
+    params.set("time", `${hours}:${minutes} ${ampm}`)
+
+    // Optional orange-pill footer (Bitcoin education). New companion versions
+    // render these; older versions ignore the unknown params (graceful).
+    const footer = receipt.footer
+    if (footer) {
+      if (footer.heading) {
+        params.set("footerHeading", capText(footer.heading, FOOTER_HEADING_MAX))
+      }
+      if (footer.text) {
+        params.set("footerText", capText(footer.text, FOOTER_TEXT_MAX))
+      }
+      if (footer.caption) {
+        params.set("footerCaption", capText(footer.caption, FOOTER_CAPTION_MAX))
+      }
+      if (footer.qr) {
+        params.set("footerQr", footer.qr)
+      }
+    }
+
+    const url = `${scheme}://print?${params.toString()}`
+    console.log("🖨️ Using payment receipt companion format:", url)
 
     return url
   }

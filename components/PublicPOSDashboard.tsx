@@ -1,6 +1,7 @@
-import { useRef } from "react"
+import { useRef, useState, useCallback, useEffect } from "react"
 
 import { useCurrencies } from "../lib/hooks/useCurrencies"
+import { usePrintReceipt } from "../lib/hooks/usePrintReceipt"
 import { usePublicPOSExchangeRate } from "../lib/hooks/usePublicPOSExchangeRate"
 import { usePublicPOSMenuState } from "../lib/hooks/usePublicPOSMenuState"
 import {
@@ -14,6 +15,7 @@ import { usePublicPOSValidation } from "../lib/hooks/usePublicPOSValidation"
 import { usePublicPOSViewState } from "../lib/hooks/usePublicPOSViewState"
 import { useTheme } from "../lib/hooks/useTheme"
 import type { CartCheckoutData } from "../lib/hooks/useViewNavigation"
+import type { PosUrlParams } from "../lib/pos-url-params"
 
 import ItemCart from "./ItemCart"
 import { useNFC } from "./NFCPayment"
@@ -24,6 +26,7 @@ import PublicPOSPaycodeOverlay from "./PublicPOS/PublicPOSPaycodeOverlay"
 import PublicPOSRegionalOverlay from "./PublicPOS/PublicPOSRegionalOverlay"
 import PublicPOSSideMenu from "./PublicPOS/PublicPOSSideMenu"
 import PublicPOSSoundOverlay from "./PublicPOS/PublicPOSSoundOverlay"
+import PublicPOSThemeCycleOverlay from "./PublicPOS/PublicPOSThemeCycleOverlay"
 import PublicPOSValidationOverlay from "./PublicPOS/PublicPOSValidationOverlay"
 import StagingBanner from "./StagingBanner"
 
@@ -41,19 +44,26 @@ import StagingBanner from "./StagingBanner"
 
 interface PublicPOSDashboardProps {
   username: string
+  /** Pre-filled POS params from the URL query (amount/memo/display), already
+      sanitized SSR-side. Undefined fields keep their defaults. */
+  urlParams?: PosUrlParams
 }
 
-export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps) {
+export default function PublicPOSDashboard({
+  username,
+  urlParams,
+}: PublicPOSDashboardProps) {
   const {
     currencies,
     loading: currenciesLoading,
     getAllCurrencies,
+    getAllCurrenciesFlat,
     popularCurrencyIds: _popularCurrencyIds,
     addToPopular,
     removeFromPopular,
     isPopularCurrency,
   } = useCurrencies()
-  const { theme, cycleTheme, darkMode } = useTheme()
+  const { theme, cycleTheme, setTheme, darkMode } = useTheme()
 
   // Username validation - validates against current environment (production or staging)
   const {
@@ -145,11 +155,48 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
     setBitcoinFormat,
     numpadLayout,
     setNumpadLayout,
+    enabledThemes,
+    setEnabledThemes,
+    amountDisplay,
+    setAmountDisplay,
     soundEnabled,
     setSoundEnabled,
     soundTheme,
     setSoundTheme,
-  } = usePublicPOSSettings()
+    orangePillMode,
+    setOrangePillMode,
+    orangePillStaticUrl,
+    setOrangePillStaticUrl,
+  } = usePublicPOSSettings(urlParams?.display)
+
+  // One-time validation of the ?display= URL param against the loaded currency
+  // list: fiat codes the backend doesn't know fall back to USD. (Bitcoin
+  // displays are always valid and never reach this check's fallback.)
+  const displayParamCheckedRef = useRef(false)
+  useEffect(() => {
+    if (displayParamCheckedRef.current || !urlParams?.display || currenciesLoading) {
+      return
+    }
+    displayParamCheckedRef.current = true
+    const known = getAllCurrenciesFlat()
+    // Only validate once the fiat list actually loaded; it always contains BTC.
+    if (known.length > 1 && !known.some((c) => c.id === displayCurrency)) {
+      setDisplayCurrency("USD")
+    }
+  }, [
+    currenciesLoading,
+    urlParams?.display,
+    displayCurrency,
+    getAllCurrenciesFlat,
+    setDisplayCurrency,
+  ])
+
+  // Selectable theme-cycle overlay + subset-aware logo cycle.
+  const [showThemeCycle, setShowThemeCycle] = useState(false)
+  const cycleEnabledThemes = useCallback(
+    () => cycleTheme(enabledThemes),
+    [cycleTheme, enabledThemes],
+  )
 
   // View navigation state
   const {
@@ -172,7 +219,22 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
     paymentData,
     handleInvoiceChange,
     handlePaymentAnimationHide,
-  } = usePublicPOSPayment({ showingInvoice, soundEnabled, posPaymentReceivedRef })
+  } = usePublicPOSPayment({
+    showingInvoice,
+    soundEnabled,
+    posPaymentReceivedRef,
+    merchant: username,
+  })
+
+  // Receipt printing for the payment-success screen (manual, button-triggered)
+  const { printReceipt, printAvailable } = usePrintReceipt({
+    amountDisplay,
+    numberFormat,
+    bitcoinFormat,
+    currencies,
+    orangePillMode,
+    staticQRUrl: orangePillStaticUrl,
+  })
 
   // Exchange rate for sats equivalent display
   const { exchangeRate, loadingRate: _loadingRate } = usePublicPOSExchangeRate({
@@ -208,10 +270,6 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
     setShowSoundSettings,
     showPaycode,
     setShowPaycode,
-    paycodeAmount,
-    setPaycodeAmount,
-    paycodeGeneratingPdf,
-    setPaycodeGeneratingPdf,
   } = usePublicPOSMenuState()
 
   // Touch + keyboard navigation
@@ -254,7 +312,7 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
             <div className="flex items-center justify-between py-4">
               {/* Blink Logo - Left (tap to cycle theme) */}
               <button
-                onClick={cycleTheme}
+                onClick={cycleEnabledThemes}
                 className="flex items-center focus:outline-none"
                 aria-label="Cycle theme"
               >
@@ -325,7 +383,7 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
         <PublicPOSSideMenu
           onClose={() => setSideMenuOpen(false)}
           theme={theme}
-          cycleTheme={cycleTheme}
+          onShowThemeCycle={() => setShowThemeCycle(true)}
           displayCurrency={displayCurrency}
           numberFormat={numberFormat}
           soundEnabled={soundEnabled}
@@ -374,6 +432,12 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
           setBitcoinFormat={setBitcoinFormat}
           numpadLayout={numpadLayout}
           setNumpadLayout={setNumpadLayout}
+          amountDisplay={amountDisplay}
+          setAmountDisplay={setAmountDisplay}
+          orangePillMode={orangePillMode}
+          setOrangePillMode={setOrangePillMode}
+          orangePillStaticUrl={orangePillStaticUrl}
+          setOrangePillStaticUrl={setOrangePillStaticUrl}
           getSubmenuBgClasses={getSubmenuBgClasses}
           getSubmenuHeaderClasses={getSubmenuHeaderClasses}
         />
@@ -394,24 +458,32 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
         />
       )}
 
+      {/* Theme cycle (selectable) overlay */}
+      {showThemeCycle && (
+        <PublicPOSThemeCycleOverlay
+          theme={theme}
+          enabledThemes={enabledThemes}
+          setEnabledThemes={setEnabledThemes}
+          setTheme={setTheme}
+          onClose={() => setShowThemeCycle(false)}
+          getSubmenuBgClasses={getSubmenuBgClasses}
+          getSubmenuHeaderClasses={getSubmenuHeaderClasses}
+          getSelectionTileClasses={getSelectionTileClasses}
+          getSelectionTileActiveClasses={getSelectionTileActiveClasses}
+        />
+      )}
+
       {/* Paycode Overlay */}
       {showPaycode && (
         <PublicPOSPaycodeOverlay
           onClose={() => setShowPaycode(false)}
           username={username}
-          darkMode={darkMode}
-          paycodeAmount={paycodeAmount}
-          setPaycodeAmount={setPaycodeAmount}
-          paycodeGeneratingPdf={paycodeGeneratingPdf}
-          setPaycodeGeneratingPdf={setPaycodeGeneratingPdf}
-          getSubmenuBgClasses={getSubmenuBgClasses}
-          getSubmenuHeaderClasses={getSubmenuHeaderClasses}
         />
       )}
 
       {/* Main Content */}
       <main
-        className={`max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mobile-content ${isFixedView ? "h-[calc(100vh-80px)] overflow-hidden py-2" : "py-6"}`}
+        className={`max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mobile-content ${isFixedView ? "h-[calc(100dvh-80px)] overflow-hidden py-2" : "py-6"}`}
         onTouchStart={handleTouchStart}
         onTouchMove={handleTouchMove}
         onTouchEnd={handleTouchEnd}
@@ -461,11 +533,17 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
           onHide={handlePaymentAnimationHide}
           soundEnabled={soundEnabled}
           soundTheme={soundTheme}
+          amountDisplay={amountDisplay}
+          numberFormat={numberFormat}
+          bitcoinFormat={bitcoinFormat}
+          currencies={currencies}
+          onPrintReceipt={printReceipt}
+          printAvailable={printAvailable}
         />
 
         {/* Conditional Content Based on Current View */}
         {currentView === "cart" ? (
-          <div className="h-[calc(100vh-160px)] min-h-[400px]">
+          <div className="h-[calc(100dvh-160px)] min-h-[400px]">
             <ItemCart
               ref={cartRef}
               displayCurrency={displayCurrency}
@@ -480,7 +558,7 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
               soundEnabled={soundEnabled}
               darkMode={darkMode}
               theme={theme}
-              cycleTheme={cycleTheme}
+              cycleTheme={cycleEnabledThemes}
               isViewTransitioning={isViewTransitioning}
               exchangeRate={exchangeRate}
             />
@@ -506,7 +584,7 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
             onInvoiceChange={handleInvoiceChange}
             darkMode={darkMode}
             theme={theme}
-            cycleTheme={cycleTheme}
+            cycleTheme={cycleEnabledThemes}
             nfcState={nfcState}
             activeBlinkAccount={{
               id: "public",
@@ -521,6 +599,9 @@ export default function PublicPOSDashboard({ username }: PublicPOSDashboardProps
             // Public POS specific props
             isPublicPOS={true}
             publicUsername={username}
+            // URL pre-fill (?amount= / ?memo=); editable after seeding
+            initialAmount={urlParams?.amount}
+            initialMemo={urlParams?.memo}
           />
         )}
       </main>

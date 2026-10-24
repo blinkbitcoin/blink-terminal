@@ -9,7 +9,12 @@ type ThemeListener = (theme: Theme) => void
 export interface UseThemeReturn {
   theme: Theme
   setTheme: (newTheme: Theme) => void
-  cycleTheme: () => void
+  /**
+   * Advance to the next theme in the cycle. When `enabled` is provided, cycle
+   * through only that subset (the logo-tap "selectable cycle"); if the active
+   * theme isn't in the subset, jump to the first enabled theme.
+   */
+  cycleTheme: (enabled?: readonly Theme[]) => void
   isDark: boolean
   isLight: boolean
   isBlinkClassic: boolean
@@ -30,13 +35,55 @@ export const THEMES = {
   BLINK_CLASSIC_LIGHT: "blink-classic-light",
 } as const
 
-// Theme order for cycling: dark → BC dark → light → BC light → dark
-const THEME_ORDER: readonly Theme[] = [
-  THEMES.DARK,
+// Theme cycle order (issue #44): the Blink themes lead, Retro follow.
+// Blink Dark → Blink Light → Retro Night → Retro Day → wrap.
+// (Internal ids are unchanged — blink-classic-* is the "Blink" look, dark/light
+// is "Retro". Only the user-facing labels and order changed.)
+export const THEME_ORDER: readonly Theme[] = [
   THEMES.BLINK_CLASSIC_DARK,
+  THEMES.BLINK_CLASSIC_LIGHT,
+  THEMES.DARK,
   THEMES.LIGHT,
+]
+
+/** User-facing theme names (ids stay stable for persistence). */
+export const THEME_LABELS: Record<Theme, string> = {
+  "blink-classic-dark": "Blink Dark",
+  "blink-classic-light": "Blink Light",
+  "dark": "Retro Night",
+  "light": "Retro Day",
+}
+
+// Fresh installs cycle only the two Blink themes (issue #44).
+export const DEFAULT_ENABLED_THEMES: readonly Theme[] = [
+  THEMES.BLINK_CLASSIC_DARK,
   THEMES.BLINK_CLASSIC_LIGHT,
 ]
+
+/**
+ * Normalize an enabled-themes list: keep only known themes in canonical
+ * THEME_ORDER and never return an empty set (falls back to the default).
+ */
+export function normalizeEnabledThemes(themes: readonly Theme[]): Theme[] {
+  const set = THEME_ORDER.filter((t) => themes.includes(t))
+  return set.length > 0 ? set : [...DEFAULT_ENABLED_THEMES]
+}
+
+/** Parse a stored enabled-themes JSON array into a normalized theme list. */
+export function parseEnabledThemes(raw: string | null): Theme[] {
+  if (!raw) {
+    return [...DEFAULT_ENABLED_THEMES]
+  }
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    if (!Array.isArray(parsed)) {
+      return [...DEFAULT_ENABLED_THEMES]
+    }
+    return normalizeEnabledThemes(parsed as Theme[])
+  } catch {
+    return [...DEFAULT_ENABLED_THEMES]
+  }
+}
 
 const STORAGE_KEY = "theme"
 const LEGACY_STORAGE_KEY = "darkMode"
@@ -48,7 +95,10 @@ const LEGACY_STORAGE_KEY = "darkMode"
 // with the new value.
 // ───────────────────────────────────────────────────────────────────
 
-let _currentTheme: Theme = THEMES.DARK
+// Fresh installs default to Blink Dark (issue #44).
+const DEFAULT_THEME: Theme = THEMES.BLINK_CLASSIC_DARK
+
+let _currentTheme: Theme = DEFAULT_THEME
 let _initialized = false
 const _listeners: Set<ThemeListener> = new Set()
 
@@ -144,9 +194,9 @@ function _initTheme(): void {
     _currentTheme = savedTheme as Theme
     applyTheme(savedTheme as Theme)
   } else {
-    _currentTheme = THEMES.DARK
-    applyTheme(THEMES.DARK)
-    localStorage.setItem(STORAGE_KEY, THEMES.DARK)
+    _currentTheme = DEFAULT_THEME
+    applyTheme(DEFAULT_THEME)
+    localStorage.setItem(STORAGE_KEY, DEFAULT_THEME)
   }
 }
 
@@ -191,12 +241,21 @@ export function useTheme(): UseThemeReturn {
   }, [])
 
   /**
-   * Cycle through themes: dark → blink-classic-dark → light → blink-classic-light → dark
+   * Cycle to the next theme. Without an argument, walks the full THEME_ORDER
+   * (Blink Dark → Blink Light → Retro Night → Retro Day → wrap). With an
+   * `enabled` subset, walks only those (in canonical order); if the active
+   * theme isn't in the subset, jumps to the first enabled theme.
    */
-  const cycleTheme = useCallback((): void => {
-    const currentIndex = THEME_ORDER.indexOf(_currentTheme)
-    const nextIndex = (currentIndex + 1) % THEME_ORDER.length
-    const nextTheme = THEME_ORDER[nextIndex]
+  const cycleTheme = useCallback((enabled?: readonly Theme[]): void => {
+    // Restrict to the enabled subset (canonical order preserved); fall back to
+    // the full order if the subset is missing or empty.
+    const cycle =
+      enabled && enabled.length > 0 ? normalizeEnabledThemes(enabled) : THEME_ORDER
+
+    const currentIndex = cycle.indexOf(_currentTheme)
+    // -1 (active theme not in the subset) → first enabled theme.
+    const nextTheme =
+      currentIndex === -1 ? cycle[0] : cycle[(currentIndex + 1) % cycle.length]
 
     localStorage.setItem(STORAGE_KEY, nextTheme)
     applyTheme(nextTheme)
@@ -230,7 +289,7 @@ export function useTheme(): UseThemeReturn {
 
 // For testing: reset shared state
 export function _resetThemeStore(): void {
-  _currentTheme = THEMES.DARK
+  _currentTheme = DEFAULT_THEME
   _initialized = false
   _listeners.clear()
 }

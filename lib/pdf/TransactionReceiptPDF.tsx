@@ -1,6 +1,8 @@
 import { Document, Page, Text, View, Image, StyleSheet } from "@react-pdf/renderer"
 import React from "react"
 
+import { safeImageSrc } from "./safe-image-src"
+
 // --- Type Definitions ---
 
 interface SettlementVia {
@@ -343,7 +345,9 @@ export const TransactionReceiptDocument: React.FC<TransactionReceiptDocumentProp
       <Page size="A4" style={styles.page}>
         {/* Header with Logo */}
         <View style={styles.header}>
-          {logoDataUrl && <Image src={logoDataUrl} style={styles.logo} />}
+          {safeImageSrc(logoDataUrl) && (
+            <Image src={safeImageSrc(logoDataUrl)} style={styles.logo} />
+          )}
           <Text style={styles.receiptTitle}>Payment Receipt</Text>
           <View style={[styles.statusBadge, { backgroundColor: statusColors.bg }]}>
             <Text style={[styles.statusText, { color: statusColors.text }]}>

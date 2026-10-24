@@ -1,6 +1,8 @@
 import type { NextApiRequest, NextApiResponse } from "next"
 
+import { requireTrustedMutation } from "../../../../lib/auth/mutation-guard"
 import * as boltcard from "../../../../lib/boltcard"
+import { requireOwnedCard } from "../../../../lib/boltcard/owner-auth"
 import { withRateLimit, RATE_LIMIT_READ } from "../../../../lib/rate-limit"
 
 /**
@@ -16,14 +18,32 @@ import { withRateLimit, RATE_LIMIT_READ } from "../../../../lib/rate-limit"
  * - Wipe/disable card
  *
  * POST /api/boltcard/cards/[cardId]
- * - Actions: activate, disable, enable, topup
+ * - Actions: activate, disable, enable, adjust, resetDaily
+ *
+ * All methods require the owner's Nostr session; another owner's card
+ * answers 404.
  */
 async function handler(req: NextApiRequest, res: NextApiResponse) {
   const cardId = req.query.cardId as string | undefined
 
-  if (!cardId) {
+  if (!cardId || typeof cardId !== "string") {
     return res.status(400).json({ error: "Missing cardId" })
   }
+
+  if (!["GET", "PUT", "DELETE", "POST"].includes(req.method ?? "")) {
+    return res.status(405).json({ error: "Method not allowed" })
+  }
+
+  try {
+    if (!(await requireOwnedCard(req, res, cardId))) return
+  } catch (error: unknown) {
+    console.error("❌ Card ownership check error:", error)
+    return res.status(500).json({ error: "Failed to load card" })
+  }
+
+  // Cookie-authenticated mutations need the same CSRF boundary as the
+  // network routes (PR #92): JSON content type + same-origin Origin.
+  if (req.method !== "GET" && !requireTrustedMutation(req, res)) return
 
   switch (req.method) {
     case "GET":
@@ -325,4 +345,4 @@ function getServerUrl(req: NextApiRequest) {
   return `${protocol}://${host}`
 }
 
-export default withRateLimit(handler, RATE_LIMIT_READ)
+export default withRateLimit(handler, RATE_LIMIT_READ, "boltcard/cards/[cardId]")

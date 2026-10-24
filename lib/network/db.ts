@@ -339,17 +339,13 @@ export async function getClient(): Promise<PoolClient> {
 // SUPER ADMIN OPERATIONS
 // ============================================
 
-// Super admin npub - only this identity can whitelist new leaders
-export const SUPER_ADMIN_NPUB =
-  "npub1flac02t5hw6jljk8x7mec22uq37ert8d3y3mpwzcma726g5pz4lsmfzlk6"
-
+// Super admins live in the super_admins table only (seeded by migration
+// 003). There is no hard-coded fallback (blink-wip#1679): a fallback could
+// not be revoked by setting the row inactive, and a database error now fails
+// closed instead of granting admin.
 export async function isSuperAdmin(npub: string | null | undefined): Promise<boolean> {
   if (!npub) return false
 
-  // Check against hardcoded super admin first (fallback if DB not available)
-  if (npub === SUPER_ADMIN_NPUB) return true
-
-  // Also check database in case we add more super admins later
   const result = await query(
     "SELECT id FROM super_admins WHERE npub = $1 AND status = $2",
     [npub, "active"],
