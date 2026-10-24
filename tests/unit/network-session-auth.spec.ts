@@ -171,8 +171,10 @@ beforeEach(() => {
   for (const fn of Object.values(mockDbFns)) fn.mockReset()
   mockSyncCommunityTransactions.mockReset()
   mockSyncAllCommunities.mockReset()
-  // Mirror the real db.ts: the hardcoded super admin is always an admin.
+  // Mirror the seeded database (migration 003): one super admin, and no
+  // whitelisted leader among these test identities.
   mockDb.isSuperAdmin = jest.fn(async (npub: string) => npub === SUPER_ADMIN_NPUB)
+  mockDb.isLeaderWhitelisted = jest.fn(async () => false)
 })
 
 describe("session-pubkey helpers", () => {
