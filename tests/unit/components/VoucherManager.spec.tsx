@@ -73,8 +73,93 @@ describe("VoucherManager", () => {
 
     await screen.findByText("AAAAAAAA")
     const [url, init] = fetchMock.mock.calls[0]
-    expect(url).toBe("/api/voucher/list?environment=production")
+    expect(url).toBe("/api/voucher/list?environment=production&limit=100")
     expect(init.headers).toEqual({ "x-voucher-api-key": "blink_owner" })
+  })
+
+  it("loads older pages on demand (blink-wip#1617)", async () => {
+    const cursor = `1000_${"9".repeat(64)}` // created_at + sha256(id): no voucher id
+    fetchMock.mockImplementation((url: string) =>
+      url.includes("before=")
+        ? ok({ ...listBody(["b".repeat(32)]), nextCursor: null })
+        : ok({ ...listBody(["a".repeat(32)]), nextCursor: cursor }),
+    )
+
+    render(<VoucherManager {...props({ apiKey: "blink_owner" })} />)
+    await screen.findByText("AAAAAAAA")
+    expect(screen.queryByText("BBBBBBBB")).toBeNull()
+
+    fireEvent.click(await screen.findByText("Load older vouchers"))
+    await screen.findByText("BBBBBBBB")
+    expect(screen.getByText("AAAAAAAA")).toBeTruthy()
+
+    const [url, init] = fetchMock.mock.calls[1]
+    expect(url).toBe(
+      `/api/voucher/list?environment=production&limit=100&before=${encodeURIComponent(cursor)}`,
+    )
+    expect(init.headers).toEqual({ "x-voucher-api-key": "blink_owner" })
+    // Last page: no more button.
+    expect(screen.queryByText("Load older vouchers")).toBeNull()
+  })
+
+  it("cancelling a voucher from an older page shows it cancelled (first-page refresh does not cover it)", async () => {
+    const cursor = `1000_${"9".repeat(64)}`
+    fetchMock.mockImplementation((url: string) => {
+      if (url.startsWith("/api/voucher/cancel")) return ok({ success: true })
+      if (url.includes("before="))
+        return ok({ ...listBody(["b".repeat(32)]), nextCursor: null })
+      // The first page never contains the older voucher.
+      return ok({ ...listBody(["a".repeat(32)]), nextCursor: cursor })
+    })
+
+    render(<VoucherManager {...props({ apiKey: "blink_owner" })} />)
+    fireEvent.click(await screen.findByText("Load older vouchers"))
+    fireEvent.click(await screen.findByText("BBBBBBBB"))
+    fireEvent.click(await screen.findByText("Cancel Voucher"))
+
+    // Back on the list, after the first-page refresh, B is cancelled...
+    await waitFor(() => expect(screen.queryByText("Cancel Voucher")).toBeNull())
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter(([u]) => !String(u).includes("cancel")),
+      ).toHaveLength(3),
+    )
+    expect(await screen.findByText("CANCELLED")).toBeTruthy()
+
+    // ...and its detail offers no active-only actions.
+    fireEvent.click(screen.getByText("BBBBBBBB"))
+    await screen.findAllByText("CANCELLED")
+    expect(screen.queryByText("Cancel Voucher")).toBeNull()
+  })
+
+  it("an older page that arrives after a key switch is dropped", async () => {
+    let resolveMore: (value: Response) => void = () => {}
+    fetchMock.mockImplementation((url: string, init: RequestInit) => {
+      const key = (init.headers as Record<string, string>)["x-voucher-api-key"]
+      if (url.includes("before=")) {
+        return new Promise<Response>((resolve) => {
+          resolveMore = resolve
+        })
+      }
+      return key === "blink_old"
+        ? ok({ ...listBody(["a".repeat(32)]), nextCursor: `1000_${"9".repeat(64)}` })
+        : ok(listBody(["c".repeat(32)]))
+    })
+
+    const { rerender } = render(<VoucherManager {...props({ apiKey: "blink_old" })} />)
+    fireEvent.click(await screen.findByText("Load older vouchers"))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    rerender(<VoucherManager {...props({ apiKey: "blink_new" })} />)
+    await screen.findByText("CCCCCCCC")
+
+    await act(async () => {
+      resolveMore({
+        json: () => Promise.resolve({ ...listBody(["b".repeat(32)]), nextCursor: null }),
+      } as Response)
+    })
+    expect(screen.queryByText("BBBBBBBB")).toBeNull()
+    expect(screen.queryByText("AAAAAAAA")).toBeNull()
   })
 
   it("makes no request and shows an empty list without a key", async () => {

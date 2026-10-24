@@ -17,6 +17,13 @@ import {
   CurrencyMetadata,
 } from "../lib/currency-utils"
 import { isRedeemedStatus } from "../lib/voucher-expiry"
+import {
+  appendPage,
+  applyFirstPage,
+  emptyVoucherList,
+  updateVoucher,
+  type VoucherListState,
+} from "../lib/voucher-pages"
 
 import { ExpiryBadge, formatExpiryDate } from "./ExpirySelector"
 
@@ -61,6 +68,9 @@ interface VoucherData {
   usdAmountCents?: number | null
   lnurl?: string
 }
+
+/** Vouchers per list page (the API default; blink-wip#1617). */
+const VOUCHER_PAGE_SIZE = 100
 
 const EMPTY_STATS: VoucherStats = {
   total: 0,
@@ -117,7 +127,11 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
     },
     ref,
   ) => {
-    const [vouchers, setVouchers] = useState<VoucherData[]>([])
+    // Pages of vouchers, newest first (blink-wip#1617): the poll refreshes
+    // the first page, "Load older vouchers" appends the next ones.
+    const [list, setList] = useState<VoucherListState<VoucherData>>(emptyVoucherList)
+    const vouchers = list.vouchers
+    const [loadingMore, setLoadingMore] = useState<boolean>(false)
     const [stats, setStats] = useState<VoucherStats>(EMPTY_STATS)
     const [loading, setLoading] = useState<boolean>(true)
     const [error, setError] = useState<string>("")
@@ -151,7 +165,7 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
     const fetchVouchers = useCallback(async () => {
       const ctx = keyContextRef.current
       if (!ctx.apiKey) {
-        setVouchers([])
+        setList(emptyVoucherList())
         setLoading(false)
         return
       }
@@ -168,7 +182,7 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
       try {
         setError("")
         const response = await fetch(
-          `/api/voucher/list?environment=${encodeURIComponent(getEnvironment())}`,
+          `/api/voucher/list?environment=${encodeURIComponent(getEnvironment())}&limit=${VOUCHER_PAGE_SIZE}`,
           {
             headers: { "x-voucher-api-key": ctx.apiKey },
             signal: controller.signal,
@@ -178,7 +192,7 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
         if (isStale()) return
 
         if (data.success) {
-          setVouchers(data.vouchers)
+          setList((prev) => applyFirstPage(prev, data.vouchers, data.nextCursor ?? null))
           if (data.stats) {
             setStats(data.stats)
           }
@@ -194,11 +208,51 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
       }
     }, [])
 
+    // Load the next (older) page. Same key-context rules as fetchVouchers.
+    const loadMore = useCallback(async () => {
+      const ctx = keyContextRef.current
+      const before = list.nextCursor
+      if (!ctx.apiKey || !before || loadingMore) return
+      const controller = new AbortController()
+      ctx.controller.signal.addEventListener("abort", () => controller.abort(), {
+        once: true,
+      })
+      const isStale = () => controller.signal.aborted || !isCurrent(ctx)
+      setLoadingMore(true)
+      try {
+        const response = await fetch(
+          `/api/voucher/list?environment=${encodeURIComponent(getEnvironment())}` +
+            `&limit=${VOUCHER_PAGE_SIZE}&before=${encodeURIComponent(before)}`,
+          { headers: { "x-voucher-api-key": ctx.apiKey }, signal: controller.signal },
+        )
+        const data = await response.json()
+        if (isStale()) return
+        if (data.success) {
+          setList((prev) =>
+            // A poll or key change may have moved on; only extend from the
+            // cursor this page was requested with.
+            prev.nextCursor === before
+              ? appendPage(prev, data.vouchers, data.nextCursor ?? null)
+              : prev,
+          )
+        } else {
+          setError(data.error || "Failed to load more vouchers")
+        }
+      } catch (err: unknown) {
+        if (isStale()) return
+        console.error("Error loading more vouchers:", err)
+        setError("Failed to load more vouchers")
+      } finally {
+        if (!isStale()) setLoadingMore(false)
+      }
+    }, [list.nextCursor, loadingMore])
+
     // Key change: end the old context, clear wallet-scoped state, load anew.
     useEffect(() => {
       keyContextRef.current.controller.abort()
       keyContextRef.current = { apiKey: voucherApiKey, controller: new AbortController() }
-      setVouchers([])
+      setList(emptyVoucherList())
+      setLoadingMore(false)
       setStats(EMPTY_STATS)
       setSelectedVoucher(null)
       setCancelling(false)
@@ -245,6 +299,16 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
 
         if (data.success) {
           setSelectedVoucher(null)
+          // The server cancelled exactly this voucher. Reflect it locally:
+          // the refresh below covers only the first page, and the voucher
+          // may be on an older loaded page (blink-wip#1617).
+          setList((prev) =>
+            updateVoucher(prev, voucherId, {
+              status: "CANCELLED",
+              cancelledAt: Date.now(),
+              timeRemaining: undefined,
+            }),
+          )
           // Refresh through the stable fetcher (current key only)
           await fetchVouchers()
         } else {
@@ -1152,6 +1216,27 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
                   </div>
                 </button>
               ))}
+            </div>
+          )}
+
+          {/* Older pages (blink-wip#1617). Filters apply to loaded vouchers;
+              tab counts come from the full stats. */}
+          {list.nextCursor && !(loading && vouchers.length === 0) && (
+            <div className="py-3 text-center">
+              {(filter !== "all" || currencyFilter !== "all") && (
+                <div className="mb-2 text-xs text-gray-500 dark:text-gray-400">
+                  Showing matches among loaded vouchers. Older vouchers are not loaded
+                  yet.
+                </div>
+              )}
+              <button
+                type="button"
+                onClick={loadMore}
+                disabled={loadingMore}
+                className="px-4 py-2 text-sm rounded-lg border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:border-purple-400 dark:hover:border-purple-500 disabled:opacity-50"
+              >
+                {loadingMore ? "Loading…" : "Load older vouchers"}
+              </button>
             </div>
           )}
         </div>

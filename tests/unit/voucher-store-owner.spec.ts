@@ -67,7 +67,11 @@ describe("getVouchersByWalletIds", () => {
     const [sql, params] = mockPoolQuery.mock.calls[0]
     expect(sql).toMatch(/COALESCE\(environment, 'production'\) = \$2/)
     expect(sql).toMatch(/wallet_id = ANY\(\$1\)/)
-    expect(sql).toMatch(/ORDER BY created_at DESC\s+LIMIT \$3/)
+    // sha256(id) breaks created_at ties so cursor pages never skip or repeat,
+    // without the id (a redemption secret) ever being the cursor (#1617)
+    expect(sql).toMatch(
+      /ORDER BY created_at DESC, encode\(sha256\(convert_to\(id, 'UTF8'\)\), 'hex'\) DESC\s+LIMIT \$3/,
+    )
     expect(params).toEqual([["w1", "w2"], "production", OWNER_LIST_LIMIT])
     expect(vouchers).toHaveLength(1)
     expect(vouchers[0]).toMatchObject({ walletId: "w1", environment: "production" })
@@ -80,10 +84,14 @@ describe("getVouchersByWalletIds", () => {
     expect(vouchers.every((v) => v.apiKey === null)).toBe(true)
   })
 
-  it("clamps the limit to the maximum", async () => {
+  it("clamps the limit to the maximum (+1 for next-page detection)", async () => {
     mockPoolQuery.mockResolvedValueOnce({ rows: [] })
     await store().getVouchersByWalletIds(["w1"], "staging", 10_000)
-    expect(mockPoolQuery.mock.calls[0][1]).toEqual([["w1"], "staging", OWNER_LIST_LIMIT])
+    expect(mockPoolQuery.mock.calls[0][1]).toEqual([
+      ["w1"],
+      "staging",
+      OWNER_LIST_LIMIT + 1,
+    ])
   })
 
   it("does not query for an empty wallet set", async () => {

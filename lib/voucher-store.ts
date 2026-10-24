@@ -29,6 +29,13 @@ import {
   DEFAULT_EXPIRY_ID,
   getVoucherStatus,
 } from "./voucher-expiry"
+import {
+  OWNER_LIST_LIMIT,
+  OWNER_STATUS_SQL,
+  ownerListingSql,
+  type OwnerListStatus,
+  type VoucherCursor,
+} from "./voucher-listing"
 
 /**
  * BACKING INVARIANT (blink-wip#1665)
@@ -109,17 +116,6 @@ export const CLAIM_VOUCHER_SQL = `UPDATE vouchers
      AND NOT claimed
      AND expires_at > $2
    RETURNING id`
-
-/**
- * Owner-scoped listing. Shaped for idx_vouchers_env_wallet_created
- * (migration 021); exported so the Postgres suite can EXPLAIN the exact
- * statement. $1 = wallet ids (text[]), $2 = environment, $3 = limit.
- */
-export const OWNER_LISTING_SQL = `SELECT * FROM vouchers
-   WHERE COALESCE(environment, 'production') = $2
-     AND wallet_id = ANY($1)
-   ORDER BY created_at DESC
-   LIMIT $3`
 
 export const MARK_VOUCHER_PAID_SQL = `UPDATE vouchers
    SET status = 'PAID'
@@ -222,9 +218,6 @@ interface VoucherRow {
   usd_amount_cents: string | null
   [key: string]: unknown
 }
-
-/** Max vouchers returned by the owner-scoped listing (newest first). */
-const OWNER_LIST_LIMIT = 500
 
 // Database connection pool (delegates to shared pool)
 function getPool() {
@@ -752,23 +745,34 @@ class VoucherStore {
    * (owner-scoped listing). Stored API keys are NOT decrypted.
    * @param walletIds - Wallet ids the caller currently owns
    * @param environment - 'production' or 'staging'
-   * @param limit - Max rows, newest first (default/max OWNER_LIST_LIMIT)
+   * @param limit - Max rows, newest first (default OWNER_LIST_LIMIT, max +1)
+   * @param options.before - Only vouchers after this cursor (older)
+   * @param options.status - Only vouchers with this (derived) status
    * @returns Array of voucher objects with status (apiKey always null)
    */
   async getVouchersByWalletIds(
     walletIds: string[],
     environment: string,
     limit: number = OWNER_LIST_LIMIT,
+    { before, status }: { before?: VoucherCursor | null; status?: OwnerListStatus } = {},
   ): Promise<Voucher[]> {
     if (walletIds.length === 0) return []
     try {
       await this.lazyCleanup()
 
-      const result: QueryResult<VoucherRow> = await query(OWNER_LISTING_SQL, [
+      const params: unknown[] = [
         walletIds,
         environment,
-        Math.min(Math.max(1, limit), OWNER_LIST_LIMIT),
-      ])
+        // +1: callers fetch one extra row to tell whether a next page exists.
+        Math.min(Math.max(1, limit), OWNER_LIST_LIMIT + 1),
+      ]
+      if (before) params.push(before.createdAt, before.tiebreak)
+      // Only the time-dependent filters (EXPIRED / ACTIVE) take "now".
+      if (status && OWNER_STATUS_SQL[status].includes("$NOW")) params.push(Date.now())
+      const result: QueryResult<VoucherRow> = await query(
+        ownerListingSql({ cursor: Boolean(before), status }),
+        params,
+      )
 
       return result.rows.map((row: VoucherRow) => {
         const voucher: Voucher = this._rowToVoucher(row, null, false) as Voucher
@@ -932,5 +936,14 @@ class VoucherStore {
 const voucherStore: VoucherStore = new VoucherStore()
 export default voucherStore
 export { VoucherStore, OWNER_LIST_LIMIT }
+// Listing helpers live in ./voucher-listing (no database / auth imports).
+export {
+  decodeVoucherCursor,
+  encodeVoucherCursor,
+  OWNER_LIST_STATUSES,
+  OWNER_LISTING_SQL,
+  ownerListingSql,
+  type OwnerListStatus,
+} from "./voucher-listing"
 
 export type { Voucher, CreateVoucherOptions, BackingInputs, VoucherStats, VoucherRow }
