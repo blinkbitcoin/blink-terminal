@@ -102,6 +102,36 @@ describe("VoucherManager", () => {
     expect(screen.queryByText("Load older vouchers")).toBeNull()
   })
 
+  it("cancelling a voucher from an older page shows it cancelled (first-page refresh does not cover it)", async () => {
+    const cursor = `1000_${"9".repeat(64)}`
+    fetchMock.mockImplementation((url: string) => {
+      if (url.startsWith("/api/voucher/cancel")) return ok({ success: true })
+      if (url.includes("before="))
+        return ok({ ...listBody(["b".repeat(32)]), nextCursor: null })
+      // The first page never contains the older voucher.
+      return ok({ ...listBody(["a".repeat(32)]), nextCursor: cursor })
+    })
+
+    render(<VoucherManager {...props({ apiKey: "blink_owner" })} />)
+    fireEvent.click(await screen.findByText("Load older vouchers"))
+    fireEvent.click(await screen.findByText("BBBBBBBB"))
+    fireEvent.click(await screen.findByText("Cancel Voucher"))
+
+    // Back on the list, after the first-page refresh, B is cancelled...
+    await waitFor(() => expect(screen.queryByText("Cancel Voucher")).toBeNull())
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter(([u]) => !String(u).includes("cancel")),
+      ).toHaveLength(3),
+    )
+    expect(await screen.findByText("CANCELLED")).toBeTruthy()
+
+    // ...and its detail offers no active-only actions.
+    fireEvent.click(screen.getByText("BBBBBBBB"))
+    await screen.findAllByText("CANCELLED")
+    expect(screen.queryByText("Cancel Voucher")).toBeNull()
+  })
+
   it("an older page that arrives after a key switch is dropped", async () => {
     let resolveMore: (value: Response) => void = () => {}
     fetchMock.mockImplementation((url: string, init: RequestInit) => {

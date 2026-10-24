@@ -21,6 +21,7 @@ import {
   appendPage,
   applyFirstPage,
   emptyVoucherList,
+  updateVoucher,
   type VoucherListState,
 } from "../lib/voucher-pages"
 
@@ -298,6 +299,16 @@ const VoucherManager = forwardRef<VoucherManagerRef, VoucherManagerProps>(
 
         if (data.success) {
           setSelectedVoucher(null)
+          // The server cancelled exactly this voucher. Reflect it locally:
+          // the refresh below covers only the first page, and the voucher
+          // may be on an older loaded page (blink-wip#1617).
+          setList((prev) =>
+            updateVoucher(prev, voucherId, {
+              status: "CANCELLED",
+              cancelledAt: Date.now(),
+              timeRemaining: undefined,
+            }),
+          )
           // Refresh through the stable fetcher (current key only)
           await fetchVouchers()
         } else {

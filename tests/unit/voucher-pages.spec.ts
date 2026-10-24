@@ -7,6 +7,7 @@ import {
   appendPage,
   applyFirstPage,
   emptyVoucherList,
+  updateVoucher,
   type VoucherListState,
 } from "../../lib/voucher-pages"
 
@@ -97,6 +98,37 @@ describe("voucher list paging", () => {
     s = applyFirstPage(s, [v("f", 6), v("e", 5)], "5_e")
     expect(ids(s)).toEqual(["f", "e", "d", "c"])
     expect(s).toMatchObject({ nextCursor: "3_c", extended: true })
+  })
+
+  it("a voucher deleted from inside a timestamp tie does not come back (review repro)", () => {
+    // Loaded [A(5), B(5)] + [C(5), D(4)]; cleanup deletes A; the refreshed
+    // first page is [B(5), C(5)]. A timestamp-only merge kept A ("5 <= 5").
+    let s = applyFirstPage(emptyVoucherList<V>(), [v("A", 5), v("B", 5)], "5_x")
+    s = appendPage(s, [v("C", 5), v("D", 4)], "4_y")
+    s = applyFirstPage(s, [v("B", 5), v("C", 5)], "5_z")
+    expect(ids(s)).toEqual(["B", "C", "D"])
+    expect(s.nextCursor).toBe("4_y")
+  })
+
+  it("a deletion right at the page boundary inside a tie is dropped too", () => {
+    let s = applyFirstPage(emptyVoucherList<V>(), [v("A", 5), v("B", 5)], "5_x")
+    s = appendPage(s, [v("C", 5), v("D", 5), v("E", 4)], "4_y")
+    // C was deleted; the refreshed page ends at D.
+    s = applyFirstPage(s, [v("B", 5), v("D", 5)], "5_z")
+    expect(ids(s)).toEqual(["B", "D", "E"])
+  })
+
+  it("updateVoucher patches one loaded voucher (e.g. cancelled on an older page)", () => {
+    let s = applyFirstPage(emptyVoucherList<V>(), [v("c", 3)], "3_c")
+    s = appendPage(s, [v("b", 2), v("a", 1)], null)
+    const next = updateVoucher(s, "a", { status: "CANCELLED" })
+    expect(next.vouchers.map((x) => `${x.id}:${x.status}`)).toEqual([
+      "c:ACTIVE",
+      "b:ACTIVE",
+      "a:CANCELLED",
+    ])
+    expect(next.nextCursor).toBe(s.nextCursor)
+    expect(updateVoucher(s, "zz", { status: "CANCELLED" })).toBe(s) // not loaded: no-op
   })
 
   it("a poll whose first page is now everything resets to a single page", () => {

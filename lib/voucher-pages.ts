@@ -13,6 +13,11 @@
  * since been deleted. If it contains none (more than a page of new vouchers
  * since the last poll, e.g. while the tab was hidden), keeping the old tail
  * would leave a silent gap — so the list resets to the first page instead.
+ *
+ * Ordering is never modelled here: the loaded list is always in the server's
+ * order (pages are appended contiguously), so "older than the refreshed page"
+ * is "after the anchor's position" — no timestamp comparison, which could not
+ * reproduce the server's tiebreak for equal created_at.
  */
 
 export interface PagedVoucher {
@@ -46,21 +51,41 @@ export function applyFirstPage<T extends PagedVoucher>(
   page: T[],
   nextCursor: string | null,
 ): VoucherListState<T> {
-  const last = page[page.length - 1]
-  const loaded = new Set(prev.vouchers.map((v) => v.id))
-  const continuous = page.some((v) => loaded.has(v.id))
+  const inPage = new Set(page.map((v) => v.id))
+  // Anchor: the last loaded voucher that the refreshed page still contains.
+  let anchor = -1
+  for (let i = prev.vouchers.length - 1; i >= 0; i--) {
+    if (inPage.has(prev.vouchers[i].id)) {
+      anchor = i
+      break
+    }
+  }
   // Not extended, the first page is now everything there is, or there is no
   // provable continuity with the loaded pages: start over from this page.
-  if (!prev.extended || !last || nextCursor === null || !continuous) {
+  if (!prev.extended || page.length === 0 || nextCursor === null || anchor < 0) {
     return { vouchers: page, nextCursor, extended: false }
   }
-  // The server breaks created_at ties by a hash the client does not have,
-  // so ties at the boundary are kept (deduplicated) rather than guessed.
-  const inPage = new Set(page.map((v) => v.id))
-  const older = prev.vouchers.filter(
-    (v) => !inPage.has(v.id) && v.createdAt <= last.createdAt,
-  )
+  // Everything loaded after the anchor is older than the refreshed page;
+  // anything before it that the page no longer contains was deleted.
+  const older = prev.vouchers.slice(anchor + 1).filter((v) => !inPage.has(v.id))
   return { vouchers: [...page, ...older], nextCursor: prev.nextCursor, extended: true }
+}
+
+/**
+ * Apply a change the server confirmed for one loaded voucher (e.g. a
+ * successful cancel). Needed for vouchers on older pages, which the
+ * first-page poll does not refresh. No-op when the voucher is not loaded.
+ */
+export function updateVoucher<T extends PagedVoucher>(
+  prev: VoucherListState<T>,
+  id: string,
+  patch: Partial<T>,
+): VoucherListState<T> {
+  if (!prev.vouchers.some((v) => v.id === id)) return prev
+  return {
+    ...prev,
+    vouchers: prev.vouchers.map((v) => (v.id === id ? { ...v, ...patch } : v)),
+  }
 }
 
 /** An older page loaded with the previous `nextCursor`. */
