@@ -23,20 +23,20 @@ jest.mock("../../lib/rate-limit", () => ({
   RATE_LIMIT_PUBLIC: {},
 }))
 
-import { pngDataUrlDimensions } from "../../lib/pdf/safe-image-src"
 import paycodePdfHandler, { config } from "../../pages/api/paycode/pdf"
 
-/** A PNG data URL whose IHDR declares w x h (body irrelevant: only the header is read). */
-const pngHeader = (w: number, h: number) => {
-  const b = Buffer.alloc(33)
-  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(b, 0)
-  b.writeUInt32BE(13, 8)
-  b.write("IHDR", 12, "latin1")
-  b.writeUInt32BE(w, 16)
-  b.writeUInt32BE(h, 20)
-  b[24] = 8
-  b[25] = 6
-  return `data:image/png;base64,${b.toString("base64")}`
+import { SIGNATURE, dataUrl, ihdr, rgbaPng } from "./png-fixtures"
+
+/** A PNG data URL that is only a signature + IHDR declaring w x h (no pixels). */
+const pngHeader = (w: number, h: number) =>
+  dataUrl(Buffer.concat([SIGNATURE, ihdr(w, h)]))
+
+/** The review's 41-byte PNG: IHDR 1x1, then a PLTE header claiming 20 MB that is absent. */
+const forgedPlte = () => {
+  const head = Buffer.alloc(8)
+  head.writeUInt32BE(20_000_000, 0)
+  head.write("PLTE", 4, "latin1")
+  return dataUrl(Buffer.concat([SIGNATURE, ihdr(1, 1), head]))
 }
 
 const call = async (body: unknown) => {
@@ -142,7 +142,16 @@ describe("paycode PDF input bounds", () => {
       { qrDataUrl: pngHeader(6000, 6000) },
       "Invalid qrDataUrl",
     ],
-    ["PNG declaring 1025x1", { qrDataUrl: pngHeader(1025, 1) }, "Invalid qrDataUrl"],
+    [
+      "a valid PNG 1025 px wide",
+      { qrDataUrl: dataUrl(rgbaPng(1025, 1)) },
+      "Invalid qrDataUrl",
+    ],
+    [
+      "a tiny PNG with a forged chunk length (renderer heap OOM)",
+      { qrDataUrl: forgedPlte() },
+      "Invalid qrDataUrl",
+    ],
     ["PNG declaring 0x0", { qrDataUrl: pngHeader(0, 0) }, "Invalid qrDataUrl"],
     [
       "PNG signature without IHDR",
@@ -167,9 +176,9 @@ describe("paycode PDF input bounds", () => {
   })
 
   it("accepts the maximum PNG side", async () => {
-    expect((await call({ ...base(), qrDataUrl: pngHeader(1024, 1024) })).statusCode).toBe(
-      200,
-    )
+    expect(
+      (await call({ ...base(), qrDataUrl: dataUrl(rgbaPng(1024, 1024)) })).statusCode,
+    ).toBe(200)
   })
 
   it("never logs caller-supplied free text", async () => {
@@ -180,12 +189,5 @@ describe("paycode PDF input bounds", () => {
 
   it("caps the request body (was 10 MB)", () => {
     expect(config.api.bodyParser.sizeLimit).toBe("300kb")
-  })
-
-  it("pngDataUrlDimensions reads the IHDR of a real PNG", () => {
-    expect(pngDataUrlDimensions(clientQr)).toEqual({ width: 400, height: 400 })
-    expect(pngDataUrlDimensions(pngHeader(7, 9))).toEqual({ width: 7, height: 9 })
-    expect(pngDataUrlDimensions("data:image/jpeg;base64,/9j/4AAQ")).toBeNull()
-    expect(pngDataUrlDimensions("data:image/png;base64,AAAA")).toBeNull()
   })
 })

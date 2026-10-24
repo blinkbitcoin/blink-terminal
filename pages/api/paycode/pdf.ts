@@ -2,7 +2,8 @@ import { renderToBuffer } from "@react-pdf/renderer"
 import type { NextApiRequest, NextApiResponse } from "next"
 import React from "react"
 
-import { isSafeImageDataUrl, pngDataUrlDimensions } from "../../../lib/pdf/safe-image-src"
+import { checkPngDataUrl } from "../../../lib/pdf/png-guard"
+import { isSafeImageDataUrl } from "../../../lib/pdf/safe-image-src"
 import { withRateLimit, RATE_LIMIT_PUBLIC } from "../../../lib/rate-limit"
 
 /**
@@ -108,18 +109,17 @@ async function handler(req: NextApiRequest, res: NextApiResponse) {
       })
     }
 
-    const dims = pngDataUrlDimensions(qrDataUrl)
-    if (
-      qrDataUrl.length > LIMITS.qrDataUrlLength ||
-      !dims ||
-      dims.width < 1 ||
-      dims.height < 1 ||
-      dims.width > LIMITS.qrMaxSide ||
-      dims.height > LIMITS.qrMaxSide
-    ) {
+    // Decode-cost guard: the renderer's PNG parser trusts chunk lengths and
+    // inflates IDAT without a limit, so only a structurally valid PNG whose
+    // pixels inflate to exactly the declared (bounded) size may reach it.
+    const png = checkPngDataUrl(qrDataUrl, {
+      maxSide: LIMITS.qrMaxSide,
+      maxDataUrlLength: LIMITS.qrDataUrlLength,
+    })
+    if (!png.ok) {
       return res.status(400).json({
         error: "Invalid qrDataUrl",
-        hint: `qrDataUrl must be a PNG of at most ${LIMITS.qrMaxSide}x${LIMITS.qrMaxSide} px and ${LIMITS.qrDataUrlLength / 1024} KB`,
+        hint: `qrDataUrl must be a valid, non-interlaced PNG of at most ${LIMITS.qrMaxSide}x${LIMITS.qrMaxSide} px and ${LIMITS.qrDataUrlLength / 1024} KB`,
       })
     }
 
