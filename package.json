@@ -41,7 +41,7 @@
     "@opentelemetry/sdk-trace-node": "^2.9.0",
     "@opentelemetry/semantic-conventions": "^1.33.0",
     "@react-pdf/renderer": "^4.5.1",
-    "@react-pdf/types": "^2.11.1",
+    "@react-pdf/types": "^2.14.0",
     "@t3-oss/env-nextjs": "^0.13.11",
     "bcryptjs": "^2.4.3",
     "bech32": "^2.0.0",
