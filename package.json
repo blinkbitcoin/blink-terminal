@@ -37,7 +37,7 @@
     "@opentelemetry/instrumentation-http": "^0.220.0",
     "@opentelemetry/instrumentation-net": "^0.64.0",
     "@opentelemetry/resources": "^2.9.0",
-    "@opentelemetry/sdk-node": "^0.220.0",
+    "@opentelemetry/sdk-node": "^0.223.0",
     "@opentelemetry/sdk-trace-node": "^2.9.0",
     "@opentelemetry/semantic-conventions": "^1.33.0",
     "@react-pdf/renderer": "^4.5.1",
