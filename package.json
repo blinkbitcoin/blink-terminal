@@ -59,7 +59,7 @@
     "react-dom": "^19.0.0",
     "react-qr-code": "^2.0.18",
     "redis": "^4.7.0",
-    "ws": "^8.18.3",
+    "ws": "^8.22.0",
     "zod": "^4.6.7"
   },
   "devDependencies": {
@@ -79,7 +79,7 @@
     "@types/qrcode": "^1.5.6",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
-    "@types/ws": "^8.18.1",
+    "@types/ws": "^8.18.2",
     "@typescript-eslint/eslint-plugin": "^8.55.0",
     "@typescript-eslint/parser": "^8.55.0",
     "autoprefixer": "^10.0.0",
