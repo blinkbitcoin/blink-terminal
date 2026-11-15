@@ -60,7 +60,7 @@ function check_code() {
     pnpm code:check
     echo "    --> Done!"
     popd
-  else 
+  else
     echo "    --> Skipping check code"
   fi
 }

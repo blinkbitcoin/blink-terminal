@@ -15,7 +15,7 @@ if [[ -f ./yarn.lock ]]; then
   yarn audit --groups dependencies --level ${LEVEL}
 elif [[ -f ./pnpm-lock.yaml ]]; then
   pnpm audit --prod --audit-level=${LEVEL}
-else 
+else
   echo "Failed audit: Unsupported PckgMgr"
   exit 2
 fi
